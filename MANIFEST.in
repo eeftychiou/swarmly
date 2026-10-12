@@ -1,0 +1,4 @@
+# The sdist carries the package and its docs; the test suite lives in the repository.
+prune tests
+prune build
+prune a2a

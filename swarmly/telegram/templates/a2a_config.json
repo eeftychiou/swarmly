@@ -1,0 +1,8 @@
+{
+  "protocol_version": "a2a/v1.0",
+  "authorized_agents": {},
+  "revocation_list": [],
+  "fast_plane": {
+    "enabled": true
+  }
+}

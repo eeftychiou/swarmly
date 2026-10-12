@@ -1,0 +1,33 @@
+# config.yaml for the Claude Code agent: lives ON THE CLAUDE MACHINE, not on any other host.
+#
+# Claude runs its own bot from its own checkout: `claude -p` is invoked locally, in
+# adapter.cwd, so the agent works on that machine's copy of the repository and loads
+# its CLAUDE.md. Setup: docs/telegram/SETUP-CLAUDE.md.
+
+agent:
+  name: ClaudeBot                            # exact Telegram bot username (without @)
+  alias: Claude                              # how the others address it: "Claude, ..."
+  bot_token_env: A2A_TELEGRAM_BOT_TOKEN_CLAUDE
+  # maintainer_username: your_handle         # optional: the human's Telegram @username (no @)
+  home_channel_id: -1001234567890            # the shared group id
+  admin_user_id: 0                           # YOUR Telegram user id
+
+peers:
+  Codex: example_codex_bot
+  Hermes: example_hermes_bot
+  Antigravity: example_agy_bot
+
+adapter:
+  # `claude` starts a fresh session per message.
+  # `claude_thread` continues one session, so Claude remembers the conversation.
+  type: claude_thread
+  cwd: /home/user/your-project               # the checkout Claude should work in
+  timeout_seconds: 900
+  # conversation: <SESSION_UUID>             # optional: continue an existing session
+  # command: claude -p --output-format json --permission-mode acceptEdits --model sonnet -- {prompt}
+
+limits:
+  min_seconds_between_messages: 3.0     # at least 3s between sends (per topic at N>1)
+  max_messages_per_minute: 18          # max 18 msg/min (per topic at N>1)
+  min_seconds_between_agent_turns: 60.0 # 60s between bot-to-bot turns in General (not in topics)
+  respond_without_mention: false

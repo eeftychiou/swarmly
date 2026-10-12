@@ -1,0 +1,66 @@
+# config.yaml — one file per agent, living next to that agent on its own machine.
+#
+# Identity is the bot token: whoever holds it *is* this bot in Telegram. The alias is the
+# name every other agent (and the human) uses to address it, here and on GitHub.
+#
+# `swarmly-telegram init` writes this file as config.yaml (or copy it by hand). Fill in the
+# bot name, the group id and your admin_user_id, then:
+#   swarmly-telegram check
+
+agent:
+  name: example_hermes_bot       # the bot username you created in @BotFather (e.g. example_hermes_bot)
+  alias: Hermes                    # the alias used in chat, on GitHub and in A2A
+  bot_token_env: A2A_TELEGRAM_BOT_TOKEN_HERMES   # preferred: keep the token out of the file
+  # bot_token: "123456:ABC-DEF..."               # or paste it here (never commit this)
+  # maintainer_username: your_handle             # optional — the human's Telegram @username (no @)
+  home_channel_id: -1001234567890  # the group every bot joins and talks in
+  admin_user_id: 0                 # YOUR Telegram user id — the human who controls everything
+  # role: developer                # coordinator | developer | reviewer | qa-tester | researcher (docs/ROLES.md)
+
+# alias -> Telegram username (or numeric user id) for everyone else in the group.
+# Needed so the agent knows *who* is talking; unmatched bots are ignored. A peer can also
+# carry its role, so this agent knows whom to hand work to:
+#   Codex: {username: example_codex_bot, role: developer}
+peers:
+  Codex: example_codex_bot
+  Antigravity: example_agy_bot
+  Claude: ClaudeBot
+
+# The git checkout whose .agents/inbox/ is the durable bus. Unset, nothing is polled; the
+# transport keeps its seen-ledger, locks and heartbeat there (docs/GETTING-STARTED.md §3).
+# bus:
+#   repo: /home/user/your-project
+
+adapter:
+  type: hermes                     # codex | claude | hermes | antigravity | echo | custom
+  cwd: /home/user/your-project
+  timeout_seconds: 900
+  max_output_chars: 3500
+  # command: 'codex exec --sandbox workspace-write {prompt}'   # override the default template
+  # extra_env: { HERMES_PROFILE: coding }
+
+# Optional: route Telegram forum topics to project repos and checkouts.
+# Each topic (numeric thread id) is bound to a project and its working directory.
+# projects:
+#   my-project:
+#     repo: your-org/your-project
+#     cwd: /home/user/your-project
+#     topics: [12, 15]
+#     worktrees: true               # optional: create isolated git worktrees per topic
+
+# Optional: GitHub identity and notifications backstop (required when projects configured)
+# github:
+#   login: example-bot-login        # this agent's own GitHub account
+#   token_env: GH_TOKEN             # environment variable holding its GitHub token
+#   poll_minutes: 5                 # check notifications every N minutes (0 disables backstop)
+#   mark_read: true                 # mark handled notifications read on GitHub
+
+limits:
+  max_message_chars: 4096          # Telegram's hard limit for text messages
+  min_seconds_between_messages: 3.0     # at least 3s between sends (per topic at N>1)
+  max_messages_per_minute: 18          # max 18 msg/min (per topic at N>1)
+  max_group_messages_per_minute: 1     # alias
+  min_seconds_between_agent_turns: 60.0 # 60s between bot-to-bot turns in General (not in topics)
+  max_agent_turns: 6               # deprecated no-op: the loop guard is removed; loop safety is routing (PROTOCOL.md §8)
+  respond_without_mention: false   # zero-token directive: chat message is passed to agent ONLY if mentioned
+  require_admin_for_broadcast: true

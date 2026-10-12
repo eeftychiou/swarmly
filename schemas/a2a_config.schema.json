@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "A2AClusterConfig",
+  "description": "The v1 bus and gateway configuration (config/a2a_config.json). Only the keys listed here are read by the code.",
+  "type": "object",
+  "required": [
+    "authorized_agents"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "protocol_version": {
+      "type": "string",
+      "const": "a2a/v1.0"
+    },
+    "coordination": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "primary_master": {
+          "type": "string",
+          "description": "Reported to gateway clients as cluster_master after authentication"
+        },
+        "failover_master": {
+          "type": "string",
+          "description": "Shown by scripts/a2a_bus.py status"
+        }
+      }
+    },
+    "authorized_agents": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "public_key_or_secret_name"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "model_family": {
+            "type": "string"
+          },
+          "framework": {
+            "type": "string"
+          },
+          "public_key_or_secret_name": {
+            "type": "string",
+            "description": "For HMAC, the name of the environment variable that holds the shared secret (never the secret itself); for Ed25519, the agent's base64 public key, written inline"
+          },
+          "role_scope": {
+            "type": "string",
+            "enum": [
+              "master",
+              "worker",
+              "auditor",
+              "human_maintainer"
+            ],
+            "description": "Shown by scripts/a2a_bus.py status; not enforced"
+          },
+          "key_type": {
+            "type": "string",
+            "enum": [
+              "hmac",
+              "ed25519"
+            ],
+            "description": "The registered key's algorithm; only signatures made with it verify. Omitted: ed25519 for an inline Ed25519 public key, else hmac"
+          }
+        }
+      }
+    },
+    "revocation_list": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Agent ids that are denied immediately"
+    },
+    "fast_plane": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Shown by scripts/a2a_bus.py status; the gateway itself is started with scripts/run_server.py"
+        }
+      }
+    }
+  }
+}

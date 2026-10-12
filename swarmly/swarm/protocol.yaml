@@ -1,0 +1,268 @@
+# swarmly swarm protocol, version 2 (a2a/2).
+#
+# This file is the single source of truth for the swarm protocol. The governor
+# (`swarmly` CLI and `swarmly mcp`) enforces it on every write and the projection
+# enforces it again on every read. docs/SWARM-PROTOCOL.md is generated from it
+# (`swarmly protocol-doc`), and a test fails when the two drift apart.
+#
+# Changing this file is on the safety list: it needs the owner's approval.
+
+protocol: a2a/2
+
+roles:
+  owner: The human root supervisor. Paged only for the safety and stuck lists.
+  planner: One appointed agent that offers work, rules on disputes and merges.
+  worker: Every other agent. Proposes, claims, builds, reviews and objects.
+
+# Task states. `null` in `from` below means "the task does not exist yet".
+states:
+  proposed: Someone suggested the work; nobody owns it.
+  offered: The planner (or owner) put it up for claiming.
+  claimed: One agent owns it under the current epoch.
+  blocked: The claimant cannot continue until something outside the task changes.
+  ready: The claimant says it is done at a specific head SHA.
+  changes_requested: A reviewer asked for changes to the ready head.
+  approved: A reviewer from a different vendor approved the ready head.
+  done: Merged or otherwise finished. Terminal.
+  rejected: Declined. Terminal.
+
+terminal_states: [done, rejected]
+
+# Who may send each intent, what it needs, and what it does to its task.
+#   roles:     who may send it (owner, planner, worker, any)
+#   task:      required | forbidden | optional
+#   from/to:   task state transition (omitted: no transition)
+#   body:      required body fields
+#   evidence:  minimum number of evidence items
+#   re:        required when the intent answers an earlier envelope; always an envelope
+#              id, <lane>:<seq> (for example claude:12)
+#   checks:    named rules the code enforces (see the doc for each)
+intents:
+  HELLO:
+    summary: Announce that an agent is online.
+    roles: [any]
+    task: forbidden
+  BYE:
+    summary: Announce that an agent is leaving. Its claims stay until released or expired.
+    roles: [any]
+    task: forbidden
+  HEARTBEAT:
+    summary: Liveness only. Does not count as progress.
+    roles: [any]
+    task: optional
+  NOTE:
+    summary: Free-form information for the record. Changes nothing.
+    roles: [any]
+    task: optional
+    body: [text]
+  QUERY:
+    summary: Ask a named agent a question. Creates an obligation to answer.
+    roles: [any]
+    task: optional
+    body: [text]
+    checks: [named_recipient]
+  ANSWER:
+    summary: Answer a QUERY.
+    roles: [any]
+    task: optional
+    body: [text]
+    re: QUERY
+  PROPOSE:
+    summary: Suggest a new task.
+    roles: [any]
+    task: required
+    from: [null]
+    to: proposed
+    body: [title]
+  OFFER:
+    summary: Put a task up for claiming, optionally to one named agent.
+    roles: [planner, owner]
+    task: required
+    from: [proposed]
+    to: offered
+  CLAIM:
+    summary: Take ownership of a task. The governor stamps the next epoch.
+    roles: [planner, worker]
+    task: required
+    from: [proposed, offered]
+    to: claimed
+    checks: [offer_target, next_epoch]
+  PROGRESS:
+    summary: Report progress on a claimed task. Also unblocks a blocked task.
+    roles: [planner, worker]
+    task: required
+    from: [claimed, blocked, changes_requested]
+    to: claimed
+    body: [text]
+    checks: [claimant, current_epoch, budget]
+  BLOCKED:
+    summary: Say the claimed task cannot continue, and why.
+    roles: [planner, worker]
+    task: required
+    from: [claimed]
+    to: blocked
+    body: [reason]
+    checks: [claimant, current_epoch]
+  READY:
+    summary: Hand a finished task in for review at an exact head SHA and branch.
+    roles: [planner, worker]
+    task: required
+    from: [claimed, changes_requested]
+    to: ready
+    body: [head_sha, branch]
+    evidence: 1
+    checks: [claimant, current_epoch, sha, budget]
+  REVIEW:
+    summary: Approve or request changes on the ready head, with evidence.
+    roles: [planner, worker, owner]
+    task: required
+    from: [ready]
+    to: "@verdict"
+    body: [verdict, head_sha]
+    evidence: 1
+    checks: [not_claimant, cross_vendor, reviewed_head, verdict]
+  DONE:
+    summary: Record that an approved task was merged or finished.
+    roles: [planner, owner]
+    task: required
+    from: [approved]
+    to: done
+    body: [merge_sha]
+    checks: [sha]
+  FAILED:
+    summary: Give up on the current attempt. The task goes back on offer and its failure count rises.
+    roles: [planner, worker]
+    task: required
+    from: [claimed, blocked, changes_requested]
+    to: offered
+    body: [reason]
+    checks: [claimant, current_epoch]
+  RELEASE:
+    summary: Hand a claimed task back without counting a failure.
+    roles: [planner, worker]
+    task: required
+    from: [claimed, blocked, changes_requested]
+    to: offered
+    checks: [claimant, current_epoch]
+  REJECT:
+    summary: Decline a task that is not being worked on.
+    roles: [planner, owner]
+    task: required
+    from: [proposed, offered, blocked]
+    to: rejected
+    body: [reason]
+  OBJECTION:
+    summary: Open a dispute about an earlier envelope. Must carry evidence.
+    roles: [any]
+    task: optional
+    body: [claim]
+    evidence: 1
+    checks: [re_any, dispute_open_or_new]
+  RESPONSE:
+    summary: Answer an objection. Each OBJECTION or RESPONSE in a dispute is one round.
+    roles: [any]
+    task: optional
+    body: [text]
+    re: OBJECTION
+    checks: [dispute_rounds]
+  RULING:
+    summary: The planner settles a dispute. A further OBJECTION after a ruling pages the owner.
+    roles: [planner, owner]
+    task: optional
+    body: [decision]
+    re: OBJECTION
+    checks: [ruling_open]
+  ESCALATE:
+    summary: Page the owner. Only for the safety list or the stuck list.
+    roles: [any]
+    task: optional
+    body: [kind, reason, options]
+    checks: [escalation_kind]
+  DECISION:
+    summary: The owner answers an escalation.
+    roles: [owner]
+    task: optional
+    body: [decision]
+    re: ESCALATE
+  REQUEST_ACTION:
+    summary: Ask the owner to allow one action from the safety list.
+    roles: [any]
+    task: optional
+    body: [category, action, reason]
+    checks: [safety_category]
+  APPROVE_ACTION:
+    summary: The owner allows or denies a REQUEST_ACTION.
+    roles: [owner]
+    task: optional
+    body: [decision]
+    re: REQUEST_ACTION
+    checks: [approval_decision]
+  ACTION_TAKEN:
+    summary: Use up an approval. `swarmly guard` sends it when it lets an approved action run, so each approval allows exactly one run.
+    roles: [any]
+    task: optional
+    body: [action]
+    re: REQUEST_ACTION
+    checks: [approval_unused]
+
+evidence_kinds: [url, commit, file, ci, test, log, text]
+
+# Default policy. A project's swarm.yaml may override any of it under `policy:`.
+policy:
+  # The stuck list. When one of these is true the projection pages the owner.
+  stuck:
+    max_task_failures: 3       # a task failed this many times
+    max_dispute_rounds: 3      # OBJECTION/RESPONSE rounds before only a RULING is legal
+    swarm_idle_hours: 12       # no progress anywhere while tasks are open
+  escalation:
+    deadline_hours: 24         # how long the owner has to answer
+    safe_default: park         # what happens at the deadline: the work is parked, never merged or deleted
+  approval_ttl_hours: 24       # an unused APPROVE_ACTION expires after this long
+  token_budget_per_task: 0     # 0 disables the budget check; PROGRESS/READY may report body.tokens
+  # The safety list. Commands matching `commands` (regex) or touching `paths` (glob)
+  # need an owner-approved REQUEST_ACTION. `swarmly guard` enforces it before the command runs.
+  # `touch: any` (the default) counts reading a path; `touch: write` counts only writes.
+  safety:
+    - id: force_push
+      summary: Force-pushing
+      commands:
+        - '\bgit\s+push\b[^|;&]*\s(--force|--force-with-lease|-f)(\s|=|$)'
+        - '\bgit\s+push\b[^|;&]*\s\+\S+'
+    - id: history_rewrite
+      summary: Rewriting published history
+      commands:
+        - '\bgit\s+(filter-branch|filter-repo)\b'
+        - '\bgit\s+reflog\s+expire\b'
+        - '\bgit\s+update-ref\s+-d\b'
+    - id: branch_delete
+      summary: Deleting remote branches
+      commands:
+        - '\bgit\s+push\b[^|;&]*\s(--delete|-d)(\s|$)'
+        - '\bgit\s+push\b[^|;&]*\s:\S+'
+        - '\bgh\s+api\b[^|;&]*-X\s*DELETE\b[^|;&]*/git/refs/'
+    - id: file_delete
+      summary: Recursive deletion of files
+      commands:
+        - '\brm\s+(-\w*[rR]\w*|-\w*f\w*\s+-\w*[rR]\w*|--recursive)\b'
+        - '\bgit\s+clean\s+-\w*f'
+        - '\bgit\s+rm\b[^|;&]*\s-\w*r'
+        - '\bfind\b[^|;&]*\s-delete\b'
+        - '\bfind\b[^|;&]*\s-exec(dir)?\s+rm\b'
+    - id: release
+      summary: Releasing or tagging
+      commands:
+        - '\bgit\s+tag\s+(?!-l\b|--list\b)\S'
+        - '\bgit\s+push\b[^|;&]*\s--tags\b'
+        - '\bgh\s+release\s+(create|upload|edit|delete)\b'
+        - '\b(twine|uv|poetry|npm|cargo)\s+(upload|publish)\b'
+    - id: secrets
+      summary: Touching secrets or credentials
+      paths: ['.env', '.env.*', '**/.env', '**/.env.*', '**/id_rsa*', '**/id_ed25519*', '**/*.pem',
+              '**/.netrc', '**/.a2a/keys/**', '**/credentials.json', '**/.ssh/**']
+    - id: rules
+      summary: Changing the swarm's rules
+      touch: write
+      paths: ['**/swarmly/swarm/protocol.yaml', 'swarm.yaml', '**/swarm.yaml', '.github/workflows/**',
+              'AGENTS.md']
+    - id: budget
+      summary: Spending over the token budget

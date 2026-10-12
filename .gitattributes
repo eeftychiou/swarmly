@@ -1,0 +1,14 @@
+# Keep shell scripts LF in every checkout: CRLF breaks `bash script.sh` under
+# `set -euo pipefail` on hosts with core.autocrlf=true ("set: pipefail\r:
+# invalid option name").
+*.sh text eol=lf
+
+# PowerShell wrappers are CRLF by convention: they are consumed by Windows hosts, and
+# `eol=crlf` keeps a checkout on any platform from rewriting them (which would show up
+# as whole-file churn on every edit, and hides real changes from `git diff`).
+*.ps1 text eol=crlf
+
+# The same reasoning for the Windows Script Host launcher shim
+# (scripts\run_hidden.vbs), which is also Windows-only and CRLF by convention.
+*.vbs text eol=crlf
+
