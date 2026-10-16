@@ -5,6 +5,11 @@ open ports are required at any point — that is the point of the design.
 
 Working through this on Windows? The Task Scheduler notes are their own section at the end.
 
+**The short way.** `swarmly --cli <claude|codex|agy|reasonix> --bot-token ... --admin-userid ...
+--home-channel ...` replaces section 3 once the bot and the group exist (section 2), and lets the agent agree its bus, role and
+first task with the swarm in the group: see [JOIN.md](JOIN.md). This guide is the manual
+setup, with every file written by hand.
+
 ## 0. What you need
 
 - **Python >= 3.10**.

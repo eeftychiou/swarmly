@@ -378,7 +378,10 @@ def cmd_protocol_doc(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="swarmly", description="The Swarmly swarm governor.")
+    p = argparse.ArgumentParser(
+        prog="swarmly", description="The Swarmly swarm governor. To start an agent that "
+        "joins a swarm in its Telegram group: swarmly --cli {agy,claude,codex,reasonix} "
+        "--bot-token TOKEN --admin-userid ID --home-channel GROUP (docs/JOIN.md).")
     p.add_argument("--swarm", help="path to swarm.yaml (default: $A2A_SWARM or ./swarm.yaml)")
     p.add_argument("--as", dest="agent", help="agent identity (default: $A2A_AGENT)")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging on stderr")
@@ -459,6 +462,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if any(arg == "--cli" or arg.startswith("--cli=") for arg in raw):
+        # `swarmly --cli <runtime> ...`: start an agent that joins the swarm (docs/JOIN.md).
+        from ..telegram.join import main as join_main
+        return join_main(raw)
     args = build_parser().parse_args(argv)
     if getattr(args, "command", None) and args.command[:1] == ["--"]:
         args.command = args.command[1:]

@@ -92,6 +92,24 @@ def build_adapter(config: AgentConfig, runner: Optional[Runner] = None, *,
     else:
         adapter = ADAPTER_TYPES[kind](config.identity.alias, settings, runner=runner,
                                       git_identity=identity)
+    apply_role(adapter, config)
+    github = getattr(config, "github", None)
+    if github is not None and github.token_env:
+        adapter.github_token_env = github.token_env
+    if transport:
+        arm = getattr(adapter, "arm_transport_failfast", None)
+        if callable(arm):
+            arm()
+    return adapter
+
+
+def apply_role(adapter: AgentAdapter, config: AgentConfig) -> None:
+    """Put the agent's role (and its team's roles) and its runtime line on *adapter*. Called
+    when the adapter is built and again whenever the swarm changes a role."""
+    settings: AdapterSettings = config.adapter
+    kind = (settings.type or "").lower()
+    adapter.role_text = ""
+    adapter.role_name = ""
     role_of = getattr(config, "role", None)
     try:
         role = role_of() if callable(role_of) else None
@@ -116,14 +134,6 @@ def build_adapter(config: AgentConfig, runner: Optional[Runner] = None, *,
         line = (f"YOUR RUNTIME: {runtime}{model}. When asked which model or tool you are, "
                 "say this; do not guess.")
         adapter.role_text = f"{adapter.role_text}\n\n{line}" if adapter.role_text else line
-    github = getattr(config, "github", None)
-    if github is not None and github.token_env:
-        adapter.github_token_env = github.token_env
-    if transport:
-        arm = getattr(adapter, "arm_transport_failfast", None)
-        if callable(arm):
-            arm()
-    return adapter
 
 
 __all__ = [

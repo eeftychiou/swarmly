@@ -1054,6 +1054,8 @@ class AgentConfig:
         config = cls.from_dict(data, source_path=config_path)
         from swarmly.telegram.roster import apply_roster
         apply_roster(config)                 # bots the admin admitted at runtime (#152)
+        from swarmly.telegram.membership import apply_swarm_state
+        apply_swarm_state(config)            # the role and team the swarm agreed on
         return config
 
     # -- validation --------------------------------------------------------------------

@@ -22,21 +22,34 @@ not do), so agents check each other instead of overlapping.
 
 The full text of each is in [`swarmly/telegram/roles/`](../swarmly/telegram/roles/).
 
-## Configure
+## How an agent gets its role
+
+Roles are not written in any config. An agent started with `swarmly --cli ...` asks the swarm
+for one when it joins ([JOIN.md](JOIN.md)): the coordinator's agent picks the role that fills
+the team's gap and answers `ROLE: @bot <role>`, which every agent records. The first agent
+of a swarm coordinates. The maintainer overrides any role at any time:
+
+```
+/role @codex_bot reviewer
+```
+
+The role's instructions reach the agent at once: its next turn introduces the role in full
+and asks it to request its first task from the coordinator, and from then on they ride in
+every turn. Every agent also knows the team's roles, so it knows whom to hand work to.
+
+A config written by hand can still start an agent with a role and list its peers' roles
+(`swarmly-telegram init --role developer` writes the `role:` line):
 
 ```yaml
 agent:
   alias: Codex
-  role: developer                  # a built-in or project role name, or a path to a .md file
+  role: developer                  # where it starts; a role the swarm gives later wins
 
 peers:
   Antigravity: {username: agy_bot, role: qa-tester}
-  Claude: {username: claude_bot, role: reviewer}
-  Hermes: hermes_bot               # a plain username still works (no role shown)
 ```
 
-`swarmly-telegram init --role developer` writes the `role:` line for you. `check` prints the
-resolved role and the peers' roles, and fails on a role it cannot find.
+`check` prints the resolved role and the peers' roles, and fails on a role it cannot find.
 
 ## Project roles
 

@@ -7,6 +7,7 @@ Start with the [README](../README.md), then [Getting started](GETTING-STARTED.md
 | Document | What it covers |
 |---|---|
 | [GETTING-STARTED.md](GETTING-STARTED.md) | bring up a first node |
+| [JOIN.md](JOIN.md) | start an agent with one command (`swarmly --cli ...`): it joins the swarm, gets a role and a first task in the group |
 | [TRANSPORTS.md](TRANSPORTS.md) | the durable transports (git, synced folder, Google Drive) and Telegram, and how to choose |
 | [ADOPT.md](ADOPT.md) | using Swarmly in your own project |
 | [ROLES.md](ROLES.md) | agent roles (coordinator, developer, reviewer, QA tester, researcher) and project roles |

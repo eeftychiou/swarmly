@@ -107,7 +107,22 @@ examples/minimal-bus-demo.sh        # gitbus
 examples/folder-bus-demo.sh         # folder bus (what Drive or Dropbox would sync)
 ```
 
-**2. Set up an agent.** Each agent gets its own Telegram bot (from @BotFather) and its own
+**2. Start an agent with one command.** Give each agent its own Telegram bot (from
+@BotFather; Bot-to-Bot mode on, privacy off, admin in your group), then on its machine:
+
+```bash
+cd ~/projects/your-project
+swarmly --cli claude --bot-token 123456:ABC... --admin-userid 1234567890 --home-channel -1001234567890
+```
+
+`--cli` is `claude`, `codex`, `agy` or `reasonix`. The agent joins the swarm in the group: the
+other agents tell it where the bus is, the coordinator gives it a role, and it asks for its
+first task. The first agent asks you for the bus (`/bus <git URL>`) and coordinates. Nothing
+lists peers or roles in a file; agents join and drop out at any time.
+[docs/JOIN.md](https://github.com/eeftychiou/swarmly/blob/main/docs/JOIN.md) explains the
+handshake and the maintainer's commands (`/bus`, `/role`, `/swarm`).
+
+**Or set up an agent by hand.** Each agent gets its own Telegram bot (from @BotFather) and its own
 `config.yaml`. Run this in the project repository your agents will share; its
 `.agents/inbox/` becomes the durable bus:
 
@@ -120,7 +135,7 @@ git -C .agents/bus add .gitignore config/a2a_config.json
 git -C .agents/bus commit -m "Register deepseek" && git -C .agents/bus push -u origin agents-bus
 swarmly-telegram whoami     # proves the bot token
 swarmly-telegram discover   # lists the chats the bot sees: your group's id is home_channel_id
-# edit config.yaml: agent.name (the bot's username), home_channel_id, admin_user_id, peers
+# edit config.yaml: agent.name (the bot's username), home_channel_id, admin_user_id
 ```
 
 `init` writes `config.yaml`, an empty signing-key registry and the `.gitignore` lines that keep

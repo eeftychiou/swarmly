@@ -40,6 +40,32 @@ class MissingKeyError(KeyError):
         return str(self.args[0]) if self.args else ""
 
 
+def vouched_keys_path(root: Path) -> Path:
+    """Where a host keeps the public keys the swarm vouched for (never committed)."""
+    return Path(root) / ".agents" / "state" / "vouched-keys.json"
+
+
+def vouch_key(root: Path, agent_id: str, public_key: str) -> bool:
+    """Remember *agent_id*'s Ed25519 public key, as posted in its JOIN by a bot Telegram
+    confirmed is an admin of the swarm's group. False when the key is not Ed25519-shaped."""
+    if not _looks_ed25519_public(public_key):
+        return False
+    path = vouched_keys_path(root)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            vouched = json.load(f)
+    except (OSError, ValueError):
+        vouched = {}
+    if not isinstance(vouched, dict):
+        vouched = {}
+    vouched[agent_id] = public_key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(vouched, indent=1, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+    return True
+
+
 def _looks_ed25519_public(value: str) -> bool:
     if len(value) != 44 or not value.endswith("="):
         return False
@@ -106,18 +132,38 @@ class DurableBus:
             self.outbox_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_config(self) -> Dict:
-        """Load cluster config if available."""
-        if self.config_path and self.config_path.exists():
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {
+        """Load cluster config if available, with the keys the swarm vouched for on top."""
+        config: Dict = {
             "authorized_agents": {},
             "revocation_list": [],
             "coordination": {"primary_master": "antigravity"}
         }
+        if self.config_path and self.config_path.exists():
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+            except Exception:
+                pass
+        self._add_vouched_keys(config)
+        return config
+
+    def _add_vouched_keys(self, config: Dict) -> None:
+        """Ed25519 keys this host's transport took from a JOIN in the group (see
+        :func:`vouch_key`): they verify an agent that joined before this checkout pulled the
+        registry commit that registers it. The registry always wins, and only agents it
+        does not list are added."""
+        agents = config.get("authorized_agents")
+        if not isinstance(agents, dict):
+            return
+        try:
+            with open(vouched_keys_path(self.root), "r", encoding="utf-8") as f:
+                vouched = json.load(f)
+        except (OSError, ValueError):
+            return
+        for agent_id, key in (vouched.items() if isinstance(vouched, dict) else ()):
+            if agent_id not in agents and isinstance(key, str) and _looks_ed25519_public(key):
+                agents[agent_id] = {"public_key_or_secret_name": key, "key_type": "ed25519",
+                                    "role_scope": "worker", "vouched": "telegram"}
 
     def key_type_for(self, agent_id: str) -> str:
         """The registered key type of ``agent_id``: ``key_type`` in its config entry, else
