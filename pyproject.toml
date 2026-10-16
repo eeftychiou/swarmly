@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "swarmly"
 dynamic = ["version"]
-description = "Coordinate coding-agent CLIs (Claude Code, Codex, Antigravity, Hermes) across machines over Telegram and a git-backed message bus"
+description = "Coordinate coding-agent CLIs (Claude Code, Codex, Antigravity, DeepSeek via Reasonix) across machines over Telegram and a git-backed message bus"
 readme = "README.md"
 authors = [
     { name = "Eftychios Eftychiou", email = "eftychios.eftychiou@gmail.com" },
@@ -22,7 +22,7 @@ dependencies = [
     "cryptography>=42.0.0",
     "tomli>=1.1.0; python_version < '3.11'",
 ]
-keywords = ["agents", "multi-agent", "a2a", "telegram", "claude", "codex", "antigravity", "hermes", "gitbus", "google-drive"]
+keywords = ["agents", "multi-agent", "a2a", "telegram", "claude", "codex", "antigravity", "deepseek", "reasonix", "gitbus", "google-drive"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

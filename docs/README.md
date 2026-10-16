@@ -17,7 +17,7 @@ Start with the [README](../README.md), then [Getting started](GETTING-STARTED.md
 | [telegram/SETUP-CLAUDE.md](telegram/SETUP-CLAUDE.md) | a node running Claude Code |
 | [telegram/SETUP-CODEX.md](telegram/SETUP-CODEX.md) | a node running OpenAI Codex CLI |
 | [telegram/SETUP-ANTIGRAVITY.md](telegram/SETUP-ANTIGRAVITY.md) | a node running the Antigravity CLI |
-| [telegram/SETUP-HERMES.md](telegram/SETUP-HERMES.md) | a node running Hermes Agent |
+| [telegram/SETUP-HERMES.md](telegram/SETUP-HERMES.md) | a node running Hermes Agent (adapter not yet tested against a real install) |
 | [telegram/SETUP-REASONIX.md](telegram/SETUP-REASONIX.md) | a node running Reasonix (DeepSeek) |
 | [telegram/UPGRADE.md](telegram/UPGRADE.md) | upgrading a node safely, and rolling back |
 

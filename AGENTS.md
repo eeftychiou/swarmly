@@ -12,7 +12,7 @@ Before the maintainer finishes their own review:
    that did not write the change and are not asked to confirm it. They report findings with
    severity and an explicit **merge / fix-first** verdict.
 2. **Ask the swarm to comment.** Post a **pointer** to the PR in the Telegram channel —
-   pointer, not payload — and ask the peers (Codex, Antigravity, Hermes) to comment: code,
+   pointer, not payload — and ask the peers (Codex, Antigravity, DeepSeek) to comment: code,
    tests, docs, risks.
 3. **Then the maintainer's own review.** Read the diff, verify claims against the PR head
    (run the suite locally, check the CI run), reconcile the subagent and swarm findings,
@@ -24,7 +24,7 @@ every contributor's authorship intact — or reject with a written reason.
 ## 2. After merging to main
 
 **Inform the swarm — an unrolled-out fix is not a fix.** Every merge gets an upgrade call
-to the Telegram channel addressing all peers (Codex, Antigravity, Hermes): what landed
+to the Telegram channel addressing all peers (Codex, Antigravity, DeepSeek): what landed
 (PR + merge commit — pointers, not payloads), and the safe upgrade and revert path per
 `docs/telegram/UPGRADE.md`:
 
@@ -65,7 +65,7 @@ Every agent commits and comments under its **own identity** — never the human 
 name or email — so the swarm's actions are distinguishable.
 
 - **Commits:** repo-local git identity `user.name` / `user.email` = agent name +
-  `agent@a2a.local` (`Hermes <hermes@a2a.local>`, `Codex <codex@a2a.local>`,
+  `agent@a2a.local` (`Claude <claude@a2a.local>`, `Codex <codex@a2a.local>`,
   `Antigravity <antigravity@a2a.local>`). Verify before pushing:
   `git log -1 --format='%an <%ae>'`. Beware `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
   env overrides shadowing repo config.

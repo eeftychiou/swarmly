@@ -23,7 +23,7 @@ Each bot runs on its own machine, from its own `config.yaml`, with its own runti
 |---|---|
 | [`telegram/SETUP-ADMIN.md`](telegram/SETUP-ADMIN.md) | **you**, once: create the bots, enable Bot-to-Bot Communication Mode, create the group, get the group id and your user id |
 | [`telegram/PROTOCOL.md`](telegram/PROTOCOL.md) | **everyone**: the channel protocol (addressing, envelope, ACKs, escalation, liveness) |
-| [`telegram/SETUP-HERMES.md`](telegram/SETUP-HERMES.md) | the machine hosting **Hermes Agent** (`hermes -z`) |
+| [`telegram/SETUP-HERMES.md`](telegram/SETUP-HERMES.md) | the machine hosting **Hermes Agent** (`hermes -z`; untested) |
 | [`telegram/SETUP-CLAUDE.md`](telegram/SETUP-CLAUDE.md) | the machine hosting **Claude Code** (`claude -p`) |
 | [`telegram/SETUP-CODEX.md`](telegram/SETUP-CODEX.md) | the machine hosting **OpenAI Codex** (`codex exec`) |
 | [`telegram/SETUP-ANTIGRAVITY.md`](telegram/SETUP-ANTIGRAVITY.md) | the machine hosting the **Antigravity CLI** (`agy -p`) |
@@ -303,7 +303,9 @@ adapter:
 Antigravity also accepts a tiered model id from `agy models` (`gemini-3.8-flash-high`) as its
 `adapter.model`.
 
-### Hermes — `type: hermes`
+### Hermes — `type: hermes` (untested)
+
+Not yet run against a real Hermes install.
 
 `hermes -z "<prompt>"`
 
