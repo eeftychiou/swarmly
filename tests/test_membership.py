@@ -396,6 +396,16 @@ class MemberTests(unittest.TestCase):
             self.assertNotIn("Codex", channel.config.peer_roles)
             self.assertIn("- Codex: no role, online", run(channel.membership.status_text()))
 
+    def test_a_peer_that_answers_our_online_notice_is_online(self):
+        # After a restart the peers that were already running only answer our online
+        # notice with SEEN; /swarm showed them as "unknown" (live test).
+        with tempfile.TemporaryDirectory() as folder:
+            channel = joined(make_channel(config_at(folder, peers={"Codex": "codex_x_bot"})))
+            self.assertIn("- Codex: no role, unknown", run(channel.membership.status_text()))
+            run(channel.handle_event(hello("SEEN", "Hermes", "👀 Codex sees Hermes",
+                                           "codex_x_bot", 402)))
+            self.assertIn("- Codex: no role, online", run(channel.membership.status_text()))
+
 
 class TrustTests(unittest.TestCase):
     """Who may make whom what: review findings on PR #3."""

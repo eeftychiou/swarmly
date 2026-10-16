@@ -504,9 +504,13 @@ class Membership:
         if envelope.type != MessageType.HELLO:
             return False
         sender = self.cfg.peer_alias_for(event.author_username, event.author_id)
-        if intent == "ONLINE":
-            self.seen(sender)         # an online notice says nothing about roles: anyone
-            return False              # can write "role: coordinator" in one
+        if intent in ("ONLINE", "SEEN"):
+            # A peer that answers our online notice with SEEN is online too: after a restart
+            # it is the only sign of the agents that were already running (live test: /swarm
+            # showed a running peer as "unknown"). Neither says anything about roles: anyone
+            # can write "role: coordinator" in one.
+            self.seen(sender)
+            return False
         if intent == "JOIN":
             await self._on_join(ref, body, event)
             return True
