@@ -232,6 +232,30 @@ class NewcomerTests(unittest.TestCase):
                      if MEMBERSHIP_MARK in row["text"]]
             self.assertTrue(intro and "@claude_x_bot" in intro[-1])
             self.assertIn("ask for your first task", intro[-1])
+            # The coordinator's answer (the first task) comes within seconds of the
+            # introduction: it passes the bot-to-bot cooldown once, never twice.
+            channel.config.limits.min_seconds_between_agent_turns = 60.0
+            answer = "@HermesBot welcome, take issue #1"
+            ok, reason = channel.should_respond(event(answer, author_id=401,
+                                                      username="claude_x_bot"))
+            self.assertTrue(ok, reason)
+            ok, reason = channel.should_respond(event(answer, author_id=401,
+                                                      username="claude_x_bot"))
+            self.assertFalse(ok)
+            self.assertIn("cooldown", reason)
+
+    def test_the_first_agent_greets_the_maintainer_not_itself(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = joined(dynamic(make_channel(config_at(folder))))
+            channel.config.identity.maintainer_username = "alice"
+            async def onboard():
+                channel.membership._onboard()
+                await drain(channel)
+            run(onboard())
+            greeting = [row["text"] for row in channel._test_sender.sent
+                        if MEMBERSHIP_MARK in row["text"]][-1]
+            self.assertIn("Greet the maintainer (@alice)", greeting)
+            self.assertIn("never open with @HermesBot", greeting)
 
     def test_a_restart_keeps_the_agreed_role(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -550,6 +574,9 @@ class LauncherTests(unittest.TestCase):
         from swarmly.telegram.join import derive_alias, render_config
         self.assertEqual(derive_alias("Claude Bot", "claude_x_bot"), "Claude")
         self.assertEqual(derive_alias("🤖", "deepseek_x_bot"), "Deepseek_x")
+        self.assertEqual(derive_alias("Claudebot", "Claude_obot"), "Claude")
+        self.assertEqual(derive_alias("CodexBot", "codex_dd_bot"), "Codex")
+        self.assertEqual(derive_alias("Robot", "robot_x_bot"), "Robot")
         text = render_config("claude_x_bot", "Claude", "claude", GROUP, ADMIN_ID,
                              Path("/work/swarmly"))
         self.assertNotIn("peers", text.split("#", 3)[-1])
@@ -597,6 +624,8 @@ class LauncherTests(unittest.TestCase):
             config.write_text("agent:\n  alias: Newbie\nadapter:\n  type: echo\n")
             lines = setup_bus(config, str(remote), "Newbie", PUB)
             self.assertTrue(any("pushed" in line for line in lines), lines)
+            # The registry push published the branch: nobody is asked to push it by hand.
+            self.assertFalse([line for line in lines if "push the new bus branch" in line])
             text = config.read_text()
             self.assertIn("  repo: ", text.split("bus:", 1)[1])
             self.assertIn("ref: origin/agents-bus", text)

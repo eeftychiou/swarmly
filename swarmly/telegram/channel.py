@@ -301,7 +301,7 @@ class ChannelEvent:
     attachments: List[Dict[str, Any]] = field(default_factory=list)   # files, photos, voice
     handoff: bool = False                  # set by routing: an expected hand-off, no cooldown
     cooldown_left: float = 0.0             # set by routing: a message to this bot the cooldown dropped
-    self_task: bool = False                # a brief this agent gave itself in a topic it opened
+    self_task: bool = False                # a brief this agent gave itself (topic or membership)
 
 
 @dataclass
@@ -804,7 +804,7 @@ class AgentChannel:
         if event.text is None:
             return False, "not a text message"
         if event.self_task:
-            return True, "this agent's own brief in a topic it opened"
+            return True, "this agent's own brief (a topic it opened, or a membership turn)"
         if event.author_id is not None and self.bot is not None:
             me = getattr(self.bot, "id", None)
             if me is not None and int(event.author_id) == int(me):

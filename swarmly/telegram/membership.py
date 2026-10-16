@@ -844,8 +844,13 @@ class Membership:
         self._onboarding = True       # onboard_pending clears when the turn has answered
         coordinator = self.coordinator_handle()
         if self.is_coordinator() or not coordinator:
-            ask = ("You coordinate this swarm. Greet the maintainer in two lines: say you are "
-                   "ready and ask what the swarm should work on.")
+            # This turn's author is the agent itself: name whom to address, or it greets
+            # itself (live test: "@Claudebot: Hi, I'm Claudebot").
+            maintainer = (self.cfg.identity.maintainer_username or "").lstrip("@")
+            ask = (f"You coordinate this swarm. Greet the maintainer"
+                   f"{f' (@{maintainer})' if maintainer else ''} in two lines: say you are "
+                   "ready and ask what the swarm should work on. Address the maintainer, "
+                   f"not yourself: never open with @{self.cfg.identity.name.lstrip('@')}.")
         else:
             ask = (f"Introduce yourself to {coordinator} in one or two lines (your alias, your "
                    "role, your runtime) and ask for your first task.")
@@ -870,6 +875,11 @@ class Membership:
             if self.state.onboard_pending:
                 self.state.onboard_pending = False
                 self._save()
+            # The coordinator answers the introduction (its first task) within seconds: let
+            # that answer past this agent's bot-to-bot cooldown once, as assign() does for
+            # the introduction (live test: the answer was dropped by the cooldown).
+            if not self.is_coordinator() and self.state.coordinator:
+                self.ch._expect_handoff(event, self.state.coordinator)
             return False              # the introduction is posted as written
         found = _DECIDE_FOR.search(text.split("\n", 1)[0])
         if found is None:

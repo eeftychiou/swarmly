@@ -83,10 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def derive_alias(first_name: str, username: str) -> str:
-    """An alias from the bot's display name ("Claude Bot" -> "Claude"), else its username
-    without the trailing "bot"."""
+    """An alias from the bot's display name ("Claude Bot" or "Claudebot" -> "Claude"), else
+    its username without the trailing "bot"."""
     for candidate in (first_name or "").split():
         word = re.sub(r"[^A-Za-z0-9_-]", "", candidate)
+        # "Claudebot", "CodexBot", "hermes_bot": the name without "bot" (live test: the
+        # swarm called Claude "Claudebot"); short words such as "Robot" stay whole.
+        stem = re.sub(r"[_-]?bot$", "", word, flags=re.I)
+        if len(stem) >= 3:
+            word = stem
         if word and word.lower() != "bot" and re.match(r"[A-Za-z]", word):
             return word[:32]
     base = re.sub(r"_?bot$", "", username or "", flags=re.I)
@@ -281,7 +286,8 @@ def setup_bus(config_path: Path, location: str, alias: str,
     """Make a checkout of the bus at *location*, register the signing key there and point
     the config at it. Returns what happened, one line each; raises JoinError."""
     from swarmly.keygen import KeygenError, plan_registry
-    from swarmly.telegram.init import BUS_BRANCH, _bus_files, _set_key, bus_branch_checkout
+    from swarmly.telegram.init import (BUS_BRANCH, PUSH_ONCE, _bus_files, _set_key,
+                                       bus_branch_checkout)
     home = config_path.parent
     local = Path(location).expanduser()
     if local.is_dir() and _git(local, "rev-parse", "--is-inside-work-tree").stdout.strip() \
@@ -315,7 +321,11 @@ def setup_bus(config_path: Path, location: str, alias: str,
         raise JoinError(f"cannot register {agent}'s key: {exc}") from exc
     if registry.read_text(encoding="utf-8-sig") != text:
         registry.write_text(text, encoding="utf-8")
-        lines.append(_commit_registry(bus_repo, alias, public_key))
+        committed = _commit_registry(bus_repo, alias, public_key)
+        if committed.startswith("registered") and "pushed" in committed:
+            # The registry push published the bus branch: no first push is left to ask for.
+            lines = [line for line in lines if not line.startswith(PUSH_ONCE)]
+        lines.append(committed)
     config = config_path.read_text(encoding="utf-8")
     config = _set_key(config, "bus", "repo", _yaml_scalar(str(bus_repo)))
     if ref:

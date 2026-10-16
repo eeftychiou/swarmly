@@ -27,6 +27,8 @@ PLACEHOLDER_HOME_CHANNEL = 0
 BUS_BRANCH = "agents-bus"
 #: Where init checks that branch out when the bus checkout is on another branch.
 BUS_WORKTREE = Path(".agents") / "bus"
+#: How a new bus branch's note asks for its first push.
+PUSH_ONCE = "push the new bus branch once with"
 
 
 class InitError(Exception):
@@ -180,10 +182,11 @@ def bus_branch_checkout(repo: Path, branch: str = BUS_BRANCH,
     # Another agent may have pushed the bus branch already: track it rather than start a
     # second, unrelated one from HEAD (best effort; offline just means no remote branch yet).
     _git(repo, "fetch", "-q", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
+    pushed = _git(repo, "rev-parse", "--verify", "-q",
+                  f"refs/remotes/{remote}/{branch}").returncode == 0
     if _git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0:
         add = _git(repo, "worktree", "add", str(worktree), branch)
-    elif _git(repo, "rev-parse", "--verify", "-q",
-              f"refs/remotes/{remote}/{branch}").returncode == 0:
+    elif pushed:
         add = _git(repo, "worktree", "add", "--track", "-b", branch, str(worktree),
                    f"{remote}/{branch}")
     else:
@@ -195,9 +198,11 @@ def bus_branch_checkout(repo: Path, branch: str = BUS_BRANCH,
                         "repository needs a first commit; --bus-branch '' keeps the current "
                         "branch)")
     _gitignore(root, ["/" + BUS_WORKTREE.as_posix() + "/"], local=True)
-    return worktree, ref, [f"checked out branch {branch} at {worktree} for bus mail, so "
-                           "agents never commit to your main branch; push it once with "
-                           f"`git -C {worktree} push -u {remote} {branch}`"]
+    notes = [f"checked out branch {branch} at {worktree} for bus mail, so agents never "
+             "commit to your main branch"]
+    if not pushed:                # a branch the remote has already needs no first push
+        notes.append(f"{PUSH_ONCE} `git -C {worktree} push -u {remote} {branch}`")
+    return worktree, ref, notes
 
 
 def _set_key(text: str, section: str, key: str, value: str) -> str:
