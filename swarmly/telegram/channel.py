@@ -301,7 +301,7 @@ class ChannelEvent:
     attachments: List[Dict[str, Any]] = field(default_factory=list)   # files, photos, voice
     handoff: bool = False                  # set by routing: an expected hand-off, no cooldown
     cooldown_left: float = 0.0             # set by routing: a message to this bot the cooldown dropped
-    self_task: bool = False                # a brief this agent gave itself in a topic it opened
+    self_task: bool = False                # a brief this agent gave itself (topic or membership)
 
 
 @dataclass
@@ -470,6 +470,8 @@ class AgentChannel:
         self.selftest = PeerSelfTest(self)       # startup check that the bots see each other
         from swarmly.telegram.roster import Roster
         self.roster = Roster(config, clock=lambda: self._clock())   # bots admitted at runtime
+        from swarmly.telegram.membership import Membership
+        self.membership = Membership(self)        # join, roles and drop-outs (membership.py)
         # /model: the model each discussion runs, set by the admin at runtime and kept
         # across restarts. Key: the topic's context id, or "general".
         self._models_path = _state_file(config, "models")
@@ -497,6 +499,7 @@ class AgentChannel:
 
         self.bot: Any = None
         self.dispatcher: Any = None
+        self.restart_requested = False           # request_restart(): the launcher starts again
         self.replies = None
         self._reply_task: Optional[asyncio.Task] = None
         if config.adapter.type == "codex_thread" and (config.source_path or config.adapter.reply_state_path):
@@ -801,7 +804,7 @@ class AgentChannel:
         if event.text is None:
             return False, "not a text message"
         if event.self_task:
-            return True, "this agent's own brief in a topic it opened"
+            return True, "this agent's own brief (a topic it opened, or a membership turn)"
         if event.author_id is not None and self.bot is not None:
             me = getattr(self.bot, "id", None)
             if me is not None and int(event.author_id) == int(me):
@@ -948,7 +951,12 @@ class AgentChannel:
     async def _handle_roster(self, envelope: Envelope, event: ChannelEvent) -> bool:
         """Swarm membership (#152): note unknown bots' HELLOs, apply the admin's ``/admit``,
         ``/remove`` and ``/sync``, and take the swarm's welcomes and peer lists. True when the
-        message is consumed."""
+        message is consumed. Joins, roles and drop-outs go to :mod:`membership` first."""
+        if envelope.type in (MessageType.HELLO, MessageType.BYE) and self._bot_account_post(event):
+            if await self.membership.handle(envelope, parse_message(event.text or "")[1], event):
+                return True
+        elif not event.author_is_bot and await self.membership.handle_command(event):
+            return True
         if envelope.type == MessageType.HELLO and self._bot_account_post(event):
             intent = (envelope.intent or "").upper()
             ref = str(envelope.ref) if envelope.ref else None
@@ -982,7 +990,8 @@ class AgentChannel:
             return True
         handles = self.roster.handles(event.text or "")
         if command == "remove":
-            self.roster.remove(handles)
+            for alias in self.roster.remove(handles):
+                self.membership.forget(alias)
             return True
         for alias, username in self.roster.admit(handles):
             await self.send(format_message(
@@ -1026,7 +1035,8 @@ class AgentChannel:
         if command == "role":
             role = self._role()
             if role is None:
-                mine = "ROLE {} none (set agent.role in config.yaml)".format(alias)
+                mine = (f"ROLE {alias} none (the coordinator gives one; the admin can "
+                        f"/role {self.config.identity.username} <role>)")
             else:
                 mine = f"ROLE {alias} {role.name}: {role.description}"
             from swarmly.telegram.roles import team_line
@@ -2656,6 +2666,9 @@ class AgentChannel:
             self._ask_for_report(event)
             return None
 
+        if await self.membership.on_reply(body, event):
+            self.stats.handled += 1                 # a role decision, applied, not posted
+            return None
         self.stats.handled += 1
         opened = parse_new_topic(body)
         if opened is not None:
@@ -3046,6 +3059,18 @@ class AgentChannel:
         joined = "|".join(names)
         return re.compile(rf"(?i)(?:@(?:{joined})\b|(?:{joined})\s*[:,])")
 
+    def peers_changed(self) -> None:
+        """The roster changed: who counts as a peer when a discussion is recapped."""
+        self._topic_memory.peer_handles = {str(h).lstrip("@").lower()
+                                           for h in self.config.peers.values() if h}
+
+    def roles_changed(self) -> None:
+        """This agent's or a peer's role changed: every adapter's next turn carries it."""
+        from swarmly.telegram.adapters import apply_role
+        for adapter in {id(a): a for a in [self.adapter, *self._project_adapters.values()]
+                        }.values():
+            apply_role(adapter, self.config)
+
     def _run_own_task(self, text: str, chat_id: int, thread_id: Optional[int],
                       name: Optional[str]) -> None:
         task = ChannelEvent(text=text, chat_id=chat_id, thread_id=thread_id, topic_name=name,
@@ -3225,7 +3250,9 @@ class AgentChannel:
     def _render_addressed(self, text: str) -> Tuple[str, List[Dict[str, Any]]]:
         body, styles = markdown_entities(text)
         found: List[Dict[str, Any]] = []
-        for alias, username in (self.config.peers or {}).items():
+        # Bots a newcomer heard of before it knows their aliases: its JOIN mentions them.
+        targets = {**self.membership.candidates, **(self.config.peers or {})}
+        for alias, username in targets.items():
             if not username:
                 continue
             body, entities = addressed(body, username, alias=alias)
@@ -3609,6 +3636,8 @@ class AgentChannel:
                     "(swarmly-telegram discover lists the chats it sees)") from exc
             raise
         self.selftest.start(getattr(me, "can_read_all_group_messages", None))
+        self.membership.lookup = self._group_member
+        await self.membership.on_start()
         await self._restore_freeze_state()
         if self.replies is not None:
             self.replies.recover()
@@ -3628,8 +3657,31 @@ class AgentChannel:
             logger.warning("could not clear a webhook before polling: %s", exc)
         await self.dispatcher.start_polling(self.bot)
 
+    def request_restart(self) -> None:
+        """Stop polling so the ``swarmly --cli`` launcher starts the transport again with
+        the config it just rewrote (a new bus moves the transport's state and lock)."""
+        self.restart_requested = True
+        if self.dispatcher is not None:
+            asyncio.ensure_future(self.dispatcher.stop_polling())
+
+    async def _group_member(self, user_id: int) -> Optional[Tuple[str, str, bool]]:
+        """``(status, username, is_bot)`` of a user in the home group (getChatMember)."""
+        member = await self.bot.get_chat_member(chat_id=self.config.identity.home_channel_id,
+                                                user_id=user_id)
+        status = getattr(member, "status", "")
+        user = getattr(member, "user", None)
+        return (str(getattr(status, "value", status)), str(getattr(user, "username", "") or ""),
+                bool(getattr(user, "is_bot", False)))
+
     async def stop(self) -> None:
         self._topic_memory.save()
+        if self.bot is not None and getattr(self, "_started_wall", None) is not None \
+                and not self.restart_requested:
+            try:                                  # peers mark this agent offline
+                await asyncio.wait_for(self.membership.on_stop(), timeout=5.0)
+            except Exception as exc:              # noqa: BLE001 - stopping goes on
+                logger.info("could not post the offline notice: %s", exc)
+        self.membership.cancel()
         try:
             if self._reply_task is not None:
                 self._reply_task.cancel()
@@ -3818,6 +3870,12 @@ class AgentChannel:
                         getattr(message, "message_id", "?"), date.isoformat(),
                         (started - date.timestamp()) / 60)
             self.stats.ignored += 1
+            return
+        left = getattr(message, "left_chat_member", None)
+        chat = getattr(getattr(message, "chat", None), "id", None)
+        if left is not None and chat == self.config.identity.home_channel_id:
+            await self.membership.member_left(getattr(left, "id", None),
+                                              getattr(left, "username", None))
             return
         await self.handle_event(self.event_from_aiogram(message))
 

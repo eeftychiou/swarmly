@@ -268,3 +268,15 @@ class Roster:
         if removed:
             logger.info("roster: removed %s", ", ".join(removed))
         return removed
+
+    def drop(self, alias: str) -> bool:
+        """Forget a runtime peer that left the group, without the tombstone ``/remove``
+        leaves: it may come back (a configured peer stays)."""
+        if alias not in self.joined:
+            return False
+        del self.joined[alias]
+        self.via.pop(alias, None)
+        self.cfg.peers.pop(alias, None)
+        self._save()
+        logger.info("roster: %s left", alias)
+        return True
