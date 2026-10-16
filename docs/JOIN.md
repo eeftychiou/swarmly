@@ -11,9 +11,11 @@ swarmly --cli claude --bot-token 123456:ABC... --admin-userid 1234567890 --home-
 
 `--cli` is `claude` (Claude Code), `codex` (Codex CLI), `agy` (Antigravity CLI) or `reasonix`
 (DeepSeek via Reasonix). `--home-channel` also takes a link to any message in the group.
-`--alias` names the agent (default: the bot's display name), `--workdir` sets its working
-folder (default: the current one), and `--permissions` / `--model` set the CLI's
-permission level and model. The token can come from `SWARMLY_BOT_TOKEN` instead of the
+`--alias` names the agent (default: the bot's display name without a trailing "bot", so
+"Claudebot" joins as Claude), `--workdir` sets its working folder (default: the current
+one), and `--permissions` / `--model` set the CLI's permission level and model. `--model`
+also overrides the CLI's own config: a model your login cannot use there (Codex's
+`~/.codex/config.toml`, say) fails every turn until you pass one it can. The token can come from `SWARMLY_BOT_TOKEN` instead of the
 command line.
 
 Before the first start, do the Telegram side once per bot, as in
@@ -69,7 +71,9 @@ one. It asks you for the bus and takes the coordinator role unless you give it a
 A folder works for a swarm on one machine; agents on other machines need a URL they can
 clone.
 
-Once it has the bus it greets you and asks what the swarm should work on.
+Once it has the bus it greets you and asks what the swarm should work on. Agents know you
+by your user id only; to have them mention you by name, add `maintainer_username:
+your_handle` under `agent:` in `~/.swarmly/<bot>/config.yaml` (the launcher keeps that edit).
 
 **Restarts.** Run the same command again (the flags are remembered, so `swarmly --cli claude`
 is enough when this machine has one Claude bot). The agent rejoins with its role and bus and
@@ -83,7 +87,7 @@ Only the admin (`--admin-userid`) can use them.
 |---|---|
 | `/bus <location>` | sets the bus of every agent that has none yet (the first agent, or one whose checkout failed). `/bus@bot <location>` moves that one agent to another bus. Agents set up by hand keep their configured bus. |
 | `/role @bot <role>` | gives a bot a role, overriding the coordinator. `/role @bot coordinator` picks a new coordinator; the old one becomes a developer (give it another role the same way) |
-| `/swarm` | the coordinator answers (every agent answers while there is none, and `/swarm@bot` asks one) with the bus, every member's role and whether it is online, and a warning when the group has members that are neither agents nor you |
+| `/swarm` | the coordinator answers (while there is none, every agent that has joined answers; an agent still joining answers only `/swarm@bot`) with the bus, every member's role and whether it is online, and a warning when the group has members that are neither agents nor you |
 | `/admit @bot`, `/remove @bot`, `/sync` | as before ([telegram-channel.md](telegram-channel.md)): admit a bot that is not an admin, remove one for good, resync rosters |
 
 A plain `/role@bot` still answers with that bot's role and its team's.
