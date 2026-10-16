@@ -116,6 +116,20 @@ class ParsingTests(unittest.TestCase):
         self.assertFalse(is_remote_bus("file:///home/me/bus"))
         self.assertFalse(is_remote_bus("C:/work/bus"))
 
+    def test_a_handle_the_transport_appends_never_joins_the_last_field(self):
+        # A member that is not the coordinator names the coordinator by alias, so the
+        # transport appends its @handle after the last line, the bus (live test).
+        from swarmly.telegram.wire import addressed
+        body = ("@newbie_x_bot 👋 Antigravity here.\nrole: reviewer\ncoordinator: Claude\n"
+                "bus: https://github.com/me/bus.git")
+        sent, _ = addressed(body, "claude_x_bot", alias="Claude")
+        self.assertTrue(sent.endswith("bus.git @claude_x_bot"))
+        self.assertEqual(parse_fields(sent)["bus"], "https://github.com/me/bus.git")
+        members = "members: Claude=@claude_x_bot#401:coordinator Codex=@codex_x_bot#402"
+        self.assertEqual(parse_fields(members)["members"], members.split(": ", 1)[1])
+        self.assertEqual(parse_fields("bus: git@github.com:me/bus.git @a_bot @b_bot")["bus"],
+                         "git@github.com:me/bus.git")
+
     def test_only_options_before_a_subcommand_start_the_launcher(self):
         from swarmly.swarm.cli import _join_command
         self.assertTrue(_join_command(["--cli", "claude"]))
@@ -395,6 +409,21 @@ class MemberTests(unittest.TestCase):
             # An online notice is not a role: anyone can write "role: coordinator" in one.
             self.assertNotIn("Codex", channel.config.peer_roles)
             self.assertIn("- Codex: no role, online", run(channel.membership.status_text()))
+
+    def test_a_newcomer_still_joining_does_not_answer_swarm(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = dynamic(make_channel(config_at(folder)))
+            swarm = event("/swarm", author_id=ADMIN_ID, username="alice", is_bot=False)
+            run(channel.handle_event(swarm))
+            self.assertFalse([r for r in channel._test_sender.sent if "SWARM" in r["text"]])
+            # Named, it answers; and once it has joined, it answers like any agent.
+            run(channel.handle_event(event("/swarm@HermesBot", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            self.assertIn("SWARM", channel._test_sender.last)
+            joined(channel, role="developer")
+            channel._test_sender.sent.clear()
+            run(channel.handle_event(swarm))
+            self.assertTrue([r for r in channel._test_sender.sent if "SWARM" in r["text"]])
 
     def test_a_peer_that_answers_our_online_notice_is_online(self):
         # After a restart the peers that were already running only answer our online

@@ -82,6 +82,7 @@ DEFAULT_ROLE_ORDER = ("developer", "reviewer", "qa-tester", "researcher")
 _ROLE_LINE = re.compile(r"(?im)^\W*ROLE:\s*@([A-Za-z0-9_]{5,32})\s+([a-z][a-z0-9_-]{0,39})\b")
 #: ``key: value`` lines of a JOIN or PRESENT body.
 _FIELD_LINE = re.compile(r"(?m)^\s*(cli|key|role|coordinator|bus|members):[ \t]*(.*?)\s*$")
+_TRAILING_HANDLES = re.compile(r"(?:\s+@[A-Za-z0-9_]{5,32})+$")
 #: One member of a coordinator's list: ``Alias=@username#user_id:role``.
 _MEMBER = re.compile(r"([A-Za-z0-9_-]{1,32})=@([A-Za-z0-9_]{5,32})#(\d{1,20})(?::([a-z][a-z0-9_-]{0,39}))?")
 #: Telegram statuses that make a bot a swarm member: the group owner made it an admin.
@@ -153,7 +154,10 @@ def parse_fields(body: str) -> Dict[str, str]:
     """The ``key: value`` lines of a JOIN, PRESENT or ROLE body (first one of each wins)."""
     found: Dict[str, str] = {}
     for key, value in _FIELD_LINE.findall(body or ""):
-        found.setdefault(key, value)
+        # The transport appends a peer's @handle to a message that names it by alias only
+        # (wire.addressed), and it lands on the last field: "bus: <url> @coordinator_bot"
+        # (live test: a newcomer could not clone that bus). No field value ends in a handle.
+        found.setdefault(key, _TRAILING_HANDLES.sub("", value))
     return found
 
 
@@ -716,7 +720,11 @@ class Membership:
                 await self.adopt_bus(args[0])
             return True
         if command == "swarm":
-            if self.is_coordinator() or not self.state.coordinator or target:
+            # With no coordinator every agent answers, but not a newcomer still joining: it
+            # knows nothing yet (live test: a starting agent answered a /swarm from its
+            # backlog with "bus: unknown, coordinator: none" while the coordinator was up).
+            joining = self.dynamic and not self.joined()
+            if self.is_coordinator() or target or (not self.state.coordinator and not joining):
                 await self.ch.send(await self.status_text(),
                                    reply_to_message_id=event.message_id)
             return True
