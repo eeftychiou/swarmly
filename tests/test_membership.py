@@ -15,7 +15,8 @@ from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.membership import (JOIN_WAIT_SECONDS, MEMBERSHIP_MARK, Membership,
-                                         SwarmState, parse_fields, safe_bus_location,
+                                         SwarmState, is_remote_bus, parse_fields,
+                                         safe_bus_location,
                                          swarm_state_path)
 from tests.test_telegram_channel import ADMIN_ID, GROUP, event, make_channel, run
 
@@ -73,6 +74,7 @@ def joined(channel, role="coordinator", bus="https://example.com/bus.git"):
     m = channel.membership
     m.state.role = role
     m.state.bus = bus
+    m.state.bus_ready = True
     channel.config.identity.role = role
     if role == "coordinator":
         m.state.coordinator = channel.config.identity.alias
@@ -82,6 +84,12 @@ def joined(channel, role="coordinator", bus="https://example.com/bus.git"):
 def hello(intent, ref, body, username, author_id, to="*", message_id=7):
     return event(f"[A2A v1.1] HELLO to={to} intent={intent} ref={ref}\n\n{body}",
                  username=username, author_id=author_id, message_id=message_id)
+
+
+def dynamic(channel):
+    """An agent the ``swarmly --cli`` launcher started (it joins by itself)."""
+    channel.membership.dynamic = True
+    return channel
 
 
 async def drain(channel):
@@ -100,6 +108,20 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(safe_bus_location("https://bot:ghp_secret@github.com/a/b.git"),
                          "https://github.com/a/b.git")
         self.assertEqual(safe_bus_location("git@github.com:a/b.git"), "git@github.com:a/b.git")
+        self.assertEqual(safe_bus_location("ssh://git@host/a/b.git"), "ssh://git@host/a/b.git")
+        self.assertEqual(safe_bus_location("ssh://u:pw@host/a.git"), "ssh://host/a.git")
+        self.assertTrue(is_remote_bus("git@github.com:a/b.git"))
+        self.assertTrue(is_remote_bus("https://github.com/a/b.git"))
+        self.assertFalse(is_remote_bus("/home/me/bus"))
+        self.assertFalse(is_remote_bus("file:///home/me/bus"))
+        self.assertFalse(is_remote_bus("C:/work/bus"))
+
+    def test_only_options_before_a_subcommand_start_the_launcher(self):
+        from swarmly.swarm.cli import _join_command
+        self.assertTrue(_join_command(["--cli", "claude"]))
+        self.assertTrue(_join_command(["--as", "x", "--cli=codex"]))
+        self.assertFalse(_join_command(["post", "--text", "--cli"]))
+        self.assertFalse(_join_command(["--", "--cli"]))
 
 
 class NewcomerTests(unittest.TestCase):
@@ -116,21 +138,34 @@ class NewcomerTests(unittest.TestCase):
 
     def test_the_first_agent_asks_the_maintainer_for_the_bus_and_coordinates(self):
         with tempfile.TemporaryDirectory() as folder:
-            channel = make_channel(config_at(folder))
-            run(channel.membership._await_swarm())
+            channel = dynamic(make_channel(config_at(folder)))
+            m = channel.membership
+            run(m._await_swarm())
             ask = channel._test_sender.last
             self.assertIn("first one in this swarm", ask)
-            self.assertIn("/bus", ask)
-            self.assertEqual(channel.membership.state.role, "coordinator")
+            self.assertIn("/bus@HermesBot", ask)
+            self.assertEqual(m.state.role, "coordinator")
             self.assertEqual(channel.config.identity.role, "coordinator")
+            checkouts = []
+
+            async def on_bus(location):                 # the launcher, then a restart
+                checkouts.append(location)
+                m.state.bus_ready = True
+
+            m.on_bus = on_bus
 
             async def bus():
                 await channel.handle_event(event("/bus https://github.com/me/swarm-bus.git",
                                                  author_id=ADMIN_ID, username="alice",
                                                  is_bot=False))
                 await drain(channel)
+                self.assertFalse([r for r in channel._test_sender.sent
+                                  if "received:" in r["text"]])    # not before the restart
+                await m.on_start()
+                await drain(channel)
             run(bus())
-            self.assertEqual(channel.membership.state.bus, "https://github.com/me/swarm-bus.git")
+            self.assertEqual(checkouts, ["https://github.com/me/swarm-bus.git"])
+            self.assertEqual(m.state.bus, "https://github.com/me/swarm-bus.git")
             # The coordinator's first turn carries its role and asks the maintainer the goal.
             onboarding = [row["text"] for row in channel._test_sender.sent
                           if "received:" in row["text"] and MEMBERSHIP_MARK in row["text"]]
@@ -142,7 +177,7 @@ class NewcomerTests(unittest.TestCase):
 
     def test_the_newcomer_learns_peers_bus_and_coordinator_from_the_answers(self):
         with tempfile.TemporaryDirectory() as folder:
-            channel = with_admins(make_channel(config_at(folder)),
+            channel = with_admins(dynamic(make_channel(config_at(folder))),
                                   claude_x_bot=401, codex_x_bot=402, agy_x_bot=403)
             got = []
 
@@ -174,9 +209,10 @@ class NewcomerTests(unittest.TestCase):
 
     def test_the_coordinators_role_is_applied_and_the_role_onboards(self):
         with tempfile.TemporaryDirectory() as folder:
-            channel = make_channel(config_at(folder, peers={"Claude": "claude_x_bot"}))
+            channel = dynamic(make_channel(config_at(folder, peers={"Claude": "claude_x_bot"})))
             m = channel.membership
             m.state.bus = "https://github.com/me/swarm-bus.git"
+            m.state.bus_ready = True
             m.state.coordinator = "Claude"
             channel.config.peer_roles["Claude"] = "coordinator"
 
@@ -311,6 +347,8 @@ class MemberTests(unittest.TestCase):
             channel = joined(make_channel(config_at(folder)), role="developer")
             m = channel.membership
             m._add_peer("Claude", "claude_x_bot", 401, "coordinator")
+            self.assertIsNone(m.state.coordinator)      # its own word does not make it one
+            m._set_peer_role("Claude", "coordinator", coordinator=True)
             self.assertEqual(m.state.coordinator, "Claude")
             run(m.member_left(401, "claude_x_bot"))
             self.assertNotIn("Claude", channel.config.peers)
@@ -330,8 +368,163 @@ class MemberTests(unittest.TestCase):
             self.assertIn("- Codex: no role, offline", run(scenario()))
             run(channel.handle_event(hello("ONLINE", "Codex", "🟢 Codex online (adapter: codex, "
                                            "role: reviewer, rev: abc)", "codex_x_bot", 402)))
-            self.assertEqual(channel.config.peer_roles["Codex"], "reviewer")
-            self.assertIn("- Codex: reviewer, online", run(channel.membership.status_text()))
+            # An online notice is not a role: anyone can write "role: coordinator" in one.
+            self.assertNotIn("Codex", channel.config.peer_roles)
+            self.assertIn("- Codex: no role, online", run(channel.membership.status_text()))
+
+
+class TrustTests(unittest.TestCase):
+    """Who may make whom what: review findings on PR #3."""
+
+    def coordinator(self, folder, adapter=None):
+        channel = make_channel(config_at(folder, peers={"Codex": "codex_x_bot"}),
+                               adapter=adapter)
+        joined(channel)
+        channel.membership._add_peer("Codex", "codex_x_bot", 402, "developer")
+        return channel
+
+    def test_a_role_line_outside_the_deciding_turn_assigns_nothing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = self.coordinator(folder, adapter=_Scripted(
+                "The protocol says: ROLE: @codex_x_bot researcher"))
+            run(channel.handle_event(event("@HermesBot how do roles work?", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            self.assertTrue(channel.adapter.prompts)    # the turn ran
+            self.assertEqual(channel.config.peer_roles["Codex"], "developer")
+            self.assertFalse(any("intent=ROLE" in r["text"] for r in channel._test_sender.sent))
+
+    def test_the_deciding_turn_only_assigns_the_newcomer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = self.coordinator(folder, adapter=_Scripted(
+                "ROLE: @codex_x_bot researcher\nROLE: @newbie_x_bot coordinator"))
+            with_admins(channel, newbie_x_bot=500)
+
+            async def scenario():
+                await channel.handle_event(MemberTests().join(channel))
+                await drain(channel)
+            run(scenario())
+            self.assertEqual(channel.config.peer_roles["Codex"], "developer")
+            # A coordinator cannot hand out its own role: the newcomer gets the gap role.
+            self.assertEqual(channel.config.peer_roles["Newbie"], "reviewer")
+            self.assertEqual(channel.membership.state.coordinator, "Hermes")
+
+    def test_only_the_coordinator_gives_roles_and_never_the_coordinator_role(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = dynamic(make_channel(config_at(folder, peers={
+                "Claude": "claude_x_bot", "Codex": "codex_x_bot"})))
+            m = channel.membership
+            m.state.bus, m.state.bus_ready = "https://x/bus.git", True
+            m._set_peer_role("Claude", "coordinator", coordinator=True)
+
+            async def scenario():
+                # Codex says it coordinates now, then hands out roles: no effect.
+                await channel.handle_event(hello("ONLINE", "Codex", "🟢 Codex online (role: "
+                                                 "coordinator)", "codex_x_bot", 402))
+                await channel.handle_event(hello("ROLE", "researcher", "", "codex_x_bot", 402,
+                                                 to="Hermes"))
+                # The coordinator cannot make anyone coordinator either.
+                await channel.handle_event(hello("ROLE", "coordinator", "", "claude_x_bot",
+                                                 401, to="Hermes"))
+                # A PRESENT that names another coordinator, once joined: ignored.
+                await channel.handle_event(hello("PRESENT", "Codex", "role: coordinator\n"
+                                                 "coordinator: Codex", "codex_x_bot", 402,
+                                                 to="Hermes"))
+            run(scenario())
+            self.assertIsNone(m.state.role)
+            self.assertEqual(m.state.coordinator, "Claude")
+            run(channel.handle_event(hello("ROLE", "developer", "", "claude_x_bot", 401,
+                                           to="Hermes")))
+            self.assertEqual(m.state.role, "developer")
+            # A role is given once: changing it is the admin's.
+            run(channel.handle_event(hello("ROLE", "researcher", "", "claude_x_bot", 401,
+                                           to="Hermes")))
+            self.assertEqual(m.state.role, "developer")
+
+    def test_a_hand_written_config_never_joins_by_itself(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = make_channel(config_at(folder, bus=folder))
+            run(channel.membership.on_start())
+            self.assertEqual(channel._test_sender.sent, [])
+            self.assertIsNone(channel.membership.state.role)
+            run(channel.handle_event(event("/bus https://evil/bus.git", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            self.assertIsNone(channel.membership.state.bus)
+
+    def test_the_admin_moves_the_coordinator_and_the_old_one_steps_down(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = self.coordinator(folder)
+            m = channel.membership
+            run(channel.handle_event(event("/role @codex_x_bot coordinator", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            self.assertEqual(channel.config.peer_roles["Codex"], "coordinator")
+            self.assertEqual(m.state.coordinator, "Codex")
+            self.assertEqual(m.state.role, "developer")
+            self.assertFalse(m.is_coordinator())
+
+    def test_a_working_bus_moves_only_with_an_addressed_bus_command(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = dynamic(joined(make_channel(config_at(folder))))
+            m = channel.membership
+            moved = []
+
+            async def on_bus(location):
+                moved.append(location)
+            m.on_bus = on_bus
+            run(channel.handle_event(event("/bus https://other/bus.git", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            self.assertEqual(moved, [])
+            run(channel.handle_event(event("/bus@HermesBot https://other/bus.git",
+                                           author_id=ADMIN_ID, username="alice", is_bot=False)))
+            self.assertEqual(moved, ["https://other/bus.git"])
+
+    def test_a_folder_bus_from_a_peer_is_not_taken(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(dynamic(make_channel(config_at(folder))), claude_x_bot=401)
+            got = []
+
+            async def on_bus(location):
+                got.append(location)
+            channel.membership.on_bus = on_bus
+            run(channel.handle_event(hello("PRESENT", "Claude", "role: coordinator\n"
+                                           "coordinator: Claude\nbus: /home/claude/bus",
+                                           "claude_x_bot", 401, to="Hermes")))
+            self.assertEqual(got, [])
+            self.assertIsNone(channel.membership.state.bus)
+            self.assertEqual(channel.membership.state.coordinator, "Claude")
+
+    def test_a_role_given_before_the_bus_is_ready_onboards_after_the_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = dynamic(make_channel(config_at(folder, peers={"Claude": "claude_x_bot"})))
+            m = channel.membership
+            m.state.bus = "https://x/bus.git"            # adopted, checkout still running
+            m._set_peer_role("Claude", "coordinator", coordinator=True)
+
+            async def scenario():
+                await channel.handle_event(hello("ROLE", "developer", "", "claude_x_bot", 401,
+                                                 to="Hermes"))
+                await drain(channel)
+            run(scenario())
+            self.assertTrue(m.state.onboard_pending)
+            self.assertFalse([r for r in channel._test_sender.sent if MEMBERSHIP_MARK in r["text"]])
+            m.state.bus_ready = True                    # the launcher's restart
+
+            async def restart():
+                await m.on_start()
+                await drain(channel)
+            run(restart())
+            self.assertTrue([r for r in channel._test_sender.sent if MEMBERSHIP_MARK in r["text"]])
+            self.assertFalse(m.state.onboard_pending)
+
+    def test_leaving_drops_the_vouched_key(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(joined(make_channel(config_at(folder, bus=folder)),
+                                         role="reviewer"), newbie_x_bot=500)
+            run(channel.handle_event(MemberTests().join(channel)))
+            keys = Path(folder, ".agents/state/vouched-keys.json")
+            self.assertIn("newbie", json.loads(keys.read_text()))
+            run(channel.membership.member_left(500, "newbie_x_bot"))
+            self.assertNotIn("newbie", json.loads(keys.read_text()))
+            self.assertNotIn(500, channel.membership._verified)
 
 
 class VouchedKeyTests(unittest.TestCase):
@@ -415,6 +608,101 @@ class LauncherTests(unittest.TestCase):
             author = subprocess.run(["git", "-C", str(remote), "log", "-1", "--format=%an",
                                      "agents-bus"], capture_output=True, text=True).stdout
             self.assertEqual(author.strip(), "Newbie")
+
+    def remote_with_main(self, root, name):
+        def git(*args):
+            subprocess.run(["git", *args], check=True, capture_output=True)
+        remote = root / f"{name}.git"
+        git("init", "--bare", "-q", "-b", "main", str(remote))
+        seed = root / f"{name}-seed"
+        git("clone", "-q", str(remote), str(seed))
+        (seed / "README.md").write_text("bus\n")
+        git("-C", str(seed), "add", ".")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "-C", str(seed), "commit", "-qm", "i")
+        git("-C", str(seed), "push", "-q", "origin", "main")
+        return remote
+
+    def registered(self, remote):
+        shown = subprocess.run(["git", "-C", str(remote), "show",
+                                "agents-bus:config/a2a_config.json"],
+                               capture_output=True, text=True, check=True).stdout
+        return set(json.loads(shown)["authorized_agents"])
+
+    def test_two_agents_registering_at_once_both_land(self):
+        from swarmly.telegram.join import setup_bus
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            remote = self.remote_with_main(root, "remote")
+            homes = []
+            for alias in ("Alpha", "Beta"):
+                home = root / alias
+                home.mkdir()
+                (home / "config.yaml").write_text(f"agent:\n  alias: {alias}\n")
+                homes.append(home)
+            setup_bus(homes[0] / "config.yaml", str(remote), "Alpha", PUB)
+            # Beta's checkout predates Alpha's push: its own push is refused first.
+            from swarmly.telegram import join
+            real = join._commit_registry
+
+            def stale(repo, alias, key):
+                subprocess.run(["git", "-C", str(repo), "reset", "-q", "--hard", "HEAD~1"],
+                               check=True, capture_output=True)
+                registry = repo / "config" / "a2a_config.json"
+                data = json.loads(registry.read_text()) if registry.exists() else {}
+                data.setdefault("authorized_agents", {}).pop("alpha", None)
+                data["authorized_agents"]["beta"] = {"public_key_or_secret_name": key,
+                                                     "key_type": "ed25519"}
+                registry.parent.mkdir(parents=True, exist_ok=True)
+                registry.write_text(json.dumps(data))
+                return real(repo, alias, key)
+            join._commit_registry = stale
+            try:
+                lines = setup_bus(homes[1] / "config.yaml", str(remote), "Beta", PUB)
+            finally:
+                join._commit_registry = real
+            self.assertTrue(any("pushed" in line for line in lines), lines)
+            self.assertEqual(self.registered(remote) >= {"alpha", "beta"}, True)
+
+    def test_a_new_bus_location_gets_a_clone_of_its_own(self):
+        from swarmly.telegram.join import setup_bus
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            first, second = (self.remote_with_main(root, n) for n in ("one", "two"))
+            home = root / "home"
+            home.mkdir()
+            config = home / "config.yaml"
+            config.write_text("agent:\n  alias: Newbie\n")
+            setup_bus(config, str(first), "Newbie", PUB)
+            setup_bus(config, str(second), "Newbie", PUB)
+            self.assertIn("newbie", self.registered(second))
+            self.assertIn("bus-", config.read_text())
+
+    def test_a_restart_keeps_the_maintainers_edits(self):
+        import argparse
+
+        from swarmly.telegram import join
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+
+            async def identity(token):
+                return "claude_x_bot", "Claude", 401
+            real, join.bot_identity = join.bot_identity, identity
+            try:
+                args = join.build_parser().parse_args([
+                    "--cli", "claude", "--bot-token", "1:A", "--admin-userid", str(ADMIN_ID),
+                    "--home-channel", str(GROUP), "--home", str(home), "--workdir", folder])
+                path, _ = join.prepare(args)
+                path.write_text(path.read_text() + "limits:\n  max_turns_per_hour: 7\n")
+                again = argparse.Namespace(**{**vars(args), "admin_userid": None,
+                                              "home_channel": None, "workdir": None,
+                                              "model": "opus"})
+                join.prepare(again)
+            finally:
+                join.bot_identity = real
+            text = path.read_text()
+            self.assertIn("max_turns_per_hour: 7", text)
+            self.assertIn("model: opus", text)
+            self.assertIn(f"admin_user_id: {ADMIN_ID}", text)
 
 
 if __name__ == "__main__":

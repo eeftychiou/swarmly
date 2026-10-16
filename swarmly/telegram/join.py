@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -219,16 +220,25 @@ def prepare(args: argparse.Namespace) -> Tuple[Path, str]:
     workdir = (args.workdir or (Path(old["cwd"]) if old.get("cwd") else Path.cwd()))
     workdir = workdir.expanduser().resolve()
     home.mkdir(parents=True, exist_ok=True)
-    token_name = f"A2A_TELEGRAM_BOT_TOKEN_{env_suffix(alias)}"
+    token_name = old.get("token_env") or f"A2A_TELEGRAM_BOT_TOKEN_{env_suffix(alias)}"
     if read_env_key(env_file, token_name) != token:
         write_env_key(env_file, token_name, token)   # owner-only, never on a command line again
-    text = render_config(username, alias, CLI_ADAPTERS[args.cli], int(group), int(admin),
-                         workdir, permissions=args.permissions or old.get("permissions"),
-                         model=args.model or old.get("model"))
-    if old.get("bus"):
-        text += f"bus:\n  repo: {_yaml_scalar(old['bus'])}\n"
-        if old.get("ref"):
-            text += f"  ref: {_yaml_scalar(old['ref'])}\n"
+    if config_path.is_file():
+        # A restart: change only what the flags say, keep every edit the maintainer made.
+        from swarmly.telegram.init import _set_key
+        text = config_path.read_text(encoding="utf-8")
+        updates = [("agent", "alias", args.alias), ("agent", "home_channel_id",
+                    group if args.home_channel else None),
+                   ("agent", "admin_user_id", args.admin_userid),
+                   ("adapter", "type", CLI_ADAPTERS[args.cli]),
+                   ("adapter", "cwd", args.workdir and workdir),
+                   ("adapter", "permissions", args.permissions), ("adapter", "model", args.model)]
+        for section, key, value in updates:
+            if value is not None:
+                text = _set_key(text, section, key, _yaml_scalar(str(value)))
+    else:
+        text = render_config(username, alias, CLI_ADAPTERS[args.cli], int(group), int(admin),
+                             workdir, permissions=args.permissions, model=args.model)
     config_path.write_text(text, encoding="utf-8")
     public = _ensure_signing_key(env_file, alias.lower())
     return config_path, public
@@ -245,6 +255,7 @@ def _read_config(path: Path) -> dict:
         return {}
     agent, adapter, bus = (data.get(k) or {} for k in ("agent", "adapter", "bus"))
     return {"alias": agent.get("alias"), "home": agent.get("home_channel_id"),
+            "token_env": agent.get("bot_token_env"),
             "admin": agent.get("admin_user_id"), "cwd": adapter.get("cwd"),
             "permissions": adapter.get("permissions"), "model": adapter.get("model"),
             "bus": bus.get("repo"), "ref": bus.get("ref")}
@@ -253,6 +264,16 @@ def _read_config(path: Path) -> dict:
 def _git(repo: Path, *args: str, timeout: int = 120) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
                           timeout=timeout, check=False)
+
+
+def _origin_key(url: str) -> str:
+    """A remote URL compared without credentials or a trailing ``.git`` or slash."""
+    from swarmly.telegram.membership import safe_bus_location
+    return re.sub(r"(\.git)?/*$", "", safe_bus_location(url))
+
+
+def _origin(repo: Path) -> str:
+    return _origin_key(_git(repo, "remote", "get-url", "origin").stdout.strip())
 
 
 def setup_bus(config_path: Path, location: str, alias: str,
@@ -268,6 +289,10 @@ def setup_bus(config_path: Path, location: str, alias: str,
         project = local.resolve()                 # a checkout on this machine: used as it is
     else:                                         # a URL (or a bare repository): cloned
         project = home / "bus"
+        if (project / ".git").exists() and _origin(project) != _origin_key(location):
+            # Another bus than the one cloned before (the admin moved it): a clone of its own.
+            digest = hashlib.sha256(_origin_key(location).encode()).hexdigest()[:10]
+            project = home / f"bus-{digest}"
         if not (project / ".git").exists():
             clone = subprocess.run(["git", "clone", "--quiet", "--", location, str(project)],
                                    capture_output=True, text=True, timeout=600, check=False)
@@ -290,7 +315,7 @@ def setup_bus(config_path: Path, location: str, alias: str,
         raise JoinError(f"cannot register {agent}'s key: {exc}") from exc
     if registry.read_text(encoding="utf-8-sig") != text:
         registry.write_text(text, encoding="utf-8")
-        lines.append(_commit_registry(bus_repo, alias))
+        lines.append(_commit_registry(bus_repo, alias, public_key))
     config = config_path.read_text(encoding="utf-8")
     config = _set_key(config, "bus", "repo", _yaml_scalar(str(bus_repo)))
     if ref:
@@ -300,21 +325,38 @@ def setup_bus(config_path: Path, location: str, alias: str,
     return lines
 
 
-def _commit_registry(repo: Path, alias: str) -> str:
-    """Commit the registry (as the agent) and push it, rebasing over a peer's push."""
+def _commit_registry(repo: Path, alias: str, public_key: str) -> str:
+    """Commit the registry (as the agent) and push it. When a peer pushed first (two agents
+    joining at once both edit the registry), take its commit and register the key again on
+    top of it, instead of leaving a rebase conflict in the checkout."""
+    from swarmly.keygen import KeygenError, plan_registry
     name, email = alias, f"{alias.lower()}@a2a.local"
-    _git(repo, "add", "config/a2a_config.json", ".gitignore")
-    commit = _git(repo, "-c", f"user.name={name}", "-c", f"user.email={email}", "commit",
-                  "--quiet", "-m", f"Register {alias}'s bus key")
-    if commit.returncode != 0:
-        return f"could not commit the registry: {(commit.stderr or commit.stdout).strip()}"
+    ident = ("-c", f"user.name={name}", "-c", f"user.email={email}")
+    registry = repo / "config" / "a2a_config.json"
     branch = _git(repo, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip() or "HEAD"
-    for _ in range(3):
+    push = None
+    for attempt in range(4):
+        if attempt:
+            _git(repo, "fetch", "--quiet", "origin", branch, timeout=300)
+            # Drop the local commit, keep the working tree, and start from the peer's files.
+            _git(repo, "reset", "--quiet", "--mixed", f"origin/{branch}")
+            _git(repo, "checkout", f"origin/{branch}", "--", "config/a2a_config.json")
+            try:
+                text, _ = plan_registry(registry, alias.lower(), public_key, "ed25519")
+            except KeygenError as exc:
+                return f"could not register the key again: {exc}"
+            if registry.read_text(encoding="utf-8-sig") == text:
+                return f"{alias}'s key is in the registry already"
+            registry.write_text(text, encoding="utf-8")
+        _git(repo, "add", "--", *(f for f in ("config/a2a_config.json", ".gitignore")
+                                  if (repo / f).exists()))
+        commit = _git(repo, *ident, "commit", "--quiet", "-m", f"Register {alias}'s bus key")
+        if commit.returncode != 0:
+            return f"could not commit the registry: {(commit.stderr or commit.stdout).strip()}"
         push = _git(repo, "push", "--quiet", "-u", "origin", branch, timeout=300)
         if push.returncode == 0:
             return f"registered {alias}'s key and pushed it to {branch}"
-        _git(repo, "-c", f"user.name={name}", "-c", f"user.email={email}", "pull",
-             "--rebase", "--quiet", "origin", branch, timeout=300)
+    assert push is not None
     detail = (push.stderr or push.stdout).strip().splitlines()
     return ("registered the key locally but the push failed: "
             f"{detail[-1] if detail else 'git push failed'}; the swarm still verifies it "
@@ -337,6 +379,7 @@ async def serve(config_path: Path, cli: str, public_key: str) -> int:
             return RUN_LOCK_EXIT_CODE
         channel = AgentChannel(config, transport=True)
         membership = channel.membership
+        membership.dynamic = True
         membership.cli = cli
         membership.public_key = public_key
 
@@ -344,12 +387,15 @@ async def serve(config_path: Path, cli: str, public_key: str) -> int:
             try:
                 lines = await asyncio.to_thread(setup_bus, config_path, location,
                                                 channel.config.identity.alias, public_key)
-            except JoinError as exc:
+            except Exception as exc:            # noqa: BLE001 - the admin is told, no crash
+                logger.warning("bus setup failed: %s", exc, exc_info=not isinstance(
+                    exc, JoinError))
                 channel.membership.state.bus = None
+                channel.membership.state.bus_ready = False
                 channel.membership.state.save(channel.membership.path)
                 await channel.membership.ask_maintainer(
                     f"⚠️ {channel.config.identity.alias} cannot use the bus: {exc}. "
-                    "Fix it and reply /bus <git URL or folder>.")
+                    f"Fix it and reply /bus{channel.membership._at()} <git URL or folder>.")
                 return
             for line in lines:
                 logger.info("bus: %s", line)
@@ -374,9 +420,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     from swarmly.logsetup import configure as configure_logging
     configure_logging("swarmly-join", verbose=args.verbose, directory=args.log_dir)
+    from swarmly.keygen import KeygenError
     try:
         config_path, public_key = prepare(args)
-    except (JoinError, OSError) as exc:
+    except (JoinError, KeygenError, OSError) as exc:
         print(f"swarmly: {exc}", file=sys.stderr)
         return 2
     from swarmly.telegram.config import AgentConfig, ConfigError

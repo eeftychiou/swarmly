@@ -461,9 +461,22 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _join_command(raw: List[str]) -> bool:
+    """`swarmly --cli ...`: a ``--cli`` among the options before any subcommand (a
+    subcommand's own arguments, or anything after ``--``, may say --cli too)."""
+    commands = {name for action in build_parser()._actions
+                if isinstance(action, argparse._SubParsersAction) for name in action.choices}
+    for arg in raw:
+        if arg == "--" or arg in commands:
+            return False
+        if arg == "--cli" or arg.startswith("--cli="):
+            return True
+    return False
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    if any(arg == "--cli" or arg.startswith("--cli=") for arg in raw):
+    if _join_command(raw):
         # `swarmly --cli <runtime> ...`: start an agent that joins the swarm (docs/JOIN.md).
         from ..telegram.join import main as join_main
         return join_main(raw)

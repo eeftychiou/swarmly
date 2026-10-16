@@ -25,6 +25,13 @@ its bot, the group and the maintainer; everything else is agreed in the group:
    prompt from then on) and asks it to introduce itself to the coordinator and ask for its
    first task, which the coordinator then hands it like any other work.
 
+Trust: a role comes from the coordinator's bot, once, for an agent that has none, and never
+the coordinator role; the admin overrides any role and is the only one who moves the
+coordinator. What an agent says about itself (online notice, JOIN, PRESENT) is recorded but
+never makes it the coordinator, except that a newcomer still joining takes the coordinator
+from the answer of the agent that says it is one. Only an agent the launcher started
+(``dynamic``) joins by itself; one set up by hand only answers newcomers.
+
 Agents drop out at any time: ``BYE intent=OFFLINE`` on a clean stop marks one offline (it
 keeps its role and rejoins with its ``HELLO intent=ONLINE``), and leaving the group removes
 it from every roster. What was agreed is kept beside the config (``<config>.swarm.json``),
@@ -65,6 +72,10 @@ JOIN_WAIT_SECONDS = 90.0
 ROLE_WAIT_SECONDS = 600.0
 #: Marks a turn the transport started for membership (a role decision, an onboarding).
 MEMBERSHIP_MARK = "[swarm membership]"
+_DECIDE_MARK = "A new agent joined the swarm:"
+_ONBOARD_MARK = "You have joined"
+#: The newcomer a role-decision turn is about: ``<alias> (@<username>)``.
+_DECIDE_FOR = re.compile(re.escape(_DECIDE_MARK) + r" ([A-Za-z0-9_-]{1,32}) \(@([A-Za-z0-9_]{5,32})\)")
 #: Roles handed out, in order, when nobody decides one: the gaps a working team fills first.
 DEFAULT_ROLE_ORDER = ("developer", "reviewer", "qa-tester", "researcher")
 #: ``ROLE: @handle role`` in a coordinator's reply.
@@ -148,8 +159,22 @@ def parse_fields(body: str) -> Dict[str, str]:
 
 def safe_bus_location(location: str) -> str:
     """A bus location fit to post: credentials in a URL (``https://user:token@host``) are
-    dropped, so a token in a remote URL never reaches the group."""
-    return re.sub(r"(?i)^([a-z][a-z0-9+.-]*://)[^/@\s]+@", r"\1", location.strip())
+    dropped, so a token in a remote URL never reaches the group. The user of an ssh URL
+    (``ssh://git@host/...``, ``git@host:...``) is not a secret and stays: without it the
+    URL no longer works."""
+    location = location.strip()
+    location = re.sub(r"(?i)^(https?://)[^/@\s]+@", r"\1", location)
+    return re.sub(r"(?i)^([a-z][a-z0-9+.-]*://)[^/@\s:]+:[^/@\s]+@", r"\1", location)
+
+
+def is_remote_bus(location: Optional[str]) -> bool:
+    """A location another machine can clone: a URL or an scp-style ``user@host:path``, not a
+    folder on this machine (``file://`` is a folder too)."""
+    if not location:
+        return False
+    if re.match(r"(?i)^[a-z][a-z0-9+.-]*://", location):
+        return not location.lower().startswith("file:")
+    return bool(re.match(r"^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^/]", location))
 
 
 #: Looks a user up in the home group: ``(status, username, is_bot)`` or None when unknown.
@@ -176,10 +201,20 @@ class Membership:
         self._remote_checked = False                     # bus_location asked git once
         self._joined_at: Optional[float] = None          # when this agent posted its JOIN
         self._present_from: List[str] = []               # members that answered the JOIN
-        self._pending_role_for: Optional[str] = None     # the newcomer a role is decided for
+        #: Newcomers a role is being decided for: Telegram username (lower) -> alias.
+        self._pending_roles: Dict[str, str] = {}
+        self._onboarding = False                         # an onboarding turn is running
+        #: Set by the ``swarmly --cli`` launcher. Only such an agent joins by itself (posts a
+        #: JOIN, asks the maintainer for a bus, takes the first agent's coordinator role); an
+        #: agent from a hand-written config only answers newcomers and records roles.
+        self.dynamic = False
         self._tasks: List[asyncio.Task] = []
         #: alias -> {"online": bool, "at": wall clock} for /swarm.
         self.presence: Dict[str, Dict[str, Any]] = {}
+        if self.state.coordinator is None and not self.is_coordinator():
+            # A hand-written config names its coordinator among its peers' roles.
+            self.state.coordinator = next((a for a, r in self.cfg.peer_roles.items()
+                                           if r == "coordinator"), None)
 
     # -- small helpers --------------------------------------------------------------------
     @property
@@ -193,8 +228,16 @@ class Membership:
         self.state.save(self.path)
 
     def joined(self) -> bool:
-        """Whether this agent is past the handshake: it has a role and knows its bus."""
-        return bool(self.state.role and self.bus_location())
+        """Whether this agent is past the handshake: it has a role and a bus to work on."""
+        return bool(self.state.role and self.bus_location() and self.bus_ready())
+
+    def bus_ready(self) -> bool:
+        """Whether this agent works on the bus: the launcher made its checkout, or the
+        config names one (an agent set up by hand)."""
+        if self.state.bus_ready:
+            return True
+        bus = self.cfg.bus
+        return not self.dynamic and bool(bus.repo or (bus.transport == "folder" and bus.folder))
 
     def bus_location(self) -> Optional[str]:
         """The bus everyone shares: the agreed one, else the configured checkout's remote (or
@@ -204,20 +247,35 @@ class Membership:
         bus = self.cfg.bus
         if bus.transport == "folder" and bus.folder:
             return bus.folder
-        if bus.repo and not self._remote_checked:
-            self._remote_checked = True
-            try:
-                out = subprocess.run(["git", "-C", str(Path(bus.repo).expanduser()), "remote",
-                                      "get-url", "origin"], capture_output=True, text=True,
-                                     timeout=10, check=False)
-            except (OSError, subprocess.SubprocessError):
-                return None
-            url = out.stdout.strip()
-            if out.returncode == 0 and url:
-                self.state.bus = safe_bus_location(url)
-                self._save()
-                return self.state.bus
-        return None
+        url = self._origin_url()
+        if url:
+            self.state.bus = url
+            self._save()
+        return url
+
+    def _origin_url(self) -> Optional[str]:
+        """The configured checkout's ``origin`` remote (asked once), fit to post."""
+        if not self.cfg.bus.repo or self._remote_checked:
+            return None
+        self._remote_checked = True
+        try:
+            out = subprocess.run(["git", "-C", str(Path(self.cfg.bus.repo).expanduser()),
+                                  "remote", "get-url", "origin"], capture_output=True,
+                                 text=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        url = out.stdout.strip()
+        return safe_bus_location(url) if out.returncode == 0 and url else None
+
+    def advertised_bus(self) -> Optional[str]:
+        """The bus location to tell a newcomer: one it can clone from its own machine, never
+        a folder on this one."""
+        bus = self.bus_location()
+        if is_remote_bus(bus):
+            return bus
+        self._remote_checked = False
+        origin = self._origin_url()
+        return origin if is_remote_bus(origin) else None
 
     def coordinator_handle(self) -> Optional[str]:
         coord = self.state.coordinator
@@ -288,12 +346,21 @@ class Membership:
             self.ch.peers_changed()
         if user_id is not None:
             self.state.peer_ids[known] = int(user_id)
-        if role and _ROLE_NAME(role):
-            self._set_peer_role(known, role)
+        if role and _ROLE_NAME(role) and role != "coordinator" \
+                and not self.cfg.peer_roles.get(known):
+            self._set_peer_role(known, role)        # what it says it is, until told otherwise
         self._save()
         return True
 
-    def _set_peer_role(self, alias: str, role: str) -> None:
+    def _set_peer_role(self, alias: str, role: str, coordinator: bool = False) -> bool:
+        """Record *alias*'s *role*. A coordinator is recorded only when *coordinator* says the
+        source may make one (the admin, or the swarm's answer to this agent's own JOIN)."""
+        if not _ROLE_NAME(role) or role not in self._role_names():
+            logger.warning("membership: unknown role %r for %s; ignored", role, alias)
+            return False
+        if role == "coordinator" and not coordinator:
+            logger.warning("membership: %s cannot be made coordinator that way; ignored", alias)
+            return False
         self.state.peer_roles[alias] = role
         self.cfg.peer_roles[alias] = role
         if role == "coordinator":
@@ -301,6 +368,7 @@ class Membership:
         elif self.state.coordinator == alias:
             self.state.coordinator = None
         self.ch.roles_changed()
+        return True
 
     def seen(self, alias: Optional[str], online: bool = True) -> None:
         if alias:
@@ -311,9 +379,15 @@ class Membership:
         """After the online notice: a newcomer (no role or no bus yet) asks to join."""
         if self.is_coordinator():
             self.state.coordinator = self.alias
+        if not self.dynamic:
+            return                    # set up by hand: it answers newcomers, never joins
         if self.joined():
             if self.state.onboard_pending:
                 self._onboard()
+            return
+        if self.state.bus and not self.state.bus_ready:
+            # The swarm named a bus but its checkout did not finish (a crash, a stop): again.
+            await self.adopt_bus(self.state.bus)
             return
         if self.state.bus and self.state.bus_ready:
             # Started again on the agreed bus: the swarm knows this agent; only the role is
@@ -384,7 +458,7 @@ class Membership:
                 f"🙋 {self.alias} here. "
                 + ("No agent answered, so I am the first one in this swarm. "
                    if first else "The swarm did not tell me where its bus is. ")
-                + "Where is the bus? Reply /bus <git URL or folder>."
+                + f"Where is the bus? Reply /bus{self._at()} <git URL or folder>."
                 + (f" I will coordinate unless you give me another role with "
                    f"/role {self.cfg.identity.username} <role>." if first and not self.state.role
                    else ""))
@@ -403,6 +477,10 @@ class Membership:
                        if self.state.coordinator else " (no coordinator answered)")
                     + f". Give me one with /role {self.cfg.identity.username} <role>: "
                     + ", ".join(self._role_names()) + ".")
+
+    def _at(self) -> str:
+        """``@thisbot``, to address a command to this agent only."""
+        return "@" + self.cfg.identity.name.lstrip("@")
 
     async def ask_maintainer(self, text: str) -> None:
         handle = self.cfg.identity.maintainer_username
@@ -427,15 +505,8 @@ class Membership:
             return False
         sender = self.cfg.peer_alias_for(event.author_username, event.author_id)
         if intent == "ONLINE":
-            self.seen(sender)
-            said = re.search(r"\brole: ([a-z][a-z0-9_-]{0,39})\b", body or "")
-            if sender and said and self.cfg.peer_roles.get(sender) != said.group(1):
-                self._set_peer_role(sender, said.group(1))
-                self._save()
-            if sender and self.cfg.peer_roles.get(sender) == "coordinator":
-                self.state.coordinator = sender
-                self._save()
-            return False
+            self.seen(sender)         # an online notice says nothing about roles: anyone
+            return False              # can write "role: coordinator" in one
         if intent == "JOIN":
             await self._on_join(ref, body, event)
             return True
@@ -472,7 +543,7 @@ class Membership:
         lines = [f"@{username} 👋 {self.alias} here."]
         lines.append(f"role: {self.state.role or 'none'}")
         lines.append(f"coordinator: {self.state.coordinator or 'none'}")
-        bus = self.bus_location()
+        bus = self.advertised_bus()
         if bus:
             lines.append(f"bus: {bus}")
         if self.is_coordinator():
@@ -486,7 +557,7 @@ class Membership:
             Envelope(type=MessageType.HELLO, to=alias, intent="PRESENT",
                      ref=self.ch._alias_ref()), "\n".join(lines)),
             reply_to_message_id=event.message_id, silent=True, allow_when_frozen=True)
-        if self.is_coordinator() and not fields.get("role") and not self.cfg.peer_roles.get(alias):
+        if self.is_coordinator() and not self.cfg.peer_roles.get(alias):
             self._decide_role(alias, username, fields.get("cli") or "unknown")
 
     def _vouch(self, alias: str, key: Optional[str]) -> None:
@@ -516,19 +587,27 @@ class Membership:
         alias = known or alias
         self._present_from.append(alias)
         self.seen(alias)
-        coordinator = fields.get("coordinator")
-        if coordinator and coordinator != "none" and ALIAS_RE.match(coordinator) \
-                and coordinator.lower() != self.alias.lower():
-            self.state.coordinator = coordinator
-        for m_alias, m_user, m_id, m_role in _MEMBER.findall(fields.get("members", "")):
-            if self.cfg.peer_alias_for(m_user) or m_user.lower() == self._me():
-                continue
-            if await self._verified_admin(int(m_id), m_user):
-                self._add_peer(m_alias, m_user, int(m_id), m_role or None)
+        # Only while this agent is still joining, and only from the coordinator itself: an
+        # answer that names itself the coordinator. Once the swarm has a coordinator, only
+        # the admin changes it (/role @bot coordinator).
+        claims = role == "coordinator" and (fields.get("coordinator") or "").lower() \
+            == alias.lower()
+        if claims and self.state.coordinator is None and not self.joined():
+            self._set_peer_role(alias, "coordinator", coordinator=True)
+        if self.state.coordinator == alias:
+            for m_alias, m_user, m_id, m_role in _MEMBER.findall(fields.get("members", "")):
+                if self.cfg.peer_alias_for(m_user) or m_user.lower() == self._me():
+                    continue
+                if await self._verified_admin(int(m_id), m_user):
+                    self._add_peer(m_alias, m_user, int(m_id), m_role or None)
         bus = fields.get("bus")
         self._save()
-        if bus and not self.state.bus and not self.cfg.bus.repo:
-            await self.adopt_bus(bus)
+        if bus and not self.state.bus and not self.bus_ready():
+            if is_remote_bus(bus):
+                await self.adopt_bus(bus)
+            else:
+                logger.warning("membership: %s named the bus %r, a folder on its machine; "
+                               "ask the admin for a URL (/bus%s)", alias, bus, self._at())
 
     async def adopt_bus(self, location: str) -> None:
         """Take *location* as this swarm's bus (the launcher makes a checkout of it)."""
@@ -544,7 +623,7 @@ class Membership:
         if not self.cfg.bus.repo:
             logger.warning("membership: set bus.repo in %s to a checkout of %s",
                            self.cfg.source_path, location)
-        if self.state.onboard_pending and self.state.role:
+        if self.state.onboard_pending and self.state.role and self.bus_ready():
             self._onboard()
 
     async def _on_role(self, envelope: Envelope, body: str, event: "ChannelEvent",
@@ -555,11 +634,23 @@ class Membership:
             return
         coordinator = self.state.coordinator
         if coordinator is None or sender.lower() != coordinator.lower():
-            if self.cfg.peer_roles.get(sender) != "coordinator":
-                logger.warning("membership: ROLE from %s ignored: it is not the coordinator",
-                               sender)
-                return
+            logger.warning("membership: ROLE from %s ignored: it is not the coordinator",
+                           sender)
+            return
         self.seen(sender)
+        if role == "coordinator":
+            logger.warning("membership: %s cannot hand out the coordinator role; only the "
+                           "admin can", sender)
+            return
+        if target.lower() == self.alias.lower():
+            current = self.state.role
+        else:
+            current = next((r for a, r in self.cfg.peer_roles.items()
+                            if a.lower() == target.lower()), None)
+        if current:
+            logger.info("membership: ROLE %s for %s ignored: it has the role %s; only the "
+                        "admin changes a role", role, target, current)
+            return
         self.apply_role(target, role, by=sender)
 
     def apply_role(self, target: str, role: str, by: str) -> None:
@@ -590,8 +681,8 @@ class Membership:
         self._save()
         self.ch.roles_changed()
         logger.info("membership: %s is now %s (given by %s)", self.alias, role, by)
-        if self.state.onboard_pending and self.bus_location():
-            self._onboard()
+        if self.state.onboard_pending and self.bus_ready():
+            self._onboard()           # else on the start that has the bus checkout
 
     # -- admin commands -------------------------------------------------------------------
     async def handle_command(self, event: "ChannelEvent") -> bool:
@@ -611,9 +702,11 @@ class Membership:
         args = (event.text or "").split()[1:]
         if command == "bus":
             if args:
-                if self.cfg.bus.repo and not self.state.bus_ready:
+                if not self.dynamic:
                     logger.info("/bus ignored: %s has a configured bus", self.alias)
                     return True
+                if self.bus_ready() and not target:
+                    return True       # a working bus moves only with /bus@thisbot
                 if safe_bus_location(args[0]) != self.state.bus:
                     self.state.bus_ready = False          # a new bus: set it up again
                 await self.adopt_bus(args[0])
@@ -628,14 +721,31 @@ class Membership:
         if len(handles) != 1 or len(roles) != 1 or not _ROLE_NAME(roles[0].lower()):
             return True
         role = roles[0].lower()
-        if handles[0].lower() == self._me():
+        if role not in self._role_names():
+            logger.warning("/role: unknown role %r", role)
+            return True
+        mine = handles[0].lower() == self._me()
+        alias = self.alias if mine else self.cfg.peer_alias_for(handles[0])
+        if alias is None:
+            return True
+        if role == "coordinator":
+            self._demote_coordinators(but=alias)
+        if mine:
             self.set_own_role(role, by="admin")
         else:
-            alias = self.cfg.peer_alias_for(handles[0])
-            if alias is not None:
-                self._set_peer_role(alias, role)
-                self._save()
+            self._set_peer_role(alias, role, coordinator=True)
+            self._save()
         return True
+
+    def _demote_coordinators(self, but: str) -> None:
+        """The admin made *but* the coordinator: whoever coordinated before becomes a
+        developer (every agent applies the same /role, so all of them agree)."""
+        demoted = DEFAULT_ROLE_ORDER[0]
+        for alias, role in list(self.cfg.peer_roles.items()):
+            if role == "coordinator" and alias.lower() != but.lower():
+                self._set_peer_role(alias, demoted)
+        if self.is_coordinator() and self.alias.lower() != but.lower():
+            self.set_own_role(demoted, by="admin: a new coordinator")
 
     async def status_text(self) -> str:
         lines = [f"SWARM bus: {self.bus_location() or 'unknown'}",
@@ -671,17 +781,10 @@ class Membership:
         alias = self.cfg.peer_alias_for(username, user_id)
         if alias is None:
             return
+        if user_id is not None:
+            self._verified.pop(int(user_id), None)
         self.ch.roster.drop(alias)
-        self.ch.peers_changed()
-        self.state.peer_roles.pop(alias, None)
-        self.cfg.peer_roles.pop(alias, None)
-        self.state.peer_ids.pop(alias, None)
-        self.presence.pop(alias, None)
-        was_coordinator = self.state.coordinator == alias
-        if was_coordinator:
-            self.state.coordinator = None
-        self._save()
-        self.ch.roles_changed()
+        was_coordinator = self.forget(alias)
         logger.info("membership: %s left the group", alias)
         # One notice, from the member whose alias sorts first, not one per bot.
         online = [a for a, p in self.presence.items() if p.get("online")] + [self.alias]
@@ -690,17 +793,42 @@ class Membership:
                 f"⚠️ {alias}, the coordinator, left the group. Pick a new one with "
                 "/role @bot coordinator.")
 
+    def forget(self, alias: str) -> bool:
+        """*alias* is out of the swarm (it left the group, or the admin removed it): its
+        role, its user id and the bus key from its JOIN go. True when it was the
+        coordinator."""
+        self.ch.peers_changed()
+        self.state.peer_roles.pop(alias, None)
+        self.cfg.peer_roles.pop(alias, None)
+        user_id = self.state.peer_ids.pop(alias, None)
+        if user_id is not None:
+            self._verified.pop(int(user_id), None)
+        self.presence.pop(alias, None)
+        self._pending_roles = {u: a for u, a in self._pending_roles.items() if a != alias}
+        was_coordinator = self.state.coordinator == alias
+        if was_coordinator:
+            self.state.coordinator = None
+        self._save()
+        self.ch.roles_changed()
+        if self.cfg.bus.repo:
+            from swarmly.bus import unvouch_key
+            try:
+                unvouch_key(Path(self.cfg.bus.repo).expanduser(), alias.lower())
+            except OSError as exc:
+                logger.warning("membership: cannot drop %s's vouched bus key: %s", alias, exc)
+        return was_coordinator
+
     # -- turns ----------------------------------------------------------------------------
     def _decide_role(self, alias: str, username: str, cli: str) -> None:
         """Ask this coordinator's agent which role the newcomer takes."""
         team = "; ".join(f"{a}: {r or 'no role yet'}" for a, r in self.team().items()
                          if a != alias)
-        text = (f"{MEMBERSHIP_MARK} A new agent joined the swarm: {alias} (@{username}), "
+        text = (f"{MEMBERSHIP_MARK} {_DECIDE_MARK} {alias} (@{username}), "
                 f"running {cli}.\nThe team now: {team}.\nRoles you can give:\n"
                 f"{self._role_catalogue()}\n\nPick the role that best fills the team's gap "
                 f"for the current work. Answer with exactly one line\nROLE: @{username} <role>\n"
                 "and one short sentence saying why. Nothing else.")
-        self._pending_role_for = alias
+        self._pending_roles[username.lstrip("@").lower()] = alias
         self.ch._run_own_task(text, int(self.cfg.identity.home_channel_id or 0), None, None)
 
     def _onboard(self) -> None:
@@ -711,10 +839,9 @@ class Membership:
         except RoleError as exc:
             logger.warning("membership: cannot read the role %s: %s", self.state.role, exc)
             return
-        if role is None:
+        if role is None or self._onboarding:
             return
-        self.state.onboard_pending = False
-        self._save()
+        self._onboarding = True       # onboard_pending clears when the turn has answered
         coordinator = self.coordinator_handle()
         if self.is_coordinator() or not coordinator:
             ask = ("You coordinate this swarm. Greet the maintainer in two lines: say you are "
@@ -722,30 +849,43 @@ class Membership:
         else:
             ask = (f"Introduce yourself to {coordinator} in one or two lines (your alias, your "
                    "role, your runtime) and ask for your first task.")
-        text = (f"{MEMBERSHIP_MARK} You have joined the swarm as its {role.name}. These are "
+        text = (f"{MEMBERSHIP_MARK} {_ONBOARD_MARK} the swarm as its {role.name}. These are "
                 f"your standing instructions from now on:\n\n{role.prompt(self.cfg.peer_roles)}"
                 f"\n\nBus: {self.bus_location() or 'unknown'}. Coordinator: "
                 f"{self.state.coordinator or 'none'}.\n\n{ask} Reply with that message only.")
         self.ch._run_own_task(text, int(self.cfg.identity.home_channel_id or 0), None, None)
 
     async def on_reply(self, body: str, event: "ChannelEvent") -> bool:
-        """This agent's reply to a turn. A coordinator's ``ROLE: @bot role`` lines become
-        role assignments. True when the reply is consumed (a role decision is not posted
-        as prose)."""
-        deciding = event.self_task and (event.text or "").startswith(MEMBERSHIP_MARK) \
-            and "A new agent joined" in (event.text or "")
-        if not self.is_coordinator():
+        """This agent's answer to a membership turn. True when it is consumed (a role
+        decision is not posted as prose).
+
+        Only the turn the transport started to decide a newcomer's role is read for a
+        ``ROLE: @bot role`` line, and only the line for that newcomer counts: a ROLE line
+        anywhere else (an agent quoting the protocol, a task's answer) assigns nothing."""
+        text = event.text or ""
+        if not event.self_task or not text.startswith(MEMBERSHIP_MARK):
             return False
-        assigned = False
-        for handle, role in _ROLE_LINE.findall(body or ""):
-            assigned |= await self.assign(handle, role.lower(), reason=_reason(body))
-        if deciding and not assigned:
-            alias = self._pending_role_for
-            username = self.cfg.peer_username_for(alias) if alias else None
-            if username:
-                await self.assign(username.lstrip("@"), self.default_role_for(alias),
-                                  reason="default: no role was decided")
-        return deciding
+        if _ONBOARD_MARK in text.split("\n", 1)[0]:
+            self._onboarding = False
+            if self.state.onboard_pending:
+                self.state.onboard_pending = False
+                self._save()
+            return False              # the introduction is posted as written
+        found = _DECIDE_FOR.search(text.split("\n", 1)[0])
+        if found is None:
+            return False
+        username = found.group(2).lower()
+        alias = self._pending_roles.pop(username, None)
+        if alias is None or not self.is_coordinator():
+            return True
+        role = next((r.lower() for h, r in _ROLE_LINE.findall(body or "")
+                     if h.lower() == username), None)
+        if role is None or role == "coordinator" or role not in self._role_names():
+            role, reason = self.default_role_for(alias), "default: no role was decided"
+        else:
+            reason = _reason(body)
+        await self.assign(found.group(2), role, reason=reason)
+        return True
 
     def default_role_for(self, alias: str) -> str:
         taken = {r for a, r in self.team().items() if r and a != alias}
@@ -753,24 +893,20 @@ class Membership:
 
     async def assign(self, handle: str, role: str, reason: str = "") -> bool:
         """Give the agent with Telegram *handle* the *role*, as the coordinator."""
-        if role not in self._role_names():
-            logger.warning("membership: unknown role %r for @%s", role, handle)
+        if role not in self._role_names() or role == "coordinator" \
+                or handle.lower() == self._me():
+            logger.warning("membership: cannot give @%s the role %r", handle, role)
             return False
-        if handle.lower() == self._me():
-            self.set_own_role(role, by=self.alias)
-            alias = self.alias
-        else:
-            alias = self.cfg.peer_alias_for(handle)
-            if alias is None:
-                return False
-            self._set_peer_role(alias, role)
-            self._save()
-            # The newcomer's introduction comes right after this turn: let it past the
-            # bot-to-bot cooldown once.
-            home = self.cfg.identity.home_channel_id
-            if home is not None:
-                from swarmly.telegram.channel import ChannelEvent
-                self.ch._expect_handoff(ChannelEvent(text="", chat_id=int(home)), alias)
+        alias = self.cfg.peer_alias_for(handle)
+        if alias is None or not self._set_peer_role(alias, role):
+            return False
+        self._save()
+        # The newcomer's introduction comes right after this turn: let it past the
+        # bot-to-bot cooldown once.
+        home = self.cfg.identity.home_channel_id
+        if home is not None:
+            from swarmly.telegram.channel import ChannelEvent
+            self.ch._expect_handoff(ChannelEvent(text="", chat_id=int(home)), alias)
         await self.ch.send(format_message(
             Envelope(type=MessageType.HELLO, to=alias, intent="ROLE", ref=role),
             f"🎭 @{handle.lstrip('@')} you are the swarm's {role}." + (f" {reason}" if reason

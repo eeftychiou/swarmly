@@ -66,6 +66,23 @@ def vouch_key(root: Path, agent_id: str, public_key: str) -> bool:
     return True
 
 
+def unvouch_key(root: Path, agent_id: str) -> bool:
+    """Forget *agent_id*'s vouched key (it left the swarm); True when there was one."""
+    path = vouched_keys_path(root)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            vouched = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(vouched, dict) or agent_id not in vouched:
+        return False
+    del vouched[agent_id]
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(vouched, indent=1, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+    return True
+
+
 def _looks_ed25519_public(value: str) -> bool:
     if len(value) != 44 or not value.endswith("="):
         return False

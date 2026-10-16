@@ -990,7 +990,8 @@ class AgentChannel:
             return True
         handles = self.roster.handles(event.text or "")
         if command == "remove":
-            self.roster.remove(handles)
+            for alias in self.roster.remove(handles):
+                self.membership.forget(alias)
             return True
         for alias, username in self.roster.admit(handles):
             await self.send(format_message(
