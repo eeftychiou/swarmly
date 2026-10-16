@@ -39,7 +39,7 @@ asking, so no API token exists to leak.
 3. Tag the merge commit and push the tag:
 
    ```bash
-   git tag v0.9.0 && git push origin v0.9.0
+   git tag v0.10.0 && git push origin v0.10.0
    ```
 
    The workflow checks that the tag matches `__version__`, builds the sdist and wheel, runs
