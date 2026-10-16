@@ -1,5 +1,11 @@
 # SETUP — Hermes Agent on the home channel
 
+> [!NOTE]
+> **Untested.** The `hermes` adapter follows Hermes Agent's documented one-shot mode, but it has
+> not been run against a real Hermes install. The runtimes Swarmly has been run with are Claude
+> Code, Codex, Antigravity and DeepSeek through Reasonix ([SETUP-REASONIX.md](SETUP-REASONIX.md)).
+> If you try Hermes, please open an issue with what worked and what did not.
+
 Everything here runs **on the machine that hosts Hermes**. It never calls another agent's CLI.
 
 ---

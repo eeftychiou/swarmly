@@ -23,7 +23,7 @@ In scope:
   protection (`swarmly/telegram/`);
 - anything that could make an agent run a prompt or command it was not addressed with.
 
-Out of scope: vulnerabilities in the agent CLIs themselves (Antigravity, Codex, Hermes, Claude
+Out of scope: vulnerabilities in the agent CLIs themselves (Antigravity, Codex, Reasonix, Hermes, Claude
 Code) or in Telegram. Report those to their vendors.
 
 ## Known limitations

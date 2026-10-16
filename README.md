@@ -15,7 +15,7 @@
 a human in charge.**
 
 Swarmly connects agent runtimes such as the **Antigravity CLI**, **OpenAI Codex CLI**,
-**Claude Code** and **Nous Research Hermes Agent** through two planes that need no public IP and no open ports:
+**Claude Code** and **DeepSeek (via the Reasonix CLI)** through two planes that need no public IP and no open ports:
 
 - **The durable plane** holds the record. Signed message envelopes are stored in one of three
   places: a git repository (**gitbus**, `.agents/inbox/`), a **synced folder** (Google Drive for
@@ -47,9 +47,13 @@ An optional TCP gateway (the "fast plane") is included for agents on the same ne
 | Antigravity CLI | `antigravity`, `antigravity_thread` | `agy -p`, or queued into an open Antigravity conversation | [SETUP-ANTIGRAVITY](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-ANTIGRAVITY.md) |
 | OpenAI Codex CLI | `codex`, `codex_thread` | `codex exec`, or queued into an open Codex task | [SETUP-CODEX](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-CODEX.md) |
 | Claude Code | `claude`, `claude_thread` | `claude -p`, or one persistent session per topic (recommended) | [SETUP-CLAUDE](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-CLAUDE.md) |
-| Hermes Agent | `hermes` | `hermes -z` | [SETUP-HERMES](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-HERMES.md) |
 | Reasonix (DeepSeek) | `reasonix` | `reasonix run -p` | [SETUP-REASONIX](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-REASONIX.md) |
 | Anything with a CLI | `custom` | any command line with a `{prompt}` placeholder | [telegram-channel.md §4](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram-channel.md) |
+| Hermes Agent (untested) | `hermes` | `hermes -z` | [SETUP-HERMES](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-HERMES.md) |
+
+The first four runtimes are the ones Swarmly has been run with on real projects. The `hermes`
+adapter is written against Hermes Agent's documented one-shot mode but has never been run
+against a real Hermes install; treat it as a starting point and report what you find.
 
 ## Coordination planes
 
@@ -90,7 +94,7 @@ keys) and `swarmly` (the swarm kernel). Google Drive as a bus needs `pipx instal
 > Telegram group with only your own bots and people you trust, and a private GitHub
 > repository for the gitbus. Run the agents as a dedicated OS user, or in a VM or container,
 > and set `adapter.permissions: standard` or `strict` on any Claude, Codex or Reasonix bot
-> that does not need more (Hermes and the default Antigravity command have no such levels).
+> that does not need more (the default Antigravity command and the untested Hermes adapter have no such levels).
 
 ## Quickstart
 
@@ -109,11 +113,11 @@ examples/folder-bus-demo.sh         # folder bus (what Drive or Dropbox would sy
 
 ```bash
 cd ~/projects/your-project
-swarmly-telegram init --alias Hermes --adapter hermes --bus-repo .
-echo 'A2A_TELEGRAM_BOT_TOKEN_HERMES=123456:ABC...' >> ~/.a2a-telegram.env
-swarmly-keygen --agent hermes --env-file ~/.a2a-telegram.env --registry .agents/bus/config/a2a_config.json
+swarmly-telegram init --alias DeepSeek --adapter reasonix --bus-repo .
+echo 'A2A_TELEGRAM_BOT_TOKEN_DEEPSEEK=123456:ABC...' >> ~/.a2a-telegram.env
+swarmly-keygen --agent deepseek --env-file ~/.a2a-telegram.env --registry .agents/bus/config/a2a_config.json
 git -C .agents/bus add .gitignore config/a2a_config.json
-git -C .agents/bus commit -m "Register hermes" && git -C .agents/bus push -u origin agents-bus
+git -C .agents/bus commit -m "Register deepseek" && git -C .agents/bus push -u origin agents-bus
 swarmly-telegram whoami     # proves the bot token
 swarmly-telegram discover   # lists the chats the bot sees: your group's id is home_channel_id
 # edit config.yaml: agent.name (the bot's username), home_channel_id, admin_user_id, peers
@@ -121,8 +125,8 @@ swarmly-telegram discover   # lists the chats the bot sees: your group's id is h
 
 `init` writes `config.yaml`, an empty signing-key registry and the `.gitignore` lines that keep
 the config and the transport's state out of git. The agent commits its bus messages in this
-checkout, so the host needs a git identity (`git config user.name` and `user.email`). `--adapter` is `hermes`, `codex`, `claude`,
-`antigravity` (or a `*_thread` variant), `echo` to test the channel without an agent CLI, or
+checkout, so the host needs a git identity (`git config user.name` and `user.email`). `--adapter` is `reasonix`, `codex`, `claude`,
+`antigravity` (or a `*_thread` variant), `hermes` (untested), `echo` to test the channel without an agent CLI, or
 `custom`. `swarmly-keygen` writes the private key to the env file (owner-only) and only the
 public key to the registry; every peer verifies against that committed registry.
 
@@ -141,13 +145,13 @@ A minimal agent config:
 
 ```yaml
 agent:
-  name: HermesBot
-  alias: Hermes
-  bot_token_env: A2A_TELEGRAM_BOT_TOKEN_HERMES
+  name: DeepSeekBot
+  alias: DeepSeek
+  bot_token_env: A2A_TELEGRAM_BOT_TOKEN_DEEPSEEK
   home_channel_id: -1001234567890
   admin_user_id: 1234567890        # your numeric Telegram user id (from @userinfobot)
 adapter:
-  type: hermes
+  type: reasonix
   cwd: /home/user/your-project
 
 # Optional: route Telegram forum topics to separate project repos & checkouts
@@ -158,7 +162,7 @@ adapter:
 #     topics: [12, 15]
 #     worktrees: true
 # github:
-#   login: hermes-bot
+#   login: deepseek-bot
 #   poll_minutes: 5
 ```
 
@@ -202,7 +206,7 @@ Intents include `TASK_PROPOSE`, `TASK_CLAIM`, `TASK_HANDOFF`, `PR_REVIEW_REQUEST
 Send and read from the command line:
 
 ```bash
-# codex's key, from `swarmly-keygen --agent codex --env-file .env --registry config/a2a_config.json`
+# codex's key, from `swarmly-keygen --agent deepseek --env-file .env --registry config/a2a_config.json`
 set -a; . ./.env; set +a          # sending refuses without A2A_KEY_CODEX
 python scripts/a2a_bus.py send --sender codex --recipient antigravity \
   --intent PR_REVIEW_REQUEST --priority HIGH --payload '{"pr_number": 47}'
@@ -308,7 +312,7 @@ asyncio.run(main())
 
 ## Status and roadmap
 
-This repository is developed by the agents it connects. Claude Code, Antigravity, Codex and Hermes
+This repository is developed by the agents it connects. Claude Code, Antigravity and Codex
 coordinate here over their own gitbus and Telegram, under a human maintainer.
 
 Planned:
@@ -332,8 +336,8 @@ agents escalate to me.
 Most of the implementation was written by the coding agents it connects. This public repository
 starts from a single commit; the development history stays in a private repository, because it
 carries the identifiers of the deployment it was built on. Of its roughly 320 non-merge commits
-at the time of writing, about 280 were made by Claude Code, Hermes, OpenAI Codex CLI and
-Antigravity agents under their own git identities (for example `Codex <codex@a2a.local>`). They
+at the time of writing, about 280 were made by Claude Code, OpenAI Codex CLI and Antigravity
+agents under per-agent git identities (for example `Codex <codex@a2a.local>`). They
 claim tasks, review each other's pull requests and report status over this project's own bus and
 Telegram channel. In the first week, before per-agent identities were introduced, some agent
 work was committed under my name.
