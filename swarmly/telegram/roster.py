@@ -19,7 +19,8 @@ so it works with the bots on different machines.
 
 ``/sync`` from the admin catches up a bot that was offline during an ``/admit``: every bot
 posts a silent ``HELLO intent=SYNC ref=<its alias>`` listing its *first-hand* peers (its
-config, and the bots it admitted itself) as ``Alias=@username``. In the next 10 minutes a bot
+config, the bots it admitted itself, and the bots Telegram confirmed as group administrators
+when they joined) as ``Alias=@username``. In the next 10 minutes a bot
 adds any bot that one of its known peers lists. A peer learned from a welcome or a list is
 not passed on, so a bot that slipped into one roster goes no further. ``/remove`` leaves a
 tombstone: a removed bot comes back only with a new ``/admit``.
@@ -50,6 +51,9 @@ PENDING_SECONDS = 24 * 3600.0
 PENDING_LIMIT = 32
 #: How long after the admin's ``/sync`` this bot takes peer lists from the swarm.
 SYNC_WINDOW_SECONDS = 600.0
+#: How a runtime peer was learned that counts as first hand: the admin's ``/admit``, or
+#: Telegram confirming it as a bot administrator of the group (the membership handshake).
+FIRST_HAND = ("admit", "admin")
 #: An alias is a single header token (it travels in ``ref=``).
 ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 #: Telegram usernames: 5-32 characters, and a bot's ends in "bot".
@@ -108,7 +112,8 @@ class Roster:
             if str(cfg.peers.get(alias, "")).lstrip("@").lower() == str(username).lower()}
         state = load_state(self.path, "roster")
         via = state.get("via") if isinstance(state.get("via"), dict) else {}
-        #: How each runtime peer was learned: "admit" (first hand), "welcome" or "sync".
+        #: How each runtime peer was learned: "admit" or "admin" (first hand), "welcome" or
+        #: "sync".
         self.via: Dict[str, str] = {a: str(via.get(a, "admit")) for a in self.joined}
         removed = state.get("removed")
         #: Bots the admin removed: a welcome or a peer list does not bring them back.
@@ -227,10 +232,13 @@ class Roster:
         self._sync_at = self._clock()
 
     def sync_list(self) -> str:
-        """This bot's first-hand peers, for its ``/sync`` answer: its config and the bots it
-        admitted itself (bots only: never the owner). A peer it only heard of from a welcome
-        or another bot's list is not passed on, so trust does not travel further."""
-        second_hand = {alias for alias in self.joined if self.via.get(alias) != "admit"}
+        """This bot's first-hand peers, for its ``/sync`` answer: its config, the bots it
+        admitted itself and the bots Telegram confirmed as group administrators when they
+        joined (bots only: never the owner). A peer it only heard of from a welcome or another
+        bot's list is not passed on, so trust does not travel further. (Live run: every bot
+        had joined with ``swarmly --cli``, so every answer was "peers: none".)"""
+        second_hand = {alias for alias in self.joined
+                       if self.via.get(alias) not in FIRST_HAND}
         return " ".join(f"{alias}=@{str(target).lstrip('@')}"
                         for alias, target in self.cfg.peers.items()
                         if alias not in second_hand and ALIAS_RE.match(alias)

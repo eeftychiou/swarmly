@@ -879,8 +879,8 @@ in `peers:` always wins and `/remove` never drops it. `/status` lists the curren
 (`peers=`).
 
 A bot that was offline during `/admit` catches up with `/sync` (admin only): every bot posts a
-silent `HELLO intent=SYNC` listing its first-hand peers (its config and the bots it admitted
-itself) as `Alias=@username`, and for the next 10 minutes each bot adds the bots that one of
+silent `HELLO intent=SYNC` listing its first-hand peers (its config, the bots it admitted
+itself, and the bots Telegram confirmed as group admins when they joined) as `Alias=@username`, and for the next 10 minutes each bot adds the bots that one of
 its known peers lists. A peer learned second hand is not passed on. A newcomer that missed its
 welcomes catches up with a second `/admit @newbot`: the bots that already have it welcome it
 again. Writing the newcomer into every other agent's `peers:` map still works too.

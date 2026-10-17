@@ -165,6 +165,17 @@ class SwarmBotsAdmitTests(unittest.TestCase):
         self.assertIn("HELLO to=* intent=SYNC ref=Hermes", answer)
         self.assertIn("Codex=@CodexBot Antigravity=@AntigravityBot", answer)
 
+    def test_sync_lists_the_peers_telegram_confirmed_at_join(self):
+        # Live run: every bot had joined with `swarmly --cli`, so every answer said
+        # "peers: none" and /sync could not catch anyone up.
+        channel = make_channel()
+        channel.roster._add("Grok", "grok_x_bot", via="admin")
+        channel.roster._add("Echo", "echo_x_bot", via="welcome")
+        run(channel.handle_event(admin("/sync")))
+        answer = channel._test_sender.sent[0]["text"]
+        self.assertIn("Grok=@grok_x_bot", answer)
+        self.assertNotIn("Echo=", answer)                  # second hand: not passed on
+
     def test_only_the_admin_starts_a_sync(self):
         channel = make_channel()
         run(channel.handle_event(event("/sync", author_id=77, username="mallory",
