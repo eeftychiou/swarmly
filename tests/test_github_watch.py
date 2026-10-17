@@ -10,8 +10,9 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from swarmly.github.client import GitHubClient, GitHubError, Issue, IssueComment, Notification, PR
-from swarmly.github.watch import GitHubWatcher, NotificationState, github_poll_once
-from swarmly.telegram.adapters.base import IncomingMessage
+from swarmly.github.watch import (MAX_TURN_ATTEMPTS, GitHubWatcher, NotificationState,
+                                  github_poll_once)
+from swarmly.telegram.adapters.base import AdapterReply, IncomingMessage
 from swarmly.telegram.channel import AgentChannel
 from swarmly.telegram.config import AgentConfig
 
@@ -448,6 +449,83 @@ class TestBackstopFixes(unittest.IsolatedAsyncioTestCase):
             ch.admitted = Admit
             await self.watcher(tmp, client, ch).poll_once()
         self.assertEqual(entered, [(-1001234567890, 12)])
+
+    # -- 2.12 / issue #12: a failed turn must not consume the notification ----------------
+
+    def failing_channel(self, error="the runtime exited 1"):
+        """A channel whose adapter fails the turn instead of answering it."""
+        class FailingAdapter:
+            def __init__(self):
+                self.calls = 0
+
+            async def respond(self, message):
+                self.calls += 1
+                return AdapterReply(text="", ok=False, error=error)
+
+            async def close(self):
+                pass
+
+        ch = MagicMock()
+        ch.adapter = ch._adapter_for.return_value = FailingAdapter()
+        ch.send = AsyncMock()
+        ch.has_recent_ref.return_value = False
+        return ch
+
+    async def test_a_successful_turn_is_still_marked_read(self):
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.notifications.return_value = [_notif()]
+            client.issue_view.return_value = None
+            outcome = await self.watcher(tmp, client, self.channel()).poll_once()
+            reloaded = NotificationState.load(Path(tmp) / "s.json")
+        self.assertEqual((outcome.turns_queued, outcome.errors), (1, []))
+        client.mark_notification_read.assert_called_once_with("n1")
+        self.assertTrue(reloaded.is_processed("n1"))
+
+    async def test_a_failed_turn_leaves_the_notification_unread(self):
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.notifications.return_value = [_notif()]
+            client.issue_view.return_value = None
+            outcome = await self.watcher(tmp, client, self.failing_channel()).poll_once()
+            reloaded = NotificationState.load(Path(tmp) / "s.json")
+        client.mark_notification_read.assert_not_called()
+        self.assertFalse(reloaded.is_processed("n1"))
+        self.assertEqual(outcome.turns_queued, 0)
+        self.assertEqual(len(outcome.errors), 1)
+        self.assertIn("left unread", outcome.errors[0])
+        self.assertEqual(reloaded.attempts("n1"), 1)
+
+    async def test_a_failed_turn_backs_off_instead_of_hot_looping(self):
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.notifications.return_value = [_notif()]
+            client.issue_view.return_value = None
+            ch = self.failing_channel()
+            # poll_minutes=5 -> the first retry waits one poll interval, so the next poll must
+            # not run the turn again.
+            first = await self.watcher(tmp, client, ch).poll_once()
+            second = await self.watcher(tmp, client, ch).poll_once()
+        self.assertEqual(ch.adapter.calls, 1)
+        self.assertEqual((first.turns_skipped, second.turns_skipped), (0, 1))
+        client.mark_notification_read.assert_not_called()
+
+    async def test_a_failed_turn_is_given_up_loudly_after_the_bound(self):
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.notifications.return_value = [_notif()]
+            client.issue_view.return_value = None
+            state_path = Path(tmp) / "s.json"
+            state = NotificationState()
+            state.failures["n1"] = {"attempts": MAX_TURN_ATTEMPTS - 1,
+                                    "retry_after": "2000-01-01T00:00:00Z"}
+            state.save(state_path)
+            outcome = await self.watcher(tmp, client, self.failing_channel()).poll_once()
+            reloaded = NotificationState.load(state_path)
+        client.mark_notification_read.assert_called_once_with("n1")
+        self.assertTrue(reloaded.is_processed("n1"))
+        self.assertEqual(len(outcome.errors), 1)
+        self.assertIn("gave up", outcome.errors[0])
 
 
 class TestAgentGitHubToken(unittest.TestCase):
