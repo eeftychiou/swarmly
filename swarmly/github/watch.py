@@ -35,6 +35,15 @@ logger = logging.getLogger("swarmly.github.watch")
 REFIRE_REASONS = frozenset({"mention", "team_mention", "review_requested", "assign",
                             "author"})
 
+#: A turn that failed leaves its notification unread, so the next poll picks it up again --
+#: without turning one broken turn into a hot loop. Between attempts the thread waits
+#: ``poll_minutes * 2**(attempt - 1)`` (one poll interval, then two, then four), and after
+#: this many failures it is given up **loudly**: an error in the poll outcome, the
+#: notification marked read so it stops absorbing the repo's poll, and a log line. Bounded
+#: retries were chosen over an unbounded retry because a permanently failing turn (a broken
+#: checkout, an expired token) would otherwise never let the poll move past that thread.
+MAX_TURN_ATTEMPTS = 3
+
 
 def _utc(now: Optional[float] = None) -> str:
     moment = (
@@ -51,6 +60,10 @@ class NotificationState:
 
     processed_ids: Dict[str, str] = field(default_factory=dict)  # id -> timestamp
     last_poll: Optional[str] = None
+    #: notification id -> {"attempts": n, "retry_after": ISO-8601 UTC}: a turn that failed.
+    #: The notification stays unread and is retried after ``retry_after``, or given up once
+    #: ``attempts`` reaches ``MAX_TURN_ATTEMPTS``.
+    failures: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Optional[Path]) -> "NotificationState":
@@ -66,7 +79,18 @@ class NotificationState:
                 processed = {str(k): str(v) for k, v in raw_processed.items()}
             elif isinstance(raw_processed, list):
                 processed = {str(k): _utc() for k in raw_processed}
-            return cls(processed_ids=processed, last_poll=data.get("last_poll"))
+            failures: Dict[str, Dict[str, Any]] = {}
+            raw_failures = data.get("failures")
+            if isinstance(raw_failures, dict):
+                for key, value in raw_failures.items():
+                    if isinstance(value, dict):
+                        try:
+                            failures[str(key)] = {"attempts": int(value.get("attempts") or 0),
+                                                  "retry_after": str(value.get("retry_after") or "")}
+                        except (TypeError, ValueError):
+                            continue
+            return cls(processed_ids=processed, last_poll=data.get("last_poll"),
+                       failures=failures)
         except Exception as exc:
             logger.warning("could not load notification state from %s: %s", path, exc)
             return cls()
@@ -79,6 +103,7 @@ class NotificationState:
             data = {
                 "processed_ids": self.processed_ids,
                 "last_poll": self.last_poll or _utc(),
+                "failures": self.failures,
             }
             tmp = path.with_suffix(f".tmp-{os.getpid()}-{int(time.time())}")
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -100,11 +125,44 @@ class NotificationState:
         local clock cannot swallow the next event; the processing time without one."""
         self.processed_ids.pop(str(notif_id), None)     # re-insert: pruning drops the oldest
         self.processed_ids[str(notif_id)] = ts or _utc()
+        self.failures.pop(str(notif_id), None)          # a handled thread owes no retry
         # Prune if too large
         if len(self.processed_ids) > 2000:
             keys = list(self.processed_ids.keys())[:-1000]
             for k in keys:
                 self.processed_ids.pop(k, None)
+
+    def record_failure(self, notif_id: str, poll_minutes: int = 5) -> int:
+        """Count a failed turn and set when the thread may be retried; return the count."""
+        previous = self.failures.get(str(notif_id)) or {}
+        try:
+            attempts = int(previous.get("attempts") or 0) + 1
+        except (TypeError, ValueError):
+            attempts = 1
+        # One poll interval, then twice, then four times: a broken runtime costs one turn
+        # per window instead of one turn per poll, without hiding the notification forever.
+        minutes = max(1, int(poll_minutes or 1)) * (2 ** max(0, attempts - 1))
+        self.failures[str(notif_id)] = {"attempts": attempts,
+                                        "retry_after": _utc(time.time() + minutes * 60)}
+        return attempts
+
+    def attempts(self, notif_id: str) -> int:
+        entry = self.failures.get(str(notif_id)) or {}
+        try:
+            return int(entry.get("attempts") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def backing_off(self, notif_id: str) -> bool:
+        """Whether the failed thread is still waiting out its backoff window."""
+        entry = self.failures.get(str(notif_id))
+        if not entry:
+            return False
+        retry_after = str(entry.get("retry_after") or "")
+        return bool(retry_after) and retry_after > _utc()
+
+    def clear_failure(self, notif_id: str) -> None:
+        self.failures.pop(str(notif_id), None)
 
 
 @dataclass
@@ -187,6 +245,11 @@ class GitHubWatcher:
                 if self.state.is_processed(notif.id, notif.updated_at,
                                            refire=notif.reason in REFIRE_REASONS):
                     continue
+                if self.state.backing_off(notif.id):
+                    # A failed turn waits out its window: retried later, not every poll.
+                    logger.debug("notification %s is backing off after a failed turn", notif.id)
+                    outcome.turns_skipped += 1
+                    continue
 
                 num = notif.number
                 # Check whether any of the project's topics recently handled this issue/PR
@@ -264,9 +327,34 @@ class GitHubWatcher:
                         cfg = dataclasses.replace(self.config, adapter=adapter_cfg)
                         adapter = build_adapter(cfg, transport=False)
                         try:
-                            await adapter.respond(incoming)
+                            reply = await adapter.respond(incoming)
                         finally:
                             await adapter.close()
+
+                    if not getattr(reply, "ok", True):
+                        # The runtime failed the turn (2.12): the notification stays unread so
+                        # the next poll retries it -- not marked read, not marked processed --
+                        # and it backs off instead of retrying every poll. After
+                        # MAX_TURN_ATTEMPTS it is given up loudly.
+                        failed = str(getattr(reply, "error", "") or "the turn did not complete")
+                        attempts = self.state.record_failure(
+                            notif.id, poll_minutes=self.config.github.poll_minutes)
+                        if attempts >= MAX_TURN_ATTEMPTS:
+                            self.state.mark_processed(notif.id, notif.updated_at)
+                            if self.config.github.mark_read:
+                                self.client.mark_notification_read(notif.id)
+                            outcome.errors.append(
+                                f"notification {notif.id}: gave up after {attempts} failed "
+                                f"turns: {failed}")
+                            logger.error("gave up on notification %s after %s failed turns: %s",
+                                         notif.id, attempts, failed)
+                        else:
+                            outcome.errors.append(
+                                f"notification {notif.id}: turn failed ({failed}); left unread, "
+                                f"retry {attempts}/{MAX_TURN_ATTEMPTS}")
+                            logger.warning("notification %s: turn failed (%s); retry %s/%s",
+                                           notif.id, failed, attempts, MAX_TURN_ATTEMPTS)
+                        continue
 
                     self.state.mark_processed(notif.id, notif.updated_at)
                     if self.config.github.mark_read:
