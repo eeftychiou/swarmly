@@ -122,6 +122,7 @@ def _helper_context(tree: ast.Module) -> dict:
     reviewer's second bypass on PR #14 -- and a local name is not the helper.
     """
     helpers, modules, values, shadowed = set(), set(), {}, set()
+    os_names = {"os"}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module = (node.module or "").split(".")
@@ -130,10 +131,14 @@ def _helper_context(tree: ast.Module) -> dict:
                     helpers.add(alias.asname or alias.name)
                 elif alias.name == "gitenv":
                     modules.add(alias.asname or alias.name)
+                elif alias.name in ("environ", "environb"):
+                    os_names.add(alias.asname or alias.name)   # ``from os import environ``
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[-1] == "gitenv":
                     modules.add(alias.asname or alias.name.split(".")[0])
+                elif alias.name == "os":
+                    os_names.add(alias.asname or alias.name)
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             shadowed.add(node.name)
@@ -157,7 +162,8 @@ def _helper_context(tree: ast.Module) -> dict:
                 if item.optional_vars is not None:
                     shadowed.update(leaf.id for leaf in ast.walk(item.optional_vars)
                                     if isinstance(leaf, ast.Name))
-    return {"helpers": helpers, "modules": modules, "values": values, "shadowed": shadowed}
+    return {"helpers": helpers, "modules": modules, "values": values, "shadowed": shadowed,
+            "os_names": os_names}
 
 
 def _is_helper_call(node: ast.AST, context: dict) -> bool:
@@ -178,6 +184,46 @@ def _is_helper_call(node: ast.AST, context: dict) -> bool:
     return False
 
 
+def _carries_host_environment(node: ast.AST, context: dict, seen: frozenset = frozenset()) -> bool:
+    """Whether ``node`` can bring the process environment (or a copy of it) back.
+
+    ``env={**git_env(), **os.environ}`` and ``env=git_env() | os.environ`` splat the real
+    environment over the scrubbed one, so ``SWARMLY_ROLE``, the ``GIT_CONFIG_*`` hooks and the
+    guard ``PATH`` all return -- the reviewer's round-5 finding on PR #14, verified by
+    reading ``SWARMLY_ROLE`` out of the child. An explicit single key
+    (``{"PATH": os.environ["PATH"]}``) is *not* this: that is a key a test chose on purpose.
+    """
+    if isinstance(node, ast.Subscript):
+        return False                       # one named key, chosen deliberately
+    if isinstance(node, ast.Attribute):
+        if node.attr in ("environ", "environb") and isinstance(node.value, ast.Name):
+            return node.value.id in context["os_names"]
+        return _carries_host_environment(node.value, context, seen)
+    if isinstance(node, ast.Call):
+        if _carries_host_environment(node.func, context, seen):
+            return True
+        return any(_carries_host_environment(arg, context, seen) for arg in node.args)
+    if isinstance(node, ast.Name) and node.id not in seen:
+        if node.id in ("environ", "environb"):
+            return True
+        return any(_carries_host_environment(value, context, seen | {node.id})
+                   for value in context["values"].get(node.id, []))
+    if isinstance(node, ast.Dict):
+        return any(key is None and _carries_host_environment(value, context, seen)
+                   for key, value in zip(node.keys, node.values))
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(_carries_host_environment(element, context, seen) for element in node.elts)
+    if isinstance(node, ast.BinOp):
+        return (_carries_host_environment(node.left, context, seen)
+                or _carries_host_environment(node.right, context, seen))
+    if isinstance(node, ast.BoolOp):
+        return any(_carries_host_environment(value, context, seen) for value in node.values)
+    if isinstance(node, ast.IfExp):
+        return (_carries_host_environment(node.body, context, seen)
+                or _carries_host_environment(node.orelse, context, seen))
+    return False
+
+
 def _is_scrubbed(node: ast.AST, context: dict, seen: frozenset = frozenset()) -> bool:
     """Whether ``node`` *unconditionally* produces a scrubbed environment.
 
@@ -185,14 +231,20 @@ def _is_scrubbed(node: ast.AST, context: dict, seen: frozenset = frozenset()) ->
     only reached on one path, which is the reviewer's first finding of round 4. Accepted:
     the helper call itself, a dict that splats the helper first (``{**git_env(), "X": "1"}``),
     a ``|`` merge with the helper on either side, and a name whose every assignment in the
-    module is one of those.
+    module is one of those -- provided nothing splats or merges the host environment back in
+    (``{**git_env(), **os.environ}`` is rejected, see ``_carries_host_environment``).
     """
     if _is_helper_call(node, context):
         return True
     if isinstance(node, ast.Dict) and node.keys and node.keys[0] is None:
-        return _is_scrubbed(node.values[0], context, seen)
+        if not _is_scrubbed(node.values[0], context, seen):
+            return False
+        later = [value for key, value in zip(node.keys[1:], node.values[1:]) if key is None]
+        return not any(_carries_host_environment(value, context, seen) for value in later)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        return _is_helper_call(node.left, context) or _is_helper_call(node.right, context)
+        helper = _is_helper_call(node.left, context) or _is_helper_call(node.right, context)
+        return helper and not (_carries_host_environment(node.left, context, seen)
+                               or _carries_host_environment(node.right, context, seen))
     if isinstance(node, ast.Name) and node.id not in seen:
         if node.id in context["shadowed"] or not context["values"].get(node.id):
             return False
@@ -350,6 +402,37 @@ class TestEveryGitSpawnIsScrubbed(unittest.TestCase):
                  "    env = dict(os.environ)\n"
                  "subprocess.run(['git', 'push'], env=env)\n")
         self.assertEqual(len(violations(mixed, "mixed.py")), 1, violations(mixed))
+
+    def test_the_host_environment_cannot_be_splatted_back_in(self):
+        """Round 5: an overlay that restores ``os.environ`` undoes the whole scrub."""
+        splat = ("import os\nimport subprocess\nfrom tests.gitenv import git_env\n"
+                 "subprocess.run(['git', 'push'], env={**git_env(), **os.environ})\n")
+        self.assertEqual(len(violations(splat, "splat.py")), 1, violations(splat))
+        merged = ("import os\nimport subprocess\nfrom tests.gitenv import git_env\n"
+                  "subprocess.run(['git', 'push'], env=git_env() | os.environ)\n")
+        self.assertEqual(len(violations(merged, "merged.py")), 1, violations(merged))
+        copied = ("import os\nimport subprocess\nfrom tests.gitenv import git_env\n"
+                  "subprocess.run(['git', 'push'], env={**git_env(), **dict(os.environ)})\n")
+        self.assertEqual(len(violations(copied, "copied.py")), 1, violations(copied))
+        via_name = ("import os\nimport subprocess\nfrom tests.gitenv import git_env\n"
+                    "host = os.environ.copy()\n"
+                    "subprocess.run(['git', 'push'], env={**git_env(), **host})\n")
+        self.assertEqual(len(violations(via_name, "via_name.py")), 1, violations(via_name))
+        named = ("import os\nimport subprocess\nfrom tests.gitenv import git_env\n"
+                 "child = {**git_env(), **os.environ}\n"
+                 "subprocess.run(['git', 'push'], env=child)\n")
+        self.assertEqual(len(violations(named, "named_env.py")), 1, violations(named))
+
+    def test_a_chosen_overlay_is_still_allowed(self):
+        """A literal overlay, or one explicit host key, is a decision a test made."""
+        literal = ("import os\nimport subprocess\nfrom tests.gitenv import git_env\n"
+                   "extra = {'X': '1'}\n"
+                   "subprocess.run(['git', 'push'], env={**git_env(), **extra})\n")
+        self.assertEqual(violations(literal, "literal.py"), [])
+        one_key = ("import os\nimport subprocess\nfrom tests.gitenv import git_env\n"
+                   "subprocess.run(['git', 'push'],\n"
+                   "               env={**git_env(), 'PATH': os.environ['PATH']})\n")
+        self.assertEqual(violations(one_key, "one_key.py"), [])
 
 
 class TestTheHelperScrubs(unittest.TestCase):
