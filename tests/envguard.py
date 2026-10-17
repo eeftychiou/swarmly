@@ -18,8 +18,9 @@ unittest calls ``load_tests`` while loading a module, so every test in that modu
 runs between an ``os.environ`` snapshot and an exact restore registered with
 ``addCleanup`` -- which also covers ``unittest.IsolatedAsyncioTestCase``.
 
-There are no import-time side effects, and the guard is inert under pytest: pytest
-does not call ``load_tests``, so only the (harmless) import happens during collection.
+There are no import-time side effects, and under pytest the same per-test snapshot and
+restore comes from ``tests/conftest.py``, which wraps every test in an autouse fixture
+(issue #7): the guard is no longer unittest-only.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import os
 import types
 import unittest
 
-__all__ = ["guard", "wrap"]
+__all__ = ["guard", "wrap", "snapshot", "restore"]
 
 
 def guard(loader, tests, pattern):
@@ -53,7 +54,7 @@ def _guard_case(test):
     def guarded_run(self, result=None, *args, **kwargs):
         # Registered before the test machinery starts, so setup, the test body, teardown and
         # the test's own cleanups all run inside the snapshot -- and ours runs last (LIFO).
-        self.addCleanup(_restore, dict(os.environ))
+        self.addCleanup(restore, snapshot())
         return original_run(result, *args, **kwargs)
 
     test.run = types.MethodType(guarded_run, test)
@@ -62,7 +63,12 @@ def _guard_case(test):
     return test
 
 
-def _restore(snapshot):
+def snapshot():
+    """The current environment, as ``restore`` wants it back."""
+    return dict(os.environ)
+
+
+def restore(snapshot):
     """Bring ``os.environ`` back to exactly ``snapshot``: drop added keys, restore changed ones."""
     for key in list(os.environ):
         if key not in snapshot:
@@ -70,3 +76,7 @@ def _restore(snapshot):
     for key, value in snapshot.items():
         if os.environ.get(key) != value:
             os.environ[key] = value
+
+
+#: Every test runs between ``snapshot()`` and ``restore()``; the old name stays for callers.
+_restore = restore

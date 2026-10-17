@@ -46,6 +46,28 @@ jobs:
         run: python -m coverage run -m unittest discover tests -v
       - name: Coverage report
         run: python -m coverage report --skip-covered --sort=cover
+      # Issue #7 / brainstorm 2.4-2.5. A host that runs an agent hands the suite its role
+      # guard -- git hooks that refuse a push to main, plus SWARMLY_ROLE and the guard
+      # directory on PATH -- under the agent's commit identity. The suite must test the
+      # code, not that guard: tests/gitenv.py scrubs the inherited environment, and
+      # tests/test_git_env_guard.py fails a git spawn that bypasses it. This run proves the
+      # scrub end to end: it fails if a test picks up the outer hooks or identity.
+      - name: Env-scrub guard (inherited guard environment)
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
+        run: |
+          guard="$(mktemp -d)"
+          for hook in pre-commit pre-push; do
+            printf '#!/bin/sh\necho "swarmly guard: refused" >&2\nexit 1\n' \
+              > "$guard/$hook"
+            chmod +x "$guard/$hook"
+          done
+          GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=core.hooksPath \
+            GIT_CONFIG_VALUE_0="$guard" \
+            GIT_AUTHOR_NAME=Guard GIT_AUTHOR_EMAIL=guard@a2a.local \
+            GIT_COMMITTER_NAME=Guard GIT_COMMITTER_EMAIL=guard@a2a.local \
+            SWARMLY_ROLE=developer \
+            python -m unittest discover tests
 
   lint:
     runs-on: ubuntu-latest

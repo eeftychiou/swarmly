@@ -17,6 +17,8 @@ import time
 import unittest
 from pathlib import Path
 
+from tests.gitenv import git_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = Path(os.environ.get("UPGRADE_TRANSPORT_SCRIPT",
                              str(REPO_ROOT / "scripts" / "upgrade_transport.sh")))
@@ -149,7 +151,7 @@ class UpgradeTransportTests(unittest.TestCase):
         # script's verify gate runs the suite in a worktree at the target sha.
         self.repo = base / "repo"
         subprocess.run(["git", "clone", "--quiet", "--no-hardlinks",
-                        str(REPO_ROOT), str(self.repo)], check=True,
+                        str(REPO_ROOT), str(self.repo)], check=True, env=git_env(),
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         shutil.rmtree(self.repo / "tests")
         (self.repo / "tests").mkdir()
@@ -176,18 +178,18 @@ class UpgradeTransportTests(unittest.TestCase):
         self.git("checkout", "-q", "good")
 
     def tearDown(self):
-        subprocess.run(["git", "-C", str(self.repo), "worktree", "prune"],
+        subprocess.run(["git", "-C", str(self.repo), "worktree", "prune"], env=git_env(),
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ---------------------------------------------------------------- helpers
     def git(self, *args):
-        subprocess.run(["git", "-C", str(self.repo), *args], check=True,
+        subprocess.run(["git", "-C", str(self.repo), *args], check=True, env=git_env(),
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def sha(self, ref):
         out = subprocess.run(["git", "-C", str(self.repo), "rev-parse", ref],
-                             capture_output=True, text=True, check=True)
+                             capture_output=True, text=True, check=True, env=git_env())
         return out.stdout.strip()
 
     def deploy_of(self, ref):

@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import subprocess
 
+from tests.gitenv import git_env
 from swarmly.models import A2AMessage, MessageIntent, MessagePriority
 from swarmly.crypto import KeyPair
 from swarmly.bus import DurableBus, BusPushError
@@ -35,17 +36,15 @@ class TestDurableBus(unittest.TestCase):
         """Drill finding (PR #78): a failed --push must surface, not vanish."""
         # Isolate from other tests' GIT_* overrides: a leaked empty identity would
         # make the *commit* fail and mask the push failure under test.
-        git_env = {key: value for key, value in os.environ.items()
-                   if not key.startswith("GIT_")}
         subprocess.run(["git", "init", "-q", "."], cwd=self.root_path,
-                       check=True, env=git_env)
+                       check=True, env=git_env())
         subprocess.run(["git", "config", "user.email", "t@example.com"],
-                       cwd=self.root_path, check=True, env=git_env)
+                       cwd=self.root_path, check=True, env=git_env())
         subprocess.run(["git", "config", "user.name", "t"], cwd=self.root_path,
-                       check=True, env=git_env)
+                       check=True, env=git_env())
         subprocess.run(["git", "remote", "add", "origin",
                         str(self.root_path / "no-such-remote.git")],
-                       cwd=self.root_path, check=True, env=git_env)
+                       cwd=self.root_path, check=True, env=git_env())
 
         msg = A2AMessage.create(sender_id="test_sender",
                                 intent=MessageIntent.STATUS_UPDATE,

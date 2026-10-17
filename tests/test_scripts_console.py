@@ -16,6 +16,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.gitenv import git_env
+
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "a2a_bus.py"
 
@@ -45,7 +47,7 @@ class BusScriptConsoleTests(unittest.TestCase):
     def test_inbox_survives_a_legacy_console_encoding(self):
         with tempfile.TemporaryDirectory() as tmp:
             bus = Path(tmp)
-            subprocess.run(["git", "init", "-q", "."], cwd=bus, check=True)
+            subprocess.run(["git", "init", "-q", "."], cwd=bus, check=True, env=git_env())
             inbox = bus / ".agents" / "inbox"
             inbox.mkdir(parents=True)
             (inbox / "msg-test.md").write_text(ENVELOPE, encoding="utf-8")

@@ -12,6 +12,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from tests.gitenv import git_env
+
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import (
     IncomingMessage,
@@ -492,13 +494,13 @@ class TestProjectRouter(unittest.TestCase):
     def test_router_worktrees_true_creates_and_returns_worktree(self):
         with TemporaryDirectory() as repo_dir:
             # Initialize a real git repo
-            subprocess.run(["git", "init", "-b", "main", repo_dir], capture_output=True, check=True)
-            subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Test"], check=True)
-            subprocess.run(["git", "-C", repo_dir, "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "init", "-b", "main", repo_dir], capture_output=True, check=True, env=git_env())
+            subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Test"], check=True, env=git_env())
+            subprocess.run(["git", "-C", repo_dir, "config", "user.email", "test@example.com"], check=True, env=git_env())
             test_file = Path(repo_dir) / "README.md"
             test_file.write_text("initial commit\n", encoding="utf-8")
-            subprocess.run(["git", "-C", repo_dir, "add", "README.md"], check=True)
-            subprocess.run(["git", "-C", repo_dir, "commit", "-m", "initial"], check=True)
+            subprocess.run(["git", "-C", repo_dir, "add", "README.md"], check=True, env=git_env())
+            subprocess.run(["git", "-C", repo_dir, "commit", "-m", "initial"], check=True, env=git_env())
 
             proj = ProjectSettings(
                 key="testproj",
@@ -595,12 +597,12 @@ class TestProjectChannel(unittest.TestCase):
 
     def test_channel_two_topics_separate_adapters_when_worktrees_true(self):
         with TemporaryDirectory() as repo_dir:
-            subprocess.run(["git", "init", "-b", "main", repo_dir], capture_output=True, check=True)
-            subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Test"], check=True)
-            subprocess.run(["git", "-C", repo_dir, "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "init", "-b", "main", repo_dir], capture_output=True, check=True, env=git_env())
+            subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Test"], check=True, env=git_env())
+            subprocess.run(["git", "-C", repo_dir, "config", "user.email", "test@example.com"], check=True, env=git_env())
             Path(repo_dir, "README.md").write_text("init\n", encoding="utf-8")
-            subprocess.run(["git", "-C", repo_dir, "add", "README.md"], check=True)
-            subprocess.run(["git", "-C", repo_dir, "commit", "-m", "init"], check=True)
+            subprocess.run(["git", "-C", repo_dir, "add", "README.md"], check=True, env=git_env())
+            subprocess.run(["git", "-C", repo_dir, "commit", "-m", "init"], check=True, env=git_env())
 
             cfg = make_config(
                 projects={
@@ -743,12 +745,12 @@ class TestProjectsEndToEnd(unittest.IsolatedAsyncioTestCase):
             default_dir.mkdir()
 
             # Initialize a real git repo for webapp to exercise worktree creation
-            subprocess.run(["git", "init", "-b", "main", str(webapp_dir)], capture_output=True, check=True)
-            subprocess.run(["git", "-C", str(webapp_dir), "config", "user.name", "Test"], check=True)
-            subprocess.run(["git", "-C", str(webapp_dir), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "init", "-b", "main", str(webapp_dir)], capture_output=True, check=True, env=git_env())
+            subprocess.run(["git", "-C", str(webapp_dir), "config", "user.name", "Test"], check=True, env=git_env())
+            subprocess.run(["git", "-C", str(webapp_dir), "config", "user.email", "test@example.com"], check=True, env=git_env())
             (webapp_dir / "README.md").write_text("# Webapp\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(webapp_dir), "add", "README.md"], check=True)
-            subprocess.run(["git", "-C", str(webapp_dir), "commit", "-m", "init"], check=True)
+            subprocess.run(["git", "-C", str(webapp_dir), "add", "README.md"], check=True, env=git_env())
+            subprocess.run(["git", "-C", str(webapp_dir), "commit", "-m", "init"], check=True, env=git_env())
 
             raw_config = {
                 "agent": {

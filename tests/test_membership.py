@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.gitenv import git_env
+
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
 from swarmly.telegram.config import AgentConfig
@@ -697,7 +699,8 @@ class LauncherTests(unittest.TestCase):
         from swarmly.telegram.join import setup_bus
 
         def git(*args, cwd=None):
-            subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+            subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                           env=git_env())
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             remote = root / "remote.git"
@@ -722,16 +725,18 @@ class LauncherTests(unittest.TestCase):
             self.assertIn("ref: origin/agents-bus", text)
             shown = subprocess.run(["git", "-C", str(remote), "show",
                                     "agents-bus:config/a2a_config.json"],
-                                   capture_output=True, text=True, check=True).stdout
+                                   capture_output=True, text=True, check=True,
+                                   env=git_env()).stdout
             self.assertEqual(json.loads(shown)["authorized_agents"]["newbie"]
                              ["public_key_or_secret_name"], PUB)
             author = subprocess.run(["git", "-C", str(remote), "log", "-1", "--format=%an",
-                                     "agents-bus"], capture_output=True, text=True).stdout
+                                     "agents-bus"], capture_output=True, text=True,
+                                    env=git_env()).stdout
             self.assertEqual(author.strip(), "Newbie")
 
     def remote_with_main(self, root, name):
         def git(*args):
-            subprocess.run(["git", *args], check=True, capture_output=True)
+            subprocess.run(["git", *args], check=True, capture_output=True, env=git_env())
         remote = root / f"{name}.git"
         git("init", "--bare", "-q", "-b", "main", str(remote))
         seed = root / f"{name}-seed"
@@ -745,7 +750,8 @@ class LauncherTests(unittest.TestCase):
     def registered(self, remote):
         shown = subprocess.run(["git", "-C", str(remote), "show",
                                 "agents-bus:config/a2a_config.json"],
-                               capture_output=True, text=True, check=True).stdout
+                               capture_output=True, text=True, check=True,
+                               env=git_env()).stdout
         return set(json.loads(shown)["authorized_agents"])
 
     def test_two_agents_registering_at_once_both_land(self):
@@ -766,7 +772,7 @@ class LauncherTests(unittest.TestCase):
 
             def stale(repo, alias, key):
                 subprocess.run(["git", "-C", str(repo), "reset", "-q", "--hard", "HEAD~1"],
-                               check=True, capture_output=True)
+                               check=True, capture_output=True, env=git_env())
                 registry = repo / "config" / "a2a_config.json"
                 data = json.loads(registry.read_text()) if registry.exists() else {}
                 data.setdefault("authorized_agents", {}).pop("alpha", None)

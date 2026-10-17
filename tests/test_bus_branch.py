@@ -8,18 +8,19 @@ from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from tests.gitenv import TEST_IDENTITY, git_env
 from swarmly.telegram.cli import _bus_on_main_branch
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.init import InitError, write_starter
 from swarmly.transports.git import GitTransport
 
-ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x", GIT_COMMITTER_NAME="t",
-           GIT_COMMITTER_EMAIL="t@x")
+#: The identity the transport's own commits run with (it commits with the process env).
+ENV = dict(os.environ, **TEST_IDENTITY)
 
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
-                          text=True, env=ENV).stdout.strip()
+                          text=True, env=git_env()).stdout.strip()
 
 
 class TestBusBranch(unittest.TestCase):

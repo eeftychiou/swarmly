@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import unittest
 
+from tests.gitenv import git_env
 from tests.swarm_helpers import SwarmCase, needs_swarm
 
 HAVE_GIT = shutil.which("git") is not None
@@ -120,7 +121,7 @@ class EnvelopeTests(SwarmCase):
 
 def _git(*args, cwd=None):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
-                          text=True).stdout.strip()
+                          text=True, env=git_env()).stdout.strip()
 
 
 @needs_swarm
