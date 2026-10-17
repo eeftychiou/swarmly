@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from tests.gitenv import git_env
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -16,7 +18,7 @@ class TestFolderDemo(unittest.TestCase):
 
     def test_alice_verifies(self):
         with TemporaryDirectory() as shared:
-            env = {k: v for k, v in os.environ.items() if not k.startswith("A2A_")}
+            env = {k: v for k, v in git_env().items() if not k.startswith("A2A_")}
             env["PYTHON"] = sys.executable
             result = subprocess.run(["bash", str(ROOT / "examples" / "folder-bus-demo.sh"),
                                      shared], capture_output=True, text=True, env=env,

@@ -25,6 +25,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from tests.gitenv import git_env
 from swarmly.telegram.adapters import EchoAdapter, SubprocessAdapter, build_adapter
 from swarmly.telegram.adapters.antigravity import AntigravityAdapter, AntigravityThreadAdapter
 from swarmly.telegram.adapters.base import AdapterReply, IncomingMessage
@@ -1448,7 +1449,7 @@ class TestOnlineNoticeRevision(unittest.TestCase):
         if (root / ".git").exists():
             expected = subprocess.run(
                 ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True).stdout.strip()
+                capture_output=True, text=True, env=git_env()).stdout.strip()
             self.assertEqual(rev, expected)
         else:
             self.assertEqual(rev, "unknown")
@@ -1462,7 +1463,7 @@ class TestOnlineNoticeRevision(unittest.TestCase):
         if (root / ".git").exists():
             expected = subprocess.run(
                 ["git", "-C", str(root), "rev-parse", "HEAD"],
-                capture_output=True, text=True).stdout.strip()
+                capture_output=True, text=True, env=git_env()).stdout.strip()
             self.assertEqual(rev, expected)
             self.assertEqual(len(rev), 40, rev)
         else:

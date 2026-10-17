@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.gitenv import TEST_IDENTITY, git_env
 from swarmly.telegram.guard import REFUSED, prepare, refusal
 
 
@@ -49,9 +50,8 @@ class TestRefusal(unittest.TestCase):
         self.assertIsNone(refusal("", "gh", ["pr", "merge", "8"]))          # no role, no guard
 
 
-GIT_ENV = {"GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "T",
-           "GIT_COMMITTER_EMAIL": "t@x", "GIT_CONFIG_GLOBAL": os.devnull,
-           "GIT_CONFIG_SYSTEM": os.devnull}
+#: The identity and the isolated global config the guard's own git commands run with.
+GIT_ENV = dict(TEST_IDENTITY, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
 
 
 @unittest.skipIf(os.name == "nt", "the POSIX wrapper is tested here")
@@ -78,7 +78,7 @@ class TestWrapper(unittest.TestCase):
     def _repos(self, tmp, role):
         def git(cwd, *args, env=None):
             return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
-                                  text=True, env=env or dict(os.environ, **GIT_ENV))
+                                  text=True, env=env or git_env(**GIT_ENV))
         origin, work = Path(tmp) / "origin.git", Path(tmp) / "work"
         git(tmp, "init", "-q", "--bare", "-b", "main", str(origin))
         git(tmp, "clone", "-q", str(origin), str(work))
@@ -86,7 +86,7 @@ class TestWrapper(unittest.TestCase):
         (work / "a").write_text("a")
         git(work, "add", "a")
         git(work, "commit", "-qm", "a")
-        env = prepare(Path(tmp) / "guard", role, dict(os.environ, **GIT_ENV))
+        env = prepare(Path(tmp) / "guard", role, git_env(**GIT_ENV))
         return work, env, git
 
     def test_the_pre_push_hook_holds_whichever_git_runs(self):

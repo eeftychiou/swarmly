@@ -6,18 +6,19 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.gitenv import TEST_IDENTITY, git_env
 from swarmly.telegram.adapters.base import IncomingMessage
 from swarmly.telegram.config import AdapterSettings
 from swarmly.telegram.git_sync import sync_checkout
 from tests.test_telegram_channel import make_channel, make_config, run
 
-ENV = dict(os.environ, GIT_AUTHOR_NAME="T", GIT_AUTHOR_EMAIL="t@x", GIT_COMMITTER_NAME="T",
-           GIT_COMMITTER_EMAIL="t@x", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+ENV = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+           **TEST_IDENTITY)
 
 
 def git(path, *args):
     return subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True,
-                          text=True, env=ENV).stdout.strip()
+                          text=True, env=git_env()).stdout.strip()
 
 
 def commit(path, name):

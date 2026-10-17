@@ -13,19 +13,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, patch
 
+from tests.gitenv import git_env
 from swarmly.transports import git as gitbus
 from swarmly.transports.git import BusPushError, GitTransport
 
 ENVELOPE = "msg-20261009T230000Z-p1p4_codex_query_request.md"
 
 
-def _clean_env():
-    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-
-
 def git(cwd, *args):
     return subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True,
-                          text=True, env=_clean_env()).stdout.strip()
+                          text=True, env=git_env()).stdout.strip()
 
 
 class _Repos(unittest.TestCase):

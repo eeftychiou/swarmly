@@ -20,6 +20,7 @@ from unittest import mock
 from pathlib import Path
 
 from tests import envguard
+from tests.gitenv import git_env
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -102,9 +103,7 @@ class TestQuickstartSigningKey(unittest.TestCase):
 class TestDemoScripts(unittest.TestCase):
     def run_demo(self, name):
         with tempfile.TemporaryDirectory() as tmp:
-            env = {**os.environ, "PYTHON": sys.executable,
-                   "GIT_AUTHOR_NAME": "demo", "GIT_AUTHOR_EMAIL": "demo@example.invalid",
-                   "GIT_COMMITTER_NAME": "demo", "GIT_COMMITTER_EMAIL": "demo@example.invalid"}
+            env = git_env(PYTHON=sys.executable)
             result = subprocess.run(["bash", str(ROOT / "examples" / name), tmp],
                                     cwd=tmp, env=env, capture_output=True, text=True, timeout=300)
         self.assertEqual(result.returncode, 0, result.stdout[-2000:] + result.stderr[-2000:])

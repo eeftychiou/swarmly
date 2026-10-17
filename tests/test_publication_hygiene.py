@@ -27,6 +27,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from tests.gitenv import git_env
+
 ROOT = Path(__file__).resolve().parent.parent
 
 # Positive control: the canary below, never a real value.
@@ -82,7 +84,8 @@ def find_identifiers(text: str):
 
 
 def _tracked_files():
-    out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True)
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True,
+                         env=git_env())
     for name in out.stdout.decode("utf-8").split("\0"):
         if name and name not in SKIP_FILES and not name.startswith(SKIP_PREFIXES):
             yield name

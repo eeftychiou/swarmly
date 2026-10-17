@@ -18,6 +18,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional
 
+from tests.gitenv import git_env
 from swarmly.bus import DurableBus
 from swarmly.crypto import CryptoAuth, KeyPair
 from swarmly.models import A2AMessage, MessageIntent, MessagePriority, RecipientInfo, SenderInfo
@@ -511,9 +512,10 @@ class TestDurableThenInstant(unittest.TestCase):
             for cmd in (["git", "init", "-q", "."], ["git", "config", "user.email", "t@x"],
                         ["git", "config", "user.name", "t"],
                         ["git", "commit", "-q", "--allow-empty", "-m", "init"]):
-                subprocess.run(cmd, cwd=tmp, check=True, capture_output=True)
+                subprocess.run(cmd, cwd=tmp, check=True, capture_output=True, env=git_env())
             sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=tmp, check=True,
-                                 capture_output=True, text=True).stdout.strip()
+                                 capture_output=True, text=True,
+                                 env=git_env()).stdout.strip()
             pointer = bus_pointer(GitTransport(Path(tmp)), "ignored", "m1_codex_x.md")
             self.assertEqual(pointer, f".agents/inbox/m1_codex_x.md@{sha}")
 
