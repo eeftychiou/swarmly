@@ -116,6 +116,75 @@ class TestWriteStarter(unittest.TestCase):
         self.assertFalse((self.tmp / "c.yaml").exists())
 
 
+class TestHomeChannelOnAFreshConfig(unittest.TestCase):
+    """Issue #11 (brainstorm 2.11): ``init --home-channel`` was refused on a fresh config,
+    although ``_group_id`` already parsed the value for ``--from``."""
+
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def test_a_group_id_lands_in_the_new_config(self):
+        config = self.tmp / "config.yaml"
+        lines = write_starter(config, "Hermes", "hermes", home_channel="-1001234567890")
+        loaded = AgentConfig.load(config)
+        self.assertEqual(loaded.identity.home_channel_id, -1001234567890)
+        self.assertTrue(any("-1001234567890" in line for line in lines), lines)
+
+    def test_a_message_link_lands_in_the_new_config(self):
+        config = self.tmp / "config.yaml"
+        write_starter(config, "Hermes", "hermes",
+                      home_channel="https://t.me/c/1234567890/1/2")
+        self.assertEqual(AgentConfig.load(config).identity.home_channel_id, -1001234567890)
+
+    def test_without_the_flag_the_placeholder_stays(self):
+        config = self.tmp / "config.yaml"
+        write_starter(config, "Hermes", "hermes")
+        self.assertEqual(AgentConfig.load(config).identity.home_channel_id, 0)
+
+    def test_an_invalid_value_is_refused_before_anything_is_written(self):
+        config = self.tmp / "config.yaml"
+        with self.assertRaises(InitError) as caught:
+            write_starter(config, "Hermes", "hermes", home_channel="my group")
+        self.assertIn("--home-channel", str(caught.exception))
+        self.assertFalse(config.exists())
+
+    def test_an_existing_config_needs_force_either_way(self):
+        config = self.tmp / "config.yaml"
+        config.write_text("mine", encoding="utf-8")
+        with self.assertRaises(InitError):
+            write_starter(config, "Hermes", "hermes", home_channel="-1001234567890")
+        self.assertEqual(config.read_text(encoding="utf-8"), "mine")
+        write_starter(config, "Hermes", "hermes", home_channel="-1001234567890", force=True)
+        self.assertEqual(AgentConfig.load(config).identity.home_channel_id, -1001234567890)
+
+    def test_the_cli_writes_it_on_a_fresh_directory(self):
+        """The reported bug: `init --home-channel` on a fresh directory used to exit 2."""
+        env = {k: v for k, v in os.environ.items() if not k.startswith("A2A_")}
+        env.update(PYTHONPATH=str(ROOT), A2A_LOG_DIR="off", PYTHONIOENCODING="utf-8")
+        config = self.tmp / "config.yaml"
+        init = subprocess.run(
+            [sys.executable, "-m", "swarmly.telegram.cli", "init", "--alias", "Tester",
+             "--adapter", "echo", "--config", str(config),
+             "--home-channel", "-1001234567890"],
+            cwd=self.tmp, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(init.returncode, 0, init.stderr)
+        self.assertEqual(AgentConfig.load(config).identity.home_channel_id, -1001234567890)
+
+    def test_the_cli_still_refuses_an_invalid_value(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("A2A_")}
+        env.update(PYTHONPATH=str(ROOT), A2A_LOG_DIR="off", PYTHONIOENCODING="utf-8")
+        init = subprocess.run(
+            [sys.executable, "-m", "swarmly.telegram.cli", "init", "--alias", "Tester",
+             "--adapter", "echo", "--config", str(self.tmp / "config.yaml"),
+             "--home-channel", "not-a-group"],
+            cwd=self.tmp, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(init.returncode, 2)
+        self.assertIn("--home-channel", init.stderr)
+        self.assertFalse((self.tmp / "config.yaml").exists())
+
+
 class TestCommandLine(unittest.TestCase):
     def test_init_then_check_passes_once_the_human_values_are_in(self):
         """The README path: init, fill in the admin id and a token, check exits 0."""
