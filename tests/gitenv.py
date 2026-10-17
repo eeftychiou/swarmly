@@ -60,11 +60,21 @@ STRIPPED_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "GIT_AUTHOR_", "GIT
 
 
 def _is_guard_dir(entry: str) -> bool:
-    """Whether a ``PATH`` entry is a transport guard directory (it holds the ``gh`` shim)."""
+    """Whether a ``PATH`` entry is a transport guard directory.
+
+    The transport names them ``guard`` or, per agent, ``guard-<alias>`` (the live one here is
+    ``guard-deepseek``), so an equality test on ``guard`` leaves the real guard first on
+    ``PATH`` -- which the reviewer caught on PR #14. A guard directory is recognised by its
+    name *and* by the shim it holds (``gh``/``git``), never by the name alone: a directory a
+    test happens to call ``guard-...`` must not be dropped from ``PATH``.
+    """
     if not entry:
         return False
     folder = Path(entry)
-    return folder.name == "guard" and (folder / "gh").exists()
+    name = folder.name.lower()
+    if name != "guard" and not name.startswith("guard-"):
+        return False
+    return any((folder / shim).exists() for shim in ("gh", "git", "gh.exe", "git.exe"))
 
 
 def _clean_path(value: str) -> str:

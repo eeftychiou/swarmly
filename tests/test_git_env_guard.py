@@ -38,13 +38,25 @@ def _called_name(node: ast.Call) -> str:
 
 
 def _git_commands(tree: ast.Module) -> list:
-    """The ``subprocess``/``os`` calls in ``tree`` whose argv is a git command."""
+    """The ``subprocess``/``os`` calls in ``tree`` whose argv is a git command.
+
+    argv is read from a literal list/tuple, from a module-level constant (``GIT = "git"``),
+    and from a variable that holds an argv list (``cmd = ["git", "push"]`` ...
+    ``subprocess.run(cmd)``) -- the form the reviewer found the scanner missing on PR #14.
+    """
     constants = {}
-    for node in tree.body:                      # module-level ``GIT = "git"`` style aliases
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
-            for target in node.targets:
+    argvs = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if isinstance(node.value, ast.Constant):
+            for target in node.targets:          # module-level ``GIT = "git"`` style aliases
                 if isinstance(target, ast.Name):
                     constants[target.id] = node.value.value
+        elif isinstance(node.value, (ast.List, ast.Tuple)):
+            for target in node.targets:          # ``cmd = ["git", ...]`` anywhere in the file
+                if isinstance(target, ast.Name):
+                    argvs[target.id] = node.value
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or _called_name(node) not in SPAWNERS:
@@ -52,6 +64,8 @@ def _git_commands(tree: ast.Module) -> list:
         if not node.args:
             continue
         argv = node.args[0]
+        if isinstance(argv, ast.Name):
+            argv = argvs.get(argv.id)
         if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
             continue
         first = argv.elts[0]
@@ -106,6 +120,24 @@ class TestEveryGitSpawnIsScrubbed(unittest.TestCase):
         aliased = "import subprocess\nGIT = 'git'\nsubprocess.run([GIT, 'status'])\n"
         self.assertEqual(len(violations(aliased, "aliased.py")), 1)
 
+    def test_the_scanner_sees_an_argv_variable(self):
+        """The reviewer's finding on PR #14: ``cmd = ["git", ...]`` then ``run(cmd)``."""
+        bad = ("import subprocess\n"
+               "def go(repo):\n"
+               "    cmd = ['git', '-C', repo, 'push', 'origin', 'main']\n"
+               "    return subprocess.run(cmd, check=True, capture_output=True)\n")
+        self.assertEqual(len(violations(bad, "varargv.py")), 1, violations(bad))
+        good = ("import subprocess\nfrom tests.gitenv import git_env\n"
+                "def go(repo):\n"
+                "    cmd = ['git', '-C', repo, 'push', 'origin', 'main']\n"
+                "    return subprocess.run(cmd, env=git_env())\n")
+        self.assertEqual(violations(good, "varargv_good.py"), [])
+        # A variable that is not an argv list is not a git spawn either way.
+        other = ("import subprocess\n"
+                 "cmd = ['python', '-V']\n"
+                 "subprocess.run(cmd)\n")
+        self.assertEqual(violations(other, "other.py"), [])
+
 
 class TestTheHelperScrubs(unittest.TestCase):
 
@@ -142,6 +174,26 @@ class TestTheHelperScrubs(unittest.TestCase):
             (guard / "gh").write_text("#!/bin/sh\n", encoding="utf-8")
             path = os.pathsep.join([str(guard), "/usr/bin"])
             self.assertNotIn(str(guard), gitenv.git_env({"PATH": path})["PATH"])
+
+    def test_a_per_alias_guard_directory_leaves_path(self):
+        """The live transport names it ``guard-<alias>``; that is the one that must go."""
+        with TemporaryDirectoryPath() as folder:
+            guard = folder / "guard-deepseek"
+            guard.mkdir()
+            (guard / "gh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (guard / "git").write_text("#!/bin/sh\n", encoding="utf-8")
+            path = os.pathsep.join([str(guard), "/usr/bin"])
+            cleaned = gitenv.git_env({"PATH": path})["PATH"]
+            self.assertNotIn(str(guard), cleaned)
+            self.assertIn("/usr/bin", cleaned)
+
+    def test_a_directory_named_like_a_guard_without_a_shim_stays(self):
+        """Only a directory that actually holds a shim is a guard; a name alone is not."""
+        with TemporaryDirectoryPath() as folder:
+            lookalike = folder / "guard-fixtures"
+            lookalike.mkdir()
+            path = os.pathsep.join([str(lookalike), "/usr/bin"])
+            self.assertIn(str(lookalike), gitenv.git_env({"PATH": path})["PATH"])
 
 
 class TemporaryDirectoryPath:
