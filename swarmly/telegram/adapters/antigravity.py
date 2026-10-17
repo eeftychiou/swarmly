@@ -518,6 +518,27 @@ class AntigravityContextMixin:
         return None
 
 
+def _unquote_model(argv: List[str]) -> List[str]:
+    """Drop the quotes ``shlex``'s non-POSIX mode leaves around a ``--model`` value.
+
+    ``default_settings`` single-quotes the engine name so a name with spaces stays one token
+    in the command template, and every shell-style POSIX split removes that quoting again.
+    On Windows the split runs non-POSIX (quotes kept), so ``agy`` would receive
+    ``"'Gemini 3.1 Pro (High)'"`` -- a name that matches no model. Review finding on PR #17:
+    the token must reach ``agy`` unquoted, and the test must assert it exactly.
+    """
+    for index, arg in enumerate(argv):
+        if arg == "--model" and index + 1 < len(argv):
+            value = argv[index + 1]
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                argv[index + 1] = value[1:-1]
+        elif arg.startswith("--model="):
+            value = arg[len("--model="):]
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                argv[index] = f"--model={value[1:-1]}"
+    return argv
+
+
 def _command_words(settings: AdapterSettings) -> List[str]:
     """``adapter.command`` split the way the argv builder splits it: shlex, in non-POSIX
     mode on Windows (review R5-1), with the quotes that mode keeps removed."""
@@ -776,7 +797,7 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
             if conv_model:
                 argv.extend(["--model", conv_model])
 
-        return argv
+        return _unquote_model(argv)
 
     async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
         if not self.settings.enabled:

@@ -361,13 +361,36 @@ class TestAntigravityModelNames(unittest.TestCase):
             AdapterSettings(type="claude", model="Gemini 3.1 Pro (High)")
 
     def test_a_documented_name_reaches_agy_as_one_token(self):
+        """The exact token, quotes included in the comparison: a Windows split keeps the
+        template's quoting, and stripping it here would hide exactly that bug (PR #17)."""
         from swarmly.telegram.adapters.antigravity import AntigravityAdapter
         settings = AdapterSettings(type="antigravity", model="Gemini 3.1 Pro (High)")
         adapter = AntigravityAdapter("Antigravity", settings)
         argv = adapter.build_argv("hello")
         model = argv[argv.index("--model") + 1]
-        self.assertEqual(model.strip("'\""), "Gemini 3.1 Pro (High)",
-                         f"an engine name must be one argv token, got {argv}")
+        self.assertEqual(model, "Gemini 3.1 Pro (High)",
+                         f"an engine name must be one unquoted argv token, got {argv}")
+
+    def test_the_quoted_template_reaches_agy_unquoted(self):
+        """``default_settings`` single-quotes the name; the argv must still be bare."""
+        import shlex
+        from swarmly.telegram.adapters.antigravity import AntigravityAdapter, _unquote_model
+        for name in ("Gemini 3.1 Pro (High)", "Claude Opus 5.5 (High)", "single-token"):
+            with self.subTest(name=name):
+                settings = AntigravityAdapter.default_settings(
+                    cwd=None, model=name, print_timeout="20m")
+                self.assertIn(f"'{name}'", settings.command, settings.command)
+                argv = AntigravityAdapter("Antigravity", settings).build_argv("hello")
+                self.assertIn("--model", argv, argv)
+                value = argv[argv.index("--model") + 1]
+                self.assertEqual(value, name, argv)
+                self.assertFalse(value.startswith(("'", '"')), argv)
+        # The non-POSIX split (what Windows uses) is the one that keeps quotes; the token
+        # must come out clean on both.
+        for posix in (True, False):
+            with self.subTest(posix=posix):
+                words = shlex.split("agy -p x --model 'Gemini 3.1 Pro (High)'", posix=posix)
+                self.assertEqual(_unquote_model(words)[-1], "Gemini 3.1 Pro (High)")
 
     def test_the_docs_and_the_validator_agree(self):
         doc = (Path(__file__).resolve().parents[1] / "docs" / "telegram"
@@ -376,7 +399,7 @@ class TestAntigravityModelNames(unittest.TestCase):
         self.assertTrue(documented, "the Antigravity setup doc shows no --model example")
         for name in documented:
             self.assertIsNone(model_problem("antigravity", name), name)
-            self.assertIsNone(AdapterSettings(type="antigravity", model=name).model and None)
+            self.assertEqual(AdapterSettings(type="antigravity", model=name).model, name)
 
 
 if __name__ == "__main__":
