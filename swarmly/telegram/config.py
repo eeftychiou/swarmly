@@ -282,6 +282,15 @@ PERMISSION_FLAGS["reasonix"] = {
 
 #: adapter.model and ``/model``: one model name, never a flag or a second argument.
 MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]/-]*")
+#: An Antigravity engine name as ``agy models`` prints it -- ``Gemini 3.1 Pro (High)``
+#: (docs/telegram/SETUP-ANTIGRAVITY.md): mixed case, digits, dots, parentheses and single
+#: spaces between words. No leading dash (a flag), no quote, no shell metacharacter and no
+#: control character: it reaches the command line as one argv token (issue #10).
+#: One word of an engine name: letters, digits, dots, hyphens, ``+``, with an optional
+#: trailing "(Qualifier)" -- never a leading dash (a flag), a quote or a metacharacter.
+_AGY_WORD = r"[A-Za-z0-9][A-Za-z0-9._+-]*(?: \([A-Za-z0-9][A-Za-z0-9._+-]*\))?"
+_AGY_MODEL = re.compile(rf"{_AGY_WORD}(?: {_AGY_WORD})*")
+_AGY_MODEL_TYPES = ("antigravity", "antigravity_thread")
 #: Adapter types whose default command takes a model.
 MODEL_TYPES = ("codex", "claude", "claude_thread", "reasonix", "antigravity")
 #: adapter.effort: the reasoning effort, mapped onto each CLI's own flag. Codex has no max.
@@ -307,6 +316,18 @@ def effort_problem(adapter_type: str, effort: str) -> Optional[str]:
 _CLAUDE_MODEL_ALIASES = ("best", "opus", "sonnet", "haiku", "opusplan")
 
 
+def model_name_ok(adapter_type: str, name: str) -> bool:
+    """Whether ``name`` is one model name for this adapter's CLI.
+
+    The generic form (``MODEL_NAME``) covers Claude, Codex and Reasonix ids. Antigravity
+    also takes the engine names ``agy models`` prints, which carry spaces and parentheses
+    (``Gemini 3.1 Pro (High)``) -- still one name, never a flag or a second argument.
+    """
+    if adapter_type in _AGY_MODEL_TYPES and _AGY_MODEL.fullmatch(name):
+        return True
+    return bool(MODEL_NAME.fullmatch(name))
+
+
 def model_problem(adapter_type: str, name: str) -> Optional[str]:
     """Why ``name`` is not a model this adapter's CLI runs, or None when it is.
 
@@ -315,7 +336,7 @@ def model_problem(adapter_type: str, name: str) -> Optional[str]:
     Codex takes gpt-*, o<digit>* and codex-* names. A typo is refused here rather than
     failing every later turn.
     """
-    if not MODEL_NAME.fullmatch(name):
+    if not model_name_ok(adapter_type, name):
         return f"{name!r} is not one model name"
     lower = name.lower()
     if adapter_type.startswith("claude"):
@@ -328,11 +349,13 @@ def model_problem(adapter_type: str, name: str) -> Optional[str]:
         if re.match(r"(gpt-|o\d|codex-)", lower):
             return None
         return f"{name!r} is not a Codex model: use a gpt-*, o3/o4-* or codex-* name"
-    if adapter_type == "antigravity":
-        # A model id from `agy models` (gemini-3.8-flash-high, ...).
-        if re.fullmatch(r"[a-z0-9][a-z0-9._-]*", name):
+    if adapter_type in _AGY_MODEL_TYPES:
+        # An id or an engine name from `agy models`: gemini-3.8-flash-high,
+        # 'Gemini 3.1 Pro (High)'. Case, spaces and parentheses are part of the name there.
+        if model_name_ok(adapter_type, name):
             return None
-        return f"{name!r} is not an Antigravity model id: see `agy models`"
+        return (f"{name!r} is not an Antigravity model: see `agy models` "
+                f"(e.g. gemini-3.8-flash-high or 'Gemini 3.1 Pro (High)')")
     if adapter_type == "reasonix":
         # A provider name from reasonix.toml (deepseek-flash, deepseek-pro, ...). Reasonix
         # names are lowercase; this refuses the other CLIs' names and obvious typos of case.
@@ -439,7 +462,7 @@ class AdapterSettings:
                 raise ConfigError(f"adapter.effort: {problem}")
         if self.model is not None:
             self.model = str(self.model).strip() or None
-            if self.model and not MODEL_NAME.fullmatch(self.model):
+            if self.model and not model_name_ok(self.type, self.model):
                 raise ConfigError(f"adapter.model must be one model name (got {self.model!r})")
         # Only a missing key means the default: YAML reads off/no/false/0 as a bool or number,
         # and a config that reads "turn it off" must not silently get standard.
@@ -488,11 +511,15 @@ class AdapterSettings:
                                   ",".join([_CLAUDE_STANDARD_TOOLS, *extra]))
         # A runtime choice comes from a state file the agent may be able to write: one that
         # is not a single model name must never reach the command line.
-        if model is not None and not MODEL_NAME.fullmatch(model):
+        if model is not None and not model_name_ok(self.type, model):
             model = None
         model = model or self.model
         model_flag = ""
         if model:
+            if not MODEL_NAME.fullmatch(model):
+                # Antigravity engine names carry spaces: 'Gemini 3.1 Pro (High)' must reach
+                # `agy` as ONE argv token, not five (issue #10).
+                model = f"'{model}'"
             model_flag = f"-m {model}" if self.type.startswith("codex") else f"--model {model}"
         # A runtime /reasoning choice comes from a state file too: only a known level.
         if effort is not None and effort_problem(self.type, effort):
