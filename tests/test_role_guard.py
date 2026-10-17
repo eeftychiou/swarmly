@@ -77,8 +77,12 @@ class TestWrapper(unittest.TestCase):
 
     def _repos(self, tmp, role):
         def git(cwd, *args, env=None):
+            # The scrubber runs unconditionally; a caller's pinned guard environment is
+            # layered on top of it. ``env or git_env(...)`` would skip the scrub whenever
+            # the caller's env is truthy, which is what the CI guard now rejects.
+            child_env = {**git_env(**GIT_ENV), **(env or {})}
             return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
-                                  text=True, env=env or git_env(**GIT_ENV))
+                                  text=True, env=child_env)
         origin, work = Path(tmp) / "origin.git", Path(tmp) / "work"
         git(tmp, "init", "-q", "--bare", "-b", "main", str(origin))
         git(tmp, "clone", "-q", str(origin), str(work))
