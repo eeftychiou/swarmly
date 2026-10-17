@@ -21,7 +21,8 @@ from swarmly.transports import BusPushError, BusTransport, GitTransport
 
 logger = logging.getLogger("swarmly.bus")
 
-__all__ = ["BusPushError", "DurableBus", "MissingKeyError", "key_env_name"]
+__all__ = ["BusPushError", "DurableBus", "MissingKeyError", "RegistryError",
+           "key_env_name"]
 
 KEY_TYPES = ("hmac", "ed25519")
 
@@ -31,6 +32,15 @@ def key_env_name(agent_id: str) -> str:
     Characters a shell variable cannot carry become ``_`` (``my-agent`` ->
     ``A2A_KEY_MY_AGENT``)."""
     return "A2A_KEY_" + re.sub(r"[^A-Z0-9_]", "_", agent_id.upper())
+
+
+class RegistryError(ValueError):
+    """The agent registry exists but cannot be used (issue #8, brainstorm 2.7).
+
+    A registry that is corrupt -- unreadable, not JSON, or not a JSON object -- used to be
+    swallowed into an empty ``authorized_agents`` map, so every signature failed to verify
+    and signed mail failed silently. It fails loudly instead: the path and the cause.
+    """
 
 
 class MissingKeyError(KeyError):
@@ -149,20 +159,40 @@ class DurableBus:
             self.outbox_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_config(self) -> Dict:
-        """Load cluster config if available, with the keys the swarm vouched for on top."""
+        """Load the agent registry, with the keys the swarm vouched for on top.
+
+        A missing registry is the documented first-run state (``init``/``keygen`` write one)
+        and keeps today's behaviour: an empty, well-formed registry. A registry that is
+        *there* but unusable raises :class:`RegistryError` naming the path and the cause --
+        an empty registry would turn a broken checkout into silent verification failures.
+        """
         config: Dict = {
             "authorized_agents": {},
             "revocation_list": [],
             "coordination": {"primary_master": "antigravity"}
         }
         if self.config_path and self.config_path.exists():
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-            except Exception:
-                pass
+            config = self._read_config(self.config_path)
         self._add_vouched_keys(config)
         return config
+
+    @staticmethod
+    def _read_config(path: Path) -> Dict:
+        """The registry at ``path`` as a dict, or :class:`RegistryError` with path and cause."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        except OSError as exc:
+            raise RegistryError(
+                f"agent registry {path} cannot be read: {exc.strerror or exc}") from exc
+        except ValueError as exc:                     # json.JSONDecodeError, bad encoding
+            raise RegistryError(
+                f"agent registry {path} is not valid JSON: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise RegistryError(
+                f"agent registry {path} must be a JSON object, "
+                f"not {type(loaded).__name__}")
+        return loaded
 
     def _add_vouched_keys(self, config: Dict) -> None:
         """Ed25519 keys this host's transport took from a JOIN in the group (see
