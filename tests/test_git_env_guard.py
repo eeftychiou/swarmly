@@ -25,7 +25,6 @@ from tests import gitenv
 
 TESTS = Path(__file__).resolve().parent
 SPAWNERS = {"run", "call", "check_call", "check_output", "Popen"}
-ALLOWED_ENV_WORDS = ("git_env", "gitenv")
 
 
 def _called_name(node: ast.Call) -> str:
@@ -111,12 +110,33 @@ def _git_commands(tree: ast.Module) -> list:
     return found
 
 
+def _calls_the_helper(node: ast.AST) -> bool:
+    """Whether ``node`` actually *calls* the scrub helper (not just mentions its name).
+
+    The previous check looked for the string ``git_env`` in the source segment, so
+    ``env={**os.environ, "NOTE": "git_env"}`` passed without ever scrubbing -- the reviewer's
+    bypass on PR #14. Only a real call counts: ``git_env(...)``, ``gitenv.git_env(...)`` or
+    ``gitenv.strip(...)``, anywhere inside the ``env=`` expression (``env=env or git_env()``
+    counts, as does ``env={**git_env(), "X": "1"}``).
+    """
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        func = sub.func
+        if isinstance(func, ast.Name) and func.id == "git_env":
+            return True
+        if isinstance(func, ast.Attribute) and func.attr in ("git_env", "strip"):
+            owner = func.value
+            if isinstance(owner, ast.Name) and owner.id == "gitenv":
+                return True
+            if isinstance(owner, ast.Attribute) and owner.attr == "gitenv":
+                return True
+    return False
+
+
 def _env_is_scrubbed(call: ast.Call, source: str) -> bool:
     for keyword in call.keywords:
-        if keyword.arg != "env":
-            continue
-        text = ast.get_source_segment(source, keyword.value) or ""
-        if any(word in text for word in ALLOWED_ENV_WORDS):
+        if keyword.arg == "env" and _calls_the_helper(keyword.value):
             return True
     return False
 
@@ -195,6 +215,31 @@ class TestEveryGitSpawnIsScrubbed(unittest.TestCase):
                     "for cmd in (['python', '-V'], ['ls']):\n"
                     "    subprocess.run(cmd)\n")
         self.assertEqual(violations(harmless, "harmless.py"), [])
+
+    def test_mentioning_the_helper_is_not_calling_it(self):
+        """The reviewer's third finding on PR #14: the name in a string is not a scrub."""
+        bypass = ("import os\nimport subprocess\n"
+                  "subprocess.run(['git', 'push'], env={**os.environ, 'NOTE': 'git_env'})\n")
+        self.assertEqual(len(violations(bypass, "bypass.py")), 1, violations(bypass))
+        # A local variable merely named like the helper is not a call either.
+        shadowed = ("import os\nimport subprocess\n"
+                    "git_env = dict(os.environ)\n"
+                    "subprocess.run(['git', 'push'], env=git_env)\n")
+        self.assertEqual(len(violations(shadowed, "shadowed.py")), 1, violations(shadowed))
+
+    def test_a_real_helper_call_in_any_shape_counts(self):
+        shapes = {
+            "plain": "subprocess.run(['git', 'push'], env=git_env())\n",
+            "module": "subprocess.run(['git', 'push'], env=gitenv.git_env())\n",
+            "strip": "subprocess.run(['git', 'push'], env=gitenv.strip())\n",
+            "or": "subprocess.run(['git', 'push'], env=env or git_env(**EXTRA))\n",
+            "unpacked": "subprocess.run(['git', 'push'], env={**git_env(), 'X': '1'})\n",
+        }
+        for name, line in shapes.items():
+            with self.subTest(shape=name):
+                source = ("import os\nimport subprocess\n"
+                          "env = None\nEXTRA = {}\n" + line)
+                self.assertEqual(violations(source, f"{name}.py"), [], name)
 
 
 class TestTheHelperScrubs(unittest.TestCase):
