@@ -8,18 +8,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [0.10.1] - 2026-10-17
 
-A correctness round: the suite is hermetic on hosts that run an agent, and five small bugs
-that each cost a live turn are fixed. No default permission level and no adapter flag
-changed.
+A correctness round: the suite is hermetic on hosts that run an agent, and the bugs that each
+cost a live turn are fixed. No default permission level and no adapter flag changed.
 
 ### Added
 
 - A hermetic test suite: `tests/gitenv.py` scrubs the inherited agent environment (guard
-  hooks, `SWARMLY_ROLE`, the agent's commit identity) from every git spawn, an `envguard`
-  pytest plugin applies it to the whole run, and CI proves the scrub end to end by running
-  the suite inside a fake guard environment (`#7`, `#14`). `tests/test_ci_workflows.py`
-  fails the suite when a workflow file stops parsing, instead of leaving GitHub to reject
-  it before any job starts (`#7`, `#14`).
+  hooks, `SWARMLY_ROLE`, the agent's commit identity) from every git spawn -- including
+  per-alias guard directories (`guard-<alias>`) on `PATH` -- an `envguard` pytest plugin
+  applies it to the whole run, and CI proves the scrub end to end by running the suite inside
+  a fake guard environment (`#7`, `#14`). `tests/test_ci_workflows.py` fails the suite when a
+  workflow file stops parsing, instead of leaving GitHub to reject it before any job starts
+  (`#7`, `#14`).
+- The suite's git-spawn guard reads the AST, so a git call cannot slip past it: literal and
+  aliased argv, loop targets, `launch = subprocess.run`, `shell=True` command lines,
+  `os.system`/`os.popen`, and an `env=` that only *mentions* `git_env`, splats
+  `os.environ` back in, or reaches the helper conditionally are all rejected (`#7`, `#14`).
 
 ### Fixed
 
@@ -27,8 +31,9 @@ changed.
   silently dropped every peer it named (`#8`, `#15`).
 - The Antigravity adapter parses `agy -c` as `--continue`, a flag with no value, instead of
   reading the next token as a conversation id (`#9`, `#16`).
-- The Antigravity model-name regex accepts the documented mixed-case engine names (`#10`,
-  `#17`).
+- The Antigravity model-name regex accepts the documented mixed-case engine names, and the
+  model reaches `agy` as one unquoted token on Windows as well -- the quoted token the
+  command template produced matched no model (`#10`, `#17`, `#21`).
 - `init --home-channel` works on a fresh config: the value lands in
   `agent.home_channel_id` instead of the command exiting 2 and asking for a hand edit
   (`#11`, `#18`).
