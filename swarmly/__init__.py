@@ -5,7 +5,7 @@ The import package was ``a2a`` before the rename; the wire identifiers (``a2a/v1
 ``a2a/2``) and the ``A2A_*`` environment variables keep their names.
 """
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 __protocol__ = "a2a/v1.0"
 
 from swarmly.models import (
