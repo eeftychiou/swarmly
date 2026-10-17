@@ -46,7 +46,8 @@ def _env_suffix(alias: str) -> str:
 
 def render_config(alias: str, adapter: str, bus_repo: Optional[Path],
                   cwd: Optional[Path], role: Optional[str] = None,
-                  bus_ref: Optional[str] = None) -> str:
+                  bus_ref: Optional[str] = None,
+                  home_channel: Optional[str] = None) -> str:
     """The template with this agent's values in place. Every substitution must hit exactly
     once, so a template edit that moves a line fails loudly here instead of writing a config
     that silently keeps the example values."""
@@ -55,7 +56,8 @@ def render_config(alias: str, adapter: str, bus_repo: Optional[Path],
     token_env = f"A2A_TELEGRAM_BOT_TOKEN_{_env_suffix(alias)}"
     swaps = [
         (r"(?m)^(  name: )example_hermes_bot()", f"example_{alias.lower()}_bot"),
-        (r"(?m)^(  home_channel_id: )-1001234567890()", f"{PLACEHOLDER_HOME_CHANNEL}       "),
+        (r"(?m)^(  home_channel_id: )-1001234567890()",
+         f"{_group_id(home_channel) if home_channel else PLACEHOLDER_HOME_CHANNEL}       "),
         (r"(?m)^(  alias: )Hermes()", alias),
         (r"(?m)^(  bot_token_env: )A2A_TELEGRAM_BOT_TOKEN_HERMES()", token_env),
         (r"(?m)^(  type: )hermes()", adapter),
@@ -336,13 +338,21 @@ def _bus_files(bus_repo: Path, project: Path, config_path: Path) -> List[str]:
 def write_starter(config_path: Path, alias: str, adapter: str,
                   bus_repo: Optional[Path] = None, cwd: Optional[Path] = None,
                   force: bool = False, role: Optional[str] = None,
-                  bus_branch: Optional[str] = BUS_BRANCH) -> List[str]:
-    """Write the config (and, with a bus, its empty registry); return what to do next."""
+                  bus_branch: Optional[str] = BUS_BRANCH,
+                  home_channel: Optional[str] = None) -> List[str]:
+    """Write the config (and, with a bus, its empty registry); return what to do next.
+
+    ``home_channel`` (issue #11) sets ``agent.home_channel_id`` on a *fresh* config -- the
+    same id-or-message-link the ``--from`` path already took. Without it the template keeps
+    its documented placeholder (``0``), which ``check`` reports as a value to fill in.
+    """
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", alias):
         raise InitError(f"alias {alias!r}: use letters, digits, '-' or '_', starting with a "
                         "letter (e.g. Hermes)")
     if adapter not in ADAPTER_CHOICES:
         raise InitError(f"unknown adapter {adapter!r}; choose one of {ADAPTER_CHOICES}")
+    if home_channel is not None:
+        _group_id(home_channel)                # refuse a bad value before anything is written
     if config_path.exists() and not force:
         raise InitError(f"{config_path} already exists; pass --force to overwrite it")
     if bus_repo is not None:
@@ -367,13 +377,16 @@ def write_starter(config_path: Path, alias: str, adapter: str,
                       base=config_path.parent)
         except RoleError as exc:
             raise InitError(str(exc)) from exc
-    text = render_config(alias, adapter, bus_repo, cwd, role=role, bus_ref=bus_ref)
+    text = render_config(alias, adapter, bus_repo, cwd, role=role, bus_ref=bus_ref,
+                         home_channel=home_channel)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(text, encoding="utf-8")
 
     agent = alias.lower()
     env_file = "~/.a2a-telegram.env"           # swarmly expands ~ on Windows too
-    lines = [f"wrote {config_path}", *bus_notes]
+    lines = [f"wrote {config_path}"
+             + (f" (home channel {_group_id(home_channel)})" if home_channel else ""),
+             *bus_notes]
     registry = None
     if bus_repo is not None:
         registry = bus_repo / "config" / "a2a_config.json"

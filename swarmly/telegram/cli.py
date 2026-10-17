@@ -64,7 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
                            "the bus, working folder and (with --home-channel) group change, "
                            "the bot, peers and settings stay")
     init.add_argument("--home-channel", metavar="GROUP",
-                      help="with --from: the new group's id or a message link copied from it")
+                      help="the group's id (-100...) or a message link copied from it: written "
+                           "into a new config, and with --from the group the config moves to")
     init.add_argument("--force", action="store_true", help="overwrite an existing config")
 
     check = sub.add_parser("check", help="validate the config, resolve the adapter CLI, ask "
@@ -927,13 +928,11 @@ def _init(args: argparse.Namespace) -> int:
             lines = write_from(Path(args.config), args.from_config, args.bus_repo, cwd=args.cwd,
                                home_channel=args.home_channel, force=args.force,
                                bus_branch=args.bus_branch.strip() or None)
-        elif args.home_channel:
-            raise InitError("--home-channel goes with --from; for a new config set "
-                            "agent.home_channel_id in the file")
         else:
             lines = write_starter(Path(args.config), args.alias, args.adapter.strip().lower(),
                                   bus_repo=args.bus_repo, cwd=args.cwd, force=args.force,
-                                  role=args.role, bus_branch=args.bus_branch.strip() or None)
+                                  role=args.role, bus_branch=args.bus_branch.strip() or None,
+                                  home_channel=args.home_channel)
     except InitError as exc:
         print(f"init: {exc}", file=sys.stderr)
         return 2
