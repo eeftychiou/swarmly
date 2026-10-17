@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shlex
 import tempfile
 import unittest
@@ -317,6 +318,65 @@ class TestCodexSessionIds(unittest.TestCase):
         with self.assertLogs("swarmly.telegram.adapters.codex", level="WARNING"):
             adapter._remember("u", "a" * 129)
         self.assertNotIn("u", adapter._threads)
+
+
+class TestAntigravityModelNames(unittest.TestCase):
+    """Issue #10 (brainstorm 2.10): the names the docs show are mixed case with spaces.
+
+    docs/telegram/SETUP-ANTIGRAVITY.md documents ``--model 'Gemini 3.1 Pro (High)'``, which
+    the lowercase-only validator refused. The names ``agy models`` lists are still one
+    argv token each, and anything shell-dangerous stays refused.
+    """
+
+    DOCUMENTED = ("Gemini 3.1 Pro (High)", "Gemini 3.8 Flash High",
+                  "gemini-3.8-flash-high", "Claude Sonnet 4.5 (Thinking)", "o3")
+
+    DANGEROUS = ("", " ", "Gemini 3.1 Pro (High) ", " Gemini", "--model", "-c", "agy -p",
+                 "Gemini; rm -rf /", "Gemini && id", "Gemini | tee /tmp/x", "$(id)", "`id`",
+                 "Gemini" + chr(10) + "3.1", "Gemini" + chr(9) + "3.1",
+                 "Gemini" + chr(0), "Gemini 3.1 'Pro'",
+                 'Gemini 3.1 "Pro"', "Gemini 3.1 $(whoami)", "Gemini > out", "Gemini*",
+                 "Gemini?", "Gemini 3.1 Pro (High))", "((High)")
+
+    def test_the_documented_names_validate(self):
+        for name in self.DOCUMENTED:
+            self.assertIsNone(model_problem("antigravity", name), name)
+            settings = AdapterSettings(type="antigravity", model=name)
+            self.assertEqual(settings.model, name)
+
+    def test_dangerous_values_stay_refused(self):
+        for name in self.DANGEROUS:
+            self.assertIsNotNone(model_problem("antigravity", name), repr(name))
+            if name.strip() == name and name:
+                with self.assertRaises(ConfigError, msg=repr(name)):
+                    AdapterSettings(type="antigravity", model=name)
+
+    def test_the_other_adapters_keep_the_strict_form(self):
+        """The Antigravity form is Antigravity's: a Claude or Codex model still gets a no."""
+        for name in ("Gemini 3.1 Pro (High)", "gemini-3.8-flash-high", "sonnet (1m)"):
+            self.assertIsNotNone(model_problem("claude", name), name)
+            self.assertIsNotNone(model_problem("codex", name), name)
+        # At config load only the generic "one model name" check runs; a space is refused.
+        with self.assertRaises(ConfigError):
+            AdapterSettings(type="claude", model="Gemini 3.1 Pro (High)")
+
+    def test_a_documented_name_reaches_agy_as_one_token(self):
+        from swarmly.telegram.adapters.antigravity import AntigravityAdapter
+        settings = AdapterSettings(type="antigravity", model="Gemini 3.1 Pro (High)")
+        adapter = AntigravityAdapter("Antigravity", settings)
+        argv = adapter.build_argv("hello")
+        model = argv[argv.index("--model") + 1]
+        self.assertEqual(model.strip("'\""), "Gemini 3.1 Pro (High)",
+                         f"an engine name must be one argv token, got {argv}")
+
+    def test_the_docs_and_the_validator_agree(self):
+        doc = (Path(__file__).resolve().parents[1] / "docs" / "telegram"
+               / "SETUP-ANTIGRAVITY.md").read_text(encoding="utf-8")
+        documented = re.findall(r"--model '([^']+)'", doc)
+        self.assertTrue(documented, "the Antigravity setup doc shows no --model example")
+        for name in documented:
+            self.assertIsNone(model_problem("antigravity", name), name)
+            self.assertIsNone(AdapterSettings(type="antigravity", model=name).model and None)
 
 
 if __name__ == "__main__":
