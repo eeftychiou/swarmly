@@ -37,26 +37,65 @@ def _called_name(node: ast.Call) -> str:
     return ""
 
 
+def _argv_candidates(tree: ast.Module) -> dict:
+    """Every list/tuple a name may hold as argv: assignments, and **loop targets**.
+
+    ``for cmd in (["git", "status"], ["git", "push"]): subprocess.run(cmd)`` hands argv to a
+    name that no assignment binds -- the form the reviewer found the scanner missing on
+    PR #14 after the variable case was fixed. A loop over another name
+    (``for cmd in commands:``) is resolved through that name's own candidate lists.
+    """
+    candidates: dict = {}
+
+    def add(name: str, value) -> None:
+        candidates.setdefault(name, []).append(value)
+
+    for node in ast.walk(tree):                  # assignments first: loops may iterate them
+        if isinstance(node, ast.Assign) and isinstance(node.value, (ast.List, ast.Tuple)):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    add(target.id, node.value)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For) or not isinstance(node.target, ast.Name):
+            continue
+        iterable = node.iter
+        if isinstance(iterable, (ast.List, ast.Tuple)):
+            for element in iterable.elts:
+                if isinstance(element, (ast.List, ast.Tuple)):
+                    add(node.target.id, element)
+        elif isinstance(iterable, ast.Name):
+            for holder in candidates.get(iterable.id, []):
+                for element in getattr(holder, "elts", []):
+                    if isinstance(element, (ast.List, ast.Tuple)):
+                        add(node.target.id, element)
+    return candidates
+
+
+def _head_is_git(argv, constants: dict) -> bool:
+    """Whether an argv literal starts with ``git`` (directly or through a string alias)."""
+    if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
+        return False
+    first = argv.elts[0]
+    head = first.value if isinstance(first, ast.Constant) else constants.get(
+        getattr(first, "id", None))
+    return isinstance(head, str) and Path(head).name in ("git", "git.exe")
+
+
 def _git_commands(tree: ast.Module) -> list:
     """The ``subprocess``/``os`` calls in ``tree`` whose argv is a git command.
 
     argv is read from a literal list/tuple, from a module-level constant (``GIT = "git"``),
-    and from a variable that holds an argv list (``cmd = ["git", "push"]`` ...
-    ``subprocess.run(cmd)``) -- the form the reviewer found the scanner missing on PR #14.
+    from a variable that holds an argv list (``cmd = ["git", "push"]``), and from a loop
+    target (``for cmd in (...): subprocess.run(cmd)``) -- the forms the review of PR #14
+    found the scanner missing.
     """
     constants = {}
-    argvs = {}
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if isinstance(node.value, ast.Constant):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
             for target in node.targets:          # module-level ``GIT = "git"`` style aliases
                 if isinstance(target, ast.Name):
                     constants[target.id] = node.value.value
-        elif isinstance(node.value, (ast.List, ast.Tuple)):
-            for target in node.targets:          # ``cmd = ["git", ...]`` anywhere in the file
-                if isinstance(target, ast.Name):
-                    argvs[target.id] = node.value
+    candidates = _argv_candidates(tree)
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or _called_name(node) not in SPAWNERS:
@@ -64,14 +103,10 @@ def _git_commands(tree: ast.Module) -> list:
         if not node.args:
             continue
         argv = node.args[0]
-        if isinstance(argv, ast.Name):
-            argv = argvs.get(argv.id)
-        if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
-            continue
-        first = argv.elts[0]
-        head = first.value if isinstance(first, ast.Constant) else constants.get(
-            getattr(first, "id", None))
-        if isinstance(head, str) and Path(head).name in ("git", "git.exe"):
+        options = candidates.get(argv.id, []) if isinstance(argv, ast.Name) else [argv]
+        # Any candidate starting with git makes the call a git spawn: a name that may hold a
+        # git argv must carry env=git_env(), even when another candidate is harmless.
+        if any(_head_is_git(option, constants) for option in options):
             found.append(node)
     return found
 
@@ -137,6 +172,29 @@ class TestEveryGitSpawnIsScrubbed(unittest.TestCase):
                  "cmd = ['python', '-V']\n"
                  "subprocess.run(cmd)\n")
         self.assertEqual(violations(other, "other.py"), [])
+
+    def test_the_scanner_sees_a_loop_target(self):
+        """The reviewer's second finding on PR #14: argv bound by a ``for`` statement."""
+        bad = ("import subprocess\n"
+               "for cmd in (['git', 'status'], ['git', 'push']):\n"
+               "    subprocess.run(cmd, check=True)\n")
+        self.assertEqual(len(violations(bad, "loop.py")), 1, violations(bad))
+        good = ("import subprocess\nfrom tests.gitenv import git_env\n"
+                "for cmd in (['git', 'status'], ['git', 'push']):\n"
+                "    subprocess.run(cmd, env=git_env())\n")
+        self.assertEqual(violations(good, "loop_good.py"), [])
+        # ... and through a name that holds the argv lists.
+        via_name = ("import subprocess\n"
+                    "commands = [['git', 'log'], ['python', '-V']]\n"
+                    "for cmd in commands:\n"
+                    "    subprocess.run(cmd)\n")
+        self.assertEqual(len(violations(via_name, "loop_name.py")), 1,
+                         violations(via_name))
+        # A loop over harmless argvs is not a git spawn: no false positive.
+        harmless = ("import subprocess\n"
+                    "for cmd in (['python', '-V'], ['ls']):\n"
+                    "    subprocess.run(cmd)\n")
+        self.assertEqual(violations(harmless, "harmless.py"), [])
 
 
 class TestTheHelperScrubs(unittest.TestCase):
