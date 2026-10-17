@@ -27,15 +27,69 @@ from tests import gitenv
 
 TESTS = Path(__file__).resolve().parent
 SPAWNERS = {"run", "call", "check_call", "check_output", "Popen"}
+#: ``os`` launches a shell too, and takes a command line -- it can carry no ``env=``.
+OS_SPAWNERS = {"system", "popen"}
+SYSTEM_SPAWNERS = set(OS_SPAWNERS)
 
 
-def _called_name(node: ast.Call) -> str:
+def _spawner_context(tree: ast.Module) -> dict:
+    """The names that start a subprocess in this module: ``subprocess`` and its aliases.
+
+    ``from subprocess import run as launch`` and ``launch = subprocess.run`` both hand the
+    spawning function a new name, which the plain name set cannot see -- the reviewer's
+    round-6 finding on PR #14.
+    """
+    spawners = set(SPAWNERS)
+    modules = {"subprocess"}
+    os_modules = {"os"}
+    shadowed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "subprocess":
+            for alias in node.names:
+                if alias.name in SPAWNERS:
+                    spawners.add(alias.asname or alias.name)
+                elif alias.name == "subprocess":
+                    modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "os":
+            for alias in node.names:
+                if alias.name in OS_SPAWNERS:            # ``from os import system``
+                    spawners.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[-1] == "subprocess":
+                    modules.add(alias.asname or alias.name.split(".")[0])
+                elif alias.name == "os":
+                    os_modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute):
+            owner = node.value.value
+            if (node.value.attr in SPAWNERS and isinstance(owner, ast.Name)
+                    and owner.id in modules):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        spawners.add(target.id)      # ``launch = subprocess.run``
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute):
+            owner = node.value.value
+            if (node.value.attr in OS_SPAWNERS and isinstance(owner, ast.Name)
+                    and owner.id in os_modules):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        spawners.add(target.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            shadowed.add(node.name)
+    return {"spawners": (spawners - shadowed) | SYSTEM_SPAWNERS,
+            "modules": (modules - shadowed) | (os_modules - shadowed)}
+
+
+def _is_spawner_call(node: ast.Call, context: dict) -> bool:
     func = node.func
     if isinstance(func, ast.Attribute):
-        return func.attr
+        owner = func.value
+        if not isinstance(owner, ast.Name) or owner.id not in context["modules"]:
+            return False
+        return func.attr in SPAWNERS or func.attr in SYSTEM_SPAWNERS
     if isinstance(func, ast.Name):
-        return func.id
-    return ""
+        return func.id in context["spawners"]
+    return False
 
 
 def _argv_candidates(tree: ast.Module) -> dict:
@@ -82,6 +136,29 @@ def _head_is_git(argv, constants: dict) -> bool:
     return isinstance(head, str) and Path(head).name in ("git", "git.exe")
 
 
+def _string_is_git(node, constants: dict) -> bool:
+    """Whether a *string* command (``shell=True``, or a program name) starts with ``git``.
+
+    ``subprocess.run("git push origin main", shell=True)`` hands the shell a command line,
+    not an argv list, so the list-shaped scan missed it -- the reviewer's round-6 finding.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        words = node.value.split()
+        return bool(words) and Path(words[0]).name in ("git", "git.exe")
+    if isinstance(node, ast.JoinedStr) and node.values:      # f"git {args}"
+        first = node.values[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            words = first.value.split()
+            return bool(words) and Path(words[0]).name in ("git", "git.exe")
+        return False
+    if isinstance(node, ast.Name):
+        head = constants.get(node.id)
+        if isinstance(head, str):
+            words = head.split()
+            return bool(words) and Path(words[0]).name in ("git", "git.exe")
+    return False
+
+
 def _git_commands(tree: ast.Module) -> list:
     """The ``subprocess``/``os`` calls in ``tree`` whose argv is a git command.
 
@@ -97,13 +174,17 @@ def _git_commands(tree: ast.Module) -> list:
                 if isinstance(target, ast.Name):
                     constants[target.id] = node.value.value
     candidates = _argv_candidates(tree)
+    spawner_context = _spawner_context(tree)
     found = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or _called_name(node) not in SPAWNERS:
+        if not isinstance(node, ast.Call) or not _is_spawner_call(node, spawner_context):
             continue
         if not node.args:
             continue
         argv = node.args[0]
+        if _string_is_git(argv, constants):
+            found.append(node)
+            continue
         options = candidates.get(argv.id, []) if isinstance(argv, ast.Name) else [argv]
         # Any candidate starting with git makes the call a git spawn: a name that may hold a
         # git argv must carry env=git_env(), even when another candidate is harmless.
@@ -433,6 +514,61 @@ class TestEveryGitSpawnIsScrubbed(unittest.TestCase):
                    "subprocess.run(['git', 'push'],\n"
                    "               env={**git_env(), 'PATH': os.environ['PATH']})\n")
         self.assertEqual(violations(one_key, "one_key.py"), [])
+
+    def test_an_aliased_spawner_is_still_a_spawner(self):
+        """Round 6: ``launch = subprocess.run`` hides the spawn behind a new name."""
+        aliased = ("import subprocess\n"
+                   "launch = subprocess.run\n"
+                   "launch(['git', 'push'])\n")
+        self.assertEqual(len(violations(aliased, "alias.py")), 1, violations(aliased))
+        imported = ("from subprocess import run as launch\n"
+                    "launch(['git', 'push'])\n")
+        self.assertEqual(len(violations(imported, "from_import.py")), 1,
+                         violations(imported))
+        module = ("import subprocess as sp\n"
+                  "sp.run(['git', 'push'])\n")
+        self.assertEqual(len(violations(module, "module_alias.py")), 1, violations(module))
+        # The scrubbed form of each stays acceptable.
+        for name, line in (("alias", "launch = subprocess.run\nlaunch(['git', 'push'], "
+                                     "env=git_env())\n"),
+                           ("from_import", "launch(['git', 'push'], env=git_env())\n")):
+            with self.subTest(shape=name):
+                head = ("import subprocess\nfrom tests.gitenv import git_env\n"
+                        if name == "alias" else
+                        "from subprocess import run as launch\n"
+                        "from tests.gitenv import git_env\n")
+                self.assertEqual(violations(head + line, f"{name}_ok.py"), [])
+
+    def test_a_string_command_is_a_spawn_too(self):
+        """Round 6: ``shell=True`` takes a command line, not an argv list."""
+        shell = ("import subprocess\n"
+                 "subprocess.run('git push origin main', shell=True)\n")
+        self.assertEqual(len(violations(shell, "shell.py")), 1, violations(shell))
+        fstring = ("import subprocess\n"
+                   "branch = 'main'\n"
+                   "subprocess.run(f'git push origin {branch}', shell=True)\n")
+        self.assertEqual(len(violations(fstring, "fstring.py")), 1, violations(fstring))
+        constant = ("import subprocess\n"
+                    "PUSH = 'git push origin main'\n"
+                    "subprocess.run(PUSH, shell=True)\n")
+        self.assertEqual(len(violations(constant, "constant.py")), 1, violations(constant))
+        scrubbed = ("import subprocess\nfrom tests.gitenv import git_env\n"
+                    "subprocess.run('git push origin main', shell=True, env=git_env())\n")
+        self.assertEqual(violations(scrubbed, "shell_ok.py"), [])
+        # A different program on a command line is not a git spawn.
+        other = ("import subprocess\n"
+                 "subprocess.run('echo git push', shell=True)\n"
+                 "subprocess.run('gh pr list', shell=True)\n")
+        self.assertEqual(violations(other, "other_shell.py"), [])
+
+    def test_os_system_is_a_spawn_too(self):
+        """``os.system`` launches a shell as well, and takes no ``env=`` at all."""
+        shell = "import os\nos.system('git push origin main')\n"
+        self.assertEqual(len(violations(shell, "os_system.py")), 1, violations(shell))
+        aliased = "import os as operating_system\noperating_system.system('git status')\n"
+        self.assertEqual(len(violations(aliased, "os_alias.py")), 1, violations(aliased))
+        harmless = "import os\nos.system('echo hi')\nos.popen('ls')\n"
+        self.assertEqual(violations(harmless, "os_harmless.py"), [])
 
 
 class TestTheHelperScrubs(unittest.TestCase):
