@@ -57,13 +57,17 @@ jobs:
         run: |
           guard="$(mktemp -d)"
           for hook in pre-commit pre-push; do
-            printf '#!/bin/sh
-echo "swarmly guard: refused" >&2
-exit 1
-' > "$guard/$hook"
+            printf '#!/bin/sh\necho "swarmly guard: refused" >&2\nexit 1\n' \
+              > "$guard/$hook"
             chmod +x "$guard/$hook"
           done
-          GIT_CONFIG_COUNT=1           GIT_CONFIG_KEY_0=core.hooksPath           GIT_CONFIG_VALUE_0="$guard"           GIT_AUTHOR_NAME=Guard GIT_AUTHOR_EMAIL=guard@a2a.local           GIT_COMMITTER_NAME=Guard GIT_COMMITTER_EMAIL=guard@a2a.local           SWARMLY_ROLE=developer           python -m unittest discover tests
+          GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=core.hooksPath \
+            GIT_CONFIG_VALUE_0="$guard" \
+            GIT_AUTHOR_NAME=Guard GIT_AUTHOR_EMAIL=guard@a2a.local \
+            GIT_COMMITTER_NAME=Guard GIT_COMMITTER_EMAIL=guard@a2a.local \
+            SWARMLY_ROLE=developer \
+            python -m unittest discover tests
 
   lint:
     runs-on: ubuntu-latest
