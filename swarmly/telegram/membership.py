@@ -85,6 +85,8 @@ _FIELD_LINE = re.compile(r"(?m)^\s*(cli|key|role|coordinator|bus|members):[ \t]*
 _TRAILING_HANDLES = re.compile(r"(?:\s+@[A-Za-z0-9_]{5,32})+$")
 #: One member of a coordinator's list: ``Alias=@username#user_id:role``.
 _MEMBER = re.compile(r"([A-Za-z0-9_-]{1,32})=@([A-Za-z0-9_]{5,32})#(\d{1,20})(?::([a-z][a-z0-9_-]{0,39}))?")
+#: The "[Alias]" banner a transport puts in front of everything it posts.
+_BANNER = re.compile(r"^\s*\[([A-Za-z0-9_-]{1,32})\]")
 #: Telegram statuses that make a bot a swarm member: the group owner made it an admin.
 ADMIN_STATUSES = ("administrator", "creator")
 
@@ -121,6 +123,11 @@ class SwarmState:
 
 def _text(value: Any) -> Optional[str]:
     return str(value).strip() or None if value not in (None, "") else None
+
+
+def _banner_alias(text: Optional[str]) -> Optional[str]:
+    match = _BANNER.match(text or "")
+    return match.group(1) if match else None
 
 
 def _is_int(value: Any) -> bool:
@@ -513,6 +520,11 @@ class Membership:
             # it is the only sign of the agents that were already running (live test: /swarm
             # showed a running peer as "unknown"). Neither says anything about roles: anyone
             # can write "role: coordinator" in one.
+            if sender is None:
+                # ONLINE names its sender in ref=; SEEN names whom it sees, so its sender
+                # comes from the "[Alias]" banner.
+                sender = await self._meet(ref if intent == "ONLINE" else _banner_alias(event.text),
+                                          event)
             self.seen(sender)
             return False
         if intent == "JOIN":
@@ -567,6 +579,23 @@ class Membership:
             reply_to_message_id=event.message_id, silent=True, allow_when_frozen=True)
         if self.is_coordinator() and not self.cfg.peer_roles.get(alias):
             self._decide_role(alias, username, fields.get("cli") or "unknown")
+
+    async def _meet(self, alias: Optional[str], event: "ChannelEvent") -> Optional[str]:
+        """An unknown bot says it is online, or answers our online notice: a member that
+        joined while this agent was offline, so it missed the JOIN (live run: Codex ignored
+        two members until the admin /admitted them). The proof is the JOIN's: Telegram says
+        it is a bot administrator of the group. Returns its alias once it is a peer."""
+        username = (event.author_username or "").lstrip("@")
+        if not alias or not ALIAS_RE.match(alias) or not username \
+                or username.lower() == self._me() or not self.joined():
+            return None
+        if not await self._verified_admin(event.author_id, username):
+            return None                                   # roster.saw_online keeps it pending
+        if not self._add_peer(alias, username, event.author_id):
+            return None
+        logger.info("membership: %s (@%s) is a member this agent missed while offline; "
+                    "added as a peer", alias, username)
+        return alias
 
     def _vouch(self, alias: str, key: Optional[str]) -> None:
         """Verify *alias*'s bus messages with the key from its JOIN until this host pulls

@@ -436,6 +436,58 @@ class MemberTests(unittest.TestCase):
             self.assertIn("- Codex: no role, online", run(channel.membership.status_text()))
 
 
+class MissedJoinTests(unittest.TestCase):
+    """Live run: Codex was offline while Antigravity and DeepSeek joined, and then ignored
+    them as strangers until the admin /admitted them."""
+
+    def test_an_admin_bot_that_joined_while_we_were_offline_becomes_a_peer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(joined(make_channel(config_at(folder)), role="developer"),
+                                  agy_x_bot=600)
+            run(channel.handle_event(hello("ONLINE", "Antigravity", "🟢 Antigravity online",
+                                           "agy_x_bot", 600)))
+            self.assertEqual(channel.config.peers["Antigravity"], "agy_x_bot")
+            self.assertEqual(channel.membership.state.peer_ids["Antigravity"], 600)
+            self.assertEqual(channel.roster.via["Antigravity"], "admin")
+            self.assertNotIn("agy_x_bot", channel.roster.pending)
+            self.assertIn("- Antigravity: no role, online",
+                          run(channel.membership.status_text()))
+
+    def test_a_seen_answer_from_a_missed_member_adds_it_by_its_banner(self):
+        # We restarted while it kept running: its SEEN answer is all we hear from it.
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(joined(make_channel(config_at(folder)), role="developer"),
+                                  deepseek_x_bot=601)
+            seen = event("[DeepSeek] [A2A v1.1] HELLO to=* intent=SEEN ref=Hermes\n\n"
+                         "👀 DeepSeek sees Hermes", username="deepseek_x_bot", author_id=601)
+            run(channel.handle_event(seen))
+            self.assertEqual(channel.config.peers["DeepSeek"], "deepseek_x_bot")
+
+    def test_a_bot_that_is_not_an_admin_still_waits_for_the_admin(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(joined(make_channel(config_at(folder)), role="developer"))
+            run(channel.handle_event(hello("ONLINE", "Rogue", "🟢 Rogue online",
+                                           "rogue_x_bot", 666)))
+            self.assertNotIn("Rogue", channel.config.peers)
+            self.assertIn("rogue_x_bot", channel.roster.pending)      # /admit still works
+
+    def test_a_removed_bot_does_not_come_back_by_saying_it_is_online(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(joined(make_channel(config_at(folder)), role="developer"),
+                                  agy_x_bot=600)
+            channel.roster.remove(["agy_x_bot"])
+            run(channel.handle_event(hello("ONLINE", "Antigravity", "🟢 Antigravity online",
+                                           "agy_x_bot", 600)))
+            self.assertNotIn("Antigravity", channel.config.peers)
+
+    def test_an_agent_still_joining_adds_nobody_from_an_online_notice(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(dynamic(make_channel(config_at(folder))), agy_x_bot=600)
+            run(channel.handle_event(hello("ONLINE", "Antigravity", "🟢 Antigravity online",
+                                           "agy_x_bot", 600)))
+            self.assertNotIn("Antigravity", channel.config.peers)
+
+
 class TrustTests(unittest.TestCase):
     """Who may make whom what: review findings on PR #3."""
 

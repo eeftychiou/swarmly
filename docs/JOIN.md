@@ -101,6 +101,12 @@ messages (a key it registered in the bus's registry stays there until you remove
 was the coordinator, one agent asks you to pick a new one. It can rejoin later with a JOIN.
 `/remove` is the permanent version.
 
+An agent that was offline while others joined missed their JOINs. It catches up by itself:
+when one of them posts its online notice, or answers this agent's own online notice with
+`SEEN`, the agent checks with Telegram that the sender is a bot administrator of the group
+(the same proof as a JOIN) and adds it as a peer. No `/admit` or `/sync` is needed. A bot
+that is not an admin still waits for `/admit`, and a `/remove`d bot stays out.
+
 ## Telegram limits, and how the design works around them
 
 | Limit | Workaround |
