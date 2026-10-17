@@ -9,7 +9,9 @@ Verified surface (Antigravity CLI operator guide, checked 2026-09-16):
 * ``--model`` — engine selection, e.g. ``'Gemini 3.1 Pro (High)'`` (``agy models`` lists them).
 * ``--add-dir`` — extra context roots; ``--sandbox`` / ``--dangerously-skip-permissions`` —
   launch-time permission overrides.
-* interactive sessions use ``agy -i`` under a PTY and resume with ``-c`` / ``--conversation``.
+* interactive sessions use ``agy -i`` under a PTY. ``--conversation <id>`` resumes a
+  conversation by id; ``-c`` is the short alias for ``--continue`` -- a flag with **no
+  value** that continues the most recent conversation (``agy --help``, checked 2026-10-17).
 
 Default command::
 
@@ -526,6 +528,33 @@ def _command_words(settings: AdapterSettings) -> List[str]:
     return [word.strip("'\"") for word in words]
 
 
+#: The ways an ``agy`` command line names a conversation. ``-c`` is the short alias for
+#: ``--continue`` and takes no value, so it is not one of the "next token is the id" forms.
+CONVERSATION_FLAGS = ("--conversation", "-c", "--continue")
+
+
+def names_a_conversation(words: Sequence[str]) -> bool:
+    """Whether an ``agy`` argv/command already picks a conversation (by id or ``--continue``)."""
+    return any(word in CONVERSATION_FLAGS or word.startswith("--conversation=")
+               for word in words)
+
+
+def argv_conversation(argv: List[str]) -> Optional[Tuple[str, str]]:
+    """The conversation id an ``agy`` argv names, as ``(id, id)``, or None.
+
+    Only ``--conversation <id>`` (and its ``--conversation=<id>`` form) carries an id.
+    ``-c`` is the short alias for ``--continue``: a bare flag, verified against
+    ``agy --help``, so it must never swallow the token that follows it -- the old parser
+    read the argument after ``-c`` as a conversation id and dropped it from the run.
+    """
+    for idx, arg in enumerate(argv):
+        if arg == "--conversation" and idx + 1 < len(argv):
+            return (argv[idx + 1], argv[idx + 1])
+        if arg.startswith("--conversation=") and len(arg) > len("--conversation="):
+            return (arg.split("=", 1)[1], arg.split("=", 1)[1])
+    return None
+
+
 def skips_approvals(settings: AdapterSettings) -> bool:
     """Whether a run skips Antigravity's approvals: the default command does; an explicit
     ``adapter.command`` only when it says ``--dangerously-skip-permissions`` itself."""
@@ -595,8 +624,9 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
             return False
         if self.settings.cwd and (Path(self.settings.cwd) / ACTIVE_CONVERSATION_FILENAME).is_file():
             return False
-        words = _command_words(self.settings)
-        return "--conversation" not in words and "-c" not in words
+        # The operator's command already picks a conversation: either by id
+        # (``--conversation <id>``) or the most recent one (``-c``/``--continue``).
+        return not names_a_conversation(_command_words(self.settings))
 
     def topic_mode(self, context_id: Optional[str]) -> str:
         """Fresh until the discussion has a conversation of its own, then its session."""
@@ -721,22 +751,18 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
     # -- execution hooks ---------------------------------------------------------------
     def build_argv(self, prompt: str) -> List[str]:
         argv = super().build_argv(prompt)
-        # Check if conversation is specified in template or dynamically
+        # Check if conversation is specified in template or dynamically. Only
+        # ``--conversation <id>`` names an id; ``-c``/``--continue`` is a bare flag.
         active = None
         topic_conv = self._turn_conversation.get()
-        if topic_conv and "--conversation" not in argv and "-c" not in argv:
+        if names_a_conversation(argv):
+            active = argv_conversation(argv)
+        elif topic_conv:
             argv.extend(["--conversation", topic_conv])
-        elif "--conversation" not in argv and "-c" not in argv:
+        else:
             active = self.resolve_conversation()
             if active:
-                conv_id, _ = active
-                argv.extend(["--conversation", conv_id])
-        else:
-            for idx, arg in enumerate(argv):
-                if arg in ("--conversation", "-c") and idx + 1 < len(argv):
-                    conv_id = argv[idx + 1]
-                    active = (conv_id, conv_id)
-                    break
+                argv.extend(["--conversation", active[0]])
 
         # Review P0-5: the configured command decides whether approvals are skipped. The
         # default template carries --dangerously-skip-permissions; a command without it

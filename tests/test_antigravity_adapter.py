@@ -642,6 +642,72 @@ class TestAntigravityAdapter(unittest.TestCase):
         self.assertIn("agentapi send-message --title='Telegram: @author' auto {prompt}", out)
 
 
+class TestConversationFlags(unittest.TestCase):
+    """Issue #9 (brainstorm 2.8): ``agy -c`` is ``--continue``, a flag with no value.
+
+    ``agy --help`` (checked 2026-10-17) reads ``-c   Short alias for --continue`` and
+    ``--conversation   Resume a previous conversation by ID``. The parser used to treat
+    ``-c`` like ``--conversation`` and read the NEXT token as a conversation id, so
+    ``agy -c -p <prompt>`` lost its ``-p`` to the parser.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.cwd = str(Path(self.tmpdir.name).resolve())
+
+    def adapter(self, command, conversation=None, resolved=None):
+        settings = AntigravityAdapter.default_settings(cwd=self.cwd, conversation=conversation)
+        settings.command = command
+        adapter = AntigravityAdapter("Antigravity", settings)
+        self.looked_up = []
+        adapter.resolve_conversation = lambda: resolved
+        adapter.resolve_conversation_model = lambda cid: self.looked_up.append(cid) or None
+        return adapter
+
+    def test_c_is_a_bare_flag_and_does_not_swallow_the_next_token(self):
+        adapter = self.adapter("agy -c -p {prompt}")
+        argv = adapter.build_argv("hello")
+        self.assertEqual(argv, ["agy", "-c", "-p", "hello"])
+        self.assertEqual(self.looked_up, [], "no conversation id may be read after -c")
+
+    def test_c_as_the_last_argument_is_harmless(self):
+        adapter = self.adapter("agy -p {prompt} -c")
+        argv = adapter.build_argv("hello")
+        self.assertEqual(argv, ["agy", "-p", "hello", "-c"])
+
+    def test_continue_long_form_is_the_same_flag(self):
+        adapter = self.adapter("agy --continue -p {prompt}")
+        self.assertEqual(adapter.build_argv("hello"), ["agy", "--continue", "-p", "hello"])
+        self.assertEqual(self.looked_up, [])
+
+    def test_the_long_form_still_names_a_conversation(self):
+        conv = "12345678-1234-5678-1234-567812345678"
+        adapter = self.adapter("agy -p {prompt} --conversation " + conv)
+        argv = adapter.build_argv("hello")
+        self.assertEqual(argv, ["agy", "-p", "hello", "--conversation", conv])
+        self.assertEqual(self.looked_up, [conv], "the model is inherited for that conversation")
+
+    def test_the_equals_form_is_read_too(self):
+        conv = "12345678-1234-5678-1234-567812345678"
+        adapter = self.adapter("agy -p {prompt} --conversation=" + conv)
+        argv = adapter.build_argv("hello")
+        self.assertEqual(argv, ["agy", "-p", "hello", f"--conversation={conv}"])
+        self.assertEqual(self.looked_up, [conv])
+
+    def test_a_command_that_names_a_conversation_is_not_per_topic(self):
+        for command in ("agy -p {prompt} --conversation abc", "agy -p {prompt} -c",
+                        "agy -p {prompt} --continue"):
+            adapter = self.adapter(command)
+            self.assertFalse(adapter._per_topic(), command)
+
+    def test_the_plain_default_stays_per_topic(self):
+        adapter = self.adapter("agy -p {prompt} --print-timeout 20m")
+        self.assertTrue(adapter._per_topic())
+        self.assertEqual(adapter.build_argv("hello"),
+                         ["agy", "-p", "hello", "--print-timeout", "20m"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
