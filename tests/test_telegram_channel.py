@@ -928,6 +928,106 @@ class TestChannelRouting(unittest.TestCase):
         self.assertIsNone(run(channel.handle_event(event("no mention, from a peer bot"))))
 
 
+class TestHandoffAddressing(unittest.TestCase):
+    """Issue #27: every @handle in a bot's hand-off counts as addressed, and a mention that is
+    still dropped is reported to the sender with the handle and the reason."""
+
+    LIST_ONE_LINE = ("[Claude] Round 2: @CodexBot review #24, @AntigravityBot QA #24, "
+                     "@HermesBot develop #27")
+    LIST_LINES = ("[Claude] Round 2 hand-off:\n- @CodexBot review #24\n"
+                  "- @AntigravityBot QA #24\n- @HermesBot develop #27")
+
+    def test_a_list_of_handles_on_one_line_addresses_every_bot_in_it(self):
+        channel = make_channel()
+        decision, reason = channel.should_respond(event(self.LIST_ONE_LINE))
+        self.assertTrue(decision, reason)
+
+    def test_a_list_of_handles_over_several_lines_addresses_every_bot_in_it(self):
+        channel = make_channel()
+        decision, reason = channel.should_respond(event(self.LIST_LINES))
+        self.assertTrue(decision, reason)
+
+    def test_each_bot_named_in_a_list_runs_its_own_turn(self):
+        channel = make_channel()
+        reply = run(channel.handle_event(event(self.LIST_LINES, message_id=7)))
+        self.assertIsNotNone(reply)
+        self.assertEqual(channel.stats.handled, 1)
+
+    def test_a_dropped_mention_tells_the_sender_the_handle_and_the_reason(self):
+        channel = make_channel()
+        reply = run(channel.handle_event(
+            event("[Codex] @CodexBot please hand @HermesBot the review", message_id=9)))
+        self.assertIsNone(reply)                       # still not this bot's work
+        notices = [entry["text"] for entry in channel._test_sender.sent]
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("@HermesBot", notices[0])        # which handle was dropped
+        self.assertIn("hand this bot the work", notices[0])   # and why
+        self.assertTrue(notices[0].startswith("⚠️"), notices[0])
+
+    def test_a_machine_notice_is_dropped_without_a_notice_back(self):
+        channel = make_channel()
+        run(channel.handle_event(event("⚠️ [Codex] paused this topic for @HermesBot", message_id=3)))
+        self.assertEqual(channel._test_sender.sent, [])   # no turn, and no notice ping-pong
+
+    def test_a_terminal_sign_off_naming_this_bot_gets_no_notice(self):
+        channel = make_channel()
+        run(channel.handle_event(event("@HermesBot closing here", message_id=4)))
+        self.assertEqual(channel._test_sender.sent, [])
+
+    def test_one_drop_notice_per_window(self):
+        channel = make_channel()
+        text = "[Codex] @CodexBot please hand @HermesBot the review"
+        run(channel.handle_event(event(text, message_id=11)))
+        run(channel.handle_event(event(text, message_id=12)))
+        self.assertEqual(len(channel._test_sender.sent), 1)
+
+    def test_each_sender_gets_its_own_drop_notice(self):
+        """#27 review: the window dedupes per sender, so a second peer's dropped hand-off is
+        reported on its own message instead of being swallowed by the first peer's notice."""
+        channel = make_channel()
+        run(channel.handle_event(event(
+            "[Codex] @CodexBot please hand @HermesBot the review",
+            username="CodexBot", author_id=202, message_id=31)))
+        run(channel.handle_event(event(
+            "[Antigravity] @AntigravityBot please hand @HermesBot the QA",
+            username="AntigravityBot", author_id=303, message_id=32)))
+        notices = [e for e in channel._test_sender.sent if e["text"].startswith("⚠️")]
+        self.assertEqual(len(notices), 2, notices)
+        self.assertEqual([n["reply_to"] for n in notices], [31, 32])
+        for notice in notices:
+            self.assertIn("@HermesBot", notice["text"])        # the handle that was dropped
+            self.assertIn("hand this bot the work", notice["text"])
+
+    def test_a_cooldown_drop_notice_names_the_dropped_handle(self):
+        """#27 review: a mention lost to the bot-to-bot cooldown still says which handle went
+        unanswered, so the sender's human does not read the silence as work taken."""
+        channel = make_channel(make_config(limits={"min_seconds_between_agent_turns": 60.0,
+                                                   "min_seconds_between_messages": 0}))
+        run(channel.handle_event(event("@HermesBot run the suite", message_id=20)))
+        self.assertIsNone(run(channel.handle_event(event("@HermesBot run it again",
+                                                          message_id=21))))
+        notices = [e for e in channel._test_sender.sent if e["text"].startswith("⚠️")]
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("@HermesBot", notices[0]["text"])        # which handle was dropped
+        self.assertIn("cooldown", notices[0]["text"])          # and why
+        self.assertEqual(notices[0]["reply_to"], 21)
+
+    def test_each_sender_gets_its_own_cooldown_notice(self):
+        """#27 review: the cooldown window is per sender, so a second peer dropped inside it
+        hears about its own message instead of being swallowed by the first peer's notice."""
+        channel = make_channel(make_config(limits={"min_seconds_between_agent_turns": 60.0,
+                                                   "min_seconds_between_messages": 0}))
+        run(channel.handle_event(event("@HermesBot run the suite", message_id=40)))
+        run(channel.handle_event(event("@HermesBot run it again", message_id=41)))
+        run(channel.handle_event(event("@HermesBot and the QA pass", username="AntigravityBot",
+                                       author_id=303, message_id=42)))
+        notices = [e for e in channel._test_sender.sent if e["text"].startswith("⚠️")]
+        self.assertEqual(len(notices), 2, notices)
+        self.assertEqual([n["reply_to"] for n in notices], [41, 42])
+        self.assertIn("CodexBot", notices[0]["text"])
+        self.assertIn("AntigravityBot", notices[1]["text"])
+
+
 # --------------------------------------------------------------------------------------
 # 4. Loop guard and pacing (Telegram requires both for bot-to-bot mode)
 # --------------------------------------------------------------------------------------

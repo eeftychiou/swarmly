@@ -188,6 +188,23 @@ def _default_gitbus_read(root: Path, ref: Optional[str] = None) -> List[Any]:
 _BANNER_AND_MENTIONS = re.compile(r"^(?:\s*(?:\[[^\]\n]{1,40}\]|@\w+)[:,]?)+\s*")
 _NOTICE_PREFIXES = ("⚠️", "↪", "❌", "🟢", "✅", "👀", "⏳", "♻️", "[system]", "[status]")
 
+#: Why a peer bot's mention of this bot is dropped without a notice back (#27): machine traffic
+#: never asked for a turn, a bot's own echo is addressed to nobody, and a stranger's or a
+#: split-reply fragment's mention is not the sender handing this bot work.
+_NO_DROP_NOTICE_REASONS = frozenset({
+    "not a text message",
+    "this agent's own brief (a topic it opened, or a membership turn)",
+    "own message",
+    "not a member of the swarm (limits.strangers: ignore)",
+    "continuation of a split message",
+    "automated status/notice from peer bot",
+    "built-in command reply from peer bot (machine traffic)",
+    "terminal acknowledgment/sign-off from peer bot (no reply needed)",
+})
+#: One drop notice per reason per topic per window: a peer that keeps naming this bot in the
+#: same dropped shape hears it once, not once per message.
+DROP_NOTICE_SECONDS = 600.0
+
 
 def machine_prose(text: str) -> str:
     """A bot message without its "[Alias]" banner and leading @mentions: what classifiers
@@ -421,8 +438,13 @@ class AgentChannel:
         # Agent-opened topics (topic_open.py): topic -> where its work was asked for.
         self._topic_origins: Dict[Tuple[int, Optional[int]], Tuple[int, Optional[int]]] = {}
         self._topics_opened: List[float] = []
-        self._cooldown_noticed = float("-inf")
         self._anonymous_noticed = float("-inf")
+        # #27 review: (chat, topic, sender) -> clock of the last cooldown notice, so each peer
+        # whose message the cooldown dropped hears it once, not one peer per window for all.
+        self._cooldown_notices: Dict[Tuple[int, Optional[int], Any], float] = {}
+        # #27: (chat, topic, reason, sender) -> clock of the last notice telling a peer bot its
+        # mention was dropped, so one drop is reported once per sender, not once per message.
+        self._drop_notices: Dict[Tuple[int, Optional[int], str, Any], float] = {}
         self._transient_retry_delays: Tuple[float, ...] = TRANSIENT_RETRY_DELAYS
         self._progress_marks: Dict[Tuple[int, Optional[int]], Set[str]] = {}
         # /pause with turns running: take no new ones, freeze when the last one ends.
@@ -605,28 +627,21 @@ class AgentChannel:
             return True
         return False
 
-    def _only_listed(self, event: ChannelEvent) -> bool:
-        """A peer bot's message that names this bot among three or more bots, but not in its
-        leading @mentions and not as a reply to it, lists the team (a roster, a summary)
-        rather than addressing this bot (live test: a team list started three turns)."""
-        if event.replies_to_bot or not self.mentions_me(event.text):
-            return False
-        text = re.sub(r"^\s*\[[^\]\n]{1,40}\]\s*", "", event.text or "")
-        handles = {h.lower() for h in re.findall(r"@(\w+)", text)}
-        bots = {str(t).lstrip("@").lower() for t in self.config.peers.values()}
-        bots |= {a.lower() for a in self.config.peers}
-        me = {self.config.identity.name.lstrip("@").lower(),
-              self.config.identity.alias.strip().lower()}
-        if len(handles & (bots | me)) < 3:
-            return False
-        leading = re.match(r"^(?:\s*@\w+[:,]?)*", text)
-        lead = {h.lower() for h in re.findall(r"@(\w+)", leading.group(0) if leading else "")}
-        # A line or bullet that opens with this bot's handle hands it something ("- @codex
-        # runs pytest"), unless a role in brackets follows ("- @codex (QA)"): an assignment
-        # list is addressing (live test: the list rule swallowed a coordinator's hand-off).
-        lead |= {h.lower() for h in re.findall(
-            r"(?m)^\s*(?:[-*•]|\d+[.)])?\s*@(\w+)[:,]?[ \t]+(?!\()\S", text)}
-        return not (lead & me)
+    def _dropped_handles(self, text: str) -> List[str]:
+        """The handles in *text* by which its author named this bot (issue #27).
+
+        A hand-off names its recipients; every one of those handles is the sender telling this
+        bot it is addressed, whichever handle (Telegram username or swarm alias) it used."""
+        found: List[str] = []
+        for handle in (self.config.identity.name.lstrip("@"),
+                       self.config.identity.alias.strip()):
+            if not handle or not text:
+                continue
+            if re.search(rf"(?i)@{re.escape(handle)}\b", text):
+                written = f"@{handle}"
+                if written.lower() not in {f.lower() for f in found}:
+                    found.append(written)
+        return found
 
     def _relayed_through_peer(self, event: ChannelEvent) -> bool:
         """A peer bot's message that opens with another bot's handle and names this bot only
@@ -835,8 +850,10 @@ class AgentChannel:
                 return False, "automated status/notice from peer bot"
             if is_command_reply(event.text):
                 return False, "built-in command reply from peer bot (machine traffic)"
-            if self._only_listed(event):
-                return False, "named in a list by a peer bot, not addressed"
+            # Issue #27: a list a peer bot writes ("@a, @b, @c" on one line or several) is a
+            # hand-off, not a roster: every @handle in it counts as addressed. Only the
+            # relay rule below still keeps a named bot from taking work meant for another,
+            # and a drop there is reported to the sender (``_mention_drop_notice``).
             if self._relayed_through_peer(event):
                 return False, "a peer asks another bot to hand this bot the work"
 
@@ -1850,6 +1867,10 @@ class AgentChannel:
             self.stats.ignored += 1
             if event.cooldown_left > 0:
                 await self._cooldown_notice(event)     # a notice, not a turn: still None
+            else:
+                # #27: a peer bot that named this bot and got no turn hears which handle was
+                # dropped and why, so a lost hand-off never reads as one that was taken.
+                await self._mention_drop_notice(event, reason)
             return None
         topic_key = (event.chat_id, event.thread_id)
         generation = (self._stop_generation, self._stop_topic_generation.get(topic_key, 0))
@@ -2754,20 +2775,61 @@ class AgentChannel:
             reply_to_message_id=event.message_id, chat_id=event.chat_id,
             thread_id=event.thread_id, silent=True)
 
+    async def _mention_drop_notice(self, event: ChannelEvent, reason: str) -> None:
+        """Tell a peer bot which of its handles this bot left unanswered, and why (issue #27).
+
+        Every @handle in a bot's hand-off counts as addressed, so a message that names this bot
+        and still gets no turn is a lost mention: the sender hears which handle was dropped
+        instead of silently assuming the work was taken. Machine traffic (a notice, a command
+        answer, a sign-off) never asked for a turn and a bot's own echo is addressed to nobody,
+        so those stay silent; peers' transports drop "⚠️" notices, so this starts no turn back.
+        """
+        if not event.author_is_bot or not event.text or reason in _NO_DROP_NOTICE_REASONS:
+            return
+        handles = self._dropped_handles(event.text)
+        if not handles:
+            return
+        # Sender identity is part of the key (#27 review): two peers whose same-kind hand-off is
+        # dropped inside one window each hear their own notice, on their own message.
+        key = (event.chat_id, event.thread_id, reason, event.author_id,
+               (event.author_username or "").lower())
+        now = self._clock()
+        last = self._drop_notices.get(key)
+        if last is not None and now - last < DROP_NOTICE_SECONDS:
+            return
+        self._drop_notices[key] = now
+        # No @ on the sender: mentioning it back would hand it a turn (and a notice of ours).
+        await self.send(
+            f"⚠️ {self.config.identity.alias} took no turn: your message names "
+            f"{', '.join(handles)}, but {reason}. Address one of those handles alone if the "
+            "work is meant for me.",
+            reply_to_message_id=event.message_id, chat_id=event.chat_id,
+            thread_id=event.thread_id, silent=True)
+
     async def _cooldown_notice(self, event: ChannelEvent) -> None:
         """Say once per cooldown window that a message to this bot was dropped, so the sender's
         human sees it. Peers' transports drop "⚠️" notices, so this starts no turn."""
         window = getattr(self.config.limits, "min_seconds_between_agent_turns", 0.0)
         now = self._clock()
-        if now - self._cooldown_noticed < window:
+        # Per sender, not per channel (#27 review): one peer's notice inside the window must not
+        # swallow the next peer's, which is a different lost hand-off on a different message.
+        key = (event.chat_id, event.thread_id,
+               event.author_id if event.author_id is not None
+               else (event.author_username or "").lower())
+        last = self._cooldown_notices.get(key)
+        if last is not None and now - last < window:
             return
-        self._cooldown_noticed = now
+        self._cooldown_notices[key] = now
         # No @: a mention would land in the sender's own cooldown and draw its notice back.
         sender = event.author_username or "a peer"
+        # A peer bot's message that named this bot lost a real hand-off, not just a message:
+        # the notice names the handle that was dropped, as the mention-drop notice does (#27).
+        handles = self._dropped_handles(event.text) if event.author_is_bot else []
+        named = f" it names {', '.join(handles)}, but" if handles else ""
         await self.send(
-            f"⚠️ {self.config.identity.alias} skipped this message from {sender}: bot-to-bot "
-            f"cooldown in General, {event.cooldown_left:.0f}s left. Send it again after that, "
-            "or use a topic (topics have no cooldown).",
+            f"⚠️ {self.config.identity.alias} skipped this message from {sender}:{named} the "
+            f"bot-to-bot cooldown in General is on, {event.cooldown_left:.0f}s left. Send it "
+            "again after that, or use a topic (topics have no cooldown).",
             reply_to_message_id=event.message_id, chat_id=event.chat_id, silent=True)
 
     def _learn_topic_refs(self, chat_id: int, thread_id: int, text: str) -> None:

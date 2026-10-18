@@ -254,11 +254,14 @@ class TestFourAgentFindings(unittest.TestCase):
                                        "topic. Post here to continue.", thread_id=9)))
         self.assertIn((GROUP, 9), channel._paused_topics)
 
-    def test_a_team_list_is_not_addressing(self):
+    def test_every_handle_in_a_bots_message_addresses_it(self):
+        """Issue #27 reversed the old "named in a list, not addressed" rule: a list a peer bot
+        writes is a hand-off, so every @handle in it counts — a roster included, because a
+        hand-off the recipient second-guesses is a hand-off that is lost."""
         channel = make_channel()
         listed = event("Team: @CodexBot (QA), @HermesBot (dev), @AntigravityBot (review).",
                        username="CodexBot")
-        self.assertFalse(channel.should_respond(listed)[0])
+        self.assertTrue(channel.should_respond(listed)[0])
         asked = event("@HermesBot please fix it; @CodexBot @AntigravityBot FYI", username="CodexBot")
         self.assertTrue(channel.should_respond(asked)[0])
         # The build 8 stall: a hand-off naming three bots, one task per bullet.
@@ -268,7 +271,9 @@ class TestFourAgentFindings(unittest.TestCase):
         self.assertTrue(channel.should_respond(handoff)[0])
         roster = event("Team:\n- @CodexBot (QA)\n- @HermesBot (dev)\n- @AntigravityBot (review)",
                        username="CodexBot")
-        self.assertFalse(channel.should_respond(roster)[0])
+        self.assertTrue(channel.should_respond(roster)[0])
+        elsewhere = event("@CodexBot @AntigravityBot: plan round 3", username="CodexBot")
+        self.assertFalse(channel.should_respond(elsewhere)[0])   # a bot naming only others
 
     def test_report_back_copies(self):
         from swarmly.telegram.topic_open import defuse_mentions, strip_report_marker
