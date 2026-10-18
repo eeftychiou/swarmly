@@ -28,9 +28,15 @@ All notable changes to this project are documented here. The format follows
   wrote before the turn runs, whatever order the parts arrive in, and the turn runs from part
   1: its message id, its reply target and its raw message are the ones the answer goes back
   to. Parts that never all arrive are delivered as what arrived, with a note naming the
-  missing ones, instead of being held forever or answered as fragments. A part header above
-  `MAX_SPLIT_PARTS` is refused as ordinary text, so no sender can name a total that reserves
-  the receiver's memory (`#29`).
+  missing ones, instead of being held forever or answered as fragments. One sender holds one
+  reply at a time: a part that cannot belong to the held one (a second part 1, another total,
+  different text at an index already held) goes out as what arrived rather than joining two
+  replies into one mixed message. One cap, `MAX_REPLY_PARTS` (20), bounds both ends:
+  `limits.max_reply_parts` above it is clamped at load, and a part header above it is refused
+  as ordinary text, so no sender can name a total that reserves the receiver's memory. Buffers
+  and their timers are bounded and cancelled when a reply is delivered, are not allocated for
+  a bot whose messages are ignored anyway (`limits.strangers: ignore`), so numbered fragments
+  cannot leave live timers behind (`#29`).
 
 ## [0.10.1] - 2026-10-17
 

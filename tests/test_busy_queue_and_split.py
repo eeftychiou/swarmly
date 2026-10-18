@@ -123,6 +123,16 @@ class TestBusyQueue(unittest.TestCase):
                 make_config(limits=bad)
         self.assertEqual(ChannelLimits().max_reply_parts, 4)
 
+    def test_max_reply_parts_is_clamped_to_the_protocol_cap(self):
+        """Review of #29: the sender and the receiver share one cap, so a configured value above
+        it is clamped here instead of emitting parts the receiver refuses."""
+        from swarmly.telegram.config import MAX_REPLY_PARTS
+
+        self.assertEqual(ChannelLimits(max_reply_parts=MAX_REPLY_PARTS + 5).max_reply_parts,
+                         MAX_REPLY_PARTS)
+        self.assertEqual(make_config(limits={"max_reply_parts": 25}).limits.max_reply_parts,
+                         MAX_REPLY_PARTS)
+
 
 class TestReplySplitting(unittest.TestCase):
     LIMIT = 4096

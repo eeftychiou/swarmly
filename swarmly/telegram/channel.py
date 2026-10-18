@@ -52,7 +52,8 @@ from swarmly.telegram.commands import (
     status_reply,
     where_reply,
 )
-from swarmly.telegram.config import EFFORT_LEVELS, AgentConfig, effort_problem, model_problem
+from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig,
+                                     effort_problem, model_problem)
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.projects import ProjectRouter
 from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
@@ -3735,7 +3736,8 @@ class AgentChannel:
         of the piece before it -- so the receiving transport reassembles the original message
         character for character (:func:`split_part`, ``AgentChannel._absorb_split``, issue #29).
         """
-        max_parts = max(int(getattr(self.config.limits, "max_reply_parts", 1) or 1), 1)
+        max_parts = min(max(int(getattr(self.config.limits, "max_reply_parts", 1) or 1), 1),
+                        MAX_SPLIT_PARTS)
         if max_parts == 1 or self._fits(text):
             return [text]
         worst = f"{max_parts}/{max_parts}"
@@ -3801,8 +3803,15 @@ class AgentChannel:
         they may arrive out of order; a reply whose parts never all arrive is delivered as what
         did arrive, with a note naming the missing ones (``_flush_split``), never silently
         dropped and never answered twice.
+
+        Only one reply per sender is held at a time, and a part that cannot belong to it (a
+        second part 1, a different total, different text at an index already held) is a
+        different reply: the held one goes out as what arrived instead of the two being joined
+        into one mixed message (#29 review). Buffers are never allocated for a sender whose
+        messages this bot ignores anyway, and their number is bounded, so a stranger cannot
+        make the transport hold parts that never complete.
         """
-        if not event.author_is_bot or not event.text:
+        if not event.author_is_bot or not event.text or not self._may_reassemble(event):
             return False, None
         # A reply held this long has lost parts: deliver what arrived before taking more.
         await self._flush_expired_splits()
@@ -3812,13 +3821,14 @@ class AgentChannel:
         index, total, body = part
         key = self._split_key(event)
         pending = self._split_pending.get(key)
-        if pending is not None and pending.total != total:
-            # Another reply by the same bot, or a stray part of one: the held reply will never
-            # complete, so it goes out now as what arrived.
-            self._split_pending.pop(key, None)
-            await self._deliver_split(pending)
+        if pending is not None and not pending.accepts(index, total, body):
+            # Another reply by the same bot started before this one finished: the held parts
+            # are not one message any more, so they go out now and this part opens the next.
+            await self._drop_split(key, pending)
             pending = None
         if pending is None:
+            if len(self._split_pending) >= MAX_PENDING_SPLITS:
+                await self._evict_oldest_split()
             # A later part can arrive first; it is held the same way, and the turn (when it
             # runs, or when the window closes) takes the earliest part's chat and topic.
             pending = _PendingSplit(total=total, opened=self._clock())
@@ -3834,20 +3844,31 @@ class AgentChannel:
                         event.author_username or "unknown", len(pending.bodies), total)
             return True, None
         self._split_pending.pop(key, None)
+        pending.disarm()
         logger.info("%s: reassembled a %d-part reply from @%s", self.config.identity.alias,
                     total, event.author_username or "unknown")
         return False, pending
 
+    def _may_reassemble(self, event: ChannelEvent) -> bool:
+        """Whether a bot's split reply is worth holding parts for.
+
+        Under ``limits.strangers: ignore`` a bot this transport does not know gets no turn, so
+        it gets no buffer and no timer either: otherwise 100 numbered fragments would leave 100
+        live timers behind and change nothing (#29 review). With ``strangers: answer`` any bot
+        may be answered, so any bot's reply may be joined."""
+        if getattr(self.config.limits, "strangers", "ignore") != "ignore":
+            return True
+        return self.roster.knows(event.author_username)
+
     def _arm_split_timeout(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
         """Deliver what arrived if the rest of a held reply does not come."""
-        if not self._split_pending:                 # pragma: no cover - always set here
-            return
 
         async def expire() -> None:
             await asyncio.sleep(SPLIT_TIMEOUT_SECONDS)
             await self._flush_split(key, pending)
 
         task = asyncio.create_task(expire())
+        pending.timer = task
         self._split_tasks.add(task)
         task.add_done_callback(self._split_tasks.discard)
 
@@ -3860,13 +3881,28 @@ class AgentChannel:
             if now - pending.opened >= SPLIT_TIMEOUT_SECONDS:
                 await self._flush_split(key, pending)
 
+    async def _drop_split(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
+        """Forget a held reply, stop its timer, and deliver what arrived."""
+        if self._split_pending.get(key) is pending:
+            self._split_pending.pop(key, None)
+        pending.disarm()
+        await self._deliver_split(pending)
+
+    async def _evict_oldest_split(self) -> None:
+        """Make room for a new reply: the oldest held one goes out as what arrived, so the
+        buffer count and the live timer count stay bounded however many senders split."""
+        if not self._split_pending:
+            return                                   # pragma: no cover - guarded by the caller
+        key, pending = min(self._split_pending.items(), key=lambda item: item[1].opened)
+        await self._drop_split(key, pending)
+
     async def _flush_split(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
         """Deliver a held reply as what arrived. The first caller wins, so the timer and the
         sweep cannot both run the turn."""
         if self._split_pending.get(key) is not pending:
+            pending.disarm()
             return
-        self._split_pending.pop(key, None)
-        await self._deliver_split(pending)
+        await self._drop_split(key, pending)
 
     async def _deliver_split(self, pending: _PendingSplit) -> None:
         """Run the one turn for what arrived of a reply, saying which parts are missing."""
@@ -4580,10 +4616,16 @@ _SPLIT_PART_RE = re.compile(
 #: How long the receiver holds the first part(s) of a split reply for the rest. A whole reply
 #: is a few consecutive posts (seconds apart); longer than this and the rest is not coming.
 SPLIT_TIMEOUT_SECONDS = 30.0
-#: Most parts one reply may claim. ``split_outgoing`` is bounded by ``limits.max_reply_parts``
-#: (4 by default), so a header asking for billions of parts is not a reply: the buffer it would
-#: reserve is the sender's instruction, and it is refused rather than believed.
-MAX_SPLIT_PARTS = 20
+#: Most replies held at once, one per sender. A new sender's reply evicts the oldest held one
+#: (delivered as what arrived), so neither the buffer map nor the timer set can grow with the
+#: number of bots that post numbered fragments.
+MAX_PENDING_SPLITS = 32
+#: Most parts one reply may claim. This is the number the sender splits into as well
+#: (``config.MAX_REPLY_PARTS``, which ``limits.max_reply_parts`` is clamped to), so whatever one
+#: transport emits, the other reassembles; a header asking for billions of parts is not a reply:
+#: the buffer it would reserve is the sender's instruction, and it is refused rather than
+#: believed.
+MAX_SPLIT_PARTS = MAX_REPLY_PARTS
 
 
 def split_part(text: str) -> Optional[Tuple[int, int, str]]:
@@ -4622,11 +4664,34 @@ class _PendingSplit:
     #: part index -> the event it arrived in: chat, topic, author, message id.
     events: Dict[int, ChannelEvent] = field(default_factory=dict)
     opened: float = 0.0                        # clock the first part arrived, for the timeout
+    #: The timeout task holding this reply, so it can be stopped when the reply is delivered.
+    timer: Optional[asyncio.Task] = field(default=None, repr=False, compare=False)
 
     @property
     def event(self) -> Optional[ChannelEvent]:
         """The earliest part's event: the turn runs as if that message had arrived whole."""
         return self.events[min(self.events)] if self.events else None
+
+    def accepts(self, index: int, total: int, body: str) -> bool:
+        """Whether a part can belong to this reply.
+
+        A different total, a second part 1 with other text, or different text at an index
+        already held is a *different reply* from the same sender: joining it here would put
+        two messages into one turn (#29 review)."""
+        if total != self.total:
+            return False
+        if index == 1:
+            return self.bodies.get(1, body) == body
+        seen = self.bodies.get(index)
+        return seen is None or seen == body
+
+    def disarm(self) -> None:
+        """Stop the timeout. Never cancels the task calling this, so a flush from inside the
+        timer still delivers the reply."""
+        task = self.timer
+        self.timer = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     def joined(self) -> str:
         return "".join(self.bodies[index] for index in sorted(self.bodies))

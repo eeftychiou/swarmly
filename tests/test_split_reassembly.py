@@ -16,7 +16,7 @@ from unittest.mock import patch
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
 from swarmly.telegram.channel import MAX_SPLIT_PARTS, split_part
-from tests.test_telegram_channel import event, make_channel, run
+from tests.test_telegram_channel import event, make_channel, make_config, run
 
 
 class RecordingEcho(EchoAdapter):
@@ -58,6 +58,19 @@ class TestSplitPart(unittest.TestCase):
     def test_a_whole_message_is_not_a_part(self):
         for text in ("", "just a message", "a message that ends (1/1)", "↪ (1/2) not a part 1"):
             self.assertIsNone(split_part(text), text)
+
+    def test_a_sender_above_the_cap_emits_only_parts_the_receiver_accepts(self):
+        """Review of #29: one cap on both ends — a configured 25 no longer emits headers the
+        receiver would refuse."""
+        sender = make_channel(make_config(limits={"max_reply_parts": MAX_SPLIT_PARTS + 5}))
+        long_reply = "\n\n".join(f"step {index}: " + "y" * 300 for index in range(90))
+        parts = sender.split_outgoing(long_reply)
+        self.assertGreater(len(parts), 1)
+        self.assertLessEqual(len(parts), MAX_SPLIT_PARTS)
+        parsed = [split_part(part) for part in parts]
+        self.assertTrue(all(item is not None for item in parsed),
+                        [part[:30] for part, item in zip(parts, parsed) if item is None])
+        self.assertEqual({item[1] for item in parsed}, {len(parts)})
 
     def test_a_total_above_the_cap_is_not_a_split_reply(self):
         """Review of #29: the total is the sender's claim, so a header asking for a billion
@@ -173,6 +186,81 @@ class TestReassembly(unittest.TestCase):
         run(channel.handle_event(event("[Codex] ↪ (2/1000000000) the rest", message_id=7)))
         self.assertEqual(channel._split_pending, {})        # no buffer for a claim that large
         self.assertEqual(len(adapter.seen), 1)              # part 1 is answered, whole
+
+    def test_two_interleaved_replies_from_one_sender_are_never_mixed(self):
+        """Review of #29: one buffer per sender, but a part that cannot belong to the held reply
+        opens the next one, so two replies interleaved by one sender stay two messages."""
+        alpha = ["@HermesBot [Codex] alpha one\n\n(1/2)", "[Codex] ↪ (2/2) alpha two"]
+        bravo = ["@HermesBot [Codex] bravo one\n\n(1/2)", "[Codex] ↪ (2/2) bravo two"]
+        channel, adapter = receiver()
+
+        async def replay():
+            for message_id, part in enumerate([alpha[0], bravo[0], bravo[1], alpha[1]], 1):
+                await channel.handle_event(event(part, message_id=message_id))
+            channel._test_clock["t"] += 3600         # whatever is still held goes out now
+            await channel.handle_event(event("[Codex] unrelated, no mention", message_id=9))
+
+        run(replay())
+        texts = [message.text for message in adapter.seen]
+        self.assertTrue(any("bravo one" in text and "bravo two" in text for text in texts), texts)
+        for text in texts:
+            self.assertFalse("alpha" in text and "bravo" in text, text)
+
+    def test_an_unlisted_bot_gets_no_buffer_and_no_timer(self):
+        """Review of #29: under ``strangers: ignore`` a bot this transport does not know cannot
+        make it hold parts (100 fragments used to leave 100 live timers and no turn)."""
+        channel, adapter = receiver()
+        self.assertEqual(channel.config.limits.strangers, "ignore")
+
+        async def spam():
+            for index in range(5):
+                await channel.handle_event(event(
+                    f"[Mystery] ↪ (2/{index + 2}) fragment", username="MysteryBot",
+                    author_id=999, message_id=index + 1))
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+        run(spam())
+        self.assertEqual(channel._split_pending, {})
+        self.assertEqual([task for task in channel._split_tasks if not task.done()], [])
+
+    def test_a_completed_reply_leaves_no_timer_behind(self):
+        """Review of #29: timers are cancelled when the reply they guard is delivered."""
+        parts = outgoing(ORIGINAL)
+        channel, adapter = receiver()
+
+        async def replay():
+            for index, part in enumerate(parts):
+                await channel.handle_event(event(part, message_id=index + 1))
+            for _ in range(3):                          # let the cancellations land
+                await asyncio.sleep(0)
+            self.assertEqual(channel._split_pending, {})
+            self.assertEqual([task for task in channel._split_tasks if not task.done()], [])
+
+        run(replay())
+        self.assertEqual(len(adapter.seen), 1)
+
+    def test_held_replies_are_bounded(self):
+        """Review of #29: only ``MAX_PENDING_SPLITS`` replies are held; the oldest is delivered
+        as what arrived to make room, so the timer set cannot grow with the sender count."""
+        channel, adapter = receiver()
+
+        async def many_senders():
+            with patch("swarmly.telegram.channel.MAX_PENDING_SPLITS", 2):
+                for index, username in enumerate(("CodexBot", "AntigravityBot")):
+                    await channel.handle_event(event(f"@HermesBot [{username}] first part\n\n(1/2)",
+                                                     username=username, author_id=500 + index,
+                                                     message_id=index + 1))
+                self.assertEqual(len(channel._split_pending), 2)
+                # A third sender is a known peer only if configured; add one for the test.
+                channel.config.peers["Hermes2"] = "HermesTwoBot"
+                await channel.handle_event(event("@HermesBot [HermesTwo] first part\n\n(1/2)",
+                                                 username="HermesTwoBot", author_id=502,
+                                                 message_id=3))
+                self.assertEqual(len(channel._split_pending), 2)   # the bound held
+
+        run(many_senders())
+        self.assertEqual(len(adapter.seen), 1)          # the evicted reply was delivered, not lost
 
     def test_a_human_message_ending_in_a_part_marker_is_still_one_turn(self):
         channel, adapter = receiver()

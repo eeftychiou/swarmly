@@ -132,6 +132,12 @@ class Roster:
         return handle == self._me() or any(
             str(t).lstrip("@").lower() == handle for t in self.cfg.peers.values())
 
+    def knows(self, username: Optional[str]) -> bool:
+        """Whether *username* is a bot this transport knows: a configured peer or an admitted
+        one. Public so the inbound path can gate work on membership without reaching into
+        ``_known`` (#29 review: an unlisted bot must not be able to make this bot hold parts)."""
+        return bool(username) and self._known(str(username))
+
     def _alias_taken(self, alias: str) -> bool:
         """An alias in use, or one that is a bot's @username (it would shadow that bot)."""
         low = alias.lower()

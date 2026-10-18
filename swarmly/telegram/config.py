@@ -546,6 +546,10 @@ SINGLE_SESSION_ADAPTERS = ("antigravity", "antigravity_thread", "codex_thread")
 #: ``limits.allow_shared_cwd``.
 NO_FILES_ADAPTERS = ("echo",)
 MAX_PARALLEL_TURNS = 8
+#: Most parts one reply may be split into, shared by the sender (`split_outgoing`) and the
+#: receiver's reassembly (`split_part`), so whatever a transport emits, the other accepts. The
+#: default is 4; a larger configured value is clamped here rather than refused at startup.
+MAX_REPLY_PARTS = 20
 
 
 @dataclass
@@ -620,6 +624,14 @@ class ChannelLimits:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ConfigError(f"limits.{key} must be a whole number of at least 1 "
                                   f"(got {value!r}).")
+        # #29 review: a reply is split into at most MAX_REPLY_PARTS parts, and the receiver
+        # refuses a part header above that. Clamping here keeps the two ends agreeing: a larger
+        # configured value loses the tail to the existing truncation instead of having every
+        # part after the cap ignored by the receiver.
+        if self.max_reply_parts > MAX_REPLY_PARTS:
+            logger.warning("limits.max_reply_parts=%s is above the %s-part protocol cap; using %s",
+                           self.max_reply_parts, MAX_REPLY_PARTS, MAX_REPLY_PARTS)
+            self.max_reply_parts = MAX_REPLY_PARTS
         cap = self.max_peer_turns_per_topic
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
             raise ConfigError("limits.max_peer_turns_per_topic must be a whole number, 0 for "

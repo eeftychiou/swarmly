@@ -665,6 +665,13 @@ most 18 a minute (per topic when topics run in parallel; see **Running topics in
 and never start a turn on a peer. Each part is paced like any other message, and text beyond the
 last part is clamped as before.
 
+**The receiving side joins the parts first.** The `↪ (k/n)` parts of one reply are held and
+joined back into the one message the sender wrote before the turn runs, in whatever order they
+arrive: the turn runs from part 1, so its message id and reply target are the ones answered.
+Parts that never all arrive are delivered as what arrived, with a note naming the missing ones.
+One cap, 20 parts, bounds both ends: a larger `max_reply_parts` is clamped at load, and a part
+header above the cap is ordinary text, never a buffer.
+
 **Topics as discussions.** In a group with Topics turned on, each topic is one discussion
 with one `context_id`, which every agent works out the same way from the topic's id alone:
 
