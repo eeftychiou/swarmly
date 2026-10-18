@@ -127,8 +127,13 @@ def most_in_a_minute(times: Sequence[float]) -> int:
 class NamesTests(unittest.TestCase):
     def test_context_ids_come_from_the_topic_id_only(self):
         self.assertIsNone(context_for(GROUP, None))
-        self.assertEqual(context_for(GROUP, 7), "tg-7")
         self.assertEqual(context_for(GROUP, 7, home_chat_id=GROUP), "tg-7")
+        # An unknown home group is not "every chat is home": without the secret there is no
+        # id (the turn is refused), and with it each chat is tagged, so two chats never
+        # collide on one context id.
+        self.assertIsNone(context_for(GROUP, 7))
+        with mock.patch.dict(os.environ, {"SWARMLY_REDACTION_SECRET": "shared-secret"}):
+            self.assertNotEqual(context_for(GROUP, 7), context_for(-1009, 7))
         # Issue #22: a context id in another group carries a tag, never the chat id -- and
         # without the swarm's shared secret there is no tag at all (fail closed).
         self.assertIsNone(context_for(-1009, 7, home_chat_id=GROUP))
@@ -156,7 +161,7 @@ class NamesTests(unittest.TestCase):
                          (None, False))
 
     def test_a_name_never_moves_or_claims_a_discussion(self):
-        topics = TopicMap()
+        topics = TopicMap(home_chat_id=GROUP)
         topics.remember(GROUP, 5, "t9 · deploy")
         topics.remember(GROUP, 6, "tg-5 · not really")
         topics.remember(GROUP, 5, "deploy (renamed)")

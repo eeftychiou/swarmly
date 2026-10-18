@@ -3076,10 +3076,15 @@ class AgentChannel:
         token = ref.get("topic")
         if isinstance(token, str) and token:
             from swarmly.telegram.redact import resolve_topic_token
-            for chat_id, _thread in resolve_topic_token(token, getattr(self, "router", None)):
-                if (int(chat_id), message_id) in self._tg_admitted:
-                    return True
-            return False
+            candidates = resolve_topic_token(token, getattr(self, "router", None))
+            # An ambiguous token (one project bound to two chats on the same thread id)
+            # cannot say which chat the mirror came from, and message ids repeat per chat:
+            # claiming it was taken could swallow another chat's hand-off. Run it instead --
+            # processed twice, never lost (review of PR #23).
+            if len(candidates) != 1:
+                return False
+            chat_id, _thread = candidates[0]
+            return (int(chat_id), message_id) in self._tg_admitted
         try:
             return (int(ref["chat"]), message_id) in self._tg_admitted
         except (KeyError, TypeError, ValueError):

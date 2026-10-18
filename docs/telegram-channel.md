@@ -118,7 +118,7 @@ agent:
   maintainer_username: example_admin     # redacted from outbound text automatically
 public_redactions:                       # optional: literal -> replacement
   "@example_admin": "<maintainer>"
-  "C:\work\client-name": "<path>"
+  'C:\work\client-name': '<path>'
 ```
 
 - **Handles and paths** named here are replaced verbatim. Chat ids, `admin_user_id` and the
@@ -132,8 +132,10 @@ public_redactions:                       # optional: literal -> replacement
   (`topic:<project>:<thread>`) instead of a chat id; each agent resolves it through its own
   `projects:`. An unbound topic falls back to an HMAC token from
   `SWARMLY_REDACTION_SECRET`, which peers cannot resolve — they then run the mirrored turn as
-  well: **processed twice, never lost**. Mirrors written before this change (a raw `chat`
-  field) are still understood.
+  well: **processed twice, never lost**. A token that resolves to more than one of this
+  agent's topics (one project bound to two chats on the same thread id) is never treated as
+  taken: message ids repeat per chat, so claiming it could swallow the other chat's
+  hand-off. Mirrors written before this change (a raw `chat` field) are still understood.
 - **Context ids carry a tag, not a chat id.** A topic in the home group stays `tg-<thread>`.
   A topic in another group needs an HMAC tag, `tg-<tag>-<thread>`, keyed by
   **`SWARMLY_REDACTION_SECRET` set to the same high-entropy value on every agent**. That is

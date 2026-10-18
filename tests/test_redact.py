@@ -280,6 +280,28 @@ class TestMirrorAndDedupe(SecretSandbox):
         self.assertEqual(payload[55], "message")
         self.assertEqual(payload["plain"], "x")
 
+    def test_an_ambiguous_token_never_suppresses_another_chats_mirror(self):
+        """Finding: one project bound to two chats on the same thread id."""
+        from swarmly.telegram.adapters import EchoAdapter
+        from swarmly.telegram.channel import AgentChannel
+        with TemporaryDirectory() as tmp:
+            cfg = AgentConfig.from_dict({
+                "agent": {"name": "HermesBot", "alias": "Hermes", "bot_token": "123456:TEST",
+                          "home_channel_id": GROUP, "admin_user_id": ADMIN_ID},
+                "adapter": {"type": "echo", "cwd": tmp},
+                "projects": {"webapp": {"repo": "example-org/webapp", "cwd": tmp,
+                                        "topics": [str(THREAD),
+                                                   f"{-1009999999999}/{THREAD}"]}},
+            })
+            channel = AgentChannel(cfg, adapter=EchoAdapter("Hermes"), sender=mock.MagicMock(),
+                                   gitbus_pull=lambda _root: None, gitbus_read=lambda _root: [])
+            # The token names the project and thread, not the chat, and message ids repeat
+            # per chat: claiming it was taken could swallow the other chat's hand-off.
+            channel._tg_admitted.append((GROUP, 55))
+            took = channel.took_telegram_copy({"topic": f"topic:webapp:{THREAD}",
+                                              "message_id": 55})
+        self.assertFalse(took)          # processed twice, never lost
+
     def test_the_old_chat_form_is_still_honoured(self):
         with TemporaryDirectory() as tmp:
             channel = self._channel(tmp)
@@ -492,6 +514,19 @@ class TestRefusedTopicTurns(SecretSandbox):
         with TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {SECRET_ENV: ""}):
             watcher, outcome, client = self._poll(tmp, GROUP)
         self.assertEqual(outcome.turns_queued, 1, outcome.errors)
+
+
+class TestDocsSample(unittest.TestCase):
+    """The config sample in the docs has to parse (review of PR #23)."""
+
+    def test_the_public_redactions_sample_is_valid_yaml(self):
+        import yaml
+        path = Path(__file__).resolve().parents[1] / "docs" / "telegram-channel.md"
+        text = path.read_text(encoding="utf-8")
+        block = text.split("### What leaves the host")[1].split("```yaml")[1].split("```")[0]
+        data = yaml.safe_load(block)
+        self.assertEqual(data["public_redactions"]["@example_admin"], "<maintainer>")
+        self.assertIn("maintainer_username", data["agent"])
 
 
 class TestChannelRefuses(SecretSandbox):

@@ -91,8 +91,8 @@ def context_for(chat_id: int, thread_id: Optional[int],
     """
     if thread_id is None:
         return None
-    if home_chat_id is None or int(chat_id) == int(home_chat_id):
-        return f"tg-{int(thread_id)}"
+    if home_chat_id is not None and int(chat_id) == int(home_chat_id):
+        return f"tg-{int(thread_id)}"        # the home group: no chat id in the id at all
     secret = os.environ.get("SWARMLY_REDACTION_SECRET", "").strip()
     if not secret:
         global _NO_SECRET_WARNED
