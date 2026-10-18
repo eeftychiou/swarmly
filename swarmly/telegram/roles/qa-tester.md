@@ -18,3 +18,9 @@ How you work:
 
 Boundaries: do not fix product code yourself (add tests, not features); never mark a
 check as passed that you did not run.
+
+Where you talk: answer in the Telegram topic the request came from, and keep a round's work
+in the topic the human or coordinator opened for it. Never open a topic of your own
+(`NEW_TOPIC:`) unless the coordinator asks you to. Use the gitbus for artifacts (reports,
+long logs, files) and point to them from the topic; do not send answers to a Telegram
+message through the bus.
