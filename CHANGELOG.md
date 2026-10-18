@@ -24,6 +24,14 @@ All notable changes to this project are documented here. The format follows
   bots, show them in `/status`, and every turn's prompt names them so work goes to a bot that
   can take it.
 
+- A reply that arrived as `↪ (k/n)` parts is joined back into the one message the sender
+  wrote before the turn runs, whatever order the parts arrive in, and the turn runs from part
+  1: its message id, its reply target and its raw message are the ones the answer goes back
+  to. Parts that never all arrive are delivered as what arrived, with a note naming the
+  missing ones, instead of being held forever or answered as fragments. A part header above
+  `MAX_SPLIT_PARTS` is refused as ordinary text, so no sender can name a total that reserves
+  the receiver's memory (`#29`).
+
 ## [0.10.1] - 2026-10-17
 
 A correctness round: the suite is hermetic on hosts that run an agent, and the bugs that each

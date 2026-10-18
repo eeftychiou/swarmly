@@ -1966,12 +1966,16 @@ class AgentChannel:
         # Issue #29: a reply that arrives as ↪ (k/n) parts is one message. The parts are held
         # until the rest are here, then the one turn runs with the whole message — never a turn
         # per fragment, and never an answer to a third of a brief.
-        held, joined = await self._absorb_split(event)
+        held, split = await self._absorb_split(event)
         if held:
             self.stats.ignored += 1
             return None
-        if joined is not None:
-            event.text = joined
+        if split is not None:
+            # The turn runs from part 1, whichever part completed the reply (#29 QA): part 1 is
+            # the message the sender wrote, so its id, its reply target and its raw message are
+            # the ones the answer goes back to. Out-of-order parts lose none of that.
+            event = split.event or event
+            event.text = split.joined()
             event.reassembled = True
 
         # Every message that names its topic teaches the name, addressed to us or not.
@@ -3788,15 +3792,15 @@ class AgentChannel:
         return (event.chat_id, event.thread_id, event.author_id,
                 (event.author_username or "").lower())
 
-    async def _absorb_split(self, event: ChannelEvent) -> Tuple[bool, Optional[str]]:
+    async def _absorb_split(self, event: ChannelEvent) -> Tuple[bool, Optional[_PendingSplit]]:
         """Hold the parts of a split reply until the whole message is here, then join it.
 
-        Returns ``(held, joined)``: ``held`` means the part was stored and this event must not
-        run a turn; ``joined`` is the whole message when the last missing part arrived, for the
-        caller to run the one turn with. Parts are matched by index, so they may arrive out of
-        order; a reply whose parts never all arrive is delivered as what did arrive, with a
-        note naming the missing ones (``_flush_split``), never silently dropped and never
-        answered twice.
+        Returns ``(held, split)``: ``held`` means the part was stored and this event must not
+        run a turn; ``split`` holds every part (and part 1's event) when the last missing part
+        arrived, for the caller to run the one turn from part 1. Parts are matched by index, so
+        they may arrive out of order; a reply whose parts never all arrive is delivered as what
+        did arrive, with a note naming the missing ones (``_flush_split``), never silently
+        dropped and never answered twice.
         """
         if not event.author_is_bot or not event.text:
             return False, None
@@ -3832,7 +3836,7 @@ class AgentChannel:
         self._split_pending.pop(key, None)
         logger.info("%s: reassembled a %d-part reply from @%s", self.config.identity.alias,
                     total, event.author_username or "unknown")
-        return False, pending.joined()
+        return False, pending
 
     def _arm_split_timeout(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
         """Deliver what arrived if the rest of a held reply does not come."""
@@ -4576,6 +4580,10 @@ _SPLIT_PART_RE = re.compile(
 #: How long the receiver holds the first part(s) of a split reply for the rest. A whole reply
 #: is a few consecutive posts (seconds apart); longer than this and the rest is not coming.
 SPLIT_TIMEOUT_SECONDS = 30.0
+#: Most parts one reply may claim. ``split_outgoing`` is bounded by ``limits.max_reply_parts``
+#: (4 by default), so a header asking for billions of parts is not a reply: the buffer it would
+#: reserve is the sender's instruction, and it is refused rather than believed.
+MAX_SPLIT_PARTS = 20
 
 
 def split_part(text: str) -> Optional[Tuple[int, int, str]]:
@@ -4584,21 +4592,23 @@ def split_part(text: str) -> Optional[Tuple[int, int, str]]:
     The cut markers are removed and nothing else is: the sender's banner and delivering
     @handles stay on part 1 (as on any message), and each later part keeps exactly the text
     that followed the cut, so the parts concatenate back to the reply that was sent. A part 1
-    whose body is empty is not a split reply, and neither is ``(1/1)``.
+    whose body is empty is not a split reply, and neither is ``(1/1)``. A total above
+    :data:`MAX_SPLIT_PARTS` is not a split reply either: it is refused as ordinary text, so no
+    header can make the receiver hold parts that will never come.
     """
     if not text:
         return None
     tail = _SPLIT_PART_RE.match(text)
     if tail is not None:
         index, total = int(tail.group("index")), int(tail.group("total"))
-        if 1 < index <= total:
+        if 1 < index <= total <= MAX_SPLIT_PARTS:
             return index, total, tail.group("body")
         return None
     first = _SPLIT_FIRST_RE.match(text)
     if first is not None:
         total = int(first.group("total"))
         body = first.group("body")
-        if total > 1 and body.strip():
+        if 1 < total <= MAX_SPLIT_PARTS and body.strip():
             return 1, total, body
     return None
 

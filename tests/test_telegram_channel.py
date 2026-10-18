@@ -118,10 +118,11 @@ def make_channel(config: AgentConfig = None, adapter=None, **kwargs):
 
 
 def event(text: str, author_id=202, username="CodexBot", is_bot=True, chat_id=GROUP,
-          replies_to_bot=False, message_id=1, thread_id=None, attachments=None) -> ChannelEvent:
+          replies_to_bot=False, message_id=1, thread_id=None, attachments=None,
+          raw=None) -> ChannelEvent:
     return ChannelEvent(text=text, chat_id=chat_id, author_id=author_id, author_username=username,
                         author_is_bot=is_bot, replies_to_bot=replies_to_bot, message_id=message_id,
-                        thread_id=thread_id, attachments=list(attachments or []))
+                        thread_id=thread_id, attachments=list(attachments or []), raw=raw)
 
 
 def run(coro):
