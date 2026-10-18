@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- CI wake: while an agent waits on a pull request's checks, the GitHub poll
+  (`github.poll_minutes`) watches that PR's check runs and wakes the agent with exactly one
+  turn when they all reach a terminal state -- pass or fail, with the failing check names on a
+  failure. The agent is watched for a PR it names in a reply (a `.../pull/<n>` link, or a bare
+  `#<n>` in a project topic). The watch and the result reported live in
+  `.agents/state/gh_ci-<alias>.json`, keyed by head commit and check state, so a restart
+  neither forgets a watch nor wakes twice for a run, while a new push is reported again
+  (`#24`).
+
 ## [0.10.1] - 2026-10-17
 
 A correctness round: the suite is hermetic on hosts that run an agent, and the bugs that each

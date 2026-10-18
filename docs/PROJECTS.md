@@ -205,6 +205,20 @@ swarmly-telegram --config config.yaml gh-poll --once --json
   every project shares it; use a per-run adapter (`codex`, `claude_thread`, ...) for
   separate sessions per project.
 
+### CI wake: a PR's checks wake the waiting agent
+- When the agent names a pull request in a reply it posts -- a
+  `https://github.com/<owner>/<repo>/pull/<n>` link, or a bare `#<n>` in a topic bound to a
+  project -- the same backstop poll (`github.poll_minutes`) also asks `gh` for that PR's
+  `statusCheckRollup`.
+- Exactly one turn runs in the topic when every check reaches a terminal state, pass or fail,
+  saying what finished, naming the failing checks on a failure, and linking the PR.
+- A wake is recorded per head commit and check state (`<sha>:<success|failure>`) in
+  `.agents/state/gh_ci-<alias>.json`, next to the notification state: a restart neither
+  forgets a watch nor repeats a wake, and a new push is reported again.
+- A watch is dropped when it fires, when `gh` has no checks for it, or after 12 hours, so a PR
+  with no CI configured does not cost polls forever. `github.poll_minutes: 0` disables it with
+  the rest of the backstop.
+
 ### GitHub token permissions
 When generating a Personal Access Token (PAT) for the agent:
 - **Classic token** (needed for the backstop: GitHub's notifications API does not accept
