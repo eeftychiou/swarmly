@@ -1,6 +1,7 @@
 """Findings of the build 9 live test where Codex was offline during a hand-off."""
 
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -81,10 +82,16 @@ class TestMovedHandoffIsMirrored(unittest.TestCase):
                     event("hi", username="DeepSeekBot"), "@CodexBot please run the full suite on main",
                     (-100, 307))
                 await asyncio.gather(*list(channel._mirror_tasks))
-            with mock.patch("swarmly.telegram.relay.post_and_notify", fake_post):
+            from swarmly.telegram.redact import SECRET_ENV
+            with mock.patch.dict(os.environ, {SECRET_ENV: "test-secret"}),                     mock.patch("swarmly.telegram.relay.post_and_notify", fake_post):
                 run(scenario())
         self.assertEqual([p["to"] for p in posted], ["Codex"])
-        self.assertEqual(posted[0]["extra"]["telegram"]["thread"], 307)
+        # Issue #22: the reference names a topic token, not the chat id or thread, so no id
+        # reaches the bus; an unbound project falls back to an HMAC token (or none at all).
+        ref = posted[0]["extra"]["telegram"]
+        self.assertNotIn("chat", ref)
+        self.assertNotIn("thread", ref)
+        self.assertTrue(ref.get("topic", "").startswith("topic:"), ref)
 
 
 class TestTopicRootIsNotAReply(unittest.TestCase):

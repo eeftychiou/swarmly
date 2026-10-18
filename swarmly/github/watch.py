@@ -22,6 +22,7 @@ from swarmly.github.client import GitHubClient, GitHubError, Notification
 from swarmly.telegram.adapters.base import IncomingMessage
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.projects import ProjectRouter
+from swarmly.telegram.redact import Redactor
 
 if TYPE_CHECKING:
     from swarmly.telegram.channel import AgentChannel
@@ -199,6 +200,8 @@ class GitHubWatcher:
         self.client = client or GitHubClient(
             token_env=config.github.token_env if config.github else "GH_TOKEN",
             alias=config.identity.alias,
+            # Issue #22: comments this watcher posts are redacted like the bus payloads.
+            redact=Redactor.from_config(config).text,
         )
         self.state_path = state_path if state_path is not None else state_file_for(config)
         self.channel = channel
@@ -295,7 +298,19 @@ class GitHubWatcher:
                     turn_text = f"GitHub notification ({notif.reason}): {user} on {repo}#{num}: {snippet}"
 
                 try:
-                    from swarmly.telegram.topics import context_for
+                    from swarmly.telegram.topics import context_block_reason, context_for
+                    blocked = context_block_reason(
+                        chat_id, thread_id, self.config.identity.home_channel_id)
+                    if blocked:
+                        # Reject, do not run: with no context id the turn would fall into the
+                        # General session, mixing another group's work into it (issue #22
+                        # review). Loud, and not retried forever.
+                        self.state.mark_processed(notif.id, notif.updated_at)
+                        if self.config.github.mark_read:
+                            self.client.mark_notification_read(notif.id)
+                        outcome.errors.append(f"notification {notif.id}: refused: {blocked}")
+                        logger.error("notification %s refused: %s", notif.id, blocked)
+                        continue
                     ctx = context_for(chat_id, thread_id, self.config.identity.home_channel_id)
                     incoming = IncomingMessage(
                         text=turn_text,

@@ -157,7 +157,8 @@ def _parse_int(where: str, value: Any, default: int, *, positive: bool = False) 
 #: ignored without a word. ``peers`` maps free-form aliases and ``limits`` is checked
 #: against :class:`ChannelLimits`.
 KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
-    "": ("agent", "peers", "adapter", "limits", "fallback", "bus", "projects", "github"),
+    "": ("agent", "peers", "adapter", "limits", "fallback", "bus", "projects", "github",
+         "public_redactions"),
     "agent": ("name", "alias", "bot_token", "bot_token_env", "home_channel_id",
               "admin_user_id", "maintainer_username", "allowed_users", "git_name",
               "git_email", "role"),
@@ -750,6 +751,10 @@ class AgentConfig:
     bus: BusSettings = field(default_factory=BusSettings)
     projects: Dict[str, ProjectSettings] = field(default_factory=dict)
     github: Optional[GitHubSettings] = None
+    #: Issue #22: literal -> replacement, applied to everything that leaves the host (bus
+    #: payloads and GitHub-facing text). Empty by default: nothing is redacted until the
+    #: operator names what is sensitive on this machine.
+    public_redactions: Dict[str, str] = field(default_factory=dict)
     source_path: Optional[Path] = None
     # Whether ``bus.poll_minutes`` was explicitly present in the raw config.
     # Validation must name the key the operator actually wrote — the resolved
@@ -1049,6 +1054,18 @@ class AgentConfig:
         elif github_raw is not None:
             raise ConfigError("'github' must be a mapping")
 
+        # Issue #22: what must not leave this host. The literal is the sensitive value
+        # (a handle, a path); the replacement is what the bus and GitHub text carry instead.
+        redactions_raw = data.get("public_redactions") or {}
+        if not isinstance(redactions_raw, dict):
+            raise ConfigError("'public_redactions' must be a mapping of literal -> replacement")
+        public_redactions: Dict[str, str] = {}
+        for literal, replacement in redactions_raw.items():
+            text = str(literal)
+            if not text.strip():
+                raise ConfigError("public_redactions: an empty key cannot be redacted")
+            public_redactions[text] = str(replacement)
+
         unknown = unknown_keys(data)
         # Review P1-8: only numeric user ids authorise a person.
         unknown += [f"agent.allowed_users: {name!r} is a handle, ignored: list the person's "
@@ -1058,7 +1075,7 @@ class AgentConfig:
             logger.warning("config: %s", line)
         return cls(identity=identity, peers=peers, peer_roles=peer_roles, adapter=adapter, limits=limits,
                    fallback=fallback, bus=bus, projects=projects_dict, github=github,
-                   source_path=source_path,
+                   public_redactions=public_redactions, source_path=source_path,
                    _bus_poll_minutes_explicit=bool(bus_poll_explicit),
                    unknown_keys=unknown)
 

@@ -107,6 +107,54 @@ python -m swarmly.telegram.cli --config config.yaml run       # serve the channe
 `check` prints the BotFather/admin checklist alongside any config problems, because a missing
 admin right is silent at runtime.
 
+### What leaves the host — `public_redactions`
+
+The durable bus and GitHub text are public by nature, so the transport replaces three things
+before anything is written there: the maintainer's handle, team ids, and absolute local
+paths. The raw values stay in local config and state.
+
+```yaml
+agent:
+  maintainer_username: example_admin     # redacted from outbound text automatically
+public_redactions:                       # optional: literal -> replacement
+  "@example_admin": "<maintainer>"
+  'C:\work\client-name': '<path>'
+```
+
+- **Handles and paths** named here are replaced verbatim. Chat ids, `admin_user_id` and the
+  numeric ids in `peers:` need no entry: the transport knows them, and replaces them with
+  `<chat>`/`<user>`. Absolute paths under `adapter.cwd`, a project's `cwd` and your home
+  directory become `<path>`.
+- **Bot @usernames stay visible.** They are public on Telegram already, and each bot's
+  allowlist ignores strangers, so redacting them buys nothing and breaks the hand-off text
+  every peer needs to read.
+- **Dedupe keeps working without an id.** A mirrored hand-off names a topic token,
+  `topic:<project>:<chat tag>:<thread>`, instead of a chat id; each agent resolves it through
+  its own `projects:`. The chat tag is an HMAC of the chat id under the swarm's shared
+  secret, so a peer bound to another chat of the same project cannot read the token as its
+  own; **without that secret a project token is not sent at all**, and every peer runs the
+  mirror. A token written without the chat tag (an older mirror) cannot name a chat either,
+  so it is never treated as taken: it is re-run, not trusted to someone else's topic. An unbound topic falls back to an HMAC token from
+  `SWARMLY_REDACTION_SECRET`, which peers cannot resolve — they then run the mirrored turn as
+  well: **processed twice, never lost**. A token that resolves to more than one of this
+  agent's topics (one project bound to two chats on the same thread id) is never treated as
+  taken: message ids repeat per chat, so claiming it could swallow the other chat's
+  hand-off. Mirrors written before this change (a raw `chat` field) are still understood.
+- **Context ids carry a tag, not a chat id.** A topic in the home group stays `tg-<thread>`.
+  A topic in another group needs an HMAC tag, `tg-<tag>-<thread>`, keyed by
+  **`SWARMLY_REDACTION_SECRET` set to the same high-entropy value on every agent**. That is
+  what makes the tag both agreed across agents and unconfirmable by an outsider; a group id
+  as the key would be guessable, so it is not accepted. **Without the secret such a topic is
+  refused**: the turn does not run, the refusal is logged and the GitHub notification is
+  marked read, so the work neither leaks nor mixes into the General session it would share
+  with every other group. Set the secret on every agent to use topics outside the home
+  group; changing it changes the tags.
+- **Two separate secrets.** `redaction.secret` (generated at `~/.swarmly/redaction.secret`,
+  override with `SWARMLY_REDACTION_SECRET_FILE`) keys the *mirror* token, which is
+  deliberately unresolvable by peers; it is per host by design.
+- **`check` validates the map**: an empty key or a non-mapping value is an error, and an
+  unset map changes nothing.
+
 Values are parsed strictly. A switch such as `adapter.enabled` or `bus.enabled` takes
 true/false, yes/no, on/off or 1/0 (quoted or not), and anything else is an error naming the
 key. `adapter.timeout_seconds` and `adapter.max_output_chars` must be positive integers (`0`
@@ -609,7 +657,9 @@ with one `context_id`, which every agent works out the same way from the topic's
 | topic | `context_id` |
 |---|---|
 | a topic in the home group (`identity.home_channel_id`) | `tg-<topic id>`, e.g. `tg-42` |
-| a topic in any other group | `tg<group id>-<topic id>` |
+| a topic in any other group, with `SWARMLY_REDACTION_SECRET` set | `tg-<tag>-<topic id>`, the tag an HMAC of the group id under that secret |
+| a topic in any other group, without the secret | none: **the turn is refused** (logged; a GitHub notification is marked read), so it never falls into the General session |
+| any threaded topic on a host that never set `identity.home_channel_id`, without the secret | none: also refused — the transport cannot tell home from another group |
 | General (no topic) | none: the shared conversation, as before |
 
 - The topic's name never decides its `context_id`, so renaming a topic does not move it to
