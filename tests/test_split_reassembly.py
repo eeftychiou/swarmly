@@ -15,7 +15,8 @@ from unittest.mock import patch
 
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
-from swarmly.telegram.channel import MAX_SPLIT_PARTS, SplitPart, split_part
+from swarmly.telegram.channel import (MAX_SPLIT_PARTS, SPLIT_TIMEOUT_SECONDS, SplitPart,
+                                      split_part)
 from tests.test_telegram_channel import event, make_channel, make_config, run
 
 
@@ -340,6 +341,61 @@ class TestReassembly(unittest.TestCase):
 
         run(many_senders())
         self.assertEqual(len(adapter.seen), 1)          # the evicted reply was delivered, not lost
+
+    def test_a_part_arriving_while_an_older_reply_flushes_is_joined_not_overwritten(self):
+        """Codex's re-review of #29: part 1 awaits the delivery of an older held reply. A later
+        part of the same reply arrives during that await and opens the buffer; part 1 must join
+        it, not overwrite it and leave half a reply."""
+        channel, adapter = receiver()
+        gate = {"entered": asyncio.Event(), "release": asyncio.Event()}
+        deliver = channel._deliver_split
+
+        async def gated(pending):
+            gate["entered"].set()
+            await gate["release"].wait()
+            await deliver(pending)
+
+        async def scenario():
+            await channel.handle_event(event("@HermesBot [Codex] old one\n\n(1/3)", message_id=1))
+            channel._test_clock["t"] += SPLIT_TIMEOUT_SECONDS + 1   # the old reply has expired
+            with patch.object(channel, "_deliver_split", gated):
+                first = asyncio.create_task(channel.handle_event(
+                    event("@HermesBot [Codex] new one\n\n(1/2)", message_id=2)))
+                await gate["entered"].wait()          # part 1 is inside the flush, awaiting
+                await channel.handle_event(event("[Codex] ↪ (2/2) new two", message_id=3))
+                gate["release"].set()
+                await first
+
+        run(scenario())
+        texts = [message.text for message in adapter.seen]
+        self.assertTrue(any("new one" in text and "new two" in text for text in texts), texts)
+
+    def test_a_part_of_the_next_reply_survives_the_delivery_of_the_held_one(self):
+        """Codex's re-review of #29: part 1 of a second reply delivers the held one, which
+        awaits a turn. A later part of the *new* reply that arrives during that await must still
+        be joined with it — the flush must not be followed by overwriting the buffer."""
+        channel, adapter = receiver()
+        gate = {"entered": asyncio.Event(), "release": asyncio.Event()}
+        deliver = channel._deliver_split
+
+        async def gated(pending):
+            gate["entered"].set()
+            await gate["release"].wait()
+            await deliver(pending)
+
+        async def scenario():
+            await channel.handle_event(event("@HermesBot [Codex] alpha one\n\n(1/2)", message_id=1))
+            with patch.object(channel, "_deliver_split", gated):
+                bravo = asyncio.create_task(channel.handle_event(
+                    event("@HermesBot [Codex] bravo one\n\n(1/2)", message_id=2)))
+                await gate["entered"].wait()          # alpha is being delivered, awaiting
+                await channel.handle_event(event("[Codex] ↪ (2/2) bravo two", message_id=3))
+                gate["release"].set()
+                await bravo
+
+        run(scenario())
+        texts = [message.text for message in adapter.seen]
+        self.assertTrue(any("bravo one" in text and "bravo two" in text for text in texts), texts)
 
     def test_a_human_message_ending_in_a_part_marker_is_still_one_turn(self):
         channel, adapter = receiver()

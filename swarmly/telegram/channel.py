@@ -3833,20 +3833,27 @@ class AgentChannel:
             return False, None
         index, total, body = part.index, part.total, part.body
         key = self._split_key(event, part.ref or "")
-        pending = self._split_pending.get(key)
-        if pending is not None and not pending.accepts(index, total, body):
+        # Delivering a held reply awaits a turn, and another part of this sender can arrive
+        # while it runs. The state is read again after every await, and a buffer is only
+        # created when the map still has none for this key: a part that opened one meanwhile
+        # is joined, never overwritten (#29 re-review).
+        while True:
+            pending = self._split_pending.get(key)
+            if pending is None:
+                if self._split_pending and len(self._split_pending) >= MAX_PENDING_SPLITS:
+                    await self._evict_oldest_split()
+                    continue                     # re-read: the eviction awaited as well
+                # A later part can arrive first; it is held the same way, and the turn (when
+                # it runs, or when the window closes) takes the earliest part's chat and topic.
+                pending = _PendingSplit(total=total, opened=self._clock())
+                self._split_pending[key] = pending
+                self._arm_split_timeout(key, pending)
+                break
+            if pending.accepts(index, total, body):
+                break
             # Another reply by the same bot started before this one finished: the held parts
             # are not one message any more, so they go out now and this part opens the next.
             await self._drop_split(key, pending)
-            pending = None
-        if pending is None:
-            if len(self._split_pending) >= MAX_PENDING_SPLITS:
-                await self._evict_oldest_split()
-            # A later part can arrive first; it is held the same way, and the turn (when it
-            # runs, or when the window closes) takes the earliest part's chat and topic.
-            pending = _PendingSplit(total=total, opened=self._clock())
-            self._split_pending[key] = pending
-            self._arm_split_timeout(key, pending)
         if index in pending.bodies:
             return True, None                       # a repeated part: nothing new to add
         pending.bodies[index] = body

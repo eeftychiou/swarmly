@@ -40,7 +40,9 @@ All notable changes to this project are documented here. The format follows
   a bot whose messages are ignored anyway (`limits.strangers: ignore`), so numbered fragments
   cannot leave live timers behind. A fragment whose first part never came keeps its `↪ (k/n)`
   marker when the window closes, so it stays a continuation and never starts a turn of its own,
-  even when its text names the bot (`#29`).
+  even when its text names the bot. Parts can arrive while a held reply is being delivered, so
+  the buffer is read again after every await: a part that opened a buffer meanwhile is joined
+  with its reply instead of being overwritten and lost (`#29`).
 
 ## [0.10.1] - 2026-10-17
 
