@@ -3076,7 +3076,10 @@ class AgentChannel:
         token = ref.get("topic")
         if isinstance(token, str) and token:
             from swarmly.telegram.redact import resolve_topic_token
-            candidates = resolve_topic_token(token, getattr(self, "router", None))
+            import os
+            candidates = resolve_topic_token(token, getattr(self, "router", None),
+                                             secret=os.environ.get(
+                                                 "SWARMLY_REDACTION_SECRET", "").strip())
             # An ambiguous token (one project bound to two chats on the same thread id)
             # cannot say which chat the mirror came from, and message ids repeat per chat:
             # claiming it was taken could swallow another chat's hand-off. Run it instead --

@@ -111,9 +111,23 @@ class TestRedactor(SecretSandbox):
         with TemporaryDirectory() as tmp:
             cfg = project_config(tmp)
             channel = self._channel(cfg)
-            ref = Redactor.from_config(cfg).topic_ref(GROUP, THREAD, channel.router)
-        self.assertEqual(ref, {"topic": f"topic:webapp:{THREAD}"})
+            with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
+                ref = Redactor.from_config(cfg).topic_ref(GROUP, THREAD, channel.router)
+        # project:chat tag:thread -- the tag says which chat without naming its id.
+        fields = ref["topic"].split(":")
+        self.assertEqual(fields[0], "topic")
+        self.assertEqual(fields[1], "webapp")
+        self.assertEqual(fields[3], str(THREAD))
+        self.assertEqual(len(fields[2]), 16)
         self.assertNotIn(str(GROUP), repr(ref))
+
+    def test_without_the_shared_secret_a_project_token_is_not_sent(self):
+        with TemporaryDirectory() as tmp:
+            cfg = project_config(tmp)
+            channel = self._channel(cfg)
+            with mock.patch.dict(os.environ, {SECRET_ENV: ""}):
+                ref = Redactor.from_config(cfg).topic_ref(GROUP, THREAD, channel.router)
+        self.assertEqual(ref, {})           # peers run the mirror: never lost
 
     def test_an_unbound_topic_falls_back_to_the_hmac_token(self):
         with TemporaryDirectory() as tmp:
@@ -226,14 +240,15 @@ class TestMirrorAndDedupe(SecretSandbox):
 
             async def fake_post(_channel, **kw):
                 posted.append(kw)
-            with mock.patch("swarmly.telegram.relay.post_and_notify", fake_post):
+            with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}),                     mock.patch("swarmly.telegram.relay.post_and_notify", fake_post):
                 async def scenario():
                     channel._mirror_handoffs("@CodexBot please review #22", GROUP, THREAD, 55)
                     await asyncio.gather(*list(channel._mirror_tasks))
                 asyncio.run(scenario())
         self.assertEqual(len(posted), 1, posted)
         ref = posted[0]["extra"]["telegram"]
-        self.assertEqual(ref["topic"], f"topic:webapp:{THREAD}")
+        self.assertEqual(ref["topic"].split(":")[1], "webapp")
+        self.assertEqual(ref["topic"].split(":")[3], str(THREAD))
         self.assertNotIn("chat", ref)
         self.assertNotIn(str(abs(GROUP)), repr(ref))
         self.assertEqual(ref["message_id"], 55)
@@ -279,6 +294,39 @@ class TestMirrorAndDedupe(SecretSandbox):
         self.assertEqual(payload["<user>"], "admin")
         self.assertEqual(payload[55], "message")
         self.assertEqual(payload["plain"], "x")
+
+    def test_another_chats_token_is_never_claimed(self):
+        """Finding: sender B's token must not read as receiver A's own topic."""
+        from swarmly.telegram.adapters import EchoAdapter
+        from swarmly.telegram.channel import AgentChannel
+        with TemporaryDirectory() as tmp,                 mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
+            cfg = AgentConfig.from_dict({
+                "agent": {"name": "HermesBot", "alias": "Hermes", "bot_token": "123456:TEST",
+                          "home_channel_id": GROUP, "admin_user_id": ADMIN_ID},
+                "adapter": {"type": "echo", "cwd": tmp},
+                # This receiver knows only its own chat (the home group) for the project.
+                "projects": {"webapp": {"repo": "example-org/webapp", "cwd": tmp,
+                                        "topics": [str(THREAD)]}},
+            })
+            channel = AgentChannel(cfg, adapter=EchoAdapter("Hermes"), sender=mock.MagicMock(),
+                                   gitbus_pull=lambda _root: None, gitbus_read=lambda _root: [])
+            channel._tg_admitted.append((GROUP, 55))
+            # The sender is bound to another chat of the same project.
+            sender_cfg = AgentConfig.from_dict({
+                "agent": {"name": "HermesBot", "alias": "Hermes", "bot_token": "123456:TEST",
+                          "home_channel_id": GROUP, "admin_user_id": ADMIN_ID},
+                "adapter": {"type": "echo", "cwd": tmp},
+                "projects": {"webapp": {"repo": "example-org/webapp", "cwd": tmp,
+                                        "topics": [f"{-1009999999999}/{THREAD}"]}},
+            })
+            sender = AgentChannel(sender_cfg, adapter=EchoAdapter("Hermes"),
+                                  sender=mock.MagicMock(), gitbus_pull=lambda _root: None,
+                                  gitbus_read=lambda _root: [])
+            ref = Redactor.from_config(sender_cfg).topic_ref(-1009999999999, THREAD,
+                                                             sender.router)
+            self.assertEqual(ref["topic"].split(":")[1], "webapp")
+            took = channel.took_telegram_copy({"topic": ref["topic"], "message_id": 55})
+        self.assertFalse(took)              # B's mirror runs here: processed twice, never lost
 
     def test_an_ambiguous_token_never_suppresses_another_chats_mirror(self):
         """Finding: one project bound to two chats on the same thread id."""

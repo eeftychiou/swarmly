@@ -102,10 +102,18 @@ def local_secret(path: Optional[Path] = None) -> str:
     return secret
 
 
-def topic_token(project: str, thread_id: Optional[int]) -> str:
-    """The token for a topic bound to ``project`` (``general`` when no thread is bound)."""
+def topic_token(project: str, thread_id: Optional[int], chat_tag: str = "") -> str:
+    """The token for a topic bound to ``project`` (``general`` when no thread is bound).
+
+    ``chat_tag`` identifies *which chat* the mirror came from, as an HMAC of the chat id
+    under the swarm's shared secret -- never the id. Without it the token cannot tell two
+    chats of one project apart, and a receiver bound to only one of them would mistake the
+    other's mirror for its own (review of PR #23).
+    """
     key = str(project).strip()
     which = "general" if thread_id is None else str(int(thread_id))
+    if chat_tag:
+        return f"{TOPIC_PREFIX}{key}:{chat_tag}:{which}"
     return f"{TOPIC_PREFIX}{key}:{which}"
 
 
@@ -117,7 +125,8 @@ def hmac_token(chat_id: int, secret: str = "") -> str:
     return f"{TOPIC_PREFIX}hmac-{digest[:16]}"
 
 
-def resolve_topic_token(token: Any, router: Any) -> List[Tuple[int, Optional[int]]]:
+def resolve_topic_token(token: Any, router: Any,
+                        secret: str = "") -> List[Tuple[int, Optional[int]]]:
     """The local ``(chat_id, thread_id)`` pairs a token names, for *this* agent.
 
     Empty for the HMAC form and for a project this agent does not configure: the caller then
@@ -128,19 +137,34 @@ def resolve_topic_token(token: Any, router: Any) -> List[Tuple[int, Optional[int
     rest = token[len(TOPIC_PREFIX):]
     if rest.startswith("hmac-"):
         return []
-    project, _, which = rest.rpartition(":")
+    parts = rest.split(":")
+    if len(parts) == 3:                     # project:chat tag:thread
+        project, tag, which = parts
+    elif len(parts) == 2:                   # project:thread (written before the chat tag)
+        project, which = parts
+        tag = ""
+    else:
+        return []
     if not project or not which:
         return []
     topics = router.topics_of(project) or []
     if which == "general":
         # Only a project that really is bound without a thread: a threadless fallback for a
         # threaded project would claim messages it never took.
-        return [(chat, None) for chat, thread_id in topics if thread_id is None]
-    try:
-        thread = int(which)
-    except ValueError:
+        found = [(chat, None) for chat, thread_id in topics if thread_id is None]
+    else:
+        try:
+            thread = int(which)
+        except ValueError:
+            return []
+        found = [(chat, thread_id) for chat, thread_id in topics if thread_id == thread]
+    if not tag:
+        return found
+    if not secret:
+        # The tag cannot be checked without the shared secret, so nothing may be claimed.
         return []
-    return [(chat, thread_id) for chat, thread_id in topics if thread_id == thread]
+    return [(chat, thread) for chat, thread in found
+            if hmac_token(chat, secret)[len(TOPIC_PREFIX) + len("hmac-"):] == tag]
 
 
 @dataclass
@@ -267,9 +291,21 @@ class Redactor:
         return hmac_token(int(chat_id), self.secret or local_secret())
 
     def topic_ref(self, chat_id: int, thread_id: Optional[int], router: Any) -> Dict[str, Any]:
-        """The ``telegram`` reference a hand-off mirror carries: a token, never the id."""
+        """The ``telegram`` reference a hand-off mirror carries: a token, never the id.
+
+        A project token names the chat too (a tag under the swarm's shared secret): without
+        it a receiver bound to another chat of the same project would read the token as its
+        own and drop the mirror. No shared secret means no project token -- the mirror then
+        carries only its message id, and every peer runs it: processed twice, never lost.
+        """
         project = None
         if router is not None and thread_id is not None:
             project = router.project_for(int(chat_id), thread_id)
-        token = topic_token(project.key, thread_id) if project is not None else self.chat_token(chat_id)
+        if project is not None:
+            shared = os.environ.get(SECRET_ENV, "").strip()
+            if not shared:
+                return {}
+            tag = hmac_token(chat_id, shared)[len(TOPIC_PREFIX) + len("hmac-"):]
+            return {"topic": topic_token(project.key, thread_id, chat_tag=tag)}
+        token = self.chat_token(chat_id)
         return {"topic": token} if token else {}

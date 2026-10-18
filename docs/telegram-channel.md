@@ -128,9 +128,12 @@ public_redactions:                       # optional: literal -> replacement
 - **Bot @usernames stay visible.** They are public on Telegram already, and each bot's
   allowlist ignores strangers, so redacting them buys nothing and breaks the hand-off text
   every peer needs to read.
-- **Dedupe keeps working without an id.** A mirrored hand-off names a topic token
-  (`topic:<project>:<thread>`) instead of a chat id; each agent resolves it through its own
-  `projects:`. An unbound topic falls back to an HMAC token from
+- **Dedupe keeps working without an id.** A mirrored hand-off names a topic token,
+  `topic:<project>:<chat tag>:<thread>`, instead of a chat id; each agent resolves it through
+  its own `projects:`. The chat tag is an HMAC of the chat id under the swarm's shared
+  secret, so a peer bound to another chat of the same project cannot read the token as its
+  own; **without that secret a project token is not sent at all**, and every peer runs the
+  mirror. An unbound topic falls back to an HMAC token from
   `SWARMLY_REDACTION_SECRET`, which peers cannot resolve — they then run the mirrored turn as
   well: **processed twice, never lost**. A token that resolves to more than one of this
   agent's topics (one project bound to two chats on the same thread id) is never treated as
