@@ -70,6 +70,8 @@ logger = logging.getLogger("swarmly.telegram.membership")
 JOIN_WAIT_SECONDS = 90.0
 #: How long a newcomer waits for the coordinator to give it a role before asking the maintainer.
 ROLE_WAIT_SECONDS = 600.0
+#: How long Telegram's "not an admin" answer stands before the bot is asked about again.
+NOT_ADMIN_RECHECK_SECONDS = 60.0
 #: Marks a turn the transport started for membership (a role decision, an onboarding).
 MEMBERSHIP_MARK = "[swarm membership]"
 _DECIDE_MARK = "A new agent joined the swarm:"
@@ -102,6 +104,7 @@ class SwarmState:
     peer_ids: Dict[str, int] = field(default_factory=dict)    # alias -> Telegram user id
     onboard_pending: bool = False             # a role was given; its first turn has not run
     bus_ready: bool = False                   # the launcher has a checkout of ``bus``
+    self_appointed: bool = False              # coordinator only because nobody answered
 
     @classmethod
     def load(cls, path: Optional[Path]) -> "SwarmState":
@@ -112,12 +115,14 @@ class SwarmState:
                    role=_text(raw.get("role")),
                    peer_roles={str(a): str(r) for a, r in roles.items() if _ROLE_NAME(r)},
                    peer_ids={str(a): int(i) for a, i in ids.items() if _is_int(i)},
-                   onboard_pending=bool(raw.get("onboard_pending")), bus_ready=bool(raw.get("bus_ready")))
+                   onboard_pending=bool(raw.get("onboard_pending")), bus_ready=bool(raw.get("bus_ready")),
+                   self_appointed=bool(raw.get("self_appointed")))
 
     def save(self, path: Optional[Path]) -> None:
         save_state(path, {"bus": self.bus, "coordinator": self.coordinator, "role": self.role,
                           "peer_roles": dict(self.peer_roles), "peer_ids": dict(self.peer_ids),
-                          "onboard_pending": self.onboard_pending, "bus_ready": self.bus_ready},
+                          "onboard_pending": self.onboard_pending, "bus_ready": self.bus_ready,
+                          "self_appointed": self.self_appointed},
                    "swarm membership")
 
 
@@ -208,7 +213,11 @@ class Membership:
         self.candidates: Dict[str, str] = {}
         self.cli = ""                                    # the runtime, for the JOIN
         self.public_key = ""                             # the bus key's public half
-        self._verified: Dict[int, bool] = {}
+        self._verified: Dict[int, bool] = {}             # user id -> confirmed bot admin
+        self._not_admin: Dict[int, float] = {}           # user id -> when Telegram said no
+        #: JOINs from bots that were not admins yet: user id -> (alias, body, the JOIN event),
+        #: answered once Telegram says the bot is an admin.
+        self._waiting_joins: Dict[int, Tuple[str, str, "ChannelEvent"]] = {}
         self._remote_checked = False                     # bus_location asked git once
         self._joined_at: Optional[float] = None          # when this agent posted its JOIN
         self._present_from: List[str] = []               # members that answered the JOIN
@@ -330,18 +339,27 @@ class Membership:
         """Telegram says this user is a bot and an administrator of the home group."""
         if user_id is None or self.lookup is None:
             return False
-        if user_id in self._verified:
-            return self._verified[user_id]
+        user_id = int(user_id)
+        if self._verified.get(user_id):
+            return True
+        # A "no" is only remembered for a while: the owner often makes a bot an admin after it
+        # first spoke (live run: a newcomer stayed a stranger until every transport restarted).
+        checked = self._not_admin.get(user_id)
+        if checked is not None and self.ch._clock() - checked < NOT_ADMIN_RECHECK_SECONDS:
+            return False
         try:
-            found = await self.lookup(int(user_id))
+            found = await self.lookup(user_id)
         except Exception as exc:                     # noqa: BLE001 - not verified, logged
             logger.warning("membership: cannot look up user %s in the group: %s", user_id, exc)
             return False
         ok = bool(found and found[0] in ADMIN_STATUSES and found[2]
                   and found[1].lower().endswith("bot")
                   and (not username or found[1].lower() == username.lstrip("@").lower()))
-        self._verified[int(user_id)] = ok
-        if not ok:
+        if ok:
+            self._verified[user_id] = True
+            self._not_admin.pop(user_id, None)
+        else:
+            self._not_admin[user_id] = self.ch._clock()
             logger.warning("membership: @%s (id %s) is not a bot administrator of the group; "
                            "make it an admin, or /admit it", username, user_id)
         return ok
@@ -475,6 +493,8 @@ class Membership:
                    else ""))
             if first and not self.state.role:
                 self.set_own_role("coordinator", by="default: the first agent")
+                self.state.self_appointed = True
+                self._save()
             return
         await self._await_role()
 
@@ -550,7 +570,11 @@ class Membership:
         known = self.cfg.peer_alias_for(username)
         if known is None and not await self._verified_admin(event.author_id, username):
             self.ch.roster.saw_online(alias, username)        # the admin can still /admit it
+            if event.author_id is not None:
+                self._waiting_joins[int(event.author_id)] = (alias, body, event)
             return
+        if event.author_id is not None:
+            self._waiting_joins.pop(int(event.author_id), None)
         fields = parse_fields(body)
         if not self._add_peer(known or alias, username, event.author_id, fields.get("role")):
             await self.ch.send(f"⚠️ @{username} the alias {alias} is taken in this swarm; "
@@ -597,6 +621,23 @@ class Membership:
                     "added as a peer", alias, username)
         return alias
 
+    async def retry_join(self, event: "ChannelEvent") -> bool:
+        """A bot whose JOIN went unanswered because it was not an admin yet posts again (its
+        question to the maintainer, an online notice, anything): ask Telegram once more and,
+        if it is an admin now, answer the JOIN it posted. True when the JOIN was answered."""
+        user_id = event.author_id
+        if user_id is None or int(user_id) not in self._waiting_joins:
+            return False
+        if self.cfg.peer_alias_for(event.author_username, user_id) is not None:
+            self._waiting_joins.pop(int(user_id), None)     # admitted another way meanwhile
+            return False
+        if not await self._verified_admin(user_id, event.author_username):
+            return False
+        alias, body, join = self._waiting_joins.pop(int(user_id))
+        logger.info("membership: %s is an admin now; answering its JOIN", alias)
+        await self._on_join(alias, body, join)
+        return True
+
     def _vouch(self, alias: str, key: Optional[str]) -> None:
         """Verify *alias*'s bus messages with the key from its JOIN until this host pulls
         the registry commit that registers it (bus.vouch_key)."""
@@ -629,7 +670,10 @@ class Membership:
         # the admin changes it (/role @bot coordinator).
         claims = role == "coordinator" and (fields.get("coordinator") or "").lower() \
             == alias.lower()
-        if claims and self.state.coordinator is None and not self.joined():
+        if claims and not self.joined() and (self.state.coordinator is None
+                                             or self.state.self_appointed):
+            if self.state.self_appointed:
+                self._step_down(alias)
             self._set_peer_role(alias, "coordinator", coordinator=True)
         if self.state.coordinator == alias:
             for m_alias, m_user, m_id, m_role in _MEMBER.findall(fields.get("members", "")):
@@ -645,6 +689,20 @@ class Membership:
             else:
                 logger.warning("membership: %s named the bus %r, a folder on its machine; "
                                "ask the admin for a URL (/bus%s)", alias, bus, self._at())
+
+    def _step_down(self, coordinator: str) -> None:
+        """This agent took the coordinator role only because nobody answered its JOIN (the
+        others could not verify it yet); the swarm's coordinator has answered now, so it gives
+        the role back and waits for the one the coordinator decides."""
+        logger.info("membership: %s answered as the coordinator; %s steps down from the "
+                    "coordinator role it took as the first agent", coordinator, self.alias)
+        self.state.role = None
+        self.cfg.identity.role = None
+        self.state.onboard_pending = False
+        self.state.self_appointed = False
+        self.state.coordinator = None
+        self._save()
+        self.ch.roles_changed()
 
     async def adopt_bus(self, location: str) -> None:
         """Take *location* as this swarm's bus (the launcher makes a checkout of it)."""
@@ -707,6 +765,7 @@ class Membership:
                            self.alias, role)
             return
         changed = role != self.state.role
+        self.state.self_appointed = False
         self.state.role = role
         self.cfg.identity.role = role
         if role == "coordinator":
@@ -819,6 +878,8 @@ class Membership:
     # -- group service messages -----------------------------------------------------------
     async def member_left(self, user_id: Optional[int], username: Optional[str]) -> None:
         """A bot left the group: it is no longer in the swarm (it rejoins with a JOIN)."""
+        if user_id is not None:
+            self._waiting_joins.pop(int(user_id), None)
         alias = self.cfg.peer_alias_for(username, user_id)
         if alias is None:
             return

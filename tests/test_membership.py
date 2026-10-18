@@ -16,7 +16,8 @@ from tests.gitenv import git_env
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
 from swarmly.telegram.config import AgentConfig
-from swarmly.telegram.membership import (JOIN_WAIT_SECONDS, MEMBERSHIP_MARK, Membership,
+from swarmly.telegram.membership import (JOIN_WAIT_SECONDS, MEMBERSHIP_MARK,
+                                         NOT_ADMIN_RECHECK_SECONDS, Membership,
                                          SwarmState, is_remote_bus, parse_fields,
                                          safe_bus_location,
                                          swarm_state_path)
@@ -488,6 +489,88 @@ class MissedJoinTests(unittest.TestCase):
             run(channel.handle_event(hello("ONLINE", "Antigravity", "🟢 Antigravity online",
                                            "agy_x_bot", 600)))
             self.assertNotIn("Antigravity", channel.config.peers)
+
+
+class LateAdminTests(unittest.TestCase):
+    """Live run: the owner made a newcomer an admin only after it had posted its JOIN; every
+    transport kept Telegram's first "not an admin" until it restarted, and the newcomer,
+    unanswered, made itself the coordinator of a swarm that already had one."""
+
+    def promoted_later(self, channel):
+        """A lookup in which @newbie_x_bot (500) becomes an admin when ``promote()`` is called."""
+        admins = set()
+
+        async def lookup(user_id):
+            if user_id in admins:
+                return ("administrator", "newbie_x_bot", True)
+            return ("member", "newbie_x_bot", True)
+        channel.membership.lookup = lookup
+        return lambda: admins.add(500)
+
+    def test_a_join_from_a_bot_made_admin_later_is_answered_when_it_speaks_again(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = joined(make_channel(config_at(folder)))
+            promote = self.promoted_later(channel)
+            join = hello("JOIN", "Newbie", f"🙋 Newbie wants to join\ncli: reasonix\nkey: {PUB}",
+                         "newbie_x_bot", 500, message_id=70)
+            plea = event("[Newbie] 🙋 Newbie here. No agent answered, so I am the first one in "
+                         "this swarm. Where is the bus?", username="newbie_x_bot",
+                         author_id=500, message_id=71)
+            run(channel.handle_event(join))
+            self.assertNotIn("Newbie", channel.config.peers)
+            promote()
+            run(channel.handle_event(plea))           # Telegram's "no" still stands
+            self.assertNotIn("Newbie", channel.config.peers)
+            channel._test_clock["t"] += NOT_ADMIN_RECHECK_SECONDS + 1
+            run(channel.handle_event(plea))
+            self.assertEqual(channel.config.peers["Newbie"], "newbie_x_bot")
+            present = [r for r in channel._test_sender.sent if "intent=PRESENT" in r["text"]]
+            self.assertEqual(len(present), 1)
+            self.assertEqual(present[0]["reply_to"], 70)          # the answer to its JOIN
+            self.assertIn("bus: https://example.com/bus.git", present[0]["text"])
+
+    def test_a_bot_that_is_still_not_an_admin_stays_out(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = joined(make_channel(config_at(folder)))
+            self.promoted_later(channel)                          # never promoted
+            run(channel.handle_event(hello("JOIN", "Newbie", "🙋 Newbie wants to join",
+                                           "newbie_x_bot", 500, message_id=70)))
+            channel._test_clock["t"] += NOT_ADMIN_RECHECK_SECONDS + 1
+            run(channel.handle_event(event("[Newbie] where is the bus?",
+                                           username="newbie_x_bot", author_id=500)))
+            self.assertNotIn("Newbie", channel.config.peers)
+            self.assertIn("newbie_x_bot", channel.roster.pending)     # /admit still works
+
+    def test_a_self_appointed_coordinator_steps_down_for_the_swarms(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(dynamic(make_channel(config_at(folder))), claude_x_bot=401)
+            m = channel.membership
+            m.set_own_role("coordinator", by="default: the first agent")
+            m.state.self_appointed = True
+            got = []
+
+            async def on_bus(location):
+                got.append(location)
+            m.on_bus = on_bus
+            run(channel.handle_event(hello(
+                "PRESENT", "Claude", "@HermesBot 👋 Claude here.\nrole: coordinator\n"
+                "coordinator: Claude\nbus: https://github.com/me/swarm-bus.git",
+                "claude_x_bot", 401, to="Hermes")))
+            self.assertEqual(m.state.coordinator, "Claude")
+            self.assertIsNone(m.state.role)                   # the coordinator decides it
+            self.assertFalse(m.state.self_appointed)
+            self.assertEqual(got, ["https://github.com/me/swarm-bus.git"])
+
+    def test_a_coordinator_the_admin_named_does_not_step_down(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(dynamic(make_channel(config_at(folder))), claude_x_bot=401)
+            m = channel.membership
+            m.set_own_role("coordinator", by="admin")
+            run(channel.handle_event(hello(
+                "PRESENT", "Claude", "@HermesBot 👋 Claude here.\nrole: coordinator\n"
+                "coordinator: Claude", "claude_x_bot", 401, to="Hermes")))
+            self.assertEqual(m.state.role, "coordinator")
+            self.assertEqual(m.state.coordinator, "Hermes")
 
 
 class TrustTests(unittest.TestCase):
