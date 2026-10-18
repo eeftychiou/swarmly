@@ -218,6 +218,12 @@ swarmly-telegram --config config.yaml gh-poll --once --json
 - A watch is dropped when it fires, when `gh` has no checks for it, or after 12 hours, so a PR
   with no CI configured does not cost polls forever. `github.poll_minutes: 0` disables it with
   the rest of the backstop.
+- An empty `statusCheckRollup` counts as pending, not success: a pull request pushed a moment
+  ago has no checks until GitHub materialises them, and a wake then would announce a run that
+  did not exist yet.
+- The wake turn is admitted like a notification turn: a bound topic outside the home group with
+  no context id (`SWARMLY_REDACTION_SECRET` unset) is refused and reported in the poll outcome,
+  rather than run into the shared General session.
 
 ### GitHub token permissions
 When generating a Personal Access Token (PAT) for the agent:

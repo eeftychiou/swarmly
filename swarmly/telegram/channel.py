@@ -3424,6 +3424,10 @@ class AgentChannel:
                 text = text()
                 if not text:
                     return None
+                # The resolved text is what goes out, so it is what may name a PR: a watch
+                # taken from the callable's source would miss the link it renders
+                # (issue #24 review).
+                self._watch_ci(text, destination, thread_id)
             parts = self.split_outgoing(strip_autolinks(str(text)))
             first = None
             self._gone_topics.discard(topic)

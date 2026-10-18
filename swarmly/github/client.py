@@ -113,9 +113,11 @@ def checks_from_rollup(number: int, head_sha: str, url: str, title: str,
     The rollup mixes ``CheckRun`` entries (``status``/``conclusion``) with ``StatusContext``
     entries (``state``); both are read here so a PR watched through either API answers the
     same. An entry the parser cannot read counts as pending: waking on a guess is worse than
-    waiting for the next poll, and the watch's own lifetime bounds the wait.
+    waiting for the next poll, and the watch's own lifetime bounds the wait. An empty rollup
+    is pending too — a PR pushed a moment ago has no checks until GitHub materialises them,
+    and a wake saying "no checks" would arrive before the run it is waiting for exists.
     """
-    checks = PRChecks(number=number, head_sha=head_sha, state="success", url=url, title=title)
+    checks = PRChecks(number=number, head_sha=head_sha, state="pending", url=url, title=title)
     for entry in rollup if isinstance(rollup, list) else []:
         if not isinstance(entry, dict):
             checks.pending.append("?")
@@ -126,15 +128,20 @@ def checks_from_rollup(number: int, head_sha: str, url: str, title: str,
         state = str(entry.get("state") or "").upper()
         checks.total += 1
         if conclusion in FAILED_CONCLUSIONS or state in {"FAILURE", "ERROR"}:
-            checks.state = "failure"
             checks.failed.append(name)
         elif status in PENDING_STATES or state in PENDING_STATES or \
                 (not conclusion and not state) or (status and status != "COMPLETED"):
             checks.pending.append(name)
         else:
             checks.passed += 1
-    if checks.pending:
+    if checks.pending or checks.total == 0:
+        # No checks at all is not "all good": a PR pushed a moment ago has none until GitHub
+        # materialises them, so the run stays pending and the next poll asks again.
         checks.state = "pending"
+    elif checks.failed:
+        checks.state = "failure"
+    else:
+        checks.state = "success"
     return checks
 
 

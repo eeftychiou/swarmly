@@ -15,7 +15,10 @@ All notable changes to this project are documented here. The format follows
   `#<n>` in a project topic). The watch and the result reported live in
   `.agents/state/gh_ci-<alias>.json`, keyed by head commit and check state, so a restart
   neither forgets a watch nor wakes twice for a run, while a new push is reported again
-  (`#24`).
+  (`#24`). A pull request whose rollup is still empty stays pending rather than waking at
+  once, a watch registered by a reply during a wake survives that poll, and a wake in a topic
+  with no context id is refused instead of running in the shared General session (`#24`
+  review).
 
 ## [0.10.1] - 2026-10-17
 

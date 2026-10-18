@@ -7,10 +7,11 @@ the result — once per head commit, and not again after a restart.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from swarmly.github.client import PRChecks, checks_from_rollup
 from swarmly.github.watch import (CI_WATCH_TTL_SECONDS, CIWatchState, GitHubWatcher,
@@ -136,9 +137,10 @@ class TestChecksFromRollup(unittest.TestCase):
 
     def test_an_empty_rollup_is_pending_not_a_wake(self):
         # A PR pushed a moment ago may have no checks yet: waiting is right, a wake saying
-        # "no checks" is noise.
+        # "no checks" is noise -- and it would land before the run it waits for exists.
         checks = checks_from_rollup(20, "abc", "", "", [])
-        self.assertEqual(checks.state, "success")
+        self.assertEqual(checks.state, "pending")
+        self.assertFalse(checks.terminal)
         self.assertIn("no check runs", checks.summary())
 
 
@@ -259,6 +261,63 @@ class TestCIWake(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(list(CIWatchState.load(watcher.ci_state_path).watches), [])
             self.assertEqual(adapter.received, [])
 
+    async def test_a_watch_registered_during_a_wake_survives_the_poll(self):
+        # The wake turn's reply names a second PR, so the channel writes that watch to the
+        # same file this poll is holding a stale snapshot of. Saving the snapshot back would
+        # erase it: the watch must still be there when the poll ends.
+        with TemporaryDirectory() as tmp:
+            channel, adapter = fake_channel()
+            watcher = watcher_for(tmp, FakeGitHub([passed()]), channel)
+            watch_pr(watcher)
+
+            async def registers_another(message):
+                register_ci_watch(watcher.config, REPO, 21, GROUP, TOPIC, project="webapp",
+                                  state_path=watcher.ci_state_path)
+                reply = MagicMock()
+                reply.text = "ACK"
+                reply.ok = True
+                return reply
+
+            adapter.respond = registers_another
+            outcome = await watcher.poll_once()
+
+            self.assertEqual(outcome.ci_wakes, 1)
+            self.assertEqual(list(CIWatchState.load(watcher.ci_state_path).watches),
+                             [f"{REPO}#21"])
+
+    async def test_a_watch_registered_between_polls_is_still_polled(self):
+        # A long-lived watcher loaded its state before the channel wrote this watch, so the
+        # poll has to read the file back instead of trusting the snapshot in memory.
+        with TemporaryDirectory() as tmp:
+            client = FakeGitHub([passed()])
+            watcher = watcher_for(tmp, client, fake_channel()[0])
+            register_ci_watch(watcher.config, REPO, 20, GROUP, TOPIC, project="webapp",
+                              state_path=watcher.ci_state_path)
+            self.assertEqual(watcher.ci_state.watches, {})   # nothing in the snapshot
+
+            outcome = await watcher.poll_once()
+
+            self.assertEqual(outcome.ci_wakes, 1)
+            self.assertEqual(client.calls, [(REPO, 20)])
+
+    async def test_a_wake_in_a_topic_without_a_context_id_is_refused(self):
+        # Same guard as the notification turns: a bound topic outside the home group with no
+        # shared secret has no context id, so its wake must be refused rather than run into
+        # the shared General session.
+        with TemporaryDirectory() as tmp:
+            channel, adapter = fake_channel()
+            watcher = watcher_for(tmp, FakeGitHub([passed()]), channel)
+            other_group = GROUP - 1
+            watcher.ci_state.watch(REPO, 20, other_group, TOPIC, project="webapp")
+            watcher.ci_state.save(watcher.ci_state_path)
+            with patch.dict(os.environ, {"SWARMLY_REDACTION_SECRET": ""}):
+                outcome = await watcher.poll_once()
+
+            self.assertEqual(outcome.ci_wakes, 0)
+            self.assertEqual(adapter.received, [])
+            self.assertEqual(outcome.delivered_topics, [])
+            self.assertTrue(any("refused" in err for err in outcome.errors), outcome.errors)
+
     async def test_a_failed_turn_is_reported_and_still_not_repeated(self):
         with TemporaryDirectory() as tmp:
             client = FakeGitHub([passed()])
@@ -354,6 +413,17 @@ class TestChannelRegistersAPRItTalksAbout(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(watch)
             self.assertEqual(watch["thread_id"], TOPIC)
             self.assertEqual(watch["project"], "webapp")
+
+    def test_a_pr_link_in_a_callable_reply_is_watched(self):
+        # The text the channel sends is what a callable resolves to, so that is what may
+        # name a PR -- the callable's source never would.
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp)
+            from tests.test_telegram_channel import run
+            run(channel.send(lambda: f"Opened https://github.com/{REPO}/pull/20"))
+
+            state = self.watched(tmp)
+            self.assertEqual(list(state.watches), [f"{REPO}#20"])
 
     def test_a_reply_without_a_pr_registers_nothing(self):
         with TemporaryDirectory() as tmp:

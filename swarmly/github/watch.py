@@ -260,6 +260,25 @@ class CIWatchState:
     def drop(self, key: str) -> None:
         self.watches.pop(key, None)
 
+    def merge_from(self, path: Optional[Path], *, keep_out: Any = ()) -> None:
+        """Fold in what another writer added to ``path`` since this snapshot was loaded.
+
+        The channel registers a watch whenever a reply names a PR, and a reply can run inside
+        this poll's wake turn: that write lands on disk while a stale ``self`` is in memory.
+        Saving it back unchanged would erase the new watch, so every save first reads the
+        file and keeps the watches and results only it knows about (issue #24 review).
+        ``keep_out`` names keys this poll dropped — they must not come back.
+        """
+        if not path:
+            return
+        on_disk = CIWatchState.load(path)
+        for key, watch in on_disk.watches.items():
+            if key not in keep_out and key not in self.watches:
+                self.watches[key] = watch
+        for key, revision in on_disk.reported.items():
+            if key not in keep_out:
+                self.reported.setdefault(key, revision)
+
     def reported_result(self, key: str) -> Optional[str]:
         return self.reported.get(key)
 
@@ -478,12 +497,20 @@ class GitHubWatcher:
     # ----------------------------------------------------------------------------------
     # Turns, and the CI wake that uses them (issue #24)
     # ----------------------------------------------------------------------------------
+    def _refused_topic(self, chat_id: int, thread_id: Optional[int]) -> Optional[str]:
+        """Why a turn in this topic has no safe context id, or ``None`` when it has one.
+
+        Both turn sources -- the notification backstop and the CI wake -- ask this, so
+        neither can route a bound topic's work into the shared General session.
+        """
+        from swarmly.telegram.topics import context_block_reason
+        return context_block_reason(chat_id, thread_id, self.config.identity.home_channel_id)
+
     def _run_turn_precheck(self, chat_id: int, thread_id: Optional[int], notif: Notification,
                            outcome: GitHubPollOutcome) -> bool:
         """Refuse a turn that has no context id, loudly and not forever (issue #22 review):
         it would fall into the shared General session and mix another group's work into it."""
-        from swarmly.telegram.topics import context_block_reason
-        blocked = context_block_reason(chat_id, thread_id, self.config.identity.home_channel_id)
+        blocked = self._refused_topic(chat_id, thread_id)
         if not blocked:
             return True
         self.state.mark_processed(notif.id, notif.updated_at)
@@ -548,15 +575,20 @@ class GitHubWatcher:
         middle of a wake repeats it at most once more, and never for a run already reported.
         """
         self._router = router
+        # A channel reply registers watches by writing the file directly (another writer,
+        # and possibly another process): fold in anything it added since this snapshot.
+        self.ci_state.merge_from(self.ci_state_path)
         if not self.ci_state.watches:
             return
         now = time.time()
         changed = False
+        dropped: set = set()
         for key, watch in list(self.ci_state.watches.items()):
             if now - float(watch.get("created_at") or 0) > CI_WATCH_TTL_SECONDS:
                 logger.info("stopped watching %s for CI: no result within %d h",
                             key, CI_WATCH_TTL_SECONDS // 3600)
                 self.ci_state.drop(key)
+                dropped.add(key)
                 changed = True
                 continue
             try:
@@ -570,6 +602,7 @@ class GitHubWatcher:
                 # watch is not worth keeping.
                 logger.info("stopped watching %s for CI: gh has no checks for it", key)
                 self.ci_state.drop(key)
+                dropped.add(key)
                 changed = True
                 continue
             outcome.ci_watched += 1
@@ -580,16 +613,28 @@ class GitHubWatcher:
             if self.ci_state.reported_result(key) == revision:
                 # Already woken for this exact run (a restart, or a re-registered watch).
                 self.ci_state.drop(key)
+                dropped.add(key)
                 outcome.ci_skipped += 1
                 changed = True
                 continue
             self.ci_state.mark_reported(key, revision)
             self.ci_state.drop(key)
-            self.ci_state.save(self.ci_state_path)       # before the turn: no double wake
+            dropped.add(key)
+            self._save_ci_state(dropped)                 # before the turn: no double wake
             changed = True
             await self._wake_on_ci(watch, checks, outcome, router)
         if changed:
-            self.ci_state.save(self.ci_state_path)
+            self._save_ci_state(dropped)
+
+    def _save_ci_state(self, keep_out: Any = ()) -> None:
+        """Persist the watches, keeping what another writer added during a wake turn.
+
+        The turn a wake runs can post a reply that names another PR, and registering that
+        watch writes this same file; a plain save of the snapshot this poll loaded would
+        erase it. So the file is re-read and merged in before every write (issue #24 review).
+        """
+        self.ci_state.merge_from(self.ci_state_path, keep_out=keep_out)
+        self.ci_state.save(self.ci_state_path)
 
     async def _wake_on_ci(self, watch: Dict[str, Any], checks: PRChecks,
                           outcome: GitHubPollOutcome,
@@ -597,6 +642,15 @@ class GitHubWatcher:
         """The one turn the waiting agent gets when its PR's checks finish."""
         chat_id = int(watch.get("chat_id") or self.config.identity.home_channel_id or 0)
         thread_id = watch.get("thread_id")
+        # The same guard the notification turns use (issue #24 review): a topic with no
+        # context id is refused rather than run into the shared General session. The watch
+        # is already spent by now, so a refused wake is reported once and not retried.
+        blocked = self._refused_topic(chat_id, thread_id)
+        if blocked:
+            outcome.errors.append(
+                f"CI wake for {watch['repo']}#{checks.number}: refused: {blocked}")
+            logger.error("CI wake for %s#%s refused: %s", watch["repo"], checks.number, blocked)
+            return
         text = (f"CI finished on {watch['repo']}#{checks.number}"
                 f"{f' ({checks.title[:80]})' if checks.title else ''}: {checks.summary()}.")
         if checks.state == "failure":
