@@ -419,5 +419,28 @@ class TestRelayEndToEnd(SecretSandbox):
         self.assertTrue(message.signature)                        # still a signed envelope
 
 
+class TestSecretIsolation(SecretSandbox):
+    """A runner-exported secret file must never be trusted (review of PR #23)."""
+
+    def test_the_suite_overrides_a_runner_secret_file(self):
+        import subprocess
+        import sys
+        repo = Path(__file__).resolve().parents[1]
+        host_secret = Path(self.secret_path).parent / "host.redaction.secret"
+        env = dict(os.environ)
+        env["SWARMLY_REDACTION_SECRET_FILE"] = str(host_secret)
+        env["PYTHONPATH"] = str(repo)
+        env["A2A_LOG_DIR"] = "off"
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import tests, swarmly.telegram.redact as r; print(r.secret_file())"],
+            capture_output=True, text=True, env=env, cwd=str(repo))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        chosen = out.stdout.strip()
+        self.assertNotEqual(chosen, str(host_secret))
+        self.assertIn("swarmly-redaction-", chosen)
+        self.assertFalse(host_secret.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
