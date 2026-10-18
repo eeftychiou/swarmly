@@ -11,9 +11,10 @@ All notable changes to this project are documented here. The format follows
 - Every @handle in a peer bot's hand-off counts as addressed, on one line or over several,
   whether it opens the message or sits in a list of three or more bots: a list a bot writes
   is a hand-off, not a roster, so nothing in it is second-guessed. A mention that is still
-  dropped (a peer asking another bot to hand the work on) is reported back to the sender,
-  naming the handle and the reason, so a lost hand-off never reads as one that was taken
-  (`#27`).
+  dropped (a peer asking another bot to hand the work on, or the bot-to-bot cooldown) is
+  reported back to the sender, naming the handle and the reason, so a lost hand-off never
+  reads as one that was taken; the report is per sender, so a second peer's dropped hand-off
+  inside the same window is still answerable (`#27`).
 
 ## [0.10.1] - 2026-10-17
 

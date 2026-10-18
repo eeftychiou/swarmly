@@ -440,9 +440,9 @@ class AgentChannel:
         self._topics_opened: List[float] = []
         self._cooldown_noticed = float("-inf")
         self._anonymous_noticed = float("-inf")
-        # #27: (chat, topic, reason) -> clock of the last notice telling a peer bot its mention
-        # was dropped, so one drop is reported once, not once per message.
-        self._drop_notices: Dict[Tuple[int, Optional[int], str], float] = {}
+        # #27: (chat, topic, reason, sender) -> clock of the last notice telling a peer bot its
+        # mention was dropped, so one drop is reported once per sender, not once per message.
+        self._drop_notices: Dict[Tuple[int, Optional[int], str, Any], float] = {}
         self._transient_retry_delays: Tuple[float, ...] = TRANSIENT_RETRY_DELAYS
         self._progress_marks: Dict[Tuple[int, Optional[int]], Set[str]] = {}
         # /pause with turns running: take no new ones, freeze when the last one ends.
@@ -2787,7 +2787,10 @@ class AgentChannel:
         handles = self._dropped_handles(event.text)
         if not handles:
             return
-        key = (event.chat_id, event.thread_id, reason)
+        # Sender identity is part of the key (#27 review): two peers whose same-kind hand-off is
+        # dropped inside one window each hear their own notice, on their own message.
+        key = (event.chat_id, event.thread_id, reason, event.author_id,
+               (event.author_username or "").lower())
         now = self._clock()
         last = self._drop_notices.get(key)
         if last is not None and now - last < DROP_NOTICE_SECONDS:
@@ -2811,10 +2814,14 @@ class AgentChannel:
         self._cooldown_noticed = now
         # No @: a mention would land in the sender's own cooldown and draw its notice back.
         sender = event.author_username or "a peer"
+        # A peer bot's message that named this bot lost a real hand-off, not just a message:
+        # the notice names the handle that was dropped, as the mention-drop notice does (#27).
+        handles = self._dropped_handles(event.text) if event.author_is_bot else []
+        named = f" it names {', '.join(handles)}, but" if handles else ""
         await self.send(
-            f"⚠️ {self.config.identity.alias} skipped this message from {sender}: bot-to-bot "
-            f"cooldown in General, {event.cooldown_left:.0f}s left. Send it again after that, "
-            "or use a topic (topics have no cooldown).",
+            f"⚠️ {self.config.identity.alias} skipped this message from {sender}:{named} the "
+            f"bot-to-bot cooldown in General is on, {event.cooldown_left:.0f}s left. Send it "
+            "again after that, or use a topic (topics have no cooldown).",
             reply_to_message_id=event.message_id, chat_id=event.chat_id, silent=True)
 
     def _learn_topic_refs(self, chat_id: int, thread_id: int, text: str) -> None:

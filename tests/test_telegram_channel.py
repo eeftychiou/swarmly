@@ -981,6 +981,37 @@ class TestHandoffAddressing(unittest.TestCase):
         run(channel.handle_event(event(text, message_id=12)))
         self.assertEqual(len(channel._test_sender.sent), 1)
 
+    def test_each_sender_gets_its_own_drop_notice(self):
+        """#27 review: the window dedupes per sender, so a second peer's dropped hand-off is
+        reported on its own message instead of being swallowed by the first peer's notice."""
+        channel = make_channel()
+        run(channel.handle_event(event(
+            "[Codex] @CodexBot please hand @HermesBot the review",
+            username="CodexBot", author_id=202, message_id=31)))
+        run(channel.handle_event(event(
+            "[Antigravity] @AntigravityBot please hand @HermesBot the QA",
+            username="AntigravityBot", author_id=303, message_id=32)))
+        notices = [e for e in channel._test_sender.sent if e["text"].startswith("⚠️")]
+        self.assertEqual(len(notices), 2, notices)
+        self.assertEqual([n["reply_to"] for n in notices], [31, 32])
+        for notice in notices:
+            self.assertIn("@HermesBot", notice["text"])        # the handle that was dropped
+            self.assertIn("hand this bot the work", notice["text"])
+
+    def test_a_cooldown_drop_notice_names_the_dropped_handle(self):
+        """#27 review: a mention lost to the bot-to-bot cooldown still says which handle went
+        unanswered, so the sender's human does not read the silence as work taken."""
+        channel = make_channel(make_config(limits={"min_seconds_between_agent_turns": 60.0,
+                                                   "min_seconds_between_messages": 0}))
+        run(channel.handle_event(event("@HermesBot run the suite", message_id=20)))
+        self.assertIsNone(run(channel.handle_event(event("@HermesBot run it again",
+                                                          message_id=21))))
+        notices = [e for e in channel._test_sender.sent if e["text"].startswith("⚠️")]
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("@HermesBot", notices[0]["text"])        # which handle was dropped
+        self.assertIn("cooldown", notices[0]["text"])          # and why
+        self.assertEqual(notices[0]["reply_to"], 21)
+
 
 # --------------------------------------------------------------------------------------
 # 4. Loop guard and pacing (Telegram requires both for bot-to-bot mode)
