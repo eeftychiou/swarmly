@@ -134,14 +134,13 @@ public_redactions:                       # optional: literal -> replacement
   `SWARMLY_REDACTION_SECRET`, which peers cannot resolve — they then run the mirrored turn as
   well: **processed twice, never lost**. Mirrors written before this change (a raw `chat`
   field) are still understood.
-- **Context ids carry a tag, not a chat id.** A topic in the home group stays `tg-<thread>`;
-  a topic in another group is `tg-<tag>-<thread>`, where the tag is an HMAC-SHA-256 of the
-  chat id (16 hex digits). A context id is shared vocabulary — every agent must name a topic
-  the same way — so the key is **shared, never per host**: `SWARMLY_REDACTION_SECRET` if you
-  set one for the swarm, otherwise the group's own id. An unkeyed digest would let anyone who
-  can guess a chat id confirm the guess by hashing it; the group id is the one shared value an
-  outsider does not have. Changing the secret changes the tags, so existing topic sessions
-  look new once.
+- **Context ids carry a tag, not a chat id.** A topic in the home group stays `tg-<thread>`.
+  A topic in another group needs an HMAC tag, `tg-<tag>-<thread>`, keyed by
+  **`SWARMLY_REDACTION_SECRET` set to the same high-entropy value on every agent**. That is
+  what makes the tag both agreed across agents and unconfirmable by an outsider; a group id
+  as the key would be guessable, so it is not accepted. **Without the secret such a topic has
+  no context id at all** — it fails closed, running turn by turn and logging one warning,
+  instead of claiming an identity it cannot protect. Changing the secret changes the tags.
 - **Two separate secrets.** `redaction.secret` (generated at `~/.swarmly/redaction.secret`,
   override with `SWARMLY_REDACTION_SECRET_FILE`) keys the *mirror* token, which is
   deliberately unresolvable by peers; it is per host by design.

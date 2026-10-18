@@ -298,30 +298,33 @@ class TestContextIds(SecretSandbox):
 
     def test_a_topic_in_another_group_is_tagged_not_named(self):
         from swarmly.telegram.topics import context_for
-        ctx = context_for(-1009999999999, THREAD, home_chat_id=GROUP)
-        self.assertNotIn("1009999999999", ctx)
-        self.assertTrue(ctx.startswith("tg-") and ctx.endswith(f"-{THREAD}"), ctx)
-        self.assertEqual(ctx, context_for(-1009999999999, THREAD, home_chat_id=GROUP))
-        self.assertNotEqual(ctx, context_for(-1008888888888, THREAD, home_chat_id=GROUP))
-
-    def test_the_same_topic_gets_the_same_tag_on_every_agent(self):
-        """Review finding: a per-host key makes one topic look different per agent."""
-        from swarmly.telegram.topics import chat_tag, chat_tag_key
-        with mock.patch.dict(os.environ, {SECRET_ENV: ""}):
-            key = chat_tag_key(GROUP)
-        self.assertEqual(key, f"home:{GROUP}")
-        one = chat_tag(-1009999999999, key=key)
-        self.assertEqual(one, chat_tag(-1009999999999, key=key))          # stable, shared
-        self.assertEqual(len(one), 16)                                    # 64 bits
-        self.assertNotIn("1009999999999", one)
-        self.assertNotEqual(one, chat_tag(-1008888888888, key=key))
-        import hashlib
-        self.assertNotEqual(one, hashlib.sha256(
-            f"chat:{-1009999999999}".encode()).hexdigest()[:16])          # never unkeyed
-        # A swarm secret, when set, is the shared key instead of the group id.
         with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
-            self.assertEqual(chat_tag_key(GROUP), "shared-secret")
-            self.assertNotEqual(chat_tag(-1009999999999, key="shared-secret"), one)
+            ctx = context_for(-1009999999999, THREAD, home_chat_id=GROUP)
+            self.assertNotIn("1009999999999", ctx)
+            self.assertTrue(ctx.startswith("tg-") and ctx.endswith(f"-{THREAD}"), ctx)
+            self.assertEqual(ctx, context_for(-1009999999999, THREAD, home_chat_id=GROUP))
+            self.assertNotEqual(ctx, context_for(-1008888888888, THREAD, home_chat_id=GROUP))
+
+    def test_a_non_home_topic_needs_a_shared_secret(self):
+        """Review finding: a guessable key (the group id) allows offline confirmation."""
+        from swarmly.telegram.topics import chat_tag, context_for
+        with mock.patch.dict(os.environ, {SECRET_ENV: ""}):
+            # Fail closed: no secret, no context id -- the topic keeps running turn by turn
+            # rather than claiming an identity anyone could confirm a chat id against.
+            self.assertIsNone(context_for(-1009999999999, THREAD, home_chat_id=GROUP))
+            with self.assertRaises(ValueError):
+                chat_tag(-1009999999999)
+        # With the swarm's own secret every agent names the topic identically.
+        with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
+            ctx = context_for(-1009999999999, THREAD, home_chat_id=GROUP)
+            self.assertEqual(ctx, context_for(-1009999999999, THREAD, home_chat_id=GROUP))
+            self.assertEqual(ctx, f"tg-{chat_tag(-1009999999999, key='shared-secret')}-{THREAD}")
+            self.assertEqual(len(chat_tag(-1009999999999, key="shared-secret")), 16)
+            self.assertNotIn("1009999999999", ctx)
+            self.assertNotEqual(ctx, context_for(-1008888888888, THREAD, home_chat_id=GROUP))
+            import hashlib
+            self.assertNotEqual(chat_tag(-1009999999999, key="shared-secret"),
+                                hashlib.sha256(f"chat:{-1009999999999}".encode()).hexdigest()[:16])
 
     def test_the_generated_secret_stays_off_the_runner_home(self):
         # The unset-secret path must not write into ~: the sandbox redirects it.

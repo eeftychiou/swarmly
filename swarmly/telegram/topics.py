@@ -5,7 +5,10 @@ In a group with Topics turned on, every message carries the topic it was posted 
 agent works out the same way without talking to the others, from the topic id alone:
 
 * a topic in the home group is ``tg-<topic id>`` (for example ``tg-42``);
-* a topic in any other group is ``tg<group id>-<topic id>``, so two groups never share one;
+* a topic in any other group is ``tg-<chat tag>-<topic id>``, the tag being an HMAC of the
+  group id under ``SWARMLY_REDACTION_SECRET`` -- the same value on every agent, so the id is
+  agreed without a chat id (or a guessable key) reaching the bus. Without that secret such a
+  topic has no context id: it fails closed rather than leak or be confirmable;
 * the General topic (no ``message_thread_id``) is no discussion in particular: ``None``.
 
 The topic's name never decides its context id: a rename cannot move a topic to another
@@ -34,50 +37,52 @@ MAX_NAME = 128          # Telegram's limit for a topic name
 
 
 def chat_tag(chat_id: int, key: Optional[str] = None) -> str:
-    """A stable tag for a chat that does not carry the id: HMAC-SHA-256, 16 hex digits.
+    """HMAC-SHA-256 of a chat id, 16 hex digits. Fails closed without a key.
 
-    A context id is **shared vocabulary**: every agent names the same topic the same way, so
-    the tag must not depend on anything per host (review of PR #23: a per-host fallback key
-    made the same topic look different on each agent). The key is therefore the value every
-    agent in the group already shares and an outsider does not:
-
-    - ``SWARMLY_REDACTION_SECRET`` when the operator sets one for the swarm, else
-    - the home chat id, passed in by :func:`context_for` (``key="home:<id>"``).
-
-    Never an unkeyed digest: that would let anyone who can guess an id confirm the guess,
-    and the first cut's 32-bit tag was collision-prone too. With no secret and no home group
-    the tag falls back to a fixed label, which is shared rather than per host.
+    A context id is shared vocabulary: every agent must name a topic the same way, so the
+    key has to be shared, and it has to be high-entropy -- a group id is guessable, which
+    would let anyone holding a tag confirm candidate chat ids offline (review of PR #23).
+    The only such value is ``SWARMLY_REDACTION_SECRET``; without it there is no tag.
     """
-    material = key
-    if material is None:
-        material = os.environ.get("SWARMLY_REDACTION_SECRET", "").strip() or "swarmly"
+    material = (key if key is not None else
+                os.environ.get("SWARMLY_REDACTION_SECRET", "").strip())
+    if not material:
+        raise ValueError("a chat tag needs a shared secret (SWARMLY_REDACTION_SECRET)")
     message = f"chat:{int(chat_id)}".encode("utf-8")
     return hmac.new(material.encode("utf-8"), message, hashlib.sha256).hexdigest()[:16]
+
+
+#: Warned once per process: a topic outside the home group needs a secret to get a tag.
+_NO_SECRET_WARNED = False
 
 
 def context_for(chat_id: int, thread_id: Optional[int],
                 home_chat_id: Optional[int] = None) -> Optional[str]:
     """The discussion a topic stands for (``None`` for the General topic).
 
-    A topic in the home group is ``tg-<thread>``; a topic in another group is
-    ``tg-<chat tag>-<thread>``. The tag replaced the raw chat id in #22: a context id travels
-    to the bus and into every prompt, so it must not name a chat. Nothing parses a context id
-    back into a chat id -- topic lookups key on ``(chat, thread)`` -- so an id written before
-    the change stays readable as an opaque label.
+    A topic in the home group is ``tg-<thread>`` -- no chat id in it at all. A topic in
+    another group is ``tg-<chat tag>-<thread>``, and the tag is an HMAC **only** under a
+    configured ``SWARMLY_REDACTION_SECRET``: every agent in the swarm shares that secret, so
+    every agent names the topic the same way, and nobody can confirm a guessed chat id
+    offline. Without a secret this **fails closed** -- no context id, so the topic keeps
+    running turn by turn instead of claiming a shared identity (issue #22 review). An id
+    written before the change stays readable as an opaque label; nothing parses one back.
     """
     if thread_id is None:
         return None
     if home_chat_id is None or int(chat_id) == int(home_chat_id):
         return f"tg-{int(thread_id)}"
-    return f"tg-{chat_tag(chat_id, key=chat_tag_key(home_chat_id))}-{int(thread_id)}"
-
-
-def chat_tag_key(home_chat_id: Optional[int]) -> str:
-    """The key a context-id tag is derived from: the swarm's shared secret, else the group.
-
-    Deliberately *not* a per-host value -- see :func:`chat_tag`.
-    """
-    return os.environ.get("SWARMLY_REDACTION_SECRET", "").strip() or f"home:{home_chat_id}"
+    secret = os.environ.get("SWARMLY_REDACTION_SECRET", "").strip()
+    if not secret:
+        global _NO_SECRET_WARNED
+        if not _NO_SECRET_WARNED:
+            _NO_SECRET_WARNED = True
+            logger.warning(
+                "topic %s is outside the home group and SWARMLY_REDACTION_SECRET is unset: "
+                "no context id, so this topic has no shared discussion identity. Set the "
+                "secret (the same value on every agent) to name such topics.", thread_id)
+        return None
+    return f"tg-{chat_tag(chat_id, key=secret)}-{int(thread_id)}"
 
 
 def topic_name(context_id: str, title: str) -> str:

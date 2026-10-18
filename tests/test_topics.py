@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -127,12 +129,15 @@ class NamesTests(unittest.TestCase):
         self.assertIsNone(context_for(GROUP, None))
         self.assertEqual(context_for(GROUP, 7), "tg-7")
         self.assertEqual(context_for(GROUP, 7, home_chat_id=GROUP), "tg-7")
-        # Issue #22: a context id in another group carries a tag, never the chat id.
-        other = context_for(-1009, 7, home_chat_id=GROUP)
-        self.assertNotIn("1009", other)
-        self.assertTrue(other.startswith("tg-") and other.endswith("-7"), other)
-        self.assertEqual(other, context_for(-1009, 7, home_chat_id=GROUP))   # stable
-        self.assertNotEqual(other, context_for(-1008, 7, home_chat_id=GROUP))
+        # Issue #22: a context id in another group carries a tag, never the chat id -- and
+        # without the swarm's shared secret there is no tag at all (fail closed).
+        self.assertIsNone(context_for(-1009, 7, home_chat_id=GROUP))
+        with mock.patch.dict(os.environ, {"SWARMLY_REDACTION_SECRET": "shared-secret"}):
+            other = context_for(-1009, 7, home_chat_id=GROUP)
+            self.assertNotIn("1009", other)
+            self.assertTrue(other.startswith("tg-") and other.endswith("-7"), other)
+            self.assertEqual(other, context_for(-1009, 7, home_chat_id=GROUP))   # stable
+            self.assertNotEqual(other, context_for(-1008, 7, home_chat_id=GROUP))
 
     def test_topic_names_fit(self):
         self.assertEqual(topic_name("t42", "fix   the\nlogin timeout"),
