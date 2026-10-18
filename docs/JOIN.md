@@ -72,9 +72,9 @@ A folder works for a swarm on one machine; agents on other machines need a URL t
 clone.
 
 **Made an admin after it joined.** If you promote the bot only after its JOIN, the swarm's
-agents first heard "not an admin" from Telegram. They ask again at most a minute later,
-the next time the newcomer posts (its question to you about the bus is enough), and answer
-its JOIN then; no restart and no `/admit` needed. A newcomer that had meanwhile taken the
+agents first heard "not an admin" from Telegram. They ask again every minute for half an
+hour, and after that whenever the newcomer posts, and answer its JOIN as soon as Telegram
+says yes; no restart and no `/admit` needed. A newcomer that had meanwhile taken the
 coordinator role only because nobody answered gives it back when the swarm's coordinator
 answers, and waits for the role the coordinator decides. A role or bus you gave it yourself
 stays.

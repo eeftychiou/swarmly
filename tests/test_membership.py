@@ -529,6 +529,27 @@ class LateAdminTests(unittest.TestCase):
             self.assertEqual(present[0]["reply_to"], 70)          # the answer to its JOIN
             self.assertIn("bus: https://example.com/bus.git", present[0]["text"])
 
+    def test_a_join_is_rechecked_even_if_the_newcomer_falls_silent(self):
+        # The owner promotes it after its last post: nobody would ever ask Telegram again.
+        with tempfile.TemporaryDirectory() as folder:
+            channel = joined(make_channel(config_at(folder)))
+            promote = self.promoted_later(channel)
+            clock = channel._test_clock
+
+            async def sleeper(seconds):
+                clock["t"] += seconds
+                promote()                             # made an admin while nobody posts
+            channel._sleep = sleeper
+
+            async def scenario():
+                await channel.handle_event(hello("JOIN", "Newbie", "🙋 Newbie wants to join",
+                                                 "newbie_x_bot", 500, message_id=70))
+                await asyncio.gather(*channel.membership._tasks)
+            run(scenario())
+            self.assertEqual(channel.config.peers["Newbie"], "newbie_x_bot")
+            present = [r for r in channel._test_sender.sent if "intent=PRESENT" in r["text"]]
+            self.assertEqual([r["reply_to"] for r in present], [70])
+
     def test_a_bot_that_is_still_not_an_admin_stays_out(self):
         with tempfile.TemporaryDirectory() as folder:
             channel = joined(make_channel(config_at(folder)))

@@ -72,6 +72,9 @@ JOIN_WAIT_SECONDS = 90.0
 ROLE_WAIT_SECONDS = 600.0
 #: How long Telegram's "not an admin" answer stands before the bot is asked about again.
 NOT_ADMIN_RECHECK_SECONDS = 60.0
+#: How long a refused JOIN is re-checked by itself (every NOT_ADMIN_RECHECK_SECONDS), for an
+#: owner who makes the bot an admin after the newcomer has stopped posting.
+WAITING_JOIN_SECONDS = 30 * 60.0
 #: Marks a turn the transport started for membership (a role decision, an onboarding).
 MEMBERSHIP_MARK = "[swarm membership]"
 _DECIDE_MARK = "A new agent joined the swarm:"
@@ -571,7 +574,10 @@ class Membership:
         if known is None and not await self._verified_admin(event.author_id, username):
             self.ch.roster.saw_online(alias, username)        # the admin can still /admit it
             if event.author_id is not None:
+                fresh = int(event.author_id) not in self._waiting_joins
                 self._waiting_joins[int(event.author_id)] = (alias, body, event)
+                if fresh:
+                    self._spawn(self._watch_waiting(int(event.author_id)))
             return
         if event.author_id is not None:
             self._waiting_joins.pop(int(event.author_id), None)
@@ -637,6 +643,18 @@ class Membership:
         logger.info("membership: %s is an admin now; answering its JOIN", alias)
         await self._on_join(alias, body, join)
         return True
+
+    async def _watch_waiting(self, user_id: int) -> None:
+        """Re-check a refused JOIN now and then: a newcomer that heard no answer stops
+        posting after asking the maintainer, so its next post may never come."""
+        waited = 0.0
+        while waited < WAITING_JOIN_SECONDS and user_id in self._waiting_joins:
+            await self.ch._sleep(NOT_ADMIN_RECHECK_SECONDS + 1)
+            waited += NOT_ADMIN_RECHECK_SECONDS + 1
+            entry = self._waiting_joins.get(user_id)
+            if entry is not None:
+                await self.retry_join(entry[2])
+        # After that only the newcomer's own next post re-checks it (retry_join).
 
     def _vouch(self, alias: str, key: Optional[str]) -> None:
         """Verify *alias*'s bus messages with the key from its JOIN until this host pulls
