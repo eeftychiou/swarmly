@@ -321,6 +321,39 @@ class MemberTests(unittest.TestCase):
             self.assertNotIn("Newbie", channel.config.peers)
             self.assertIn("newbie_x_bot", channel.roster.pending)     # /admit still works
 
+    def test_a_bot_made_an_admin_after_its_join_is_taken_in_on_its_next_post(self):
+        # Live run: the owner made the newcomer an admin a minute after it joined; every
+        # member kept Telegram's first "no" until it restarted, so the newcomer stayed a
+        # stranger and declared itself the first agent.
+        from swarmly.telegram.membership import REFUSED_RECHECK_SECONDS
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(joined(make_channel(config_at(folder))))
+            calls = []
+            lookup = channel.membership.lookup
+
+            async def counting(user_id):
+                calls.append(user_id)
+                return await lookup(user_id)
+            channel.membership.lookup = counting
+            run(channel.handle_event(self.join(channel)))
+            self.assertNotIn("Newbie", channel.config.peers)
+            asked = "🙋 Newbie here. No agent answered. Where is the bus?"
+            run(channel.handle_event(event(asked, username="newbie_x_bot", author_id=500,
+                                           message_id=71)))
+            self.assertNotIn("Newbie", channel.config.peers)     # asked again too soon
+            self.assertEqual(len(calls), 1)
+            channel.membership.lookup = admins(500)
+            channel.membership.lookup.names[500] = "newbie_x_bot"
+            channel._test_clock["t"] += REFUSED_RECHECK_SECONDS + 1
+            run(channel.handle_event(event(asked, username="newbie_x_bot", author_id=500,
+                                           message_id=72)))
+            self.assertEqual(channel.config.peers["Newbie"], "newbie_x_bot")
+            self.assertNotIn("newbie_x_bot", channel.roster.pending)
+            present = channel._test_sender.sent[-1]
+            self.assertIn("HELLO to=Newbie intent=PRESENT ref=Hermes", present["text"])
+            self.assertIn("bus: https://example.com/bus.git", present["text"])
+            self.assertEqual(present["reply_to"], 72)
+
     def test_the_coordinator_decides_the_role_in_a_turn(self):
         with tempfile.TemporaryDirectory() as folder:
             adapter = _Scripted("ROLE: @newbie_x_bot qa-tester\nThe team has no tester yet.")

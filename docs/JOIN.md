@@ -22,7 +22,8 @@ Before the first start, do the Telegram side once per bot, as in
 [telegram/SETUP-ADMIN.md](telegram/SETUP-ADMIN.md): create the bot in @BotFather, turn on
 **Bot-to-Bot Communication Mode**, turn **Group Privacy** off (`/setprivacy`, Disable), add the
 bot to the group and **make it an admin**. Admin status is how the swarm recognises its own
-agents (below).
+agents (below). If you make it an admin only after it has joined, the swarm takes it in on
+its next post (a refused check is asked again after a minute); no restart is needed.
 
 ## What happens
 

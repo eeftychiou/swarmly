@@ -87,6 +87,10 @@ _TRAILING_HANDLES = re.compile(r"(?:\s+@[A-Za-z0-9_]{5,32})+$")
 _MEMBER = re.compile(r"([A-Za-z0-9_-]{1,32})=@([A-Za-z0-9_]{5,32})#(\d{1,20})(?::([a-z][a-z0-9_-]{0,39}))?")
 #: The "[Alias]" banner a transport puts in front of everything it posts.
 _BANNER = re.compile(r"^\s*\[([A-Za-z0-9_-]{1,32})\]")
+#: How long a "not a bot admin of the group" answer stands before Telegram is asked again. A bot
+#: the owner makes an admin after it joined becomes a member on its next message (live run: the
+#: answer was kept until restart, so a newcomer made admin a minute late stayed a stranger).
+REFUSED_RECHECK_SECONDS = 60.0
 #: Telegram statuses that make a bot a swarm member: the group owner made it an admin.
 ADMIN_STATUSES = ("administrator", "creator")
 
@@ -209,6 +213,7 @@ class Membership:
         self.cli = ""                                    # the runtime, for the JOIN
         self.public_key = ""                             # the bus key's public half
         self._verified: Dict[int, bool] = {}
+        self._refused: Dict[int, float] = {}             # user id -> when Telegram said no
         self._remote_checked = False                     # bus_location asked git once
         self._joined_at: Optional[float] = None          # when this agent posted its JOIN
         self._present_from: List[str] = []               # members that answered the JOIN
@@ -330,8 +335,11 @@ class Membership:
         """Telegram says this user is a bot and an administrator of the home group."""
         if user_id is None or self.lookup is None:
             return False
-        if user_id in self._verified:
-            return self._verified[user_id]
+        if self._verified.get(int(user_id)):
+            return True
+        refused = self._refused.get(int(user_id))
+        if refused is not None and self.ch._clock() - refused < REFUSED_RECHECK_SECONDS:
+            return False
         try:
             found = await self.lookup(int(user_id))
         except Exception as exc:                     # noqa: BLE001 - not verified, logged
@@ -340,8 +348,12 @@ class Membership:
         ok = bool(found and found[0] in ADMIN_STATUSES and found[2]
                   and found[1].lower().endswith("bot")
                   and (not username or found[1].lower() == username.lstrip("@").lower()))
-        self._verified[int(user_id)] = ok
-        if not ok:
+        if ok:
+            self._verified[int(user_id)] = True
+            self._refused.pop(int(user_id), None)
+        else:
+            self._verified.pop(int(user_id), None)
+            self._refused[int(user_id)] = self.ch._clock()
             logger.warning("membership: @%s (id %s) is not a bot administrator of the group; "
                            "make it an admin, or /admit it", username, user_id)
         return ok
@@ -560,6 +572,14 @@ class Membership:
         alias = known or alias
         self.seen(alias)
         self._vouch(alias, fields.get("key"))
+        await self._present(alias, event)
+        if self.is_coordinator() and not self.cfg.peer_roles.get(alias):
+            self._decide_role(alias, username, fields.get("cli") or "unknown")
+
+    async def _present(self, alias: str, event: "ChannelEvent") -> None:
+        """Answer *alias*'s JOIN (or its first post once it is verified) with this agent's
+        role, the coordinator, the bus and, from the coordinator, every member."""
+        username = (event.author_username or "").lstrip("@")
         lines = [f"@{username} 👋 {self.alias} here."]
         lines.append(f"role: {self.state.role or 'none'}")
         lines.append(f"coordinator: {self.state.coordinator or 'none'}")
@@ -577,8 +597,6 @@ class Membership:
             Envelope(type=MessageType.HELLO, to=alias, intent="PRESENT",
                      ref=self.ch._alias_ref()), "\n".join(lines)),
             reply_to_message_id=event.message_id, silent=True, allow_when_frozen=True)
-        if self.is_coordinator() and not self.cfg.peer_roles.get(alias):
-            self._decide_role(alias, username, fields.get("cli") or "unknown")
 
     async def _meet(self, alias: Optional[str], event: "ChannelEvent") -> Optional[str]:
         """An unknown bot says it is online, or answers our online notice: a member that
@@ -596,6 +614,23 @@ class Membership:
         logger.info("membership: %s (@%s) is a member this agent missed while offline; "
                     "added as a peer", alias, username)
         return alias
+
+    async def recheck(self, event: "ChannelEvent") -> None:
+        """A bot that Telegram did not list as an admin when it said hello posts again: ask
+        again, and if the owner has made it an admin since, take it in as if its JOIN had
+        just arrived (every member answers it; the coordinator gives it a role)."""
+        username = (event.author_username or "").lstrip("@")
+        pending = self.ch.roster.pending.get(username.lower())
+        if pending is None or self.cfg.peer_alias_for(username, event.author_id) is not None:
+            return
+        alias = await self._meet(pending[0], event)
+        if alias is None:
+            return
+        self.ch.roster.pending.pop(username.lower(), None)
+        self.seen(alias)
+        await self._present(alias, event)
+        if self.is_coordinator() and not self.cfg.peer_roles.get(alias):
+            self._decide_role(alias, username, "unknown")
 
     def _vouch(self, alias: str, key: Optional[str]) -> None:
         """Verify *alias*'s bus messages with the key from its JOIN until this host pulls
