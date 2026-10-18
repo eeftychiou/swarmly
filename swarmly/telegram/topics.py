@@ -64,15 +64,17 @@ def context_block_reason(chat_id: int, thread_id: Optional[int],
     choice is between leaking a chat id, naming a guessable one, and pretending to be the
     General session -- none acceptable, so the turn is refused instead (issue #22 review).
     """
-    if thread_id is None or home_chat_id is None:
-        return None
-    if int(chat_id) == int(home_chat_id):
-        return None
+    if thread_id is None:
+        return None                      # General: no context id involved
     if os.environ.get("SWARMLY_REDACTION_SECRET", "").strip():
         return None
-    return ("this topic is outside the home group and SWARMLY_REDACTION_SECRET is not set: "
-            "set the same secret on every agent, or work in the home group. Refusing the "
-            "turn rather than sharing the General session or naming a chat id.")
+    if home_chat_id is not None and int(chat_id) == int(home_chat_id):
+        return None                      # the home group needs no tag at all
+    # Every other threaded topic -- including one whose home group is unknown, where the
+    # transport used to treat any chat as home -- has no safe context id.
+    return ("this topic has no context id and SWARMLY_REDACTION_SECRET is not set: set the "
+            "same secret on every agent, or work in the home group. Refusing the turn rather "
+            "than sharing the General session or naming a chat id.")
 
 
 def context_for(chat_id: int, thread_id: Optional[int],

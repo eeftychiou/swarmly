@@ -494,5 +494,50 @@ class TestRefusedTopicTurns(SecretSandbox):
         self.assertEqual(outcome.turns_queued, 1, outcome.errors)
 
 
+class TestChannelRefuses(SecretSandbox):
+    """The Telegram side is gated too, not only the GitHub backstop (review of PR #23)."""
+
+    def _channel(self, home):
+        from swarmly.telegram.adapters import EchoAdapter
+        from swarmly.telegram.channel import AgentChannel
+        cfg = AgentConfig.from_dict({
+            "agent": {"name": "HermesBot", "alias": "Hermes", "bot_token": "123456:TEST",
+                      "home_channel_id": home or GROUP, "admin_user_id": ADMIN_ID},
+            "peers": {"Codex": "CodexBot"},
+            "adapter": {"type": "echo"},
+        })
+        if home is None:
+            cfg.identity.home_channel_id = None      # a host that never named its group
+        channel = AgentChannel(cfg, adapter=EchoAdapter("Hermes"), sender=mock.MagicMock(),
+                               gitbus_pull=lambda _root: None, gitbus_read=lambda _root: [])
+        channel.send = mock.AsyncMock()
+        return channel
+
+    def test_a_threaded_topic_without_a_secret_is_refused(self):
+        from tests.test_telegram_channel import event
+        with mock.patch.dict(os.environ, {SECRET_ENV: ""}):
+            channel = self._channel(home=None)
+            asyncio.run(channel.handle_event(event("@HermesBot hello", thread_id=THREAD,
+                                                   chat_id=-1009999999999)))
+        self.assertEqual(channel.stats.ignored, 1)
+        channel.send.assert_not_awaited()               # no turn, no reply, no General session
+
+    def test_the_same_topic_runs_once_the_secret_is_set(self):
+        from tests.test_telegram_channel import event
+        with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
+            channel = self._channel(home=None)
+            asyncio.run(channel.handle_event(event("@HermesBot hello", thread_id=THREAD,
+                                                   chat_id=-1009999999999)))
+        channel.send.assert_awaited()
+
+    def test_the_home_group_topic_needs_no_secret(self):
+        from tests.test_telegram_channel import event
+        with mock.patch.dict(os.environ, {SECRET_ENV: ""}):
+            channel = self._channel(home=GROUP)
+            asyncio.run(channel.handle_event(event("@HermesBot hello", thread_id=THREAD,
+                                                   chat_id=GROUP)))
+        channel.send.assert_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1719,6 +1719,17 @@ class AgentChannel:
         if not (in_home_channel or is_admin_dm):
             self.stats.ignored += 1
             return None
+        # Issue #22: a threaded topic that cannot get a context id is refused here, before a
+        # turn can reach the adapter with context_id=None, which is the shared General
+        # session. The GitHub backstop is gated the same way.
+        from swarmly.telegram.topics import context_block_reason
+        blocked = context_block_reason(event.chat_id, event.thread_id,
+                                       self.config.identity.home_channel_id)
+        if blocked:
+            self.stats.ignored += 1
+            logger.error("refusing a turn in chat=%s topic=%s: %s",
+                         event.chat_id, event.thread_id, blocked)
+            return None
 
         # Every message that names its topic teaches the name, addressed to us or not.
         if event.thread_id is not None:

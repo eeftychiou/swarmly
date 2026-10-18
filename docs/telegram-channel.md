@@ -652,7 +652,8 @@ with one `context_id`, which every agent works out the same way from the topic's
 |---|---|
 | a topic in the home group (`identity.home_channel_id`) | `tg-<topic id>`, e.g. `tg-42` |
 | a topic in any other group, with `SWARMLY_REDACTION_SECRET` set | `tg-<tag>-<topic id>`, the tag an HMAC of the group id under that secret |
-| a topic in any other group, without the secret | none: **the turn is refused** (logged, notification marked read), so it never falls into the General session |
+| a topic in any other group, without the secret | none: **the turn is refused** (logged; a GitHub notification is marked read), so it never falls into the General session |
+| any threaded topic on a host that never set `identity.home_channel_id`, without the secret | none: also refused — the transport cannot tell home from another group |
 | General (no topic) | none: the shared conversation, as before |
 
 - The topic's name never decides its `context_id`, so renaming a topic does not move it to
