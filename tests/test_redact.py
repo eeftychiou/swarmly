@@ -234,6 +234,19 @@ class TestMirrorAndDedupe(unittest.TestCase):
         self.assertEqual(payload["message_id"], 55)      # not an id: stays a number
         self.assertEqual(payload["peer"], "CodexBot")
 
+    def test_an_integer_dict_key_is_redacted_too(self):
+        """Review finding: a chat id can travel as a dict *key*, not only as a value."""
+        with TemporaryDirectory() as tmp:
+            cfg = project_config(tmp)
+            payload = Redactor.from_config(cfg).value(
+                {GROUP: "chat", ADMIN_ID: "admin", 55: "message", "plain": "x"})
+        self.assertNotIn(GROUP, payload)
+        self.assertNotIn(ADMIN_ID, payload)
+        self.assertEqual(payload["<chat>"], "chat")
+        self.assertEqual(payload["<user>"], "admin")
+        self.assertEqual(payload[55], "message")
+        self.assertEqual(payload["plain"], "x")
+
     def test_the_old_chat_form_is_still_honoured(self):
         with TemporaryDirectory() as tmp:
             channel = self._channel(tmp)
@@ -257,6 +270,23 @@ class TestContextIds(unittest.TestCase):
         self.assertTrue(ctx.startswith("tg-") and ctx.endswith(f"-{THREAD}"), ctx)
         self.assertEqual(ctx, context_for(-1009999999999, THREAD, home_chat_id=GROUP))
         self.assertNotEqual(ctx, context_for(-1008888888888, THREAD, home_chat_id=GROUP))
+
+    def test_the_tag_is_keyed_when_a_secret_is_set(self):
+        """Review finding: an unkeyed 32-bit tag is guessable and collision-prone."""
+        from swarmly.telegram.topics import chat_tag
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(SECRET_ENV, None)
+            unkeyed = chat_tag(-1009999999999)
+            self.assertEqual(len(unkeyed), 32)
+            with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
+                keyed = chat_tag(-1009999999999)
+                self.assertEqual(len(keyed), 16)
+                self.assertEqual(keyed, chat_tag(-1009999999999))        # stable
+                self.assertNotEqual(keyed, unkeyed)
+                self.assertNotEqual(keyed, chat_tag(-1008888888888))
+            # Another secret gives another tag: the tag cannot be confirmed without it.
+            with mock.patch.dict(os.environ, {SECRET_ENV: "another-secret"}):
+                self.assertNotEqual(chat_tag(-1009999999999), keyed)
 
     def test_the_home_group_keeps_the_short_form(self):
         from swarmly.telegram.topics import context_for

@@ -181,10 +181,22 @@ class Redactor:
         if isinstance(value, int):
             return self.number(int(value))
         if isinstance(value, dict):
-            return {self.text(str(k)) if isinstance(k, str) else k: self.value(v)
-                    for k, v in value.items()}
+            # A key is redacted like a value: an int key is how a chat id travels as
+            # ``{<chat id>: ...}``, and the first cut only looked at string keys (review of
+            # PR #23).
+            return {self.key(k): self.value(v) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [self.value(item) for item in value]
+        return value
+
+    def key(self, value: Any) -> Any:
+        """A dict key after the redaction: a string is scrubbed, an int id replaced."""
+        if isinstance(value, str):
+            return self.text(value)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return self.number(int(value))
         return value
 
     def number(self, value: int) -> Any:

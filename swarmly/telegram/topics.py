@@ -23,6 +23,7 @@ import logging
 import os
 import tempfile
 import hashlib
+import hmac
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -33,9 +34,18 @@ MAX_NAME = 128          # Telegram's limit for a topic name
 
 
 def chat_tag(chat_id: int) -> str:
-    """A short, stable tag for a chat: the same id always gives the same tag, and the tag
-    does not carry the id (issue #22 -- a context id reaches the bus and the prompt)."""
-    return hashlib.sha256(f"chat:{int(chat_id)}".encode("utf-8")).hexdigest()[:8]
+    """A stable tag for a chat that does not carry the id.
+
+    Keyed with ``SWARMLY_REDACTION_SECRET`` when it is set: an unkeyed digest lets anyone
+    who can guess an id confirm the guess by hashing it. 16 hex digits keyed and 32 unkeyed,
+    so a collision needs a birthday attack on 64/128 bits -- the first cut used 8 (32 bits),
+    which is both guessable and collision-prone (review of PR #23).
+    """
+    message = f"chat:{int(chat_id)}".encode("utf-8")
+    secret = os.environ.get("SWARMLY_REDACTION_SECRET", "")
+    if secret:
+        return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()[:16]
+    return hashlib.sha256(message).hexdigest()[:32]
 
 
 def context_for(chat_id: int, thread_id: Optional[int],

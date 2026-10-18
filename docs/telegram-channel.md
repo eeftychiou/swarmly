@@ -134,6 +134,12 @@ public_redactions:                       # optional: literal -> replacement
   `SWARMLY_REDACTION_SECRET`, which peers cannot resolve — they then run the mirrored turn as
   well: **processed twice, never lost**. Mirrors written before this change (a raw `chat`
   field) are still understood.
+- **Context ids carry a tag, not a chat id.** A topic in the home group stays `tg-<thread>`;
+  a topic in another group is `tg-<tag>-<thread>`, where the tag is an HMAC of the chat id
+  under `SWARMLY_REDACTION_SECRET` (16 hex digits) or, without a secret, a plain SHA-256
+  prefix (32 hex digits — wider, but anyone who can guess an id can confirm it). Set the
+  secret if you want the tag unguessable; changing it changes the tags, so existing topic
+  sessions look new once.
 - **`check` validates the map**: an empty key or a non-mapping value is an error, and an
   unset map changes nothing.
 
