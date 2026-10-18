@@ -72,6 +72,30 @@ class TestSplitPart(unittest.TestCase):
                         [part[:30] for part, item in zip(parts, parsed) if item is None])
         self.assertEqual({item[1] for item in parsed}, {len(parts)})
 
+    def test_a_configured_21_parts_sends_parts_the_receiver_joins(self):
+        """Codex's re-review of #29: ``max_reply_parts: 21`` must not emit a ``(1/21)`` the
+        receiver refuses — the configuration is clamped to the one cap, and a reply split at
+        that setting still arrives whole on the other side."""
+        from swarmly.telegram.config import MAX_REPLY_PARTS
+
+        sender = make_channel(make_config(limits={"max_reply_parts": 21}))
+        self.assertEqual(sender.config.limits.max_reply_parts, MAX_REPLY_PARTS)  # clamped
+        parts = sender.split_outgoing(ORIGINAL)
+        self.assertGreater(len(parts), 1)
+        self.assertLessEqual(len(parts), MAX_SPLIT_PARTS)
+        self.assertEqual({split_part(part)[1] for part in parts}, {len(parts)})
+        channel, adapter = receiver()
+        posts = [f"@HermesBot [Codex] {part}" if index == 0 else f"[Codex] {part}"
+                 for index, part in enumerate(parts)]
+
+        async def replay():
+            for index, post in enumerate(posts):
+                await channel.handle_event(event(post, message_id=900 + index))
+
+        run(replay())
+        self.assertEqual(len(adapter.seen), 1)
+        self.assertIn(ORIGINAL, adapter.seen[0].text)
+
     def test_a_total_above_the_cap_is_not_a_split_reply(self):
         """Review of #29: the total is the sender's claim, so a header asking for a billion
         parts is refused instead of reserving the buffer it names."""
