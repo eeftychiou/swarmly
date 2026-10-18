@@ -29,6 +29,7 @@ import html
 import json
 import logging
 import re
+import secrets
 import socket
 import subprocess
 import time
@@ -36,7 +37,7 @@ import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -3740,7 +3741,12 @@ class AgentChannel:
                         MAX_SPLIT_PARTS)
         if max_parts == 1 or self._fits(text):
             return [text]
-        worst = f"{max_parts}/{max_parts}"
+        # One token per reply, so a receiver can tell two replies by one sender apart even when
+        # their parts interleave (#29 review). It rides inside the marker, so a receiver that
+        # predates it still sees "↪ (k/n" and treats the part as a continuation. The token is
+        # part of the marker the cut has to leave room for.
+        ref = secrets.token_hex(3)
+        worst = f"{max_parts}/{max_parts} #{ref}"
         head_room, tail_room = f"\n\n({worst})", f"↪ ({worst}) "
         pieces: List[str] = []
         rest = text
@@ -3757,8 +3763,9 @@ class AgentChannel:
         if len(pieces) == 1:
             return pieces
         total = len(pieces)
-        parts = [f"{pieces[0]}\n\n(1/{total})"]
-        parts += [f"↪ ({index}/{total}) {piece}" for index, piece in enumerate(pieces[1:], 2)]
+        parts = [f"{pieces[0]}\n\n(1/{total} #{ref})"]
+        parts += [f"↪ ({index}/{total} #{ref}) {piece}"
+                  for index, piece in enumerate(pieces[1:], 2)]
         return parts
 
     def _fits(self, text: str) -> bool:
@@ -3789,10 +3796,12 @@ class AgentChannel:
     # Split replies (issue #29)
     # ----------------------------------------------------------------------------------
     @staticmethod
-    def _split_key(event: ChannelEvent) -> Tuple[Any, ...]:
-        """Which reply a part belongs to: one sender, in one chat and discussion."""
+    def _split_key(event: ChannelEvent, ref: str = "") -> Tuple[Any, ...]:
+        """Which reply a part belongs to: one sender, in one chat and discussion, and the
+        reply's own correlation token when the sender wrote one. Without a token the sender's
+        held reply is the only candidate, which is what an older transport gets (#29 review)."""
         return (event.chat_id, event.thread_id, event.author_id,
-                (event.author_username or "").lower())
+                (event.author_username or "").lower(), ref)
 
     async def _absorb_split(self, event: ChannelEvent) -> Tuple[bool, Optional[_PendingSplit]]:
         """Hold the parts of a split reply until the whole message is here, then join it.
@@ -3818,8 +3827,8 @@ class AgentChannel:
         part = split_part(event.text)
         if part is None:
             return False, None
-        index, total, body = part
-        key = self._split_key(event)
+        index, total, body = part.index, part.total, part.body
+        key = self._split_key(event, part.ref or "")
         pending = self._split_pending.get(key)
         if pending is not None and not pending.accepts(index, total, body):
             # Another reply by the same bot started before this one finished: the held parts
@@ -4601,18 +4610,23 @@ def _current_task_cancelling() -> bool:
 
 # A later part of a split message, as received: optional leading mentions, the sender's
 # "[Alias]" banner, then the "↪ (k/n)" marker that split_outgoing puts on parts 2..n.
-_CONTINUATION_RE = re.compile(r"^(?:@\w+\s+)*(?:\[[^\]\n]{1,64}\]\s*)?↪ \(\d+/\d+\)")
+_CONTINUATION_RE = re.compile(
+    r"^(?:@\w+\s+)*(?:\[[^\]\n]{1,64}\]\s*)?↪ \(\d+/\d+(?: #\w{1,16})?\)")
 
 # --------------------------------------------------------------------------------------
 # Split replies (issue #29): ↪ (k/n) parts are one message at the receiver
 # --------------------------------------------------------------------------------------
-#: Part 1 of a split reply: the reply first, then "(1/n)" appended by ``split_outgoing``.
-_SPLIT_FIRST_RE = re.compile(r"^(?P<body>.*)\n\n\(1/(?P<total>\d+)\)[ \t]*\Z", re.S)
+#: Part 1 of a split reply: the reply first, then "(1/n)" appended by ``split_outgoing``. The
+#: optional ``#token`` inside the parentheses correlates the parts of one reply, so two replies
+#: by one sender that interleave cannot be joined into one mixed message (#29 review). A sender
+#: that writes none (an older transport) is still reassembled, one reply at a time.
+_SPLIT_FIRST_RE = re.compile(
+    r"^(?P<body>.*)\n\n\(1/(?P<total>\d+)(?: #(?P<ref>\w{1,16}))?\)[ \t]*\Z", re.S)
 #: Part k > 1: the marker first (after the sender's banner and the @handles that delivered
 #: it), then the reply from where the previous part was cut.
 _SPLIT_PART_RE = re.compile(
     r"^(?:@\w+[:,]?\s*)*(?:\[[^\]\n]{1,64}\]\s*)?"
-    r"↪ \((?P<index>\d+)/(?P<total>\d+)\)[ \t]?(?P<body>.*)\Z", re.S)
+    r"↪ \((?P<index>\d+)/(?P<total>\d+)(?: #(?P<ref>\w{1,16}))?\)[ \t]?(?P<body>.*)\Z", re.S)
 #: How long the receiver holds the first part(s) of a split reply for the rest. A whole reply
 #: is a few consecutive posts (seconds apart); longer than this and the rest is not coming.
 SPLIT_TIMEOUT_SECONDS = 30.0
@@ -4628,8 +4642,17 @@ MAX_PENDING_SPLITS = 32
 MAX_SPLIT_PARTS = MAX_REPLY_PARTS
 
 
-def split_part(text: str) -> Optional[Tuple[int, int, str]]:
-    """``(index, total, body)`` when *text* is one part of a split reply, else ``None``.
+class SplitPart(NamedTuple):
+    """One part of a split reply: where it sits, the text it carries, and its reply's token."""
+
+    index: int
+    total: int
+    body: str
+    ref: Optional[str] = None           # the reply's correlation token, when the sender wrote one
+
+
+def split_part(text: str) -> Optional[SplitPart]:
+    """The part *text* is, else ``None``.
 
     The cut markers are removed and nothing else is: the sender's banner and delivering
     @handles stay on part 1 (as on any message), and each later part keeps exactly the text
@@ -4644,14 +4667,14 @@ def split_part(text: str) -> Optional[Tuple[int, int, str]]:
     if tail is not None:
         index, total = int(tail.group("index")), int(tail.group("total"))
         if 1 < index <= total <= MAX_SPLIT_PARTS:
-            return index, total, tail.group("body")
+            return SplitPart(index, total, tail.group("body"), tail.group("ref"))
         return None
     first = _SPLIT_FIRST_RE.match(text)
     if first is not None:
         total = int(first.group("total"))
         body = first.group("body")
         if 1 < total <= MAX_SPLIT_PARTS and body.strip():
-            return 1, total, body
+            return SplitPart(1, total, body, first.group("ref"))
     return None
 
 

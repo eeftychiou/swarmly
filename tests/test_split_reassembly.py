@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
-from swarmly.telegram.channel import MAX_SPLIT_PARTS, split_part
+from swarmly.telegram.channel import MAX_SPLIT_PARTS, SplitPart, split_part
 from tests.test_telegram_channel import event, make_channel, make_config, run
 
 
@@ -47,13 +47,19 @@ def outgoing(original: str, alias: str = "Codex") -> list:
 
 
 ORIGINAL = "\n\n".join(f"paragraph {index}: " + "y" * 200 for index in range(60))
+#: Two long replies by one sender, each its own markers, for the interleaving tests.
+ALPHA = ("alpha-start\n\n" + "\n\n".join("a" * 300 for _ in range(20))
+         + "\n\nalpha-end")
+BRAVO = ("bravo-start\n\n" + "\n\n".join("b" * 300 for _ in range(20))
+         + "\n\nbravo-end")
 
 
 class TestSplitPart(unittest.TestCase):
     def test_the_markers_are_read_off_each_part(self):
-        self.assertEqual(split_part("body\n\n(1/3)"), (1, 3, "body"))
-        self.assertEqual(split_part("[Codex] ↪ (2/3) more"), (2, 3, "more"))
-        self.assertEqual(split_part("@HermesBot [Codex] ↪ (3/3)tail"), (3, 3, "tail"))
+        self.assertEqual(split_part("body\n\n(1/3)"), SplitPart(1, 3, "body"))
+        self.assertEqual(split_part("[Codex] ↪ (2/3) more"), SplitPart(2, 3, "more"))
+        self.assertEqual(split_part("@HermesBot [Codex] ↪ (3/3)tail"),
+                         SplitPart(3, 3, "tail"))
 
     def test_a_whole_message_is_not_a_part(self):
         for text in ("", "just a message", "a message that ends (1/1)", "↪ (1/2) not a part 1"):
@@ -102,7 +108,7 @@ class TestSplitPart(unittest.TestCase):
         for text in ("body\n\n(1/1000000000)", "[Codex] ↪ (2/999999999) more"):
             self.assertIsNone(split_part(text), text)
         self.assertEqual(split_part(f"body\n\n(1/{MAX_SPLIT_PARTS})"),
-                         (1, MAX_SPLIT_PARTS, "body"))       # the cap itself is allowed
+                         SplitPart(1, MAX_SPLIT_PARTS, "body"))   # the cap is allowed
         self.assertIsNone(split_part(f"body\n\n(1/{MAX_SPLIT_PARTS + 1})"))
 
 
@@ -212,8 +218,8 @@ class TestReassembly(unittest.TestCase):
         self.assertEqual(len(adapter.seen), 1)              # part 1 is answered, whole
 
     def test_two_interleaved_replies_from_one_sender_are_never_mixed(self):
-        """Review of #29: one buffer per sender, but a part that cannot belong to the held reply
-        opens the next one, so two replies interleaved by one sender stay two messages."""
+        """Review of #29: without a token (an older sender) a part that cannot belong to the
+        held reply opens the next one, so two interleaved replies stay two messages."""
         alpha = ["@HermesBot [Codex] alpha one\n\n(1/2)", "[Codex] ↪ (2/2) alpha two"]
         bravo = ["@HermesBot [Codex] bravo one\n\n(1/2)", "[Codex] ↪ (2/2) bravo two"]
         channel, adapter = receiver()
@@ -229,6 +235,28 @@ class TestReassembly(unittest.TestCase):
         self.assertTrue(any("bravo one" in text and "bravo two" in text for text in texts), texts)
         for text in texts:
             self.assertFalse("alpha" in text and "bravo" in text, text)
+
+    def test_interleaved_replies_that_start_out_of_order_are_never_mixed(self):
+        """Review of #29: A1, B2, B1, A2 — part 2 of one reply arriving before that reply's
+        part 1 must not complete the other. Each reply carries its own token, so they are held
+        apart and each comes out whole."""
+        alpha = outgoing(ALPHA)
+        bravo = outgoing(BRAVO)
+        self.assertEqual(len(alpha), 2, alpha)
+        self.assertEqual(len(bravo), 2, bravo)
+        self.assertNotEqual(split_part(alpha[0]).ref, split_part(bravo[0]).ref)
+        channel, adapter = receiver()
+
+        async def replay():
+            for message_id, part in enumerate([alpha[0], bravo[1], bravo[0], alpha[1]], 1):
+                await channel.handle_event(event(part, message_id=message_id))
+
+        run(replay())
+        texts = [message.text for message in adapter.seen]
+        self.assertTrue(any(ALPHA in text for text in texts), [text[:80] for text in texts])
+        self.assertTrue(any(BRAVO in text for text in texts), [text[:80] for text in texts])
+        for text in texts:
+            self.assertFalse("alpha-start" in text and "bravo-start" in text, text[:120])
 
     def test_an_unlisted_bot_gets_no_buffer_and_no_timer(self):
         """Review of #29: under ``strangers: ignore`` a bot this transport does not know cannot

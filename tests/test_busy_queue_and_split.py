@@ -11,6 +11,7 @@ The busy queue and long-reply splitting, both ported from ductor's Telegram tran
 from __future__ import annotations
 
 import asyncio
+import re
 import unittest
 from html import escape
 
@@ -157,9 +158,12 @@ class TestReplySplitting(unittest.TestCase):
         text = "x" * 9000
         parts = channel.split_outgoing(text)
         self.assertEqual(len(parts), 3)
-        self.assertTrue(parts[0].endswith("\n\n(1/3)"))
-        self.assertTrue(parts[1].startswith("↪ (2/3) "))
-        self.assertTrue(parts[2].startswith("↪ (3/3) "))
+        # Each part carries the reply's correlation token inside its marker (#29 review).
+        self.assertRegex(parts[0], r"\n\n\(1/3 #[0-9a-f]{6}\)\Z")
+        self.assertRegex(parts[1], r"\A↪ \(2/3 #[0-9a-f]{6}\) ")
+        self.assertRegex(parts[2], r"\A↪ \(3/3 #[0-9a-f]{6}\) ")
+        refs = {re.search(r"#[0-9a-f]{6}", part).group(0) for part in parts}
+        self.assertEqual(len(refs), 1, refs)          # one reply, one token
         self.assertEqual("".join(self.strip_markers(parts)), text)
         self.assert_each_part_fits(channel, parts)
 

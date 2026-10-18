@@ -325,8 +325,9 @@ up to `max_reply_parts` consecutive messages. Part 1 carries the envelope header
 addressing and ends with `(1/n)`; parts 2..n start with `↪ (k/n)` and carry no mentions. A
 receiving transport never starts a turn on a `↪ (k/n)` part from a peer bot; instead it holds
 the parts and joins them back into the one message the sender wrote, then runs one turn from
-part 1 (issue #29). A peer that needs the full text of a long handoff should still read it from
-the durable record (`bus=`).
+part 1 (issue #29). Each marker carries the reply's own token (`↪ (2/3 #9fa0c1)`), so two
+replies by one sender that interleave never mix. A peer that needs the full text of a long
+handoff should still read it from the durable record (`bus=`).
 
 **Messages that arrive mid-turn are queued.** With `busy_behavior: queue` (the default) an
 addressed message that arrives while a turn is running waits, up to `busy_queue_max`, and runs
