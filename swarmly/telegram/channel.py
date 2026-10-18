@@ -325,6 +325,7 @@ class ChannelEvent:
     handoff: bool = False                  # set by routing: an expected hand-off, no cooldown
     cooldown_left: float = 0.0             # set by routing: a message to this bot the cooldown dropped
     self_task: bool = False                # a brief this agent gave itself (topic or membership)
+    reassembled: bool = False              # #29: the split parts of one reply, joined already
 
 
 @dataclass
@@ -479,6 +480,9 @@ class AgentChannel:
         self._topics_reported: Set[Tuple[int, Optional[int]]] = set()   # sent REPORT_BACK
         self._report_asked: Set[Tuple[int, Optional[int]]] = set()      # REPORT_NOTE sent
         self._self_tasks: Set[asyncio.Task] = set()
+        # #29: sender+chat+topic -> the parts of a split reply already here, and their timers.
+        self._split_pending: Dict[Tuple[Any, ...], _PendingSplit] = {}
+        self._split_tasks: Set[asyncio.Task] = set()
         self._gone_topics: set = set()             # topics a reply in flight found closed
         # Whether a post to a closed or deleted topic goes to General with a note (a reply
         # must land somewhere); ``swarmly-telegram send --topic`` turns it off so a wrong
@@ -1959,6 +1963,17 @@ class AgentChannel:
                          event.chat_id, event.thread_id, blocked)
             return None
 
+        # Issue #29: a reply that arrives as ↪ (k/n) parts is one message. The parts are held
+        # until the rest are here, then the one turn runs with the whole message — never a turn
+        # per fragment, and never an answer to a third of a brief.
+        held, joined = await self._absorb_split(event)
+        if held:
+            self.stats.ignored += 1
+            return None
+        if joined is not None:
+            event.text = joined
+            event.reassembled = True
+
         # Every message that names its topic teaches the name, addressed to us or not.
         if event.thread_id is not None:
             self.topics.remember(event.chat_id, event.thread_id, event.topic_name,
@@ -2255,6 +2270,7 @@ class AgentChannel:
             general_is_for_setup=self._work_moves_to_topics(event),
             role_brief=self._role_brief(),
             fresh_text=self._fresh_text(event, text[len(recap):]),
+            reassembled=event.reassembled,
         )
 
         try:
@@ -3710,6 +3726,10 @@ class AgentChannel:
         the envelope header and the peer addressing and ends with ``(1/n)``; later parts start
         with ``↪ (k/n)``, which receiving transports treat as a continuation, never a new
         turn. Text that still remains after the last part is clamped as before.
+
+        The pieces are exact slices of *text* -- the whitespace a cut falls on stays at the end
+        of the piece before it -- so the receiving transport reassembles the original message
+        character for character (:func:`split_part`, ``AgentChannel._absorb_split``, issue #29).
         """
         max_parts = max(int(getattr(self.config.limits, "max_reply_parts", 1) or 1), 1)
         if max_parts == 1 or self._fits(text):
@@ -3724,8 +3744,8 @@ class AgentChannel:
                 break
             cut = self._split_point(rest, lambda p: self._fits(
                 (p + head_room) if first else (tail_room + p)))
-            pieces.append(rest[:cut].rstrip())
-            rest = rest[cut:].lstrip("\n")
+            pieces.append(rest[:cut])
+            rest = rest[cut:]
         if rest.strip():
             pieces.append(rest)
         if len(pieces) == 1:
@@ -3758,6 +3778,108 @@ class AgentChannel:
             if at > 0:
                 return at + len(separator)
         return low
+
+    # ----------------------------------------------------------------------------------
+    # Split replies (issue #29)
+    # ----------------------------------------------------------------------------------
+    @staticmethod
+    def _split_key(event: ChannelEvent) -> Tuple[Any, ...]:
+        """Which reply a part belongs to: one sender, in one chat and discussion."""
+        return (event.chat_id, event.thread_id, event.author_id,
+                (event.author_username or "").lower())
+
+    async def _absorb_split(self, event: ChannelEvent) -> Tuple[bool, Optional[str]]:
+        """Hold the parts of a split reply until the whole message is here, then join it.
+
+        Returns ``(held, joined)``: ``held`` means the part was stored and this event must not
+        run a turn; ``joined`` is the whole message when the last missing part arrived, for the
+        caller to run the one turn with. Parts are matched by index, so they may arrive out of
+        order; a reply whose parts never all arrive is delivered as what did arrive, with a
+        note naming the missing ones (``_flush_split``), never silently dropped and never
+        answered twice.
+        """
+        if not event.author_is_bot or not event.text:
+            return False, None
+        # A reply held this long has lost parts: deliver what arrived before taking more.
+        await self._flush_expired_splits()
+        part = split_part(event.text)
+        if part is None:
+            return False, None
+        index, total, body = part
+        key = self._split_key(event)
+        pending = self._split_pending.get(key)
+        if pending is not None and pending.total != total:
+            # Another reply by the same bot, or a stray part of one: the held reply will never
+            # complete, so it goes out now as what arrived.
+            self._split_pending.pop(key, None)
+            await self._deliver_split(pending)
+            pending = None
+        if pending is None:
+            # A later part can arrive first; it is held the same way, and the turn (when it
+            # runs, or when the window closes) takes the earliest part's chat and topic.
+            pending = _PendingSplit(total=total, opened=self._clock())
+            self._split_pending[key] = pending
+            self._arm_split_timeout(key, pending)
+        if index in pending.bodies:
+            return True, None                       # a repeated part: nothing new to add
+        pending.bodies[index] = body
+        pending.events[index] = event
+        if pending.missing():
+            logger.info("%s: holding part %d/%d of a split reply from @%s (%d/%d arrived)",
+                        self.config.identity.alias, index, total,
+                        event.author_username or "unknown", len(pending.bodies), total)
+            return True, None
+        self._split_pending.pop(key, None)
+        logger.info("%s: reassembled a %d-part reply from @%s", self.config.identity.alias,
+                    total, event.author_username or "unknown")
+        return False, pending.joined()
+
+    def _arm_split_timeout(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
+        """Deliver what arrived if the rest of a held reply does not come."""
+        if not self._split_pending:                 # pragma: no cover - always set here
+            return
+
+        async def expire() -> None:
+            await asyncio.sleep(SPLIT_TIMEOUT_SECONDS)
+            await self._flush_split(key, pending)
+
+        task = asyncio.create_task(expire())
+        self._split_tasks.add(task)
+        task.add_done_callback(self._split_tasks.discard)
+
+    async def _flush_expired_splits(self) -> None:
+        """Deliver the held parts of replies that have waited out ``SPLIT_TIMEOUT_SECONDS``."""
+        if not self._split_pending:
+            return
+        now = self._clock()
+        for key, pending in list(self._split_pending.items()):
+            if now - pending.opened >= SPLIT_TIMEOUT_SECONDS:
+                await self._flush_split(key, pending)
+
+    async def _flush_split(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
+        """Deliver a held reply as what arrived. The first caller wins, so the timer and the
+        sweep cannot both run the turn."""
+        if self._split_pending.get(key) is not pending:
+            return
+        self._split_pending.pop(key, None)
+        await self._deliver_split(pending)
+
+    async def _deliver_split(self, pending: _PendingSplit) -> None:
+        """Run the one turn for what arrived of a reply, saying which parts are missing."""
+        event = pending.event
+        if event is None or not pending.bodies:
+            return
+        text = pending.joined()
+        if pending.missing():
+            logger.warning("%s: a %d-part reply from @%s is missing part(s) %s; delivering "
+                           "what arrived", self.config.identity.alias, pending.total,
+                           event.author_username or "unknown",
+                           ", ".join(str(i) for i in pending.missing()))
+            text += pending.note()
+        event.text = text
+        event.reassembled = True
+        # It runs the rest of the inbound path, so it is one turn with one message.
+        await self.handle_event(event)
 
     async def send(self, text: Union[str, Callable[[], Optional[str]]],
                    reply_to_message_id: Optional[int] = None,
@@ -4440,6 +4562,73 @@ def _current_task_cancelling() -> bool:
 # A later part of a split message, as received: optional leading mentions, the sender's
 # "[Alias]" banner, then the "↪ (k/n)" marker that split_outgoing puts on parts 2..n.
 _CONTINUATION_RE = re.compile(r"^(?:@\w+\s+)*(?:\[[^\]\n]{1,64}\]\s*)?↪ \(\d+/\d+\)")
+
+# --------------------------------------------------------------------------------------
+# Split replies (issue #29): ↪ (k/n) parts are one message at the receiver
+# --------------------------------------------------------------------------------------
+#: Part 1 of a split reply: the reply first, then "(1/n)" appended by ``split_outgoing``.
+_SPLIT_FIRST_RE = re.compile(r"^(?P<body>.*)\n\n\(1/(?P<total>\d+)\)[ \t]*\Z", re.S)
+#: Part k > 1: the marker first (after the sender's banner and the @handles that delivered
+#: it), then the reply from where the previous part was cut.
+_SPLIT_PART_RE = re.compile(
+    r"^(?:@\w+[:,]?\s*)*(?:\[[^\]\n]{1,64}\]\s*)?"
+    r"↪ \((?P<index>\d+)/(?P<total>\d+)\)[ \t]?(?P<body>.*)\Z", re.S)
+#: How long the receiver holds the first part(s) of a split reply for the rest. A whole reply
+#: is a few consecutive posts (seconds apart); longer than this and the rest is not coming.
+SPLIT_TIMEOUT_SECONDS = 30.0
+
+
+def split_part(text: str) -> Optional[Tuple[int, int, str]]:
+    """``(index, total, body)`` when *text* is one part of a split reply, else ``None``.
+
+    The cut markers are removed and nothing else is: the sender's banner and delivering
+    @handles stay on part 1 (as on any message), and each later part keeps exactly the text
+    that followed the cut, so the parts concatenate back to the reply that was sent. A part 1
+    whose body is empty is not a split reply, and neither is ``(1/1)``.
+    """
+    if not text:
+        return None
+    tail = _SPLIT_PART_RE.match(text)
+    if tail is not None:
+        index, total = int(tail.group("index")), int(tail.group("total"))
+        if 1 < index <= total:
+            return index, total, tail.group("body")
+        return None
+    first = _SPLIT_FIRST_RE.match(text)
+    if first is not None:
+        total = int(first.group("total"))
+        body = first.group("body")
+        if total > 1 and body.strip():
+            return 1, total, body
+    return None
+
+
+@dataclass
+class _PendingSplit:
+    """The parts of one split reply that have arrived, and where they came from."""
+
+    total: int
+    bodies: Dict[int, str] = field(default_factory=dict)
+    #: part index -> the event it arrived in: chat, topic, author, message id.
+    events: Dict[int, ChannelEvent] = field(default_factory=dict)
+    opened: float = 0.0                        # clock the first part arrived, for the timeout
+
+    @property
+    def event(self) -> Optional[ChannelEvent]:
+        """The earliest part's event: the turn runs as if that message had arrived whole."""
+        return self.events[min(self.events)] if self.events else None
+
+    def joined(self) -> str:
+        return "".join(self.bodies[index] for index in sorted(self.bodies))
+
+    def missing(self) -> List[int]:
+        return [index for index in range(1, self.total + 1) if index not in self.bodies]
+
+    def note(self) -> str:
+        """What the turn is told when the rest of the reply never arrived."""
+        missing = ", ".join(str(index) for index in self.missing())
+        return (f"\n\n(parts {missing} of this {self.total}-part reply never arrived; this is "
+                "what did)")
 
 
 async def _maybe_await(value: Any) -> Any:

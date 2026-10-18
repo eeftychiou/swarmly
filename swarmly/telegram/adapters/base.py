@@ -80,6 +80,9 @@ class IncomingMessage:
     fresh_text: Optional[str] = None
     project: Optional[str] = None                  # the bound project key; None = unbound
     project_repo: Optional[str] = None             # the project's github repo (owner/name)
+    # Issue #29: the channel joined the ``↪ (k/n)`` parts of a split reply before this turn, so
+    # ``text`` is the whole message the sender wrote -- one message, one answer.
+    reassembled: bool = False
 
 
 #: Characters a chat-controlled name (topic, sender) never carries into a prompt line:

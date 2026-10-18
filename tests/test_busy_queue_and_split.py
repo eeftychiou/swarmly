@@ -167,7 +167,9 @@ class TestReplySplitting(unittest.TestCase):
         parts = channel.split_outgoing("\n\n".join(paragraphs))
         self.assertGreater(len(parts), 1)
         for body in self.strip_markers(parts):
-            for chunk in body.split("\n\n"):
+            # A cut keeps the whitespace it fell on (issue #29: the parts must join back to
+            # the original), so a body may end in the blank line the next part starts after.
+            for chunk in (c for c in body.split("\n\n") if c.strip()):
                 self.assertIn(chunk, paragraphs, "a paragraph was cut in the middle")
 
     def test_html_escaping_is_counted(self):
