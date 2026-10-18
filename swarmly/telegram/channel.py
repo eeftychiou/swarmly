@@ -438,8 +438,10 @@ class AgentChannel:
         # Agent-opened topics (topic_open.py): topic -> where its work was asked for.
         self._topic_origins: Dict[Tuple[int, Optional[int]], Tuple[int, Optional[int]]] = {}
         self._topics_opened: List[float] = []
-        self._cooldown_noticed = float("-inf")
         self._anonymous_noticed = float("-inf")
+        # #27 review: (chat, topic, sender) -> clock of the last cooldown notice, so each peer
+        # whose message the cooldown dropped hears it once, not one peer per window for all.
+        self._cooldown_notices: Dict[Tuple[int, Optional[int], Any], float] = {}
         # #27: (chat, topic, reason, sender) -> clock of the last notice telling a peer bot its
         # mention was dropped, so one drop is reported once per sender, not once per message.
         self._drop_notices: Dict[Tuple[int, Optional[int], str, Any], float] = {}
@@ -2809,9 +2811,15 @@ class AgentChannel:
         human sees it. Peers' transports drop "⚠️" notices, so this starts no turn."""
         window = getattr(self.config.limits, "min_seconds_between_agent_turns", 0.0)
         now = self._clock()
-        if now - self._cooldown_noticed < window:
+        # Per sender, not per channel (#27 review): one peer's notice inside the window must not
+        # swallow the next peer's, which is a different lost hand-off on a different message.
+        key = (event.chat_id, event.thread_id,
+               event.author_id if event.author_id is not None
+               else (event.author_username or "").lower())
+        last = self._cooldown_notices.get(key)
+        if last is not None and now - last < window:
             return
-        self._cooldown_noticed = now
+        self._cooldown_notices[key] = now
         # No @: a mention would land in the sender's own cooldown and draw its notice back.
         sender = event.author_username or "a peer"
         # A peer bot's message that named this bot lost a real hand-off, not just a message:

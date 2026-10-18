@@ -1012,6 +1012,21 @@ class TestHandoffAddressing(unittest.TestCase):
         self.assertIn("cooldown", notices[0]["text"])          # and why
         self.assertEqual(notices[0]["reply_to"], 21)
 
+    def test_each_sender_gets_its_own_cooldown_notice(self):
+        """#27 review: the cooldown window is per sender, so a second peer dropped inside it
+        hears about its own message instead of being swallowed by the first peer's notice."""
+        channel = make_channel(make_config(limits={"min_seconds_between_agent_turns": 60.0,
+                                                   "min_seconds_between_messages": 0}))
+        run(channel.handle_event(event("@HermesBot run the suite", message_id=40)))
+        run(channel.handle_event(event("@HermesBot run it again", message_id=41)))
+        run(channel.handle_event(event("@HermesBot and the QA pass", username="AntigravityBot",
+                                       author_id=303, message_id=42)))
+        notices = [e for e in channel._test_sender.sent if e["text"].startswith("⚠️")]
+        self.assertEqual(len(notices), 2, notices)
+        self.assertEqual([n["reply_to"] for n in notices], [41, 42])
+        self.assertIn("CodexBot", notices[0]["text"])
+        self.assertIn("AntigravityBot", notices[1]["text"])
+
 
 # --------------------------------------------------------------------------------------
 # 4. Loop guard and pacing (Telegram requires both for bot-to-bot mode)
