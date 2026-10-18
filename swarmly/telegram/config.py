@@ -171,7 +171,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
             "mirror_handoffs"),
     "fallback": ("gitbus_root", "gitbus_ref", "gitbus_poll_minutes"),
     "projects": ("repo", "cwd", "topics", "worktrees"),
-    "github": ("login", "token_env", "poll_minutes", "mark_read"),
+    "github": ("login", "token_env", "poll_minutes", "mark_read", "tracking_label"),
 }
 
 
@@ -736,6 +736,9 @@ class GitHubSettings:
     token_env: str = "GH_TOKEN"
     poll_minutes: int = 5
     mark_read: bool = True
+    #: The label that marks a tracking issue (round end): closing one wakes the coordinator
+    #: to post the round report (issue #25). "" disables the watch.
+    tracking_label: str = "tracking"
 
 
 @dataclass
@@ -1045,11 +1048,13 @@ class AgentConfig:
             gtoken_env = str(github_raw.get("token_env") or "GH_TOKEN").strip()
             gpoll = _parse_int("github.poll_minutes", github_raw.get("poll_minutes"), 5)
             gmark = _parse_bool("github.mark_read", github_raw.get("mark_read", True))
+            glabel = str(github_raw.get("tracking_label", "tracking") or "").strip()
             github = GitHubSettings(
                 login=glogin,
                 token_env=gtoken_env,
                 poll_minutes=gpoll,
                 mark_read=gmark,
+                tracking_label=glabel,
             )
         elif github_raw is not None:
             raise ConfigError("'github' must be a mapping")

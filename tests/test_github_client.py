@@ -161,6 +161,27 @@ class TestGitHubClient(unittest.TestCase):
             self.assertIn("enhancement", args)
             self.assertEqual(args[args.index("--body") + 1], "Details\n\n— Antigravity")
 
+    def test_client_issues_with_label_lists_open_and_closed(self):
+        fake_data = [
+            {"number": 34, "title": "Round 2 tracking", "body": "", "author": {"login": "claude"},
+             "state": "CLOSED", "labels": [{"name": "tracking"}], "assignees": []},
+            {"number": 35, "title": "Next round", "body": "", "author": {"login": "claude"},
+             "state": "OPEN", "labels": [{"name": "tracking"}],
+             "assignees": [{"login": "codex"}]},
+        ]
+        with patch.object(self.client, "_run", return_value=(0, json.dumps(fake_data), "")) as run:
+            issues = self.client.issues_with_label("example-org/webapp", "tracking")
+            args = run.call_args[0][0]
+        self.assertEqual([(i.number, i.state) for i in issues], [(34, "CLOSED"), (35, "OPEN")])
+        self.assertEqual(issues[1].assignees, ["codex"])
+        self.assertEqual(args[:3], ["issue", "list", "--repo"])
+        self.assertEqual(args[args.index("--label") + 1], "tracking")
+
+    def test_an_unanswerable_issue_list_is_an_error_not_an_empty_round(self):
+        with patch.object(self.client, "_run", return_value=(1, "", "HTTP 401: Bad credentials")):
+            with self.assertRaises(GitHubError):
+                self.client.issues_with_label("repo", "tracking")
+
     def test_client_handles_gh_missing(self):
         with patch("shutil.which", return_value=None):
             code, out, err = self.client._run(["issue", "view", "1"])
@@ -170,6 +191,8 @@ class TestGitHubClient(unittest.TestCase):
             self.assertIsNone(self.client.pr_view("repo", 1))
             with self.assertRaises(GitHubError):     # failure is not "no notifications"
                 self.client.notifications()
+            with self.assertRaises(GitHubError):     # nor "no tracking issues"
+                self.client.issues_with_label("repo", "tracking")
             self.assertFalse(self.client.comment("repo", 1, "body"))
             self.assertIsNone(self.client.create_issue("repo", "t", "b"))
             self.assertFalse(self.client.mark_notification_read("1"))
@@ -180,6 +203,8 @@ class TestGitHubClient(unittest.TestCase):
             self.assertIsNone(self.client.pr_view("repo", 999))
             with self.assertRaises(GitHubError):     # failure is not "no notifications"
                 self.client.notifications()
+            with self.assertRaises(GitHubError):
+                self.client.issues_with_label("repo", "tracking")
             self.assertFalse(self.client.comment("repo", 999, "hi"))
             self.assertIsNone(self.client.create_issue("repo", "t", "b"))
             self.assertFalse(self.client.mark_notification_read("999"))
@@ -190,6 +215,8 @@ class TestGitHubClient(unittest.TestCase):
             self.assertIsNone(self.client.pr_view("repo", 1))
             with self.assertRaises(GitHubError):     # failure is not "no notifications"
                 self.client.notifications()
+            with self.assertRaises(GitHubError):
+                self.client.issues_with_label("repo", "tracking")
 
     def test_client_injects_env_token(self):
         with patch.dict(os.environ, {"TEST_GH_TOKEN": "ghp_secrettoken123"}):

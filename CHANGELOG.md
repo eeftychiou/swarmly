@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A round now ends with a report to the human in the round's topic, and closing the round's
+  tracking issue is what triggers it: closing sends no GitHub notification, so the
+  notifications backstop also remembers which issues carrying `github.tracking_label`
+  (default `tracking`) were open and wakes the **coordinator** in the project's bound topic
+  with a *post the round report now* turn when one closes. One report per closure -- an issue
+  that stays closed is quiet, a reopened-and-closed one is a new round end -- and a closure
+  whose turn fails stays queued, backing off and then given up loudly like a failed
+  notification turn, instead of losing the round end. Only an agent whose `agent.role` is
+  `coordinator` is woken, and `tracking_label: ""` disables the watch (`#25`).
+
 ### Fixed
 
 - Every @handle in a peer bot's hand-off counts as addressed, on one line or over several,

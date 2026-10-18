@@ -326,6 +326,7 @@ class TestProjectsConfig(unittest.TestCase):
                 "token_env": "GH_TOKEN_TEST",
                 "poll_minutes": 10,
                 "mark_read": False,
+                "tracking_label": "round",
             },
         }
         cfg = AgentConfig.from_dict(data)
@@ -335,7 +336,18 @@ class TestProjectsConfig(unittest.TestCase):
         self.assertEqual(cfg.github.token_env, "GH_TOKEN_TEST")
         self.assertEqual(cfg.github.poll_minutes, 10)
         self.assertFalse(cfg.github.mark_read)
+        self.assertEqual(cfg.github.tracking_label, "round")
         self.assertEqual(cfg.validate(), [])
+
+    def test_the_tracking_label_defaults_to_tracking(self):
+        data = {
+            "agent": {"name": "HermesBot", "alias": "Hermes", "bot_token": "1:T",
+                      "home_channel_id": GROUP, "admin_user_id": ADMIN_ID},
+            "github": {"login": "my-agent-bot"},
+        }
+        cfg = AgentConfig.from_dict(data)
+        assert cfg.github is not None
+        self.assertEqual(cfg.github.tracking_label, "tracking")
 
     def test_config_github_validation_missing_login_when_projects_configured(self):
         with TemporaryDirectory() as tmp:

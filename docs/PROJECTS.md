@@ -16,6 +16,13 @@ In multi-agent engineering workflows, high-bandwidth collaboration requires two 
 1. **Realtime plane (Telegram)**: Fast notifications, status updates, ping handoffs, and interactive human steering happen inside Telegram forum topics. Each topic represents a specific stream of work (e.g., a feature, an integration, or a maintenance track).
 2. **Durable plane (GitHub)**: The authoritative record of tasks, technical proposals, code reviews, and merged changes lives in GitHub issues and pull requests. Agents sign their durable actions (`— <alias>`), link issues, and create pull requests.
 3. **Missed-ping backstop**: If an agent misses a Telegram notification, a background watcher checks GitHub notifications at regular intervals (`github.poll_minutes`). Any missed review requests, assignments, or mentions queue turns in the bound Telegram topic, skipping items that were already addressed recently.
+   **Round end**: a tracking issue (the issue a round is tracked in) carries the
+   `github.tracking_label` label. Closing one sends no GitHub notification, so the
+   watcher remembers which labelled issues were open and wakes the **coordinator**
+   in the bound topic with a *post the round report now* turn -- once per closure,
+   retried (with backoff, then given up loudly) if that turn fails. Only an agent
+   whose `agent.role` is `coordinator` gets that turn; `tracking_label: ""`
+   disables the watch.
 
 ### Topic-to-project binding
 
@@ -84,6 +91,8 @@ github:
                                        # acts as the agent. Never point it at the owner's token.
   poll_minutes: 5                      # backstop poll interval in minutes (0 disables backstop)
   mark_read: true                      # mark handled notifications as read on GitHub
+  tracking_label: tracking             # label that marks a tracking issue: closing one
+                                       # wakes the coordinator to post the round report
 ```
 
 ---
