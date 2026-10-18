@@ -107,6 +107,36 @@ python -m swarmly.telegram.cli --config config.yaml run       # serve the channe
 `check` prints the BotFather/admin checklist alongside any config problems, because a missing
 admin right is silent at runtime.
 
+### What leaves the host — `public_redactions`
+
+The durable bus and GitHub text are public by nature, so the transport replaces three things
+before anything is written there: the maintainer's handle, team ids, and absolute local
+paths. The raw values stay in local config and state.
+
+```yaml
+agent:
+  maintainer_username: example_admin     # redacted from outbound text automatically
+public_redactions:                       # optional: literal -> replacement
+  "@example_admin": "<maintainer>"
+  "C:\work\client-name": "<path>"
+```
+
+- **Handles and paths** named here are replaced verbatim. Chat ids, `admin_user_id` and the
+  numeric ids in `peers:` need no entry: the transport knows them, and replaces them with
+  `<chat>`/`<user>`. Absolute paths under `adapter.cwd`, a project's `cwd` and your home
+  directory become `<path>`.
+- **Bot @usernames stay visible.** They are public on Telegram already, and each bot's
+  allowlist ignores strangers, so redacting them buys nothing and breaks the hand-off text
+  every peer needs to read.
+- **Dedupe keeps working without an id.** A mirrored hand-off names a topic token
+  (`topic:<project>:<thread>`) instead of a chat id; each agent resolves it through its own
+  `projects:`. An unbound topic falls back to an HMAC token from
+  `SWARMLY_REDACTION_SECRET`, which peers cannot resolve — they then run the mirrored turn as
+  well: **processed twice, never lost**. Mirrors written before this change (a raw `chat`
+  field) are still understood.
+- **`check` validates the map**: an empty key or a non-mapping value is an error, and an
+  unset map changes nothing.
+
 Values are parsed strictly. A switch such as `adapter.enabled` or `bus.enabled` takes
 true/false, yes/no, on/off or 1/0 (quoted or not), and anything else is an error naming the
 key. `adapter.timeout_seconds` and `adapter.max_output_chars` must be positive integers (`0`

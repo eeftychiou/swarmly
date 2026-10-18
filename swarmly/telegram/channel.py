@@ -55,6 +55,7 @@ from swarmly.telegram.commands import (
 from swarmly.telegram.config import EFFORT_LEVELS, AgentConfig, effort_problem, model_problem
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.projects import ProjectRouter
+from swarmly.telegram.redact import Redactor
 from swarmly.telegram.topic_open import (GENERAL_PEER_REPLY_CHARS, GENERAL_REPLY_CHARS,
                                          MAX_TOPICS_PER_HOUR, REPORT_NOTE, SELF_TASK_NOTE,
                                          TOPIC_ASKED_NOTE, asks_for_topic, defuse_mentions,
@@ -2889,7 +2890,14 @@ class AgentChannel:
                 "at": self._clock(), "message_id": message_id, "nudged": False}
         if not (self.config.bus.repo and getattr(self.config.bus, "mirror_handoffs", True)):
             return
-        ref = {"chat": int(chat_id), "thread": thread_id, "message_id": message_id}
+        # Issue #22: the bus carries a topic token, never the chat id. The token resolves
+        # through each peer's own config, so dedupe survives without an id leaving the host;
+        # an unbound topic falls back to an HMAC token, which no peer can resolve (it then
+        # runs the mirror too: processed twice, never lost).
+        ref = dict(Redactor.from_config(self.config).topic_ref(
+            int(chat_id), thread_id, getattr(self, "router", None)))
+        if message_id is not None:
+            ref["message_id"] = message_id
 
         def write() -> None:
             from swarmly.telegram.relay import post_and_notify
@@ -3040,13 +3048,31 @@ class AgentChannel:
         return event.author_username if event.author_is_bot else None
 
     def took_telegram_copy(self, ref: Any) -> bool:
-        """Whether this bot already ran (or queued) the Telegram message a bus mirror
-        names."""
-        try:
-            key = (int(ref["chat"]), int(ref["message_id"]))
-        except (TypeError, KeyError, ValueError):
+        """Whether this bot already ran (or queued) the Telegram message a bus mirror names.
+
+        Issue #22: a mirror names a topic token rather than a chat id. An un-resolvable token
+        (the HMAC fallback, a project this agent does not configure) reports "not taken", so
+        the turn runs from the bus as well -- a duplicate, never a lost hand-off. The old
+        ``{"chat": id}`` form is still accepted, so a mirror written before the change keeps
+        its dedupe.
+        """
+        if not isinstance(ref, dict):
             return False
-        return key in self._tg_admitted
+        try:
+            message_id = int(ref["message_id"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        token = ref.get("topic")
+        if isinstance(token, str) and token:
+            from swarmly.telegram.redact import resolve_topic_token
+            for chat_id, _thread in resolve_topic_token(token, getattr(self, "router", None)):
+                if (int(chat_id), message_id) in self._tg_admitted:
+                    return True
+            return False
+        try:
+            return (int(ref["chat"]), message_id) in self._tg_admitted
+        except (KeyError, TypeError, ValueError):
+            return False
 
     def _peer_handle(self) -> "re.Pattern[str]":
         """Matches a peer's @username or @alias, or ``Alias:``, at the start of a text."""

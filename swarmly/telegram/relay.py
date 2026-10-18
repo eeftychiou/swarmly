@@ -75,6 +75,7 @@ async def post_and_notify(channel: Any, *, to: str, text: str, intent: str = "ST
     still be delivered by the poller.
     """
     from swarmly.bus import DurableBus
+    from swarmly.telegram.redact import Redactor
     from swarmly.models import (A2AMessage, MessageIntent, MessagePriority, RecipientInfo,
                             SenderInfo)
 
@@ -94,7 +95,11 @@ async def post_and_notify(channel: Any, *, to: str, text: str, intent: str = "ST
         sender=SenderInfo(agent_id=alias.lower(), model_family="custom", framework="custom"),
         recipient=RecipientInfo(agent_id=recipient.lower()),
         intent=MessageIntent(intent), priority=MessagePriority.ROUTINE,
-        signature="", payload={"text": text, **(extra or {})})
+        signature="",
+        # Issue #22: one choke point for everything that leaves the host -- the maintainer's
+        # handle, chat ids and absolute paths are replaced here, so a new sender cannot
+        # forget it. Raw values stay in local config and state.
+        payload=Redactor.from_config(cfg).value({"text": text, **(extra or {})}))
     key, key_type = bus.signing_key(alias.lower())     # MissingKeyError: nothing is sent
     path = bus.post_message(message, private_key=key, key_type=key_type, git_push=True)
     location = str(path)
