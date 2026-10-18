@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("swarmly.github.client")
 
@@ -67,9 +67,14 @@ class Notification:
 class GitHubClient:
     """Thin wrapper around ``gh`` CLI with environment injection and safe fallbacks."""
 
-    def __init__(self, token_env: str = "GH_TOKEN", alias: Optional[str] = None) -> None:
+    def __init__(self, token_env: str = "GH_TOKEN", alias: Optional[str] = None,
+                 redact: Optional[Callable[[str], str]] = None) -> None:
         self.token_env = token_env
         self.alias = alias
+        # Issue #22: everything this client writes to GitHub goes through the redactor, so a
+        # comment cannot carry the maintainer's handle, a chat id or an absolute path by
+        # accident. Without one the text is passed through unchanged.
+        self.redact = redact or (lambda text: text)
 
     def _env(self) -> Dict[str, str]:
         env = dict(os.environ)
@@ -250,6 +255,7 @@ class GitHubClient:
 
     def comment(self, repo: str, number: int, body: str) -> bool:
         """Post a comment signed with the agent's identity."""
+        body = self.redact(body)
         signed_body = body
         if self.alias:
             signature = f"— {self.alias}"
@@ -270,6 +276,8 @@ class GitHubClient:
         labels: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Create a new issue and return its number."""
+        title = self.redact(title)
+        body = self.redact(body)
         signed_body = body
         if self.alias:
             signature = f"— {self.alias}"

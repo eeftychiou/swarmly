@@ -22,6 +22,7 @@ from swarmly.github.client import GitHubClient, GitHubError, Notification
 from swarmly.telegram.adapters.base import IncomingMessage
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.projects import ProjectRouter
+from swarmly.telegram.redact import Redactor
 
 if TYPE_CHECKING:
     from swarmly.telegram.channel import AgentChannel
@@ -199,6 +200,8 @@ class GitHubWatcher:
         self.client = client or GitHubClient(
             token_env=config.github.token_env if config.github else "GH_TOKEN",
             alias=config.identity.alias,
+            # Issue #22: comments this watcher posts are redacted like the bus payloads.
+            redact=Redactor.from_config(config).text,
         )
         self.state_path = state_path if state_path is not None else state_file_for(config)
         self.channel = channel

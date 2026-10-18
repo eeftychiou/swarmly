@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import tempfile
+import hashlib
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -31,14 +32,27 @@ logger = logging.getLogger("swarmly.telegram.topics")
 MAX_NAME = 128          # Telegram's limit for a topic name
 
 
+def chat_tag(chat_id: int) -> str:
+    """A short, stable tag for a chat: the same id always gives the same tag, and the tag
+    does not carry the id (issue #22 -- a context id reaches the bus and the prompt)."""
+    return hashlib.sha256(f"chat:{int(chat_id)}".encode("utf-8")).hexdigest()[:8]
+
+
 def context_for(chat_id: int, thread_id: Optional[int],
                 home_chat_id: Optional[int] = None) -> Optional[str]:
-    """The discussion a topic stands for (``None`` for the General topic)."""
+    """The discussion a topic stands for (``None`` for the General topic).
+
+    A topic in the home group is ``tg-<thread>``; a topic in another group is
+    ``tg-<chat tag>-<thread>``. The tag replaced the raw chat id in #22: a context id travels
+    to the bus and into every prompt, so it must not name a chat. Nothing parses a context id
+    back into a chat id -- topic lookups key on ``(chat, thread)`` -- so an id written before
+    the change stays readable as an opaque label.
+    """
     if thread_id is None:
         return None
     if home_chat_id is None or int(chat_id) == int(home_chat_id):
         return f"tg-{int(thread_id)}"
-    return f"tg{abs(int(chat_id))}-{int(thread_id)}"
+    return f"tg-{chat_tag(chat_id)}-{int(thread_id)}"
 
 
 def topic_name(context_id: str, title: str) -> str:

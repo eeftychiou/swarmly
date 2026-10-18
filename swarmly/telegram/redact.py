@@ -155,10 +155,14 @@ class Redactor:
             if literal:
                 out = out.replace(literal, self.literals[literal])
         for chat in self.chat_ids:
-            out = out.replace(str(abs(chat)), CHAT).replace(str(chat), CHAT)
+            # The signed form first: replacing the digits of a negative id first leaves a
+            # stray "-" behind ("chat -<chat>").
+            for form in (str(chat), str(abs(chat))):
+                out = out.replace(form, CHAT)
         for user in self.user_ids:
             if len(str(abs(user))) >= 5:            # a short id would eat unrelated numbers
-                out = out.replace(str(abs(user)), USER)
+                for form in (str(user), str(abs(user))):
+                    out = out.replace(form, USER)
         for path in self.paths:
             if len(path) >= 4:
                 out = out.replace(path, PATH)
@@ -175,12 +179,24 @@ class Redactor:
         if isinstance(value, bool):
             return value
         if isinstance(value, int):
-            return CHAT if int(value) in self.chat_ids else value
+            return self.number(int(value))
         if isinstance(value, dict):
             return {self.text(str(k)) if isinstance(k, str) else k: self.value(v)
                     for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [self.value(item) for item in value]
+        return value
+
+    def number(self, value: int) -> Any:
+        """An int as it may leave the host: an id becomes its placeholder, anything else
+        stays a number. A structured payload carries ids as ints -- a chat id here, the
+        admin's user id there -- so the check covers both signs, not only the home chat."""
+        for chat in self.chat_ids:
+            if value in (chat, abs(chat)):
+                return CHAT
+        for user in self.user_ids:
+            if value in (user, abs(user)):
+                return USER
         return value
 
     # -- tokens ------------------------------------------------------------------------

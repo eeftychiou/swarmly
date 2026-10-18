@@ -127,7 +127,12 @@ class NamesTests(unittest.TestCase):
         self.assertIsNone(context_for(GROUP, None))
         self.assertEqual(context_for(GROUP, 7), "tg-7")
         self.assertEqual(context_for(GROUP, 7, home_chat_id=GROUP), "tg-7")
-        self.assertEqual(context_for(-1009, 7, home_chat_id=GROUP), "tg1009-7")
+        # Issue #22: a context id in another group carries a tag, never the chat id.
+        other = context_for(-1009, 7, home_chat_id=GROUP)
+        self.assertNotIn("1009", other)
+        self.assertTrue(other.startswith("tg-") and other.endswith("-7"), other)
+        self.assertEqual(other, context_for(-1009, 7, home_chat_id=GROUP))   # stable
+        self.assertNotEqual(other, context_for(-1008, 7, home_chat_id=GROUP))
 
     def test_topic_names_fit(self):
         self.assertEqual(topic_name("t42", "fix   the\nlogin timeout"),

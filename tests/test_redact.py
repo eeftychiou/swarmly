@@ -8,6 +8,7 @@ runs the mirrored turn anyway -- processed twice, never lost.
 import asyncio
 import os
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
@@ -220,6 +221,19 @@ class TestMirrorAndDedupe(unittest.TestCase):
                                               "message_id": 55})
         self.assertFalse(took)          # processed twice, never lost
 
+    def test_a_numeric_id_in_a_structured_payload_is_replaced(self):
+        """Finding 3: an id can travel as an int, not only inside a string."""
+        with TemporaryDirectory() as tmp:
+            cfg = project_config(tmp)
+            payload = Redactor.from_config(cfg).value(
+                {"admin": ADMIN_ID, "chat": GROUP, "abs_chat": abs(GROUP),
+                 "peer": "CodexBot", "message_id": 55})
+        self.assertEqual(payload["admin"], "<user>")
+        self.assertEqual(payload["chat"], CHAT)
+        self.assertEqual(payload["abs_chat"], CHAT)
+        self.assertEqual(payload["message_id"], 55)      # not an id: stays a number
+        self.assertEqual(payload["peer"], "CodexBot")
+
     def test_the_old_chat_form_is_still_honoured(self):
         with TemporaryDirectory() as tmp:
             channel = self._channel(tmp)
@@ -232,6 +246,104 @@ class TestMirrorAndDedupe(unittest.TestCase):
             channel = self._channel(tmp)
             self.assertFalse(channel.took_telegram_copy({"topic": "topic:webapp:12"}))
             self.assertFalse(channel.took_telegram_copy("nonsense"))
+
+class TestContextIds(unittest.TestCase):
+    """Finding 1: a context id reaches the bus and the prompt, so it carries no chat id."""
+
+    def test_a_topic_in_another_group_is_tagged_not_named(self):
+        from swarmly.telegram.topics import context_for
+        ctx = context_for(-1009999999999, THREAD, home_chat_id=GROUP)
+        self.assertNotIn("1009999999999", ctx)
+        self.assertTrue(ctx.startswith("tg-") and ctx.endswith(f"-{THREAD}"), ctx)
+        self.assertEqual(ctx, context_for(-1009999999999, THREAD, home_chat_id=GROUP))
+        self.assertNotEqual(ctx, context_for(-1008888888888, THREAD, home_chat_id=GROUP))
+
+    def test_the_home_group_keeps_the_short_form(self):
+        from swarmly.telegram.topics import context_for
+        self.assertEqual(context_for(GROUP, THREAD, home_chat_id=GROUP), f"tg-{THREAD}")
+
+
+class TestGitHubWrites(unittest.TestCase):
+    """Finding 2: the GitHub write helpers apply the same redactor."""
+
+    def _client(self, seen):
+        from swarmly.github.client import GitHubClient
+        with TemporaryDirectory() as tmp:
+            cfg = project_config(tmp, public_redactions={"@example_admin": "<maintainer>"})
+            redactor = Redactor.from_config(cfg)
+            client = GitHubClient(alias="DeepSeek", redact=redactor.text)
+            client._run = lambda args, timeout=30.0: (seen.append(args), (0, "", ""))[1]
+            return client, str(cfg.identity.home_channel_id)
+
+    def test_a_comment_is_redacted_before_it_is_sent(self):
+        seen = []
+        client, chat = self._client(seen)
+        leaky = "C:" + chr(92) + "Users" + chr(92) + "someone" + chr(92) + "x"
+        client.comment("example-org/repo", 22, f"chat {chat}, see {leaky}")
+        body = seen[0][seen[0].index("--body") + 1]
+        self.assertNotIn(chat, body)
+        self.assertNotIn("someone", body)
+        self.assertIn("<chat>", body)
+        self.assertIn("<path>", body)
+
+    def test_an_issue_title_and_body_are_redacted(self):
+        seen = []
+        client, chat = self._client(seen)
+        client.create_issue("example-org/repo", f"leak {chat}", "@example_admin please look")
+        title = seen[0][seen[0].index("--title") + 1]
+        body = seen[0][seen[0].index("--body") + 1]
+        self.assertNotIn(chat, title)
+        self.assertNotIn("@example_admin", body)
+        self.assertIn("<maintainer>", body)
+
+    def test_the_watcher_builds_a_redacting_client(self):
+        from swarmly.github.watch import GitHubWatcher
+        with TemporaryDirectory() as tmp:
+            cfg = project_config(tmp)
+            watcher = GitHubWatcher(cfg, client=None, state_path=Path(tmp) / "s.json")
+        self.assertEqual(watcher.client.redact(f"chat {GROUP}"), "chat <chat>")
+        self.assertEqual(watcher.client.redact("plain text"), "plain text")
+
+
+class TestRelayEndToEnd(unittest.TestCase):
+    """Finding 4: prove the redaction on the envelope that actually lands on the bus."""
+
+    def setUp(self):
+        previous = os.environ.get("A2A_KEY_HERMES")
+        os.environ["A2A_KEY_HERMES"] = "test-signing-key"
+        self.addCleanup(lambda: os.environ.__setitem__("A2A_KEY_HERMES", previous)
+                        if previous is not None else os.environ.pop("A2A_KEY_HERMES", None))
+
+    def test_the_stored_envelope_carries_no_handle_id_or_path(self):
+        from swarmly.bus import A2AMessage
+        from swarmly.telegram.adapters import EchoAdapter
+        from swarmly.telegram.channel import AgentChannel
+        from swarmly.telegram.relay import post_and_notify
+        from swarmly.transports.folder import FolderTransport
+
+        async def sender(payload, reply_to_message_id=None):
+            return None
+
+        with TemporaryDirectory() as bus_dir, TemporaryDirectory() as state,                 TemporaryDirectory() as work:
+            cfg = config(bus={"transport": "folder", "folder": bus_dir, "repo": state,
+                              "mirror_handoffs": True},
+                         projects={"webapp": {"repo": "example-org/webapp", "cwd": work,
+                                              "topics": [THREAD]}},
+                         public_redactions={"@example_admin": "<maintainer>"})
+            channel = AgentChannel(cfg, adapter=EchoAdapter("Hermes"), sender=sender)
+            asyncio.run(post_and_notify(
+                channel, to="Codex", intent="TASK_HANDOFF", notify=False,
+                text=f"@example_admin see {work} on chat {GROUP}, admin {ADMIN_ID}",
+                extra={"telegram": {"chat": GROUP, "message_id": 7}}))
+            raw = FolderTransport(Path(bus_dir)).list_messages()[0][1]
+        message = A2AMessage.from_yaml_frontmatter(raw)
+        payload = message.payload
+        self.assertIn("<maintainer>", payload["text"])
+        for secret in (str(GROUP), str(abs(GROUP)), str(ADMIN_ID), work):
+            self.assertNotIn(secret, raw)
+        self.assertEqual(payload["telegram"]["chat"], "<chat>")   # replaced, not deleted
+        self.assertEqual(payload["telegram"]["message_id"], 7)
+        self.assertTrue(message.signature)                        # still a signed envelope
 
 
 if __name__ == "__main__":
