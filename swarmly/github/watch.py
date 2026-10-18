@@ -2,6 +2,10 @@
 
 Polls GitHub notifications for configured projects, deduplicates via state file,
 skips items already mentioned/handled in the bound topic, and queues turns for missed pings.
+
+It also carries the CI wake (issue #24): a pull request an agent is waiting on has its check
+runs polled here, and when they reach a terminal state the waiting agent gets one turn with
+the result — once per head commit, across restarts.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from swarmly.github.client import GitHubClient, GitHubError, Notification
+from swarmly.github.client import GitHubClient, GitHubError, Notification, PRChecks
 from swarmly.telegram.adapters.base import IncomingMessage
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.projects import ProjectRouter
@@ -174,6 +178,126 @@ class GitHubPollOutcome:
     turns_skipped: int = 0
     errors: List[str] = field(default_factory=list)
     delivered_topics: List[Tuple[int, Optional[int]]] = field(default_factory=list)
+    #: Issue #24: PRs whose checks were polled, and the wake turns run for the ones that
+    #: reached a terminal state (``ci_wakes``) or had already been reported (``ci_skipped``).
+    ci_watched: int = 0
+    ci_wakes: int = 0
+    ci_skipped: int = 0
+
+
+#: How long a PR is watched for its checks before the watch is dropped. A PR whose checks
+#: never report (no CI configured, a wedged runner) stops costing polls after this.
+CI_WATCH_TTL_SECONDS = 12 * 3600.0
+#: Bounds on the persisted numbers: the watches in flight and the reported results kept to
+#: stop a duplicate wake.
+MAX_CI_WATCHES = 20
+MAX_CI_REPORTED = 500
+
+
+def _ci_key(repo: str, number: int) -> str:
+    return f"{repo}#{int(number)}"
+
+
+@dataclass
+class CIWatchState:
+    """The PRs this agent waits on for CI, and which results it has already been woken for.
+
+    Persisted so a restart neither forgets a watch nor wakes the agent twice for the same
+    run: ``reported`` maps a PR to ``<head sha>:<state>``, and a wake is only run when that
+    differs from what the API says now (a new push changes the sha; a re-run the state).
+    """
+
+    watches: Dict[str, Dict[str, Any]] = field(default_factory=dict)   # "repo#n" -> watch
+    reported: Dict[str, str] = field(default_factory=dict)             # "repo#n" -> "sha:state"
+
+    @classmethod
+    def load(cls, path: Optional[Path]) -> "CIWatchState":
+        if not path or not path.exists():
+            return cls()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return cls()
+            raw_watches = data.get("watches")
+            watches: Dict[str, Dict[str, Any]] = {}
+            if isinstance(raw_watches, dict):
+                for key, value in raw_watches.items():
+                    if isinstance(value, dict) and value.get("repo") and value.get("number"):
+                        watches[str(key)] = dict(value)
+            raw_reported = data.get("reported")
+            reported = ({str(k): str(v) for k, v in raw_reported.items()}
+                        if isinstance(raw_reported, dict) else {})
+            return cls(watches=watches, reported=reported)
+        except Exception as exc:
+            logger.warning("could not load CI watch state from %s: %s", path, exc)
+            return cls()
+
+    def save(self, path: Optional[Path]) -> None:
+        if not path:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {"watches": self.watches, "reported": self.reported}
+            tmp = path.with_suffix(f".tmp-{os.getpid()}-{int(time.time())}")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning("could not save CI watch state to %s: %s", path, exc)
+
+    def watch(self, repo: str, number: int, chat_id: int, thread_id: Optional[int],
+              project: Optional[str] = None, now: Optional[float] = None) -> str:
+        """Start watching a PR's checks. Watching twice is watching once (a re-registered
+        watch keeps its original clock, so the TTL cannot be refreshed forever)."""
+        key = _ci_key(repo, number)
+        if key not in self.watches:
+            if len(self.watches) >= MAX_CI_WATCHES:
+                self.watches.pop(next(iter(self.watches)))
+            self.watches[key] = {"repo": repo, "number": int(number), "chat_id": int(chat_id),
+                                 "thread_id": thread_id, "project": project,
+                                 "created_at": float(now if now is not None else time.time())}
+        return key
+
+    def drop(self, key: str) -> None:
+        self.watches.pop(key, None)
+
+    def reported_result(self, key: str) -> Optional[str]:
+        return self.reported.get(key)
+
+    def mark_reported(self, key: str, revision: str) -> None:
+        self.reported.pop(key, None)              # re-insert: pruning drops the oldest
+        self.reported[key] = revision
+        while len(self.reported) > MAX_CI_REPORTED:
+            self.reported.pop(next(iter(self.reported)))
+
+
+def ci_state_file_for(config: AgentConfig) -> Optional[Path]:
+    """Path to gh_ci-<alias>.json in the transport state dir."""
+    try:
+        from swarmly.telegram.poll import state_dir
+        alias = re.sub(r"[^a-z0-9_.-]+", "_", config.identity.alias.lower()).strip("._") or "agent"
+        return state_dir(config) / f"gh_ci-{alias}.json"
+    except Exception:
+        return None
+
+
+def register_ci_watch(config: AgentConfig, repo: str, number: int, chat_id: int,
+                      thread_id: Optional[int], project: Optional[str] = None,
+                      state_path: Optional[Path] = None) -> bool:
+    """Record that this agent waits on ``repo#number``'s checks (issue #24).
+
+    Called when the agent reports on a pull request: the next polls ask GitHub for its checks
+    and wake the agent once when they finish. False when the watcher is off (no ``github:``
+    section or ``poll_minutes: 0``), in which case nothing is written.
+    """
+    if not config.github or config.github.poll_minutes <= 0 or not repo or not number:
+        return False
+    path = state_path if state_path is not None else ci_state_file_for(config)
+    state = CIWatchState.load(path)
+    key = state.watch(repo, number, chat_id, thread_id, project=project)
+    state.save(path)
+    logger.info("watching %s for CI: %s wakes when its checks finish", key,
+                config.identity.alias)
+    return True
 
 
 def state_file_for(config: AgentConfig) -> Optional[Path]:
@@ -204,8 +328,16 @@ class GitHubWatcher:
             redact=Redactor.from_config(config).text,
         )
         self.state_path = state_path if state_path is not None else state_file_for(config)
+        # Issue #24: the CI watches live beside the notification state (same directory, own
+        # file), derived from the state path a caller gave so a test's temp dir holds both.
+        self.ci_state_path = (
+            state_path.with_name(f"{state_path.stem}-ci{state_path.suffix}")
+            if state_path is not None else ci_state_file_for(config)
+        )
         self.channel = channel
         self.state = NotificationState.load(self.state_path)
+        self.ci_state = CIWatchState.load(self.ci_state_path)
+        self._router: Optional[ProjectRouter] = None
 
     async def poll_once(self) -> GitHubPollOutcome:
         """Execute one polling pass across all configured projects."""
@@ -298,54 +430,10 @@ class GitHubWatcher:
                     turn_text = f"GitHub notification ({notif.reason}): {user} on {repo}#{num}: {snippet}"
 
                 try:
-                    from swarmly.telegram.topics import context_block_reason, context_for
-                    blocked = context_block_reason(
-                        chat_id, thread_id, self.config.identity.home_channel_id)
-                    if blocked:
-                        # Reject, do not run: with no context id the turn would fall into the
-                        # General session, mixing another group's work into it (issue #22
-                        # review). Loud, and not retried forever.
-                        self.state.mark_processed(notif.id, notif.updated_at)
-                        if self.config.github.mark_read:
-                            self.client.mark_notification_read(notif.id)
-                        outcome.errors.append(f"notification {notif.id}: refused: {blocked}")
-                        logger.error("notification %s refused: %s", notif.id, blocked)
+                    ctx_ok = self._run_turn_precheck(chat_id, thread_id, notif, outcome)
+                    if not ctx_ok:
                         continue
-                    ctx = context_for(chat_id, thread_id, self.config.identity.home_channel_id)
-                    incoming = IncomingMessage(
-                        text=turn_text,
-                        author_alias="GitHub",
-                        context_id=ctx,
-                        project=project.key,
-                        project_repo=project.repo,
-                    )
-                    if self.channel is not None:
-                        adapter = (
-                            self.channel._adapter_for(chat_id, thread_id)
-                            if hasattr(self.channel, "_adapter_for")
-                            else self.channel.adapter
-                        )
-                        admitted = getattr(self.channel, "admitted", None)
-                        if admitted is not None:
-                            # The topic's turn lock and a parallel-turn slot, like a chat turn:
-                            # never two turns at once in one checkout.
-                            async with admitted(chat_id, thread_id):
-                                reply = await adapter.respond(incoming)
-                        else:
-                            reply = await adapter.respond(incoming)
-                        if reply and reply.text:
-                            await self.channel.send(reply.text, chat_id=chat_id, thread_id=thread_id)
-                    else:
-                        from swarmly.telegram.channel import build_adapter
-                        workdir = router.workdir_for(project, thread_id or 0)
-                        adapter_cfg = dataclasses.replace(self.config.adapter, cwd=str(workdir))
-                        cfg = dataclasses.replace(self.config, adapter=adapter_cfg)
-                        adapter = build_adapter(cfg, transport=False)
-                        try:
-                            reply = await adapter.respond(incoming)
-                        finally:
-                            await adapter.close()
-
+                    reply = await self._run_turn(project, chat_id, thread_id, turn_text)
                     if not getattr(reply, "ok", True):
                         # The runtime failed the turn (2.12): the notification stays unread so
                         # the next poll retries it -- not marked read, not marked processed --
@@ -380,9 +468,164 @@ class GitHubWatcher:
                     outcome.errors.append(f"notification {notif.id}: {exc}")
                     logger.exception("failed to process notification %s: %s", notif.id, exc)
 
+        # Issue #24: the same poll carries the CI wakes for the PRs this agent waits on.
+        await self._poll_ci_watches(outcome, router)
+
         self.state.last_poll = _utc()
         self.state.save(self.state_path)
         return outcome
+
+    # ----------------------------------------------------------------------------------
+    # Turns, and the CI wake that uses them (issue #24)
+    # ----------------------------------------------------------------------------------
+    def _run_turn_precheck(self, chat_id: int, thread_id: Optional[int], notif: Notification,
+                           outcome: GitHubPollOutcome) -> bool:
+        """Refuse a turn that has no context id, loudly and not forever (issue #22 review):
+        it would fall into the shared General session and mix another group's work into it."""
+        from swarmly.telegram.topics import context_block_reason
+        blocked = context_block_reason(chat_id, thread_id, self.config.identity.home_channel_id)
+        if not blocked:
+            return True
+        self.state.mark_processed(notif.id, notif.updated_at)
+        if self.config.github.mark_read:
+            self.client.mark_notification_read(notif.id)
+        outcome.errors.append(f"notification {notif.id}: refused: {blocked}")
+        logger.error("notification %s refused: %s", notif.id, blocked)
+        return False
+
+    async def _run_turn(self, project: Optional[Any], chat_id: int, thread_id: Optional[int],
+                        text: str) -> Any:
+        """Run one adapter turn and post its reply where the work lives.
+
+        The turn is admitted exactly like a chat turn (the topic's lock and a parallel-turn
+        slot), so neither the notification backstop nor a CI wake can put two turns into one
+        checkout at once.
+        """
+        from swarmly.telegram.topics import context_for
+        ctx = context_for(chat_id, thread_id, self.config.identity.home_channel_id)
+        incoming = IncomingMessage(
+            text=text,
+            author_alias="GitHub",
+            context_id=ctx,
+            project=getattr(project, "key", None) if project is not None else None,
+            project_repo=getattr(project, "repo", None) if project is not None else None,
+        )
+        if self.channel is not None:
+            adapter = (
+                self.channel._adapter_for(chat_id, thread_id)
+                if hasattr(self.channel, "_adapter_for")
+                else self.channel.adapter
+            )
+            admitted = getattr(self.channel, "admitted", None)
+            if admitted is not None:
+                async with admitted(chat_id, thread_id):
+                    reply = await adapter.respond(incoming)
+            else:
+                reply = await adapter.respond(incoming)
+            if reply and reply.text:
+                await self.channel.send(reply.text, chat_id=chat_id, thread_id=thread_id)
+            return reply
+
+        from swarmly.telegram.channel import build_adapter
+        workdir = (self._router.workdir_for(project, thread_id or 0)
+                   if project is not None and self._router is not None
+                   else self.config.adapter.cwd)
+        adapter_cfg = dataclasses.replace(self.config.adapter, cwd=str(workdir))
+        cfg = dataclasses.replace(self.config, adapter=adapter_cfg)
+        adapter = build_adapter(cfg, transport=False)
+        try:
+            return await adapter.respond(incoming)
+        finally:
+            await adapter.close()
+
+    async def _poll_ci_watches(self, outcome: GitHubPollOutcome,
+                               router: Optional[ProjectRouter] = None) -> None:
+        """Wake each waiting agent once when its PR's checks reach a terminal state (#24).
+
+        A watch is dropped when it fires, when its PR is gone, or after ``CI_WATCH_TTL_SECONDS``
+        — so a PR with no CI stops costing polls instead of waking a bot forever. The result
+        it fired for is recorded (``<sha>:<state>``) before the turn runs: a restart in the
+        middle of a wake repeats it at most once more, and never for a run already reported.
+        """
+        self._router = router
+        if not self.ci_state.watches:
+            return
+        now = time.time()
+        changed = False
+        for key, watch in list(self.ci_state.watches.items()):
+            if now - float(watch.get("created_at") or 0) > CI_WATCH_TTL_SECONDS:
+                logger.info("stopped watching %s for CI: no result within %d h",
+                            key, CI_WATCH_TTL_SECONDS // 3600)
+                self.ci_state.drop(key)
+                changed = True
+                continue
+            try:
+                checks = self.client.pr_checks(str(watch["repo"]), int(watch["number"]))
+            except Exception as exc:                     # a poll must never die on one PR
+                outcome.errors.append(f"CI watch {key}: {exc}")
+                logger.warning("CI watch %s could not be polled: %s", key, exc)
+                continue
+            if checks is None:
+                # Not a PR (an issue number the agent named), deleted, or gh cannot say: the
+                # watch is not worth keeping.
+                logger.info("stopped watching %s for CI: gh has no checks for it", key)
+                self.ci_state.drop(key)
+                changed = True
+                continue
+            outcome.ci_watched += 1
+            watch["head_sha"] = checks.head_sha
+            if not checks.terminal:
+                continue
+            revision = f"{checks.head_sha}:{checks.state}"
+            if self.ci_state.reported_result(key) == revision:
+                # Already woken for this exact run (a restart, or a re-registered watch).
+                self.ci_state.drop(key)
+                outcome.ci_skipped += 1
+                changed = True
+                continue
+            self.ci_state.mark_reported(key, revision)
+            self.ci_state.drop(key)
+            self.ci_state.save(self.ci_state_path)       # before the turn: no double wake
+            changed = True
+            await self._wake_on_ci(watch, checks, outcome, router)
+        if changed:
+            self.ci_state.save(self.ci_state_path)
+
+    async def _wake_on_ci(self, watch: Dict[str, Any], checks: PRChecks,
+                          outcome: GitHubPollOutcome,
+                          router: Optional[ProjectRouter] = None) -> None:
+        """The one turn the waiting agent gets when its PR's checks finish."""
+        chat_id = int(watch.get("chat_id") or self.config.identity.home_channel_id or 0)
+        thread_id = watch.get("thread_id")
+        text = (f"CI finished on {watch['repo']}#{checks.number}"
+                f"{f' ({checks.title[:80]})' if checks.title else ''}: {checks.summary()}.")
+        if checks.state == "failure":
+            text += (" Fix the failing checks — or say on the PR why they cannot be fixed — "
+                     "then push again.")
+        else:
+            text += " The PR is ready for review and QA."
+        if checks.url:
+            text += f"\n{checks.url}"
+        project = None
+        if watch.get("project"):
+            project = self.config.projects.get(str(watch["project"]))
+        if project is None and router is not None:
+            project = router.project_for(chat_id, thread_id)
+        try:
+            reply = await self._run_turn(project, chat_id, thread_id, text)
+        except Exception as exc:
+            outcome.errors.append(f"CI wake for {watch['repo']}#{checks.number}: {exc}")
+            logger.exception("CI wake for %s#%s failed: %s", watch["repo"], checks.number, exc)
+            return
+        if not getattr(reply, "ok", True):
+            outcome.errors.append(
+                f"CI wake for {watch['repo']}#{checks.number}: the turn did not complete "
+                f"({getattr(reply, 'error', '') or 'no reason given'})")
+            return
+        outcome.ci_wakes += 1
+        outcome.delivered_topics.append((chat_id, thread_id))
+        logger.info("woke %s for CI on %s#%s: %s", self.config.identity.alias,
+                    watch["repo"], checks.number, checks.state)
 
 
 async def github_poll_once(
