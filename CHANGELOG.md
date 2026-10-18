@@ -38,7 +38,9 @@ All notable changes to this project are documented here. The format follows
   as ordinary text, so no sender can name a total that reserves the receiver's memory. Buffers
   and their timers are bounded and cancelled when a reply is delivered, are not allocated for
   a bot whose messages are ignored anyway (`limits.strangers: ignore`), so numbered fragments
-  cannot leave live timers behind (`#29`).
+  cannot leave live timers behind. A fragment whose first part never came keeps its `↪ (k/n)`
+  marker when the window closes, so it stays a continuation and never starts a turn of its own,
+  even when its text names the bot (`#29`).
 
 ## [0.10.1] - 2026-10-17
 

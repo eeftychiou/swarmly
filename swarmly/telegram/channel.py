@@ -3822,6 +3822,10 @@ class AgentChannel:
         """
         if not event.author_is_bot or not event.text or not self._may_reassemble(event):
             return False, None
+        if event.reassembled:
+            # A reply this transport already joined goes on through the inbound path; its text
+            # is the sender's whole message, not another part to hold (#29 QA).
+            return False, None
         # A reply held this long has lost parts: deliver what arrived before taking more.
         await self._flush_expired_splits()
         part = split_part(event.text)
@@ -3925,6 +3929,12 @@ class AgentChannel:
                            event.author_username or "unknown",
                            ", ".join(str(i) for i in pending.missing()))
             text += pending.note()
+        if 1 not in pending.bodies:
+            # Nothing arrived but the sender's later parts: that is a fragment, not a message.
+            # Keeping its marker means the rest of the inbound path still recognises it as the
+            # continuation of a reply whose first part never came, so it can start no turn
+            # (#29 QA) — the alternative is a third of a brief answered as a brief.
+            text = f"↪ ({min(pending.bodies)}/{pending.total}) {text}"
         event.text = text
         event.reassembled = True
         # It runs the rest of the inbound path, so it is one turn with one message.

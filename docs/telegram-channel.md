@@ -671,9 +671,10 @@ arrive: the turn runs from part 1, so its message id and reply target are the on
 Each part's marker also carries the reply's own token (`(2/3 #9fa0c1)`), so two replies by one
 sender that interleave are never joined into one mixed message; a sender that writes no token
 (an older transport) is still reassembled, one reply at a time. Parts that never all arrive are
-delivered as what arrived, with a note naming the missing ones. One cap, 20 parts, bounds both
-ends: a larger `max_reply_parts` is clamped at load, and a part header above the cap is ordinary
-text, never a buffer.
+delivered as what arrived, with a note naming the missing ones. A fragment whose first part
+never came keeps its `↪ (k/n)` marker, so it stays a continuation and starts no turn. One cap,
+20 parts, bounds both ends: a larger `max_reply_parts` is clamped at load, and a part header
+above the cap is ordinary text, never a buffer.
 
 **Topics as discussions.** In a group with Topics turned on, each topic is one discussion
 with one `context_id`, which every agent works out the same way from the topic's id alone:

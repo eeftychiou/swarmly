@@ -190,6 +190,33 @@ class TestReassembly(unittest.TestCase):
         self.assertEqual(adapter.seen, [])
         self.assertEqual(channel.stats.ignored, 1)
 
+    def test_an_orphan_fragment_times_out_as_a_fragment(self):
+        """QA review of #29: a ``↪`` fragment whose part 1 never comes is delivered with its
+        marker still on it, so it stays a continuation — it does not become a message that
+        names the bot and starts a turn of its own."""
+        channel, adapter = receiver()
+        delivered = []
+        inner = channel.handle_event
+
+        async def spy(ev):
+            delivered.append(ev.text)
+            return await inner(ev)
+
+        channel.handle_event = spy
+
+        async def orphan():
+            with patch("swarmly.telegram.channel.SPLIT_TIMEOUT_SECONDS", 0.0):
+                await channel.handle_event(
+                    event("[Codex] ↪ (2/3) @HermesBot please also check this", message_id=4))
+                for _ in range(20):
+                    await asyncio.sleep(0.01)
+
+        run(orphan())
+        self.assertEqual(adapter.seen, [])                  # a fragment starts no turn
+        self.assertTrue(delivered)
+        self.assertTrue(delivered[-1].startswith("↪ (2/3) "), delivered[-1])
+        self.assertIn("never arrived", delivered[-1])
+
     def test_a_held_reply_arms_a_timer_that_delivers_what_arrived(self):
         """Review of #29: the timeout is scheduled and it fires — the held part is delivered
         with the missing-part note even when no later message comes along to sweep it out."""
