@@ -56,6 +56,25 @@ def chat_tag(chat_id: int, key: Optional[str] = None) -> str:
 _NO_SECRET_WARNED = False
 
 
+def context_block_reason(chat_id: int, thread_id: Optional[int],
+                         home_chat_id: Optional[int]) -> Optional[str]:
+    """Why a turn in this topic must be refused, or ``None`` when it is fine.
+
+    A topic outside the home group needs a shared secret to get a context id. Without one the
+    choice is between leaking a chat id, naming a guessable one, and pretending to be the
+    General session -- none acceptable, so the turn is refused instead (issue #22 review).
+    """
+    if thread_id is None or home_chat_id is None:
+        return None
+    if int(chat_id) == int(home_chat_id):
+        return None
+    if os.environ.get("SWARMLY_REDACTION_SECRET", "").strip():
+        return None
+    return ("this topic is outside the home group and SWARMLY_REDACTION_SECRET is not set: "
+            "set the same secret on every agent, or work in the home group. Refusing the "
+            "turn rather than sharing the General session or naming a chat id.")
+
+
 def context_for(chat_id: int, thread_id: Optional[int],
                 home_chat_id: Optional[int] = None) -> Optional[str]:
     """The discussion a topic stands for (``None`` for the General topic).

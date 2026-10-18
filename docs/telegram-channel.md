@@ -138,9 +138,11 @@ public_redactions:                       # optional: literal -> replacement
   A topic in another group needs an HMAC tag, `tg-<tag>-<thread>`, keyed by
   **`SWARMLY_REDACTION_SECRET` set to the same high-entropy value on every agent**. That is
   what makes the tag both agreed across agents and unconfirmable by an outsider; a group id
-  as the key would be guessable, so it is not accepted. **Without the secret such a topic has
-  no context id at all** — it fails closed, running turn by turn and logging one warning,
-  instead of claiming an identity it cannot protect. Changing the secret changes the tags.
+  as the key would be guessable, so it is not accepted. **Without the secret such a topic is
+  refused**: the turn does not run, the refusal is logged and the GitHub notification is
+  marked read, so the work neither leaks nor mixes into the General session it would share
+  with every other group. Set the secret on every agent to use topics outside the home
+  group; changing it changes the tags.
 - **Two separate secrets.** `redaction.secret` (generated at `~/.swarmly/redaction.secret`,
   override with `SWARMLY_REDACTION_SECRET_FILE`) keys the *mirror* token, which is
   deliberately unresolvable by peers; it is per host by design.
@@ -649,7 +651,8 @@ with one `context_id`, which every agent works out the same way from the topic's
 | topic | `context_id` |
 |---|---|
 | a topic in the home group (`identity.home_channel_id`) | `tg-<topic id>`, e.g. `tg-42` |
-| a topic in any other group | `tg<group id>-<topic id>` |
+| a topic in any other group, with `SWARMLY_REDACTION_SECRET` set | `tg-<tag>-<topic id>`, the tag an HMAC of the group id under that secret |
+| a topic in any other group, without the secret | none: **the turn is refused** (logged, notification marked read), so it never falls into the General session |
 | General (no topic) | none: the shared conversation, as before |
 
 - The topic's name never decides its `context_id`, so renaming a topic does not move it to

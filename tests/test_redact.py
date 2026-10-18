@@ -445,5 +445,54 @@ class TestSecretIsolation(SecretSandbox):
         self.assertFalse(host_secret.exists())
 
 
+class TestRefusedTopicTurns(SecretSandbox):
+    """A turn in a non-home topic is refused without the secret, not run as General."""
+
+    def _config(self, tmp, chat):
+        # ``topics:`` takes "<chat>/<thread>" for another group, a bare thread for home.
+        topic = [str(THREAD)] if chat == GROUP else [f"{chat}/{THREAD}"]
+        return AgentConfig.from_dict({
+            "agent": {"name": "HermesBot", "alias": "Hermes", "bot_token": "123456:TEST",
+                      "home_channel_id": GROUP, "admin_user_id": ADMIN_ID},
+            "adapter": {"type": "echo", "cwd": tmp},
+            "projects": {"webapp": {"repo": "example-org/webapp", "cwd": tmp,
+                                    "topics": topic}},
+            "github": {"login": "hermes-bot", "poll_minutes": 5},
+        })
+
+    def _poll(self, tmp, chat):
+        from swarmly.github.client import GitHubClient, Notification
+        from swarmly.github.watch import GitHubWatcher
+        client = mock.MagicMock(spec=GitHubClient)
+        client.notifications.return_value = [Notification(
+            id="n1", reason="mention", repo="example-org/webapp", subject_title="t",
+            subject_type="Issue",
+            subject_url="https://api.github.com/repos/example-org/webapp/issues/1",
+            number=1, updated_at="2026-10-10T12:00:00Z")]
+        client.issue_view.return_value = None
+        watcher = GitHubWatcher(self._config(tmp, chat), client=client,
+                                state_path=Path(tmp) / "s.json")
+        return watcher, asyncio.run(watcher.poll_once()), client
+
+    def test_a_topic_in_another_group_is_refused_without_the_secret(self):
+        with TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {SECRET_ENV: ""}):
+            watcher, outcome, client = self._poll(tmp, -1009999999999)
+        self.assertEqual(outcome.turns_queued, 0)
+        self.assertTrue(any("refused" in error for error in outcome.errors), outcome.errors)
+        self.assertTrue(watcher.state.is_processed("n1"))     # not retried forever
+        client.mark_notification_read.assert_called_once_with("n1")
+
+    def test_the_same_topic_runs_once_the_secret_is_set(self):
+        env = mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"})
+        with TemporaryDirectory() as tmp, env:
+            watcher, outcome, client = self._poll(tmp, -1009999999999)
+        self.assertEqual(outcome.turns_queued, 1, outcome.errors)
+
+    def test_the_home_group_needs_no_secret(self):
+        with TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {SECRET_ENV: ""}):
+            watcher, outcome, client = self._poll(tmp, GROUP)
+        self.assertEqual(outcome.turns_queued, 1, outcome.errors)
+
+
 if __name__ == "__main__":
     unittest.main()
