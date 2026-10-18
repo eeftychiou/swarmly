@@ -13,13 +13,25 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from swarmly.telegram.config import AgentConfig, ConfigError
-from swarmly.telegram.redact import (CHAT, PATH, Redactor, SECRET_ENV, hmac_token,
-                                     local_secret,
+from swarmly.telegram.redact import (CHAT, PATH, Redactor, SECRET_ENV, SECRET_FILE_ENV,
+                                     hmac_token, local_secret, secret_file,
                                      resolve_topic_token, topic_token)
 
 GROUP = -1001234567890
 ADMIN_ID = 987654321
 THREAD = 12
+
+
+class SecretSandbox(unittest.TestCase):
+    """Keep the generated local secret out of the runner's home directory."""
+
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.secret_path = Path(tmp.name) / "redaction.secret"
+        patcher = mock.patch.dict(os.environ, {SECRET_FILE_ENV: str(self.secret_path)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 def config(**overrides):
@@ -40,7 +52,7 @@ def project_config(tmp, **overrides):
                                       "topics": [THREAD]}}, **overrides)
 
 
-class TestTokens(unittest.TestCase):
+class TestTokens(SecretSandbox):
     """The two token forms, and what a peer can do with each."""
 
     def test_a_bound_topic_is_an_alias_not_an_id(self):
@@ -93,7 +105,7 @@ class TestTokens(unittest.TestCase):
         self.assertEqual(resolve_topic_token(None, router), [])
 
 
-class TestRedactor(unittest.TestCase):
+class TestRedactor(SecretSandbox):
 
     def test_a_hand_off_reference_is_a_token(self):
         with TemporaryDirectory() as tmp:
@@ -195,7 +207,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual([k for k in cfg.unknown_keys if "public_redactions" in k], [])
 
 
-class TestMirrorAndDedupe(unittest.TestCase):
+class TestMirrorAndDedupe(SecretSandbox):
     """The mirror names a token, and each peer decides from its own config."""
 
     def _channel(self, tmp):
@@ -281,7 +293,7 @@ class TestMirrorAndDedupe(unittest.TestCase):
             self.assertFalse(channel.took_telegram_copy({"topic": "topic:webapp:12"}))
             self.assertFalse(channel.took_telegram_copy("nonsense"))
 
-class TestContextIds(unittest.TestCase):
+class TestContextIds(SecretSandbox):
     """Finding 1: a context id reaches the bus and the prompt, so it carries no chat id."""
 
     def test_a_topic_in_another_group_is_tagged_not_named(self):
@@ -292,31 +304,38 @@ class TestContextIds(unittest.TestCase):
         self.assertEqual(ctx, context_for(-1009999999999, THREAD, home_chat_id=GROUP))
         self.assertNotEqual(ctx, context_for(-1008888888888, THREAD, home_chat_id=GROUP))
 
-    def test_the_tag_is_always_keyed(self):
-        """Review finding: an unkeyed tag is guessable and collision-prone, so require a key."""
-        from swarmly.telegram.topics import chat_tag
-        with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
-            keyed = chat_tag(-1009999999999)
-            self.assertEqual(len(keyed), 16)                             # 64 bits
-            self.assertEqual(keyed, chat_tag(-1009999999999))            # stable
-            self.assertNotEqual(keyed, chat_tag(-1008888888888))
-            self.assertNotEqual(chat_tag(-1009999999999, secret="other"), keyed)
-        # With no configured secret the local one keys it: still 16 hex, still stable, and
-        # never the digest anyone can recompute from the id alone.
+    def test_the_same_topic_gets_the_same_tag_on_every_agent(self):
+        """Review finding: a per-host key makes one topic look different per agent."""
+        from swarmly.telegram.topics import chat_tag, chat_tag_key
         with mock.patch.dict(os.environ, {SECRET_ENV: ""}):
-            local = chat_tag(-1009999999999)
-            self.assertEqual(len(local), 16)
-            self.assertEqual(local, chat_tag(-1009999999999))
+            key = chat_tag_key(GROUP)
+        self.assertEqual(key, f"home:{GROUP}")
+        one = chat_tag(-1009999999999, key=key)
+        self.assertEqual(one, chat_tag(-1009999999999, key=key))          # stable, shared
+        self.assertEqual(len(one), 16)                                    # 64 bits
+        self.assertNotIn("1009999999999", one)
+        self.assertNotEqual(one, chat_tag(-1008888888888, key=key))
         import hashlib
-        unkeyed = hashlib.sha256(f"chat:{-1009999999999}".encode()).hexdigest()[:16]
-        self.assertNotEqual(local, unkeyed)
+        self.assertNotEqual(one, hashlib.sha256(
+            f"chat:{-1009999999999}".encode()).hexdigest()[:16])          # never unkeyed
+        # A swarm secret, when set, is the shared key instead of the group id.
+        with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
+            self.assertEqual(chat_tag_key(GROUP), "shared-secret")
+            self.assertNotEqual(chat_tag(-1009999999999, key="shared-secret"), one)
+
+    def test_the_generated_secret_stays_off_the_runner_home(self):
+        # The unset-secret path must not write into ~: the sandbox redirects it.
+        with mock.patch.dict(os.environ, {SECRET_ENV: ""}):
+            local_secret()
+        self.assertTrue(self.secret_path.exists())
+        self.assertEqual(secret_file(), self.secret_path)
 
     def test_the_home_group_keeps_the_short_form(self):
         from swarmly.telegram.topics import context_for
         self.assertEqual(context_for(GROUP, THREAD, home_chat_id=GROUP), f"tg-{THREAD}")
 
 
-class TestGitHubWrites(unittest.TestCase):
+class TestGitHubWrites(SecretSandbox):
     """Finding 2: the GitHub write helpers apply the same redactor."""
 
     def _client(self, seen):
@@ -358,10 +377,11 @@ class TestGitHubWrites(unittest.TestCase):
         self.assertEqual(watcher.client.redact("plain text"), "plain text")
 
 
-class TestRelayEndToEnd(unittest.TestCase):
+class TestRelayEndToEnd(SecretSandbox):
     """Finding 4: prove the redaction on the envelope that actually lands on the bus."""
 
     def setUp(self):
+        super().setUp()
         previous = os.environ.get("A2A_KEY_HERMES")
         os.environ["A2A_KEY_HERMES"] = "test-signing-key"
         self.addCleanup(lambda: os.environ.__setitem__("A2A_KEY_HERMES", previous)

@@ -33,19 +33,26 @@ logger = logging.getLogger("swarmly.telegram.topics")
 MAX_NAME = 128          # Telegram's limit for a topic name
 
 
-def chat_tag(chat_id: int, secret: Optional[str] = None) -> str:
+def chat_tag(chat_id: int, key: Optional[str] = None) -> str:
     """A stable tag for a chat that does not carry the id: HMAC-SHA-256, 16 hex digits.
 
-    Always keyed. An unkeyed digest would let anyone who can guess an id confirm the guess
-    by hashing it, and the first cut's 32-bit tag was collision-prone too (review of PR #23).
-    The key is ``SWARMLY_REDACTION_SECRET`` when the operator sets it, otherwise a local
-    secret generated once and kept beside the transport's state
-    (:func:`swarmly.telegram.redact.local_secret`) -- never nothing.
+    A context id is **shared vocabulary**: every agent names the same topic the same way, so
+    the tag must not depend on anything per host (review of PR #23: a per-host fallback key
+    made the same topic look different on each agent). The key is therefore the value every
+    agent in the group already shares and an outsider does not:
+
+    - ``SWARMLY_REDACTION_SECRET`` when the operator sets one for the swarm, else
+    - the home chat id, passed in by :func:`context_for` (``key="home:<id>"``).
+
+    Never an unkeyed digest: that would let anyone who can guess an id confirm the guess,
+    and the first cut's 32-bit tag was collision-prone too. With no secret and no home group
+    the tag falls back to a fixed label, which is shared rather than per host.
     """
-    from swarmly.telegram.redact import local_secret
-    key = (secret or local_secret()).encode("utf-8")
+    material = key
+    if material is None:
+        material = os.environ.get("SWARMLY_REDACTION_SECRET", "").strip() or "swarmly"
     message = f"chat:{int(chat_id)}".encode("utf-8")
-    return hmac.new(key, message, hashlib.sha256).hexdigest()[:16]
+    return hmac.new(material.encode("utf-8"), message, hashlib.sha256).hexdigest()[:16]
 
 
 def context_for(chat_id: int, thread_id: Optional[int],
@@ -62,7 +69,15 @@ def context_for(chat_id: int, thread_id: Optional[int],
         return None
     if home_chat_id is None or int(chat_id) == int(home_chat_id):
         return f"tg-{int(thread_id)}"
-    return f"tg-{chat_tag(chat_id)}-{int(thread_id)}"
+    return f"tg-{chat_tag(chat_id, key=chat_tag_key(home_chat_id))}-{int(thread_id)}"
+
+
+def chat_tag_key(home_chat_id: Optional[int]) -> str:
+    """The key a context-id tag is derived from: the swarm's shared secret, else the group.
+
+    Deliberately *not* a per-host value -- see :func:`chat_tag`.
+    """
+    return os.environ.get("SWARMLY_REDACTION_SECRET", "").strip() or f"home:{home_chat_id}"
 
 
 def topic_name(context_id: str, title: str) -> str:
