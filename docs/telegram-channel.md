@@ -133,7 +133,8 @@ public_redactions:                       # optional: literal -> replacement
   its own `projects:`. The chat tag is an HMAC of the chat id under the swarm's shared
   secret, so a peer bound to another chat of the same project cannot read the token as its
   own; **without that secret a project token is not sent at all**, and every peer runs the
-  mirror. An unbound topic falls back to an HMAC token from
+  mirror. A token written without the chat tag (an older mirror) cannot name a chat either,
+  so it is never treated as taken: it is re-run, not trusted to someone else's topic. An unbound topic falls back to an HMAC token from
   `SWARMLY_REDACTION_SECRET`, which peers cannot resolve — they then run the mirrored turn as
   well: **processed twice, never lost**. A token that resolves to more than one of this
   agent's topics (one project bound to two chats on the same thread id) is never treated as

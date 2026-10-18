@@ -159,7 +159,11 @@ def resolve_topic_token(token: Any, router: Any,
             return []
         found = [(chat, thread_id) for chat, thread_id in topics if thread_id == thread]
     if not tag:
-        return found
+        # A token without a chat tag cannot say which chat it came from, and a receiver
+        # bound to one chat of a project would read it as its own -- and drop another
+        # chat's mirror when a message id happens to match (review of PR #23). It is never
+        # claimable: the peer runs the mirror instead.
+        return []
     if not secret:
         # The tag cannot be checked without the shared secret, so nothing may be claimed.
         return []

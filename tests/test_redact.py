@@ -91,8 +91,18 @@ class TestTokens(SecretSandbox):
         from swarmly.telegram.projects import ProjectRouter
         cfg = project_config(".")
         router = ProjectRouter(cfg.projects, cfg.identity.home_channel_id)
-        self.assertEqual(resolve_topic_token("topic:webapp:12", router), [(GROUP, THREAD)])
-        self.assertEqual(resolve_topic_token("topic:webapp:general", router), [])
+        tag = hmac_token(GROUP, "shared-secret").split("-")[-1]
+        token = topic_token("webapp", THREAD, chat_tag=tag)
+        self.assertEqual(resolve_topic_token(token, router, secret="shared-secret"),
+                         [(GROUP, THREAD)])
+        # A token without the chat tag cannot name a chat, and is never resolved for
+        # claiming: an old mirror is re-run rather than trusted to someone else's topic.
+        self.assertEqual(resolve_topic_token("topic:webapp:12", router,
+                                             secret="shared-secret"), [])
+        self.assertEqual(resolve_topic_token("topic:webapp:general", router,
+                                             secret="shared-secret"), [])
+        # The tag needs the shared secret to check; without it nothing may be claimed.
+        self.assertEqual(resolve_topic_token(token, router), [])
 
     def test_the_fallback_and_unknown_projects_resolve_to_nothing(self):
         from swarmly.telegram.projects import ProjectRouter
@@ -254,12 +264,22 @@ class TestMirrorAndDedupe(SecretSandbox):
         self.assertEqual(ref["message_id"], 55)
 
     def test_a_resolvable_token_still_skips_the_copy_it_took(self):
-        with TemporaryDirectory() as tmp:
+        with TemporaryDirectory() as tmp,                 mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
+            channel = self._channel(tmp)
+            token = topic_token("webapp", THREAD,
+                                chat_tag=hmac_token(GROUP, "shared-secret").split("-")[-1])
+            channel._tg_admitted.append((GROUP, 55))
+            took = channel.took_telegram_copy({"topic": token, "message_id": 55})
+        self.assertTrue(took)
+
+    def test_a_token_without_a_chat_tag_is_never_claimed(self):
+        """A legacy 3-field token cannot say which chat it came from (review of PR #23)."""
+        with TemporaryDirectory() as tmp,                 mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
             channel = self._channel(tmp)
             channel._tg_admitted.append((GROUP, 55))
             took = channel.took_telegram_copy({"topic": f"topic:webapp:{THREAD}",
                                               "message_id": 55})
-        self.assertTrue(took)
+        self.assertFalse(took)
 
     def test_an_hmac_token_runs_the_turn_again_rather_than_losing_it(self):
         with TemporaryDirectory() as tmp:
