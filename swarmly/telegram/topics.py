@@ -33,19 +33,19 @@ logger = logging.getLogger("swarmly.telegram.topics")
 MAX_NAME = 128          # Telegram's limit for a topic name
 
 
-def chat_tag(chat_id: int) -> str:
-    """A stable tag for a chat that does not carry the id.
+def chat_tag(chat_id: int, secret: Optional[str] = None) -> str:
+    """A stable tag for a chat that does not carry the id: HMAC-SHA-256, 16 hex digits.
 
-    Keyed with ``SWARMLY_REDACTION_SECRET`` when it is set: an unkeyed digest lets anyone
-    who can guess an id confirm the guess by hashing it. 16 hex digits keyed and 32 unkeyed,
-    so a collision needs a birthday attack on 64/128 bits -- the first cut used 8 (32 bits),
-    which is both guessable and collision-prone (review of PR #23).
+    Always keyed. An unkeyed digest would let anyone who can guess an id confirm the guess
+    by hashing it, and the first cut's 32-bit tag was collision-prone too (review of PR #23).
+    The key is ``SWARMLY_REDACTION_SECRET`` when the operator sets it, otherwise a local
+    secret generated once and kept beside the transport's state
+    (:func:`swarmly.telegram.redact.local_secret`) -- never nothing.
     """
+    from swarmly.telegram.redact import local_secret
+    key = (secret or local_secret()).encode("utf-8")
     message = f"chat:{int(chat_id)}".encode("utf-8")
-    secret = os.environ.get("SWARMLY_REDACTION_SECRET", "")
-    if secret:
-        return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()[:16]
-    return hashlib.sha256(message).hexdigest()[:32]
+    return hmac.new(key, message, hashlib.sha256).hexdigest()[:16]
 
 
 def context_for(chat_id: int, thread_id: Optional[int],

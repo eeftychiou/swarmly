@@ -23,6 +23,7 @@ so a new call site cannot forget it.
 from __future__ import annotations
 
 import hashlib
+import logging
 import hmac
 import os
 import re
@@ -30,13 +31,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-__all__ = ["TOPIC_PREFIX", "SECRET_ENV", "topic_token", "hmac_token", "resolve_topic_token",
+logger = logging.getLogger("swarmly.telegram.redact")
+
+__all__ = ["TOPIC_PREFIX", "SECRET_ENV", "SECRET_FILE_ENV", "local_secret",
+           "secret_file", "topic_token", "hmac_token", "resolve_topic_token",
            "Redactor", "CHAT", "PATH", "USER", "HANDLE"]
 
 TOPIC_PREFIX = "topic:"
-#: Shared secret for the HMAC form. Without it there is no token at all, which degrades to
-#: the peer running the mirrored turn (a duplicate, never a lost hand-off).
+#: Shared secret for the HMAC forms (the fallback topic token and the chat tag). An operator
+#: may set it; when it is not set a **local** secret is generated once and kept beside the
+#: transport's state, so a tag is never an unkeyed digest (review of PR #23).
 SECRET_ENV = "SWARMLY_REDACTION_SECRET"
+#: Where the generated local secret lives (``~/.swarmly/redaction.secret`` by default).
+SECRET_FILE_ENV = "SWARMLY_REDACTION_SECRET_FILE"
+_LOCAL_SECRET_CACHE: Dict[str, str] = {}
 
 CHAT = "<chat>"
 PATH = "<path>"
@@ -50,6 +58,50 @@ _WINDOWS_PATH = re.compile(r"(?i)\b[A-Z]:\\{1,2}(?:Users|Documents and Settings)
 _POSIX_PATH = re.compile(r"(?<![\w/])/(?:home|Users)/[^/\s\"']+")
 
 
+def secret_file() -> Path:
+    """The file the generated local secret is kept in."""
+    override = os.environ.get(SECRET_FILE_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".swarmly" / "redaction.secret"
+
+
+def local_secret(path: Optional[Path] = None) -> str:
+    """The HMAC secret for this host: configured, generated once, or per-process.
+
+    A digest without a secret is only a hash anyone can recompute, so one is never used:
+    ``SWARMLY_REDACTION_SECRET`` wins, otherwise a random secret is written to
+    ``redaction.secret`` (owner-only) and reused, and if even that fails the process falls
+    back to an in-memory secret -- tags then differ between runs, which is a visible
+    nuisance, not a leak.
+    """
+    configured = os.environ.get(SECRET_ENV, "").strip()
+    if configured:
+        return configured
+    target = path or secret_file()
+    key = str(target)
+    if key in _LOCAL_SECRET_CACHE:
+        return _LOCAL_SECRET_CACHE[key]
+    secret = ""
+    try:
+        if target.exists():
+            secret = target.read_text(encoding="utf-8").strip()
+        if not secret:
+            secret = os.urandom(32).hex()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(secret, encoding="utf-8")
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+    except OSError:
+        logger.warning("could not keep a redaction secret at %s; using a per-process one",
+                       target)
+        secret = os.urandom(32).hex()
+    _LOCAL_SECRET_CACHE[key] = secret
+    return secret
+
+
 def topic_token(project: str, thread_id: Optional[int]) -> str:
     """The token for a topic bound to ``project`` (``general`` when no thread is bound)."""
     key = str(project).strip()
@@ -57,10 +109,9 @@ def topic_token(project: str, thread_id: Optional[int]) -> str:
     return f"{TOPIC_PREFIX}{key}:{which}"
 
 
-def hmac_token(chat_id: int, secret: str) -> str:
+def hmac_token(chat_id: int, secret: str = "") -> str:
     """The fallback token: an HMAC of the chat id, opaque to every peer by design."""
-    if not secret:
-        return ""
+    secret = secret or local_secret()
     digest = hmac.new(secret.encode("utf-8"), str(int(chat_id)).encode("utf-8"),
                       hashlib.sha256).hexdigest()
     return f"{TOPIC_PREFIX}hmac-{digest[:16]}"
@@ -144,7 +195,7 @@ class Redactor:
             chat_ids=tuple(sorted({c for c in chat_ids if c})),
             user_ids=tuple(sorted({u for u in user_ids if u})),
             paths=tuple(sorted({p for p in paths if p}, key=len, reverse=True)),
-            secret=os.environ.get(SECRET_ENV, ""),
+            secret=os.environ.get(SECRET_ENV, "").strip() or local_secret(),
         )
 
     # -- redaction ---------------------------------------------------------------------
@@ -213,7 +264,7 @@ class Redactor:
 
     # -- tokens ------------------------------------------------------------------------
     def chat_token(self, chat_id: int) -> str:
-        return hmac_token(int(chat_id), self.secret)
+        return hmac_token(int(chat_id), self.secret or local_secret())
 
     def topic_ref(self, chat_id: int, thread_id: Optional[int], router: Any) -> Dict[str, Any]:
         """The ``telegram`` reference a hand-off mirror carries: a token, never the id."""

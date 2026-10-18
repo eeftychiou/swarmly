@@ -14,6 +14,7 @@ from unittest import mock
 
 from swarmly.telegram.config import AgentConfig, ConfigError
 from swarmly.telegram.redact import (CHAT, PATH, Redactor, SECRET_ENV, hmac_token,
+                                     local_secret,
                                      resolve_topic_token, topic_token)
 
 GROUP = -1001234567890
@@ -54,7 +55,25 @@ class TestTokens(unittest.TestCase):
         self.assertTrue(first.startswith("topic:hmac-"))
         self.assertNotIn(str(abs(GROUP)), first)
         self.assertNotEqual(first, hmac_token(GROUP, "another-secret"))
-        self.assertEqual(hmac_token(GROUP, ""), "")      # no secret, no token
+        # No configured secret is not "no token": a local secret stands in, so the token is
+        # still keyed (review of PR #23 -- an unkeyed digest is guessable).
+        local = hmac_token(GROUP, "")
+        self.assertTrue(local.startswith("topic:hmac-"), local)
+        self.assertNotEqual(local, first)
+
+    def test_the_local_secret_is_generated_once_and_reused(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "nested" / "redaction.secret"
+            with mock.patch.dict(os.environ, {SECRET_ENV: ""}):
+                first = local_secret(target)
+                second = local_secret(target)
+            self.assertEqual(first, second)
+            self.assertTrue(target.exists())
+            self.assertEqual(target.read_text(encoding="utf-8").strip(), first)
+            self.assertGreaterEqual(len(first), 32)
+            # A configured secret wins over the stored one.
+            with mock.patch.dict(os.environ, {SECRET_ENV: "from-env"}):
+                self.assertEqual(local_secret(target), "from-env")
 
     def test_a_bound_token_resolves_to_the_local_topic(self):
         from swarmly.telegram.projects import ProjectRouter
@@ -93,11 +112,13 @@ class TestRedactor(unittest.TestCase):
                 ref = redactor.topic_ref(GROUP, 99, channel.router)     # thread 99: no project
                 self.assertTrue(ref["topic"].startswith("topic:hmac-"), ref)
                 self.assertEqual(ref["topic"], hmac_token(GROUP, "shared-secret"))
-                # ... and without a secret there is no token at all, which also means a peer
-                # cannot dedupe: it runs the turn. Never a lost hand-off.
+                # Without a configured secret the token is keyed by the local one, and it is
+                # still opaque to every peer: they run the mirrored turn too, so a hand-off
+                # is processed twice rather than lost.
                 os.environ.pop(SECRET_ENV)
-                self.assertEqual(Redactor.from_config(cfg).topic_ref(GROUP, 99,
-                                                                    channel.router), {})
+                fallback = Redactor.from_config(cfg).topic_ref(GROUP, 99, channel.router)
+                self.assertTrue(fallback["topic"].startswith("topic:hmac-"), fallback)
+                self.assertEqual(resolve_topic_token(fallback["topic"], channel.router), [])
 
     def test_chat_ids_user_ids_paths_and_the_handle_are_replaced(self):
         with TemporaryDirectory() as tmp:
@@ -271,22 +292,24 @@ class TestContextIds(unittest.TestCase):
         self.assertEqual(ctx, context_for(-1009999999999, THREAD, home_chat_id=GROUP))
         self.assertNotEqual(ctx, context_for(-1008888888888, THREAD, home_chat_id=GROUP))
 
-    def test_the_tag_is_keyed_when_a_secret_is_set(self):
-        """Review finding: an unkeyed 32-bit tag is guessable and collision-prone."""
+    def test_the_tag_is_always_keyed(self):
+        """Review finding: an unkeyed tag is guessable and collision-prone, so require a key."""
         from swarmly.telegram.topics import chat_tag
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(SECRET_ENV, None)
-            unkeyed = chat_tag(-1009999999999)
-            self.assertEqual(len(unkeyed), 32)
-            with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
-                keyed = chat_tag(-1009999999999)
-                self.assertEqual(len(keyed), 16)
-                self.assertEqual(keyed, chat_tag(-1009999999999))        # stable
-                self.assertNotEqual(keyed, unkeyed)
-                self.assertNotEqual(keyed, chat_tag(-1008888888888))
-            # Another secret gives another tag: the tag cannot be confirmed without it.
-            with mock.patch.dict(os.environ, {SECRET_ENV: "another-secret"}):
-                self.assertNotEqual(chat_tag(-1009999999999), keyed)
+        with mock.patch.dict(os.environ, {SECRET_ENV: "shared-secret"}):
+            keyed = chat_tag(-1009999999999)
+            self.assertEqual(len(keyed), 16)                             # 64 bits
+            self.assertEqual(keyed, chat_tag(-1009999999999))            # stable
+            self.assertNotEqual(keyed, chat_tag(-1008888888888))
+            self.assertNotEqual(chat_tag(-1009999999999, secret="other"), keyed)
+        # With no configured secret the local one keys it: still 16 hex, still stable, and
+        # never the digest anyone can recompute from the id alone.
+        with mock.patch.dict(os.environ, {SECRET_ENV: ""}):
+            local = chat_tag(-1009999999999)
+            self.assertEqual(len(local), 16)
+            self.assertEqual(local, chat_tag(-1009999999999))
+        import hashlib
+        unkeyed = hashlib.sha256(f"chat:{-1009999999999}".encode()).hexdigest()[:16]
+        self.assertNotEqual(local, unkeyed)
 
     def test_the_home_group_keeps_the_short_form(self):
         from swarmly.telegram.topics import context_for

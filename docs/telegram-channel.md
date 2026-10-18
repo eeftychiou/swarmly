@@ -135,11 +135,12 @@ public_redactions:                       # optional: literal -> replacement
   well: **processed twice, never lost**. Mirrors written before this change (a raw `chat`
   field) are still understood.
 - **Context ids carry a tag, not a chat id.** A topic in the home group stays `tg-<thread>`;
-  a topic in another group is `tg-<tag>-<thread>`, where the tag is an HMAC of the chat id
-  under `SWARMLY_REDACTION_SECRET` (16 hex digits) or, without a secret, a plain SHA-256
-  prefix (32 hex digits — wider, but anyone who can guess an id can confirm it). Set the
-  secret if you want the tag unguessable; changing it changes the tags, so existing topic
-  sessions look new once.
+  a topic in another group is `tg-<tag>-<thread>`, where the tag is an HMAC-SHA-256 of the
+  chat id (16 hex digits). It is **always keyed**: `SWARMLY_REDACTION_SECRET` when you set
+  it, otherwise a local secret generated once at `~/.swarmly/redaction.secret` (owner-only,
+  override with `SWARMLY_REDACTION_SECRET_FILE`). An unkeyed digest would let anyone who can
+  guess a chat id confirm the guess by hashing it. Changing the secret changes the tags, so
+  existing topic sessions look new once.
 - **`check` validates the map**: an empty key or a non-mapping value is an error, and an
   unset map changes nothing.
 
