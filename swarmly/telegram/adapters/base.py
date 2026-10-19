@@ -29,6 +29,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
+from swarmly.telegram.children import ChildRegistry
 from swarmly.telegram.config import AdapterSettings
 
 #: Review P0-6: variables a runtime never inherits (unless listed in adapter.pass_env):
@@ -591,6 +592,13 @@ class SubprocessAdapter(AgentAdapter):
             "a2a_turn_model", default=None)
         self._turn_effort: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
             "a2a_turn_effort", default=None)
+        # Issue #68: the pids of the CLIs this adapter runs. With no path nothing is kept,
+        # so a transport that was never given a state file cannot reap what it left behind.
+        self.children = ChildRegistry(None)
+
+    def use_child_registry(self, path: Optional[Path]) -> None:
+        """Persist the pids of the CLIs this adapter starts, so a restart can reap orphans."""
+        self.children = ChildRegistry(path)
 
     # -- command construction ----------------------------------------------------------
     def build_argv(self, prompt: str) -> List[str]:
@@ -639,6 +647,11 @@ class SubprocessAdapter(AgentAdapter):
         process = await self._runner(argv, self.settings.cwd, self.environment(),
                                      float(self.settings.timeout_seconds))
         try:
+            self.children.add(getattr(process, "pid", None), _describe_argv(argv))
+        except Exception:                                    # noqa: BLE001 - never blocks a turn
+            logger.warning("%s: could not record the CLI pid %s", self.alias,
+                           getattr(process, "pid", None), exc_info=True)
+        try:
             stdout, stderr = await asyncio.wait_for(process.communicate(),
                                                     timeout=float(self.settings.timeout_seconds))
         except BaseException as exc:
@@ -648,6 +661,7 @@ class SubprocessAdapter(AgentAdapter):
                            type(exc).__name__, time.monotonic() - started,
                            getattr(process, "pid", "?"))
             await _kill(process)
+            self._forget_child(process)                     # it is gone, not orphaned (#68)
             raise
         rc = getattr(process, "returncode", 0)
         out, err = _decode(stdout), _decode(stderr)
@@ -659,7 +673,18 @@ class SubprocessAdapter(AgentAdapter):
             logger.debug("%s: stdout head:\n%s", self.alias, out[:LOG_HEAD_CHARS])
         if err and not rc:
             logger.debug("%s: stderr tail:\n%s", self.alias, _tail(err))
+        self._forget_child(process)
         return process, stdout, stderr
+
+    def _forget_child(self, process: Any) -> None:
+        """The CLI exited: drop its pid from the registry (#68)."""
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int):
+            return
+        try:
+            self.children.remove(pid)
+        except Exception:                                    # noqa: BLE001 - best effort
+            logger.warning("%s: could not drop the CLI pid %s", self.alias, pid, exc_info=True)
 
     async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
         if not self.settings.enabled:

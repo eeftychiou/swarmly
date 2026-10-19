@@ -43,6 +43,7 @@ from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
 from swarmly.telegram.adapters.base import (AdapterReply, is_silent_reply, load_state,
                                            save_state, topic_mode)
+from swarmly.telegram.children import reap_orphans
 from swarmly.telegram.cleanup import DELETE_BATCH, Cleanup, GeneralLedger, TopicInfo
 from swarmly.telegram.commands import (
     DIAG_COMMANDS,
@@ -373,6 +374,8 @@ class AgentChannel:
         sessions = getattr(self.adapter, "SESSIONS_STATE", None)
         if adapter is None and sessions and hasattr(self.adapter, "use_state_file"):
             self.adapter.use_state_file(_state_file(config, sessions))
+        if hasattr(self.adapter, "use_child_registry"):
+            self.adapter.use_child_registry(_state_file(config, "children"))
         # durable-plane fallback (fallback.gitbus_poll_minutes)
         self._bus_task: Optional[asyncio.Task] = None
         self._lane_poll_task: Optional[asyncio.Task] = None    # one lane poll per doorbell burst
@@ -654,6 +657,9 @@ class AgentChannel:
             if sessions and hasattr(adapter, "use_state_file"):
                 suffix = f"{project.key}-t{thread_id}" if project.worktrees else project.key
                 adapter.use_state_file(_state_file(self.config, sessions, suffix=suffix))
+            if hasattr(adapter, "use_child_registry"):
+                suffix = f"{project.key}-t{thread_id}" if project.worktrees else project.key
+                adapter.use_child_registry(_state_file(self.config, "children", suffix=suffix))
             self._project_adapters[cache_key] = adapter
         return self._project_adapters[cache_key]
 
@@ -1553,6 +1559,40 @@ class AgentChannel:
         return len(ids)
 
     # -- short-lived notices (issue #64) --------------------------------------------------
+
+    def _reap_orphaned_children(self) -> List[int]:
+        """End the CLIs a dead transport left behind (#68); returns the pids that were ended.
+
+        Never the children of a live transport (a second transport in the same state dir),
+        and never a pid whose start time no longer matches the recorded one. A failure here
+        is logged and never stops the transport from starting.
+        """
+        paths = [p for p in (self.adapter_registry_paths()) if p is not None]
+        killed: List[int] = []
+        for path in paths:
+            try:
+                killed.extend(reap_orphans(path))
+            except Exception:                              # noqa: BLE001 - start anyway
+                logger.exception("could not reap the children recorded in %s", path)
+        if killed:
+            logger.warning("reaped %d orphaned CLI process(es): %s", len(killed), killed)
+        return killed
+
+    def adapter_registry_paths(self) -> List[Optional[Path]]:
+        """The child registries this transport reads at start (#68).
+
+        Its own, and every project one it wrote before -- the per-topic worktree registries
+        carry a topic id in their name, so they are found by the same prefix rather than
+        guessed from the config.
+        """
+        main = _state_file(self.config, "children")
+        paths: List[Optional[Path]] = [main]
+        if main is not None:
+            try:
+                paths.extend(sorted(main.parent.glob(f"{main.stem}-*.json")))
+            except OSError:
+                logger.warning("could not list the child registries beside %s", main)
+        return paths
 
     def ephemeral_notices_minutes(self) -> float:
         """``limits.ephemeral_notices_minutes``: 0 (or less) turns the sweep off."""
@@ -4704,6 +4744,9 @@ class AgentChannel:
 
         if not self.config.identity.token_is_present():
             raise RuntimeError("no bot token in config; set agent.bot_token or bot_token_env")
+        # Issue #68: a previous run that was killed left its CLI children running. End them
+        # before this one starts a second CLI on the same conversations.
+        self._reap_orphaned_children()
         self.bot = Bot(token=self.config.identity.bot_token,
                        default=DefaultBotProperties(parse_mode="HTML"))
         self.dispatcher = Dispatcher()
