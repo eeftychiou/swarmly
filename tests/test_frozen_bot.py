@@ -91,6 +91,28 @@ class TestQuotaFreeze(unittest.TestCase):
         self.assertTrue(any("intent=RESUMED" in s["text"] for s in channel._test_sender.sent))
 
 
+class TestFreezeAtOnce(unittest.TestCase):
+
+    def _channel(self):
+        channel = make_channel(make_config(adapter={"type": "claude"}))
+        channel._wall = lambda: dt.datetime(2026, 10, 19, 12, 0).timestamp()
+        return channel
+
+    def test_a_reset_weeks_away_freezes_on_the_first_failure(self):
+        channel = self._channel()
+        run(channel._note_adapter_failure(
+            "Codex failed: You've hit your usage limit. Upgrade to Plus to continue using "
+            "Codex, or try again at Nov 16th, 2026 10:06 PM."))
+        self.assertTrue(channel._frozen)
+        self.assertEqual(channel._freeze_until, dt.datetime(2026, 11, 16, 22, 6).timestamp())
+        self.assertIn("intent=FROZEN", channel._test_sender.last)
+
+    def test_a_short_wait_still_needs_the_threshold(self):
+        channel = self._channel()
+        run(channel._note_adapter_failure("Quota exceeded. Please retry in 41s."))
+        self.assertFalse(channel._frozen)
+
+
 class TestPersistedFreeze(unittest.TestCase):
 
     def setUp(self):

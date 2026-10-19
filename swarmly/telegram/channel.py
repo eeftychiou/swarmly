@@ -209,6 +209,8 @@ _NO_DROP_NOTICE_REASONS = frozenset({
 DROP_NOTICE_SECONDS = 600.0
 #: A frozen bot tells a person who addresses it so at most once per topic per window.
 FROZEN_REMINDER_SECONDS = 600.0
+#: A quota the provider says resets this far away or more freezes the bot on the first failure.
+QUOTA_FREEZE_AT_ONCE_SECONDS = 3600.0
 
 
 def machine_prose(text: str) -> str:
@@ -1530,10 +1532,15 @@ class AgentChannel:
             return
         self._quota_failures += 1
         threshold = max(1, int(self.config.limits.quota_freeze_threshold))
+        now = self._wall()
+        resets = quota_resets_at(detail, now)
         logger.warning("quota-signature adapter failure %d/%d", self._quota_failures, threshold)
-        if self._quota_failures >= threshold:
-            now = self._wall()
-            until = quota_resets_at(detail, now) or now + self._quota_retry_seconds()
+        # A provider that names a reset an hour or more away will refuse every turn until
+        # then: freeze on the first such failure (live run: the count restarts with every
+        # bot restart, so a quota out for weeks never reached the threshold).
+        if self._quota_failures >= threshold or (
+                resets is not None and resets - now >= QUOTA_FREEZE_AT_ONCE_SECONDS):
+            until = resets or now + self._quota_retry_seconds()
             self._set_frozen(True, "quota", until)
             self.stats.last_error = "auto-frozen: adapter quota exhausted"
             await self.send(self._frozen_notice(), allow_when_frozen=True)
