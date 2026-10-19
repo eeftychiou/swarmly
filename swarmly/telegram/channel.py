@@ -1153,6 +1153,13 @@ class AgentChannel:
         CLI's own default)."""
         return self._models.get(self._model_key(event)) or self.config.adapter.model
 
+    def bus_turn_choices(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        """The /model and /reasoning choices for a turn run from the bus: those of the topic
+        the text is about (an issue or PR it names), else General's. None = the adapter's."""
+        topic = self.topic_for_text(text or "")
+        key = (self.topics.context(topic[0], topic[1]) if topic else None) or "general"
+        return self._models.get(key), self._efforts.get(key)
+
     def _effort_for(self, event: Optional[ChannelEvent]) -> Optional[str]:
         """The reasoning effort this discussion runs at: its /reasoning choice, else
         adapter.effort (None: the CLI's own default)."""

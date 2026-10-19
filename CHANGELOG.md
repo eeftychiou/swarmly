@@ -24,6 +24,9 @@ All notable changes to this project are documented here. The format follows
   bots, show them in `/status`, and every turn's prompt names them so work goes to a bot that
   can take it.
 
+- A turn run from the bus uses the `/model` and `/reasoning` choice of the topic it is about
+  (General's when it names none) instead of the CLI's default model.
+
 ## [0.10.1] - 2026-10-17
 
 A correctness round: the suite is hermetic on hosts that run an agent, and the bugs that each

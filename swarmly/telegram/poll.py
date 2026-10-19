@@ -1118,15 +1118,24 @@ def build_fallback_envelope(*, sender: str, recipient: str,
 # --------------------------------------------------------------------------------------
 
 
-def _bus_incoming(text: str, sender: str, cfg: Any, token: str) -> IncomingMessage:
-    """The IncomingMessage shape both the main loop and the drain path inject."""
+def _bus_incoming(text: str, sender: str, cfg: Any, token: str,
+                  channel: Any = None) -> IncomingMessage:
+    """The IncomingMessage shape both the main loop and the drain path inject.
+
+    A bus turn runs the model and effort chosen with /model and /reasoning for the topic the
+    text is about (General's when it names none), as a Telegram turn there would: without
+    them it fell back to the CLI's default model (live run: Antigravity's bus turns ran
+    the expensive default after its topics had been switched off it)."""
     sender = plain(sender, limit=32) or "unknown"      # review P0-8: a bus-controlled name
+    choices = getattr(channel, "bus_turn_choices", None)
+    model, effort = choices(text) if callable(choices) else (None, None)
     return IncomingMessage(
         text=text, author_alias=f"{sender} (gitbus)",
         mentions=dict(cfg.peers),
         maintainer_username=cfg.identity.maintainer_username,
         author_username=f"{sender} (gitbus)",
         response_instructions=inject_planted_token("", token),
+        model=model, effort=effort,
     )
 
 
@@ -1605,7 +1614,7 @@ async def bus_poll_once(channel: Any, *,
             adapter: AgentAdapter = channel.adapter
             token = planted_token_for(message, ticket_id=None)
             outcome.tokens[message_id] = token
-            incoming = _bus_incoming(text, sender, cfg, token)
+            incoming = _bus_incoming(text, sender, cfg, token, channel)
             try:
                 async with _Admission(channel, refresh):
                     reply = await adapter.respond(incoming)
@@ -1711,7 +1720,7 @@ async def bus_poll_once(channel: Any, *,
                     continue
                 drain_token = planted_token_for(message_id, ticket_id=None)
                 outcome.tokens[message_id] = drain_token
-                incoming = _bus_incoming(text, sender, cfg, drain_token)
+                incoming = _bus_incoming(text, sender, cfg, drain_token, channel)
                 try:
                     async with _Admission(channel, refresh):
                         reply = await channel.adapter.respond(incoming)
@@ -1914,7 +1923,7 @@ async def _swarm_lane_step(channel: Any, cfg: AgentConfig, repo: Path,
             continue
         token = planted_token_for(env_id, ticket_id=None)
         outcome.tokens[env_id] = token
-        incoming = _bus_incoming(text, sender, cfg, token)
+        incoming = _bus_incoming(text, sender, cfg, token, channel)
         failure: Optional[str] = None
         reply: Optional[AdapterReply] = None
         try:
