@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A round now ends with a report to the human in the round's topic, and closing the round's
+  tracking issue is what triggers it: closing sends no GitHub notification, so the
+  notifications backstop also remembers which issues carrying `github.tracking_label`
+  (default `tracking`) were open and wakes the **coordinator** in the project's bound topic
+  with a *post the round report now* turn when one closes. One report per closure -- an issue
+  that stays closed is quiet, a reopened-and-closed one is a new round end -- and a closure
+  whose turn fails stays queued, backing off and then given up loudly like a failed
+  notification turn, instead of losing the round end. Only an agent whose `agent.role` is
+  `coordinator` is woken, and `tracking_label: ""` disables the watch (`#25`).
 - CI wake: while an agent waits on a pull request's checks, the GitHub poll
   (`github.poll_minutes`) watches that PR's check runs and wakes the agent with exactly one
   turn when they all reach a terminal state -- pass or fail, with the failing check names on a
@@ -32,6 +41,41 @@ All notable changes to this project are documented here. The format follows
   reported back to the sender, naming the handle and the reason, so a lost hand-off never
   reads as one that was taken; the report is per sender, so a second peer's dropped hand-off
   inside the same window is still answerable (`#27`).
+
+- A bot frozen on quota no longer goes silent and stays frozen for good. The freeze ends by
+  itself at the reset time the provider's error gives (else after `quota_retry_minutes`), and
+  a person who addresses the frozen bot is told why and how to resume. `/status` shows the
+  freeze, `/model@<bot> <name>` lifts a quota freeze to try the other model (instead of
+  promising a turn that never came), and `/resume` tells the peers. Peers keep track of frozen
+  bots, show them in `/status`, and every turn's prompt names them so work goes to a bot that
+  can take it.
+
+- A turn run from the bus uses the `/model` and `/reasoning` choice of the topic it is about
+  (General's when it names none) instead of the CLI's default model.
+- A reply that arrived as `↪ (k/n)` parts is joined back into the one message the sender
+  wrote before the turn runs, whatever order the parts arrive in, and the turn runs from part
+  1: its message id, its reply target and its raw message are the ones the answer goes back
+  to. Parts that never all arrive are delivered as what arrived, with a note naming the
+  missing ones, instead of being held forever or answered as fragments. Each part's marker
+  carries the reply's own token (`(2/3 #9fa0c1)`), so two replies by one sender that
+  interleave can never be joined into one mixed message. The token is what a part is joined on:
+  a part with no token cannot be attributed to a reply, so a sender that writes none (a
+  transport older than this one) is not joined — its part 1 runs its turn as before, and its
+  later parts stay continuations that start no turn, never two messages in one turn. A token
+  that contradicts itself (another total, different text at an index already held) goes out as
+  what arrived rather than joining two replies into one. One cap, `MAX_REPLY_PARTS` (20), bounds
+  both ends:
+  `limits.max_reply_parts` above it is clamped at load, and a part header above it is refused
+  as ordinary text, so no sender can name a total that reserves the receiver's memory; a number
+  written with more digits than the marker accepts (three) does not match it at all, so the
+  sender's number is never converted at a size the receiver cannot bound. Buffers
+  and their timers are bounded and cancelled when a reply is delivered, are not allocated for
+  a bot whose messages are ignored anyway (`limits.strangers: ignore`), so numbered fragments
+  cannot leave live timers behind. A fragment whose first part never came keeps its `↪ (k/n)`
+  marker when the window closes, so it stays a continuation and never starts a turn of its own,
+  even when its text names the bot. Parts can arrive while a held reply is being delivered, so
+  the buffer is read again after every await: a part that opened a buffer meanwhile is joined
+  with its reply instead of being overwritten and lost (`#29`).
 
 ## [0.10.1] - 2026-10-17
 

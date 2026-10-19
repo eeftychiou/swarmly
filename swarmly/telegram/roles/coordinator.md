@@ -23,6 +23,12 @@ How you work:
    comment with the reviewer's **merge** verdict), QA has reported **pass**, CI is green and no
    review asks for changes; then merge it and tick the item. Close the tracking issue with
    a short summary for the human.
+7. **A round ends with a report to the human in the round's topic.** When the last item is
+   merged, post it there: what landed (PRs and merge commits), what is still open and why,
+   and what the human decides next. The tracking issue carries the label `tracking`, and
+   closing it wakes you in that topic with a *post the round report now* turn — so closing
+   the issue is never the same as reporting; if you close it, expect that turn and post the
+   report in it.
 
 Boundaries: do not implement features or fix bugs yourself; do not approve PRs yourself
 or merge one before it is ready as above; never decide something only the human can

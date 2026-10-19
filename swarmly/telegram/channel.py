@@ -29,6 +29,7 @@ import html
 import json
 import logging
 import re
+import secrets
 import socket
 import subprocess
 import time
@@ -36,7 +37,7 @@ import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -52,9 +53,12 @@ from swarmly.telegram.commands import (
     status_reply,
     where_reply,
 )
-from swarmly.telegram.config import EFFORT_LEVELS, AgentConfig, effort_problem, model_problem
+from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig,
+                                     effort_problem, model_problem)
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.projects import ProjectRouter
+from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
+from swarmly.telegram.model_list import available_models, cached_models, format_list
 from swarmly.telegram.redact import Redactor
 from swarmly.telegram.topic_open import (GENERAL_PEER_REPLY_CHARS, GENERAL_REPLY_CHARS,
                                          MAX_TOPICS_PER_HOUR, REPORT_NOTE, SELF_TASK_NOTE,
@@ -186,7 +190,8 @@ def _default_gitbus_read(root: Path, ref: Optional[str] = None) -> List[Any]:
 
 
 _BANNER_AND_MENTIONS = re.compile(r"^(?:\s*(?:\[[^\]\n]{1,40}\]|@\w+)[:,]?)+\s*")
-_NOTICE_PREFIXES = ("⚠️", "↪", "❌", "🟢", "✅", "👀", "⏳", "♻️", "[system]", "[status]")
+_NOTICE_PREFIXES = ("⚠️", "↪", "❌", "🟢", "✅", "👀", "⏳", "♻️", "🧊", "▶", "[system]",
+                    "[status]")
 
 #: Why a peer bot's mention of this bot is dropped without a notice back (#27): machine traffic
 #: never asked for a turn, a bot's own echo is addressed to nobody, and a stranger's or a
@@ -204,6 +209,8 @@ _NO_DROP_NOTICE_REASONS = frozenset({
 #: One drop notice per reason per topic per window: a peer that keeps naming this bot in the
 #: same dropped shape hears it once, not once per message.
 DROP_NOTICE_SECONDS = 600.0
+#: A frozen bot tells a person who addresses it so at most once per topic per window.
+FROZEN_REMINDER_SECONDS = 600.0
 
 
 def machine_prose(text: str) -> str:
@@ -320,6 +327,7 @@ class ChannelEvent:
     handoff: bool = False                  # set by routing: an expected hand-off, no cooldown
     cooldown_left: float = 0.0             # set by routing: a message to this bot the cooldown dropped
     self_task: bool = False                # a brief this agent gave itself (topic or membership)
+    reassembled: bool = False              # #29: the split parts of one reply, joined already
 
 
 @dataclass
@@ -387,6 +395,14 @@ class AgentChannel:
             if isinstance(pair, list) and len(pair) == 2 and all(
                     isinstance(v, int) and not isinstance(v, bool) for v in pair):
                 self._tg_admitted.append((pair[0], pair[1]))
+        # (message id, author) of the same messages: a mirror whose topic token this bot cannot
+        # resolve (no shared secret) is still recognised by its sender and message id (round 2
+        # export: every hand-off was answered twice, once from Telegram and once from the bus).
+        self._tg_admitted_by: deque = deque(maxlen=500)
+        for pair in load_state(self._admitted_path, "handled Telegram messages").get("by", []):
+            if isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], int) \
+                    and not isinstance(pair[0], bool) and isinstance(pair[1], str):
+                self._tg_admitted_by.append((pair[0], pair[1]))
         self._mirror_tasks: Set[asyncio.Task] = set()
         # Hand-offs this bot made that the receiving bot has not answered yet:
         # (chat, thread, peer alias) -> {"at", "message_id", "nudged"}.
@@ -452,9 +468,23 @@ class AgentChannel:
         self._pause_where: Tuple[Optional[int], Optional[int]] = (None, None)
         self._queue_full_noticed = float("-inf")
         self._ref_topics: Dict[str, Tuple[int, int]] = {}     # "#12" -> the topic about it
+        # Kept across restarts (round 2 export: two restarts emptied it, and #34 and #37 each
+        # got a new topic though one was already about them). "#12" -> wall-clock last seen.
+        self._ref_seen: Dict[str, float] = {}
+        self._refs_path = _state_file(config, "topic-refs")
+        now = time.time()
+        for ref, item in load_state(self._refs_path, "issue topics").get("refs", {}).items():
+            if isinstance(ref, str) and isinstance(item, list) and len(item) == 3 \
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                            for v in item) and now - item[2] < REF_TOPIC_SECONDS:
+                self._ref_topics[ref] = (int(item[0]), int(item[1]))
+                self._ref_seen[ref] = float(item[2])
         self._topics_reported: Set[Tuple[int, Optional[int]]] = set()   # sent REPORT_BACK
         self._report_asked: Set[Tuple[int, Optional[int]]] = set()      # REPORT_NOTE sent
         self._self_tasks: Set[asyncio.Task] = set()
+        # #29: sender+chat+topic -> the parts of a split reply already here, and their timers.
+        self._split_pending: Dict[Tuple[Any, ...], _PendingSplit] = {}
+        self._split_tasks: Set[asyncio.Task] = set()
         self._gone_topics: set = set()             # topics a reply in flight found closed
         # Whether a post to a closed or deleted topic goes to General with a note (a reply
         # must land somewhere); ``swarmly-telegram send --topic`` turns it off so a wrong
@@ -462,7 +492,17 @@ class AgentChannel:
         self.reroute_gone_topics = True
         self._frozen = False
         self._freeze_ref: Optional[str] = None
+        self._freeze_until: Optional[float] = None   # wall time a quota freeze lifts itself
         self._quota_failures = 0  # #49: consecutive quota-signature adapter failures
+        self._wall: Callable[[], float] = time.time
+        self._frozen_told: Dict[Tuple[int, Optional[int]], float] = {}   # topic -> clock
+        self._announce_resumed = False             # a /model lifted a quota freeze
+        # Peers that said they are frozen: alias -> {"ref", "until"} (wall time or None).
+        self._peers_frozen_path = _state_file(config, "peer-freezes")
+        self._peers_frozen: Dict[str, Dict[str, Any]] = {
+            str(alias): dict(entry) for alias, entry in
+            load_state(self._peers_frozen_path, "peer freezes").items()
+            if isinstance(entry, dict)}
         # Token economy (issue #43): machine-class traffic recorded as state, not model turns.
         self._machine_log: deque = deque(maxlen=50)
         self._peer_last_seen: Dict[str, Dict[str, Any]] = {}
@@ -970,6 +1010,9 @@ class AgentChannel:
         """Swarm membership (#152): note unknown bots' HELLOs, apply the admin's ``/admit``,
         ``/remove`` and ``/sync``, and take the swarm's welcomes and peer lists. True when the
         message is consumed. Joins, roles and drop-outs go to :mod:`membership` first."""
+        if self._bot_account_post(event) and (envelope.intent or "").upper() != "JOIN" \
+                and await self.membership.retry_join(event):
+            return True               # its JOIN is answered now; this post was its plea
         if envelope.type in (MessageType.HELLO, MessageType.BYE) and self._bot_account_post(event):
             if await self.membership.handle(envelope, parse_message(event.text or "")[1], event):
                 return True
@@ -1047,9 +1090,16 @@ class AgentChannel:
                 result += f" github: @{self.config.github.login} (backstop: {self.config.github.poll_minutes}m, last: {last_poll})"
             else:
                 result += " github: disabled"
+            frozen_peers = self.frozen_peers()
+            if frozen_peers:
+                result += " frozen_peers=" + ",".join(
+                    f"{peer}({entry.get('ref') or 'frozen'})"
+                    for peer, entry in sorted(frozen_peers.items()))
+            blocker = self.stats.last_error or "none"
+            if self._frozen:
+                blocker = f"frozen: {self._freeze_reason()} (/resume@{self.config.identity.name})"
             return status_reply(alias, task=f"adapter:{self.config.adapter.type}",
-                                result=result,
-                                blocker=self.stats.last_error or "none")
+                                result=result, blocker=blocker)
         if command == "role":
             role = self._role()
             if role is None:
@@ -1108,6 +1158,13 @@ class AgentChannel:
         """The model this discussion runs: its /model choice, else adapter.model (None: the
         CLI's own default)."""
         return self._models.get(self._model_key(event)) or self.config.adapter.model
+
+    def bus_turn_choices(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        """The /model and /reasoning choices for a turn run from the bus: those of the topic
+        the text is about (an issue or PR it names), else General's. None = the adapter's."""
+        topic = self.topic_for_text(text or "")
+        key = (self.topics.context(topic[0], topic[1]) if topic else None) or "general"
+        return self._models.get(key), self._efforts.get(key)
 
     def _effort_for(self, event: Optional[ChannelEvent]) -> Optional[str]:
         """The reasoning effort this discussion runs at: its /reasoning choice, else
@@ -1168,8 +1225,10 @@ class AgentChannel:
             current = self._model_for(event)
             source = ("/model" if key in self._models
                       else "adapter.model" if adapter.model else "the CLI's default")
+            frozen = f"\n\n{self._frozen_line()}" if self._frozen else ""
             return (f"{alias} runs {current or 'its CLI default model'} here ({source}). "
-                    f"The admin can switch it with /model@{self.config.identity.name} <name>.")
+                    f"The admin can switch it with /model@{self.config.identity.name} <name>."
+                    f"{self._model_choices()}{frozen}")
         if len(args) > 1:
             return f"{alias}: /model takes one model name (or default)."
         if not self.config.is_admin(event.author_id):
@@ -1181,7 +1240,7 @@ class AgentChannel:
             self._models.pop(key, None)
             save_state(self._models_path, self._models, "model choices")
             return (f"{alias} goes back to {adapter.model or 'its CLI default model'} here "
-                    "from the next turn.")
+                    f"from the next turn.{self._after_model_switch(adapter.model or 'default')}")
         if name != adapter.model:
             problem = model_problem(adapter.type, name)
             if problem:
@@ -1189,7 +1248,53 @@ class AgentChannel:
         self._models[key] = name
         save_state(self._models_path, self._models, "model choices")
         logger.info("/model: %s now runs %s in %s", alias, name, key)
-        return f"{alias} runs {name} here from the next turn; the conversation carries on."
+        return (f"{alias} runs {name} here from the next turn; the conversation carries on."
+                f"{self._after_model_switch(name)}")
+
+    def _after_model_switch(self, name: str) -> str:
+        """A quota usually belongs to one model, so switching lifts a quota freeze (the next
+        turn is the test; it freezes again if this model's quota is out too). Any other freeze
+        stays, and the reply says so instead of promising a turn that will not come."""
+        if not self._frozen:
+            return ""
+        if self._freeze_ref == "quota":
+            self._set_frozen(False, None)
+            self._announce_resumed = True
+            logger.info("/model lifted the quota freeze to try %s", name)
+            return (f" Its quota freeze is lifted to try {name}; it freezes again if that "
+                    "model's quota is out too.")
+        return (f" It is still frozen ({self._freeze_reason()}): "
+                f"/resume@{self.config.identity.name} to start it.")
+
+    def _model_choices(self) -> str:
+        """The models /model can switch to, as the end of the bare /model answer."""
+        adapter_type = self.config.adapter.type
+        names = cached_models(adapter_type)
+        if names:
+            extra = "\n(or any claude-* name)" if adapter_type.startswith("claude") else ""
+            return f"\n\nModels it can switch to:\n{format_list(names)}{extra}"
+        where = ("`agy models`" if adapter_type.startswith("antigravity")
+                 else "its reasonix.toml" if adapter_type == "reasonix"
+                 else "its CLI")
+        return f"\n\n(Its models could not be listed just now; see {where}.)"
+
+    async def _look_up_models(self, event: ChannelEvent) -> None:
+        """Before a bare /model for this bot is answered: ask the CLI which models it has
+        (agy models, codex app-server), unless a recent answer is kept."""
+        parsed = parse_command(event.text or "")
+        if not parsed or parsed[0] != "model" or command_args(event.text or ""):
+            return
+        target = parsed[1]
+        if target and target.lstrip("@").lower() \
+                != self.config.identity.name.lstrip("@").lower():
+            return
+        if not self.config.adapter.model_switchable:
+            return
+        try:
+            env = self.adapter.environment()
+        except Exception:                              # noqa: BLE001 - the CLI's own env
+            env = None
+        await available_models(self.config.adapter.type, env=env)
 
     def _direct_chat(self, event: ChannelEvent) -> bool:
         """The admin's private chat with this bot, where a bare command can only mean this bot.
@@ -1304,10 +1409,13 @@ class AgentChannel:
             return None
         return Path(source).with_suffix(".freeze.json")
 
-    def _set_frozen(self, frozen: bool, ref: Optional[str]) -> None:
+    def _set_frozen(self, frozen: bool, ref: Optional[str],
+                    until: Optional[float] = None) -> None:
         """Apply and persist the freeze flag so a restart cannot silently release it."""
         self._frozen = frozen
         self._freeze_ref = ref if frozen else None
+        self._freeze_until = until if frozen else None
+        self._frozen_told.clear()
         if not frozen:
             self._quota_failures = 0
         path = self._freeze_state_path()
@@ -1315,14 +1423,18 @@ class AgentChannel:
             return
         try:
             if frozen:
-                path.write_text(json.dumps({"frozen": True, "ref": ref, "at": self._clock()}))
+                path.write_text(json.dumps({"frozen": True, "ref": ref, "at": self._wall(),
+                                            "until": until}))
             elif path.exists():
                 path.unlink()
         except OSError as exc:
             logger.warning("freeze state could not be persisted: %s", exc)
 
     async def _restore_freeze_state(self) -> None:
-        """Re-apply a persisted freeze on startup and re-announce it once."""
+        """Re-apply a persisted freeze on startup and re-announce it once.
+
+        A quota freeze whose end has passed is not restored: the quota is back. One saved
+        before freezes had an end gets the retry interval from now."""
         path = self._freeze_state_path()
         if path is None or not path.exists():
             return
@@ -1333,20 +1445,89 @@ class AgentChannel:
             return
         if not isinstance(data, dict) or not data.get("frozen"):
             return
-        ref = data.get("ref")
+        ref = str(data["ref"]) if data.get("ref") else None
+        until = data.get("until")
+        until = float(until) if isinstance(until, (int, float)) else None
+        if ref == "quota":
+            if until is None:
+                until = self._wall() + self._quota_retry_seconds()
+            elif until <= self._wall():
+                logger.info("quota freeze from %s ended while stopped; not restored", path)
+                self._set_frozen(False, None)
+                return
         self._frozen = True
-        self._freeze_ref = str(ref) if ref else None
+        self._freeze_ref = ref
+        self._freeze_until = until
         logger.info("freeze state restored from %s (ref=%s)", path, ref)
-        await self.send(format_message(Envelope(
-            type=MessageType.STATUS, to="*", intent="FROZEN",
-            ref=self._freeze_ref, rev=_local_revision())), allow_when_frozen=True)
+        await self.send(self._frozen_notice(), allow_when_frozen=True)
+
+    def _quota_retry_seconds(self) -> float:
+        return max(1.0, float(getattr(self.config.limits, "quota_retry_minutes", 60.0))) * 60
+
+    def _freeze_reason(self) -> str:
+        """Why this bot is frozen, in words, with when it ends."""
+        why = {"quota": "its provider's quota ran out",
+               "pause": "the admin paused it"}.get(self._freeze_ref or "",
+                                                 f"it was frozen ({self._freeze_ref or 'no reason'})")
+        until = describe_until(self._freeze_until)
+        return f"{why}, {until}" if until else why
+
+    def _frozen_line(self) -> str:
+        """What a frozen bot tells a person who addresses it."""
+        name = self.config.identity.name
+        line = (f"🧊 {self.config.identity.alias} is frozen: {self._freeze_reason()}. "
+                f"It takes no work until then; the admin can /resume@{name}")
+        if self._freeze_ref == "quota" and self.config.adapter.model_switchable:
+            line += f" or switch it to another model with /model@{name} <name>"
+        return line + "."
+
+    def _frozen_notice(self) -> str:
+        """The FROZEN broadcast: machine header for peers (``ttl`` = how long), words for people."""
+        return format_message(Envelope(
+            type=MessageType.STATUS, to="*", intent="FROZEN", ref=self._freeze_ref,
+            ttl=ttl_for(self._freeze_until, self._wall()), rev=_local_revision()),
+            self._frozen_line())
+
+    def _resumed_notice(self, why: str) -> str:
+        return format_message(Envelope(
+            type=MessageType.STATUS, to="*", intent="RESUMED", ref="quota",
+            rev=_local_revision()), f"▶ {self.config.identity.alias} resumed: {why}.")
+
+    async def _lift_expired_freeze(self) -> bool:
+        """A quota freeze ends at the time the provider gave (or after the retry interval):
+        the next turn is the probe, and repeated quota failures freeze it again."""
+        if not self._frozen or self._freeze_ref != "quota" or self._freeze_until is None \
+                or self._wall() < self._freeze_until:
+            return False
+        self._set_frozen(False, None)
+        logger.info("quota freeze ended; resuming")
+        await self.send(self._resumed_notice("its quota freeze has ended"),
+                        allow_when_frozen=True)
+        return True
+
+    async def _tell_frozen(self, event: ChannelEvent) -> None:
+        """A person who addresses a frozen bot is told so, once per topic in a while,
+        instead of silence."""
+        if event.author_is_bot or not self._frozen or not self._may_start_turns(event):
+            return
+        if not (self.mentions_me(event.text or "") or event.replies_to_bot
+                or self._direct_chat(event)):
+            return
+        key = (event.chat_id, event.thread_id)
+        if self._clock() - self._frozen_told.get(key, float("-inf")) < FROZEN_REMINDER_SECONDS:
+            return
+        self._frozen_told[key] = self._clock()
+        await self.send(self._frozen_line(), reply_to_message_id=event.message_id,
+                        chat_id=event.chat_id, thread_id=event.thread_id,
+                        allow_when_frozen=True)
 
     async def _note_adapter_failure(self, detail: str) -> None:
         """#49.E: repeated quota-signature failures freeze the channel before the ticket storm.
 
         Deliberately narrow: only failure text carrying a known quota/429 signature counts,
-        a non-quota failure resets the streak, and the freeze never fires twice (RESUME or
-        the persisted state is the only way back).
+        a non-quota failure resets the streak, and the freeze never fires twice. It ends at
+        the reset time the error gives, else after ``limits.quota_retry_minutes``; /resume
+        and a /model switch end it sooner.
         """
         if self._frozen or not self.config.limits.auto_freeze_on_quota:
             return
@@ -1357,11 +1538,50 @@ class AgentChannel:
         threshold = max(1, int(self.config.limits.quota_freeze_threshold))
         logger.warning("quota-signature adapter failure %d/%d", self._quota_failures, threshold)
         if self._quota_failures >= threshold:
-            self._set_frozen(True, "quota")
+            now = self._wall()
+            until = quota_resets_at(detail, now) or now + self._quota_retry_seconds()
+            self._set_frozen(True, "quota", until)
             self.stats.last_error = "auto-frozen: adapter quota exhausted"
-            await self.send(format_message(Envelope(
-                type=MessageType.STATUS, to="*", intent="FROZEN", ref="quota",
-                rev=_local_revision())), allow_when_frozen=True)
+            await self.send(self._frozen_notice(), allow_when_frozen=True)
+
+    def _track_peer_freeze(self, envelope: Envelope, event: ChannelEvent) -> None:
+        """Remember which peers said they are frozen, so turns can route around them."""
+        if not event.author_is_bot:
+            return
+        kind, intent = envelope.type, (envelope.intent or "").upper()
+        alias = self._alias_for(event)
+        if kind == MessageType.STATUS and intent == "FROZEN":
+            ttl = parse_ttl(envelope.ttl)
+            self._peers_frozen[alias] = {"ref": envelope.ref,
+                                         "until": self._wall() + ttl if ttl else None}
+        elif (kind == MessageType.STATUS and intent == "RESUMED") or \
+                (kind == MessageType.HELLO and intent == "ONLINE"):
+            # A restarted peer that is still frozen says FROZEN again right after ONLINE.
+            if self._peers_frozen.pop(alias, None) is None:
+                return
+        else:
+            return
+        save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
+
+    def frozen_peers(self) -> Dict[str, Dict[str, Any]]:
+        """Peers frozen now (ones whose freeze has ended are dropped)."""
+        now = self._wall()
+        return {alias: dict(entry) for alias, entry in self._peers_frozen.items()
+                if entry.get("until") is None or float(entry["until"]) > now}
+
+    def _frozen_peers_note(self) -> str:
+        """A line for every turn naming the frozen peers, so work is not handed to them."""
+        peers = self.frozen_peers()
+        if not peers:
+            return ""
+        parts = []
+        for alias, entry in sorted(peers.items()):
+            why = {"quota": "quota ran out", "pause": "paused"}.get(
+                str(entry.get("ref") or ""), "frozen")
+            until = describe_until(entry.get("until"))
+            parts.append(f"{alias} ({why}{', ' + until if until else ''})")
+        return (f"\n\n[Frozen peers take no work until they resume: {'; '.join(parts)}. "
+                "Give their part to another peer; if no one else can do it, tell the admin.]")
 
     # Machine-class envelope kinds recorded as state without waking the adapter (token
     # economy, issue #43). REQUEST/RESPONSE/BLOCKED are never machine-class.
@@ -1536,6 +1756,10 @@ class AgentChannel:
                 await self.check_stalled_handoffs()
             except Exception:                              # noqa: BLE001 - a tick must never die silently
                 logger.exception("hand-off check failed")
+            try:
+                await self._lift_expired_freeze()
+            except Exception:                              # noqa: BLE001 - a tick must never die silently
+                logger.exception("freeze expiry check failed")
 
     # -- durable-plane fallback --------------------------------------------------------
     def _gitbus_root(self) -> Path:
@@ -1748,6 +1972,21 @@ class AgentChannel:
                          event.chat_id, event.thread_id, blocked)
             return None
 
+        # Issue #29: a reply that arrives as ↪ (k/n) parts is one message. The parts are held
+        # until the rest are here, then the one turn runs with the whole message — never a turn
+        # per fragment, and never an answer to a third of a brief.
+        held, split = await self._absorb_split(event)
+        if held:
+            self.stats.ignored += 1
+            return None
+        if split is not None:
+            # The turn runs from part 1, whichever part completed the reply (#29 QA): part 1 is
+            # the message the sender wrote, so its id, its reply target and its raw message are
+            # the ones the answer goes back to. Out-of-order parts lose none of that.
+            event = split.event or event
+            event.text = split.joined()
+            event.reassembled = True
+
         # Every message that names its topic teaches the name, addressed to us or not.
         if event.thread_id is not None:
             self.topics.remember(event.chat_id, event.thread_id, event.topic_name,
@@ -1791,6 +2030,7 @@ class AgentChannel:
                     event.author_is_bot, (event.text[:120] if event.text else "<no text>"))
 
         envelope, _body = parse_message(event.text or "")
+        self._track_peer_freeze(envelope, event)
         if in_home_channel:
             self.selftest.observe(envelope, event)
             if await self._handle_roster(envelope, event):
@@ -1841,19 +2081,34 @@ class AgentChannel:
             return None
         if pause_reply is not None:
             self.stats.handled += 1
-            return await self.send(pause_reply, reply_to_message_id=event.message_id,
+            sent = await self.send(pause_reply, reply_to_message_id=event.message_id,
                                    chat_id=event.chat_id, thread_id=event.thread_id,
                                    allow_when_frozen=True)
+            if self._announce_resumed:              # /resume ended a quota freeze
+                self._announce_resumed = False
+                await self.send(self._resumed_notice("the admin resumed it"),
+                                allow_when_frozen=True)
+            return sent
 
+        if self._frozen:
+            await self._lift_expired_freeze()
         if self._frozen or self._pause_pending:
+            if self._may_start_turns(event):
+                await self._look_up_models(event)
             command_reply = (self._handle_command(event)
                              if self._may_start_turns(event) else None)
             if command_reply is not None:
                 self.stats.handled += 1
-                return await self.send(command_reply, reply_to_message_id=event.message_id,
+                sent = await self.send(command_reply, reply_to_message_id=event.message_id,
                                        chat_id=event.chat_id, thread_id=event.thread_id,
-                                   allow_when_frozen=True)
+                                       allow_when_frozen=True)
+                if self._announce_resumed:          # a /model switch lifted a quota freeze
+                    self._announce_resumed = False
+                    await self.send(self._resumed_notice("switched to another model"),
+                                    allow_when_frozen=True)
+                return sent
             logger.info("routing decision: respond=False (reason: transport frozen)")
+            await self._tell_frozen(event)
             self.stats.ignored += 1
             return None
 
@@ -1861,7 +2116,11 @@ class AgentChannel:
         logger.info("routing decision: respond=%s (reason: %s)", decision, reason)
         if decision and event.message_id is not None:
             self._tg_admitted.append((int(event.chat_id), int(event.message_id)))
-            save_state(self._admitted_path, {"ids": [list(p) for p in self._tg_admitted]},
+            if event.author_username:
+                self._tg_admitted_by.append((int(event.message_id),
+                                             str(event.author_username).lstrip("@").lower()))
+            save_state(self._admitted_path, {"ids": [list(p) for p in self._tg_admitted],
+                                             "by": [list(p) for p in self._tg_admitted_by]},
                        "handled Telegram messages")
         if not decision:
             self.stats.ignored += 1
@@ -1886,6 +2145,7 @@ class AgentChannel:
                                    allow_when_frozen=True)
 
         # §6: /ping /status /diag are transport-level liveness — answered without a runtime turn.
+        await self._look_up_models(event)
         command_reply = self._handle_command(event)
         if command_reply is not None:
             self.stats.handled += 1
@@ -2003,6 +2263,7 @@ class AgentChannel:
         text = recap + text
         if not event.author_is_bot and not is_admin_dm:     # peers can't see a DM
             text += self._waiting_note(event.text)
+        text += self._frozen_peers_note()
         if not event.self_task and asks_for_topic(event.text or ""):
             text += f"\n\n{TOPIC_ASKED_NOTE}"
         incoming = IncomingMessage(
@@ -2022,6 +2283,7 @@ class AgentChannel:
             general_is_for_setup=self._work_moves_to_topics(event),
             role_brief=self._role_brief(),
             fresh_text=self._fresh_text(event, text[len(recap):]),
+            reassembled=event.reassembled,
         )
 
         try:
@@ -2157,6 +2419,7 @@ class AgentChannel:
         alias = self.config.identity.alias
         if command == "resume":
             was = self._frozen or self._pause_pending
+            self._announce_resumed = self._freeze_ref == "quota"     # peers route around it
             self._pause_pending = False
             self._set_frozen(False, None)
             return f"▶ {alias} resumed." if was else f"▶ {alias} was not paused."
@@ -2720,7 +2983,10 @@ class AgentChannel:
             known = self._topic_for_refs(f"{event.text or ''}\n{body}")
             if known is not None:
                 return await self._post_in_known_topic(event, body, known)
-            if not event.author_is_bot or hands_off:
+            if (not event.author_is_bot or hands_off) and not _is_bus_echo(event):
+                # A bus echo is a step in work that is already going on somewhere: a fresh
+                # topic for the answer to it starts that work over without its context
+                # (round 2 export: three topics opened this way).
                 # A person's request is a new work item: it gets its own topic, and so does a
                 # hand-off (the export of a live test showed short hand-offs staying in
                 # General). Otherwise, between bots a topic is opened on purpose (NEW_TOPIC),
@@ -2834,15 +3100,51 @@ class AgentChannel:
 
     def _learn_topic_refs(self, chat_id: int, thread_id: int, text: str) -> None:
         """Remember which topic first talked about each issue or PR (any bot's topic: every
-        transport sees the group), so later work on it goes there, not to a new topic."""
+        transport sees the group), so later work on it goes there, not to a new topic.
+        An entry not seen for REF_TOPIC_SECONDS is let go: the item has moved on."""
+        now = time.time()
+        changed = False
+        topic = (int(chat_id), int(thread_id))
         for ref in issue_refs(text):
-            self._ref_topics.setdefault(ref, (chat_id, thread_id))
+            known = self._ref_topics.get(ref)
+            if known is None or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS:
+                self._ref_topics[ref] = topic
+                changed = True
+            elif known != topic:
+                continue
+            elif now - self._ref_seen.get(ref, now) >= 3600:
+                changed = True                  # on disk at most hourly per item
+            self._ref_seen[ref] = now
+        if changed:
+            self._save_ref_topics()
 
     def _topic_for_refs(self, text: str) -> Optional[Tuple[int, int]]:
+        now = time.time()
         for ref in issue_refs(text):
-            if ref in self._ref_topics:
+            if ref in self._ref_topics \
+                    and now - self._ref_seen.get(ref, now) < REF_TOPIC_SECONDS:
                 return self._ref_topics[ref]
         return None
+
+    def topic_for_text(self, text: str) -> Optional[Tuple[int, int]]:
+        """The topic already about an issue or PR *text* names, if any (poll.py: a bus reply
+        is posted there rather than in General)."""
+        return self._topic_for_refs(text)
+
+    def _forget_topic_refs(self, chat_id: Optional[int], thread_id: Optional[int]) -> None:
+        """A topic was closed or deleted: work on its items no longer goes there."""
+        gone = [ref for ref, topic in self._ref_topics.items()
+                if topic == (chat_id, thread_id)]
+        for ref in gone:
+            del self._ref_topics[ref]
+            self._ref_seen.pop(ref, None)
+        if gone:
+            self._save_ref_topics()
+
+    def _save_ref_topics(self) -> None:
+        save_state(self._refs_path, {"refs": {
+            ref: [chat, thread, self._ref_seen.get(ref, time.time())]
+            for ref, (chat, thread) in self._ref_topics.items()}}, "issue topics")
 
     async def _post_in_known_topic(self, event: ChannelEvent, body: str,
                                    topic: Tuple[int, int]) -> Any:
@@ -2873,10 +3175,21 @@ class AgentChannel:
         ``moved``: the brief is this agent's reply to work started in General, posted in the
         new topic instead; it already is the work, so nothing more is run."""
         home = self.config.identity.home_channel_id
+        if not moved:
+            # A topic already about the same issue or PR takes the work (round 2 export:
+            # "PR #37 re-review" was opened while a topic about #37 existed).
+            known = self._topic_for_refs(f"{title}\n{brief}")
+            if known is not None:
+                return await self._continue_in_topic(event, brief, known)
         now = self._clock()
         self._topics_opened = [t for t in self._topics_opened if now - t < 3600]
         reason = ""
         thread_id: Optional[int] = None
+        refs = issue_refs(f"{title}\n{event.text or ''}\n{brief}" if moved else title)
+        if moved and refs and refs[0] not in title:
+            # Named after the item, not the first words of the message (round 2 export:
+            # "Copy — QA ready for 34").
+            title = f"{refs[0]} {title}"
         name = topic_name(self.config.identity.alias, title)
         if len(self._topics_opened) >= MAX_TOPICS_PER_HOUR:
             reason = f"{MAX_TOPICS_PER_HOUR} topics opened in the last hour already"
@@ -2929,6 +3242,26 @@ class AgentChannel:
             # Not addressed to a peer: the brief is this agent's own task, in the new topic.
             # A peer named further down (to confirm scope, say) still sees the brief.
             self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", home, thread_id, name)
+        return sent
+
+    async def _continue_in_topic(self, event: ChannelEvent, brief: str,
+                                 topic: Tuple[int, int]) -> Any:
+        """NEW_TOPIC for an item a topic is already about: the brief goes there instead."""
+        chat_id, thread_id = topic
+        here = (int(event.chat_id), event.thread_id) == (chat_id, thread_id)
+        logger.info("not opening a topic: topic %s is already about the same item", thread_id)
+        sent = await self.send(brief, chat_id=chat_id, thread_id=thread_id)
+        self._log_topic(chat_id, thread_id, self.config.identity.alias, brief,
+                        self.last_first_message_id)
+        self._mirror_handoffs(brief, chat_id, thread_id, self.last_first_message_id,
+                              asker=self._asker(event))
+        if not here:
+            sent = await self.send(
+                f"↪ continued in {topic_link(chat_id, thread_id)}, already about this item",
+                chat_id=event.chat_id, thread_id=event.thread_id)
+        if not hands_over(brief, self._peer_handle()):
+            self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", chat_id, thread_id,
+                               self.topics.name(chat_id, thread_id))
         return sent
 
     def assigned_peers(self, text: str) -> List[str]:
@@ -3088,10 +3421,34 @@ class AgentChannel:
         if minutes <= 0 or not self._pending_handoffs:
             return
         now, wait = self._clock(), minutes * 60.0
+        frozen = self.frozen_peers()
+        # Only the coordinator nudges a peer (round 2: every bot reminded every other one).
+        # A swarm with no known coordinator (a hand-written setup) keeps the old behaviour.
+        coordinator = self.membership.state.coordinator
+        may_nudge = coordinator is None or self.membership.is_coordinator()
         for key, entry in list(self._pending_handoffs.items()):
             chat_id, thread_id, alias = key
             handle = str(self.config.peers.get(alias, alias)).lstrip("@")
             age = now - float(entry["at"])
+            if alias in frozen:
+                # A frozen peer cannot answer: no reminder, no "may be stopped" notice; the
+                # work goes back to the bot that handed it over at once (live run: the
+                # coordinator kept pinging a bot frozen on quota).
+                self._pending_handoffs.pop(key, None)
+                logger.info("hand-off to %s in %s: it is frozen; handing the work back",
+                            alias, thread_id or "General")
+                self._run_own_task(FROZEN_REASSIGN_NOTE.format(alias=alias),
+                                   chat_id, thread_id, self.topics.name(chat_id, thread_id))
+                continue
+            if not may_nudge:
+                if age >= 2 * wait:
+                    self._pending_handoffs.pop(key, None)
+                    logger.info("hand-off to %s in %s unanswered after %.0f min; deciding "
+                                "without a nudge (only the coordinator nudges)",
+                                alias, thread_id or "General", age / 60)
+                    self._run_own_task(REASSIGN_NOTE.format(alias=alias, minutes=round(age / 60)),
+                                       chat_id, thread_id, self.topics.name(chat_id, thread_id))
+                continue
             if not entry["nudged"] and age >= wait:
                 entry["nudged"] = True
                 logger.warning("hand-off to %s in %s has had no answer for %.0f min: reminding",
@@ -3120,7 +3477,7 @@ class AgentChannel:
         """The peer bot a reply answers, if a bot asked."""
         return event.author_username if event.author_is_bot else None
 
-    def took_telegram_copy(self, ref: Any) -> bool:
+    def took_telegram_copy(self, ref: Any, sender: Optional[str] = None) -> bool:
         """Whether this bot already ran (or queued) the Telegram message a bus mirror names.
 
         Issue #22: a mirror names a topic token rather than a chat id. An un-resolvable token
@@ -3136,6 +3493,18 @@ class AgentChannel:
         except (KeyError, TypeError, ValueError):
             return False
         token = ref.get("topic")
+        if sender and "chat" not in ref and (
+                not isinstance(token, str) or not token or token.startswith("topic:hmac-")):
+            # No token this bot can resolve (no shared secret): the message the mirror names
+            # was taken here if this bot took that message id from the mirror's sender.
+            # Message ids repeat only across chats, and the same bot posting the same id in
+            # two chats this bot also reads, both within the ledger, is not a real case.
+            target = self.config.peers.get(sender)
+            if target is None:
+                target = next((t for a, t in self.config.peers.items()
+                               if a.lower() == sender.lower()), sender)
+            handle = str(target).lstrip("@").lower()
+            return (message_id, handle) in self._tg_admitted_by
         if isinstance(token, str) and token:
             from swarmly.telegram.redact import resolve_topic_token
             import os
@@ -3394,11 +3763,20 @@ class AgentChannel:
         the envelope header and the peer addressing and ends with ``(1/n)``; later parts start
         with ``↪ (k/n)``, which receiving transports treat as a continuation, never a new
         turn. Text that still remains after the last part is clamped as before.
+
+        The pieces are exact slices of *text* -- the whitespace a cut falls on stays at the end
+        of the piece before it -- so the receiving transport reassembles the original message
+        character for character (:func:`split_part`, ``AgentChannel._absorb_split``, issue #29).
         """
-        max_parts = max(int(getattr(self.config.limits, "max_reply_parts", 1) or 1), 1)
+        max_parts = min(max(int(getattr(self.config.limits, "max_reply_parts", 1) or 1), 1),
+                        MAX_SPLIT_PARTS)
         if max_parts == 1 or self._fits(text):
             return [text]
-        worst = f"{max_parts}/{max_parts}"
+        # One token per reply: it is what the receiver joins the parts on, so two replies by one
+        # sender can never be joined into one mixed message (#29 review, #29 QA). It rides inside
+        # the marker, which is part of what the cut has to leave room for.
+        ref = secrets.token_hex(3)
+        worst = f"{max_parts}/{max_parts} #{ref}"
         head_room, tail_room = f"\n\n({worst})", f"↪ ({worst}) "
         pieces: List[str] = []
         rest = text
@@ -3408,15 +3786,16 @@ class AgentChannel:
                 break
             cut = self._split_point(rest, lambda p: self._fits(
                 (p + head_room) if first else (tail_room + p)))
-            pieces.append(rest[:cut].rstrip())
-            rest = rest[cut:].lstrip("\n")
+            pieces.append(rest[:cut])
+            rest = rest[cut:]
         if rest.strip():
             pieces.append(rest)
         if len(pieces) == 1:
             return pieces
         total = len(pieces)
-        parts = [f"{pieces[0]}\n\n(1/{total})"]
-        parts += [f"↪ ({index}/{total}) {piece}" for index, piece in enumerate(pieces[1:], 2)]
+        parts = [f"{pieces[0]}\n\n(1/{total} #{ref})"]
+        parts += [f"↪ ({index}/{total} #{ref}) {piece}"
+                  for index, piece in enumerate(pieces[1:], 2)]
         return parts
 
     def _fits(self, text: str) -> bool:
@@ -3461,6 +3840,202 @@ class AgentChannel:
                                  project=project.key if project is not None else None)
             except Exception:                              # a send never fails over a watch
                 logger.warning("could not watch %s#%s for CI", repo, number, exc_info=True)
+
+    # ----------------------------------------------------------------------------------
+    # Split replies (issue #29)
+    # ----------------------------------------------------------------------------------
+    @staticmethod
+    def _split_key(event: ChannelEvent, ref: str) -> Tuple[Any, ...]:
+        """Which reply a part belongs to: one sender, in one chat and discussion, and the
+        reply's own correlation token. The token is part of the key, so two replies by one
+        sender that interleave are held apart and each comes out whole (#29 review)."""
+        return (event.chat_id, event.thread_id, event.author_id,
+                (event.author_username or "").lower(), ref)
+
+    async def _absorb_split(self, event: ChannelEvent) -> Tuple[bool, Optional[_PendingSplit]]:
+        """Hold the parts of a split reply until the whole message is here, then join it.
+
+        Returns ``(held, split)``: ``held`` means the part was stored and this event must not
+        run a turn; ``split`` holds every part (and part 1's event) when the last missing part
+        arrived, for the caller to run the one turn from part 1. Parts are matched by index, so
+        they may arrive out of order; a reply whose parts never all arrive is delivered as what
+        did arrive, with a note naming the missing ones (``_flush_split``), never silently
+        dropped and never answered twice.
+
+        Parts are only ever joined when the sender's marker carries the reply's own token, and
+        a token names exactly one reply: what is held is that reply, and nothing else can be
+        joined to it. Without a token a part cannot be attributed at all — ``A1, B2, B1, A2``
+        from one sender (two replies, same total, no tokens) is indistinguishable from one
+        reply arriving out of order, and joining it puts two messages into one turn (#29 QA).
+        So a sender that writes no token (an older transport) is not joined: its part 1 runs
+        its turn as it did before #29, and its continuations stay continuations, which start no
+        turn. Bounded, so a stranger cannot make the transport hold parts that never complete.
+        """
+        if not event.author_is_bot or not event.text or not self._may_reassemble(event):
+            return False, None
+        if event.reassembled:
+            # A reply this transport already joined goes on through the inbound path; its text
+            # is the sender's whole message, not another part to hold (#29 QA).
+            return False, None
+        part = split_part(event.text)
+        if part is None:
+            # Not a part at all: nothing to hold. A reply held past its window still goes out
+            # here, so an unrelated message is enough to sweep a dead buffer.
+            await self._flush_expired_splits()
+            return False, None
+        if not part.ref:
+            # No token, no attribution: joining a tokenless part is a guess, and the guess
+            # mixes two interleaved replies into one turn (A1, B2, B1, A2 — #29 QA). Such a
+            # part is left to the rest of the inbound path, where part 1 is an ordinary
+            # message and a continuation is filtered out and starts no turn.
+            return False, None
+        index, total, body = part.index, part.total, part.body
+        key = self._split_key(event, part.ref)
+        # The buffer is claimed before this part awaits anything, and the part goes into it with
+        # no await in between: delivering a held reply awaits a turn, and another part can
+        # arrive while that runs, but it joins this state instead of opening a rival one that
+        # would later be overwritten and lose the reply (#29 review).
+        pending = await self._claim_split(key, total, index, body)
+        if index in pending.bodies:
+            return True, None                       # a repeated part: nothing new to add
+        pending.bodies[index] = body
+        pending.events[index] = event
+        if pending.missing():
+            logger.info("%s: holding part %d/%d of a split reply from @%s (%d/%d arrived)",
+                        self.config.identity.alias, index, total,
+                        event.author_username or "unknown", len(pending.bodies), total)
+            # A reply past its window goes out as what arrived; this one is not, so it is kept
+            # out of the sweep however long the delivery of another reply takes.
+            await self._flush_expired_splits(keep=key)
+            return True, None
+        self._split_pending.pop(key, None)
+        pending.disarm()
+        logger.info("%s: reassembled a %d-part reply from @%s", self.config.identity.alias,
+                    total, event.author_username or "unknown")
+        return False, pending
+
+    async def _claim_split(self, key: Tuple[Any, ...], total: int, index: int,
+                           body: str) -> _PendingSplit:
+        """The buffer this part belongs to, claimed before the caller awaits anything.
+
+        When the map has room the state is created and stored with no await at all, so a part
+        that arrives while this coroutine is suspended elsewhere can only join it, never be
+        replaced by a fresh buffer holding half the reply (#29 review). Only when something
+        must be delivered to make room, or a held reply the sender contradicted (or that has
+        waited out its window) must go out first, does this await — and it then re-reads the
+        map and joins whatever is there, the delivery's own awaits included.
+        """
+        while True:
+            pending = self._split_pending.get(key)
+            if pending is not None:
+                if self._split_expired(pending):
+                    # Parts came too late to be joined: what arrived goes out now, and this
+                    # part opens the next buffer rather than reviving a dead reply.
+                    await self._drop_split(key, pending)
+                    continue                         # re-read: that delivery awaited
+                if pending.accepts(index, total, body):
+                    return pending
+                # The same token naming a different total, or different text at an index
+                # already held: the sender contradicted itself, so these parts are not one
+                # message. What is held goes out now and this part opens the next buffer —
+                # never joined.
+                await self._drop_split(key, pending)
+                continue                             # re-read: that delivery awaited
+            if self._split_pending and len(self._split_pending) >= MAX_PENDING_SPLITS:
+                await self._evict_oldest_split()
+                continue                             # re-read: the eviction awaited as well
+            # A later part can arrive first; it is held the same way, and the turn (when it
+            # runs, or when the window closes) takes the earliest part's chat and topic.
+            pending = _PendingSplit(total=total, opened=self._clock())
+            self._split_pending[key] = pending
+            self._arm_split_timeout(key, pending)
+            return pending
+
+    def _split_expired(self, pending: _PendingSplit) -> bool:
+        """Whether a held reply has waited out ``SPLIT_TIMEOUT_SECONDS`` for its missing parts."""
+        return self._clock() - pending.opened >= SPLIT_TIMEOUT_SECONDS
+
+    def _may_reassemble(self, event: ChannelEvent) -> bool:
+        """Whether a bot's split reply is worth holding parts for.
+
+        Under ``limits.strangers: ignore`` a bot this transport does not know gets no turn, so
+        it gets no buffer and no timer either: otherwise 100 numbered fragments would leave 100
+        live timers behind and change nothing (#29 review). With ``strangers: answer`` any bot
+        may be answered, so any bot's reply may be joined."""
+        if getattr(self.config.limits, "strangers", "ignore") != "ignore":
+            return True
+        return self.roster.knows(event.author_username)
+
+    def _arm_split_timeout(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
+        """Deliver what arrived if the rest of a held reply does not come."""
+
+        async def expire() -> None:
+            await asyncio.sleep(SPLIT_TIMEOUT_SECONDS)
+            await self._flush_split(key, pending)
+
+        task = asyncio.create_task(expire())
+        pending.timer = task
+        self._split_tasks.add(task)
+        task.add_done_callback(self._split_tasks.discard)
+
+    async def _flush_expired_splits(self, keep: Optional[Tuple[Any, ...]] = None) -> None:
+        """Deliver the held parts of replies that have waited out ``SPLIT_TIMEOUT_SECONDS``,
+        except the one under *keep*: the reply the caller is in the middle of taking a part
+        for is not swept even if the delivery of another reply takes longer than the window."""
+        if not self._split_pending:
+            return
+        now = self._clock()
+        for key, pending in list(self._split_pending.items()):
+            if key == keep:
+                continue
+            if now - pending.opened >= SPLIT_TIMEOUT_SECONDS:
+                await self._flush_split(key, pending)
+
+    async def _drop_split(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
+        """Forget a held reply, stop its timer, and deliver what arrived."""
+        if self._split_pending.get(key) is pending:
+            self._split_pending.pop(key, None)
+        pending.disarm()
+        await self._deliver_split(pending)
+
+    async def _evict_oldest_split(self) -> None:
+        """Make room for a new reply: the oldest held one goes out as what arrived, so the
+        buffer count and the live timer count stay bounded however many senders split."""
+        if not self._split_pending:
+            return                                   # pragma: no cover - guarded by the caller
+        key, pending = min(self._split_pending.items(), key=lambda item: item[1].opened)
+        await self._drop_split(key, pending)
+
+    async def _flush_split(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
+        """Deliver a held reply as what arrived. The first caller wins, so the timer and the
+        sweep cannot both run the turn."""
+        if self._split_pending.get(key) is not pending:
+            pending.disarm()
+            return
+        await self._drop_split(key, pending)
+
+    async def _deliver_split(self, pending: _PendingSplit) -> None:
+        """Run the one turn for what arrived of a reply, saying which parts are missing."""
+        event = pending.event
+        if event is None or not pending.bodies:
+            return
+        text = pending.joined()
+        if pending.missing():
+            logger.warning("%s: a %d-part reply from @%s is missing part(s) %s; delivering "
+                           "what arrived", self.config.identity.alias, pending.total,
+                           event.author_username or "unknown",
+                           ", ".join(str(i) for i in pending.missing()))
+            text += pending.note()
+        if 1 not in pending.bodies:
+            # Nothing arrived but the sender's later parts: that is a fragment, not a message.
+            # Keeping its marker means the rest of the inbound path still recognises it as the
+            # continuation of a reply whose first part never came, so it can start no turn
+            # (#29 QA) — the alternative is a third of a brief answered as a brief.
+            text = f"↪ ({min(pending.bodies)}/{pending.total}) {text}"
+        event.text = text
+        event.reassembled = True
+        # It runs the rest of the inbound path, so it is one turn with one message.
+        await self.handle_event(event)
 
     async def send(self, text: Union[str, Callable[[], Optional[str]]],
                    reply_to_message_id: Optional[int] = None,
@@ -3631,6 +4206,7 @@ class AgentChannel:
                            "; posting in General" if self.reroute_gone_topics else "")
             self.stats.errors += 1      # not last_error: the reply still lands, no blocker
             self._gone_topics.add((destination, thread_id))
+            self._forget_topic_refs(destination, thread_id)
             if self._turn_slots is not None or not self.reroute_gone_topics:
                 raise
         return await self._post_in_general(payload, entities, plain, destination, thread_id,
@@ -4064,6 +4640,16 @@ ATTACHMENTS_DIRNAME = ".a2a-attachments"
 GROUP_MESSAGES_PER_MINUTE = 18
 #: How long a bot left waiting by a person's multi-bot message expects the hand-off.
 HANDOFF_NOTE_SECONDS = 1800.0
+# How long a topic stays the place for an issue or PR nobody mentions there any more.
+REF_TOPIC_SECONDS = 7 * 24 * 3600.0
+
+
+def _is_bus_echo(event: "ChannelEvent") -> bool:
+    """A peer's answer to bus mail, as poll.py posts it ("[gitbus ← sender] ...")."""
+    return bool(event.author_is_bot) and _BUS_ECHO.match(event.text or "") is not None
+
+
+_BUS_ECHO = re.compile(r"^\s*(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\]\s*)?\[gitbus \u2190 ")
 #: Progress a topic's bot-turn cap resets on (see ``_note_progress``).
 _COMMIT_LINK = re.compile(r"github\.com/[\w.-]+/[\w.-]+/commit/([0-9a-f]{7,40})")
 #: Run by the bot that handed work to a peer that never answered (check_stalled_handoffs).
@@ -4071,6 +4657,11 @@ REASSIGN_NOTE = ("{alias} has not answered your hand-off in this topic for {minu
                  "has not said it is busy, so it may be down. Decide what happens to the work "
                  "now: hand it to another peer whose role fits, or do it yourself, and say so "
                  "here. If it can wait for {alias}, reply exactly NO_REPLY.")
+#: Run when a hand-off went to a peer that is frozen (quota or pause).
+FROZEN_REASSIGN_NOTE = ("{alias} is frozen and cannot answer your hand-off in this topic. "
+                        "Decide what happens to the work now: hand it to another peer whose "
+                        "role fits, or do it yourself, and say so here. If it can wait until "
+                        "{alias} resumes, say that instead.")
 #: Run after a topic turn hit the time limit in a resumable session.
 CONTINUE_NOTE = ("Your previous turn in this topic hit the time limit and was stopped. Your "
                  "session still holds the work so far: continue the task from where it "
@@ -4137,7 +4728,134 @@ def _current_task_cancelling() -> bool:
 
 # A later part of a split message, as received: optional leading mentions, the sender's
 # "[Alias]" banner, then the "↪ (k/n)" marker that split_outgoing puts on parts 2..n.
-_CONTINUATION_RE = re.compile(r"^(?:@\w+\s+)*(?:\[[^\]\n]{1,64}\]\s*)?↪ \(\d+/\d+\)")
+_CONTINUATION_RE = re.compile(
+    r"^(?:@\w+\s+)*(?:\[[^\]\n]{1,64}\]\s*)?↪ \(\d+/\d+(?: #\w{1,16})?\)")
+
+# --------------------------------------------------------------------------------------
+# Split replies (issue #29): ↪ (k/n) parts are one message at the receiver
+# --------------------------------------------------------------------------------------
+#: Part 1 of a split reply: the reply first, then "(1/n)" appended by ``split_outgoing``. The
+#: optional ``#token`` inside the parentheses correlates the parts of one reply: it is what a
+#: receiver joins on, so two replies by one sender that interleave are never joined into one
+#: mixed message (#29 review), and a part written without one is not joined at all (#29 QA).
+#: The numbers in a header are read with a bounded digit width (``_SPLIT_NUMBER``), never with
+#: ``\d+``: a header carrying a thousand digits is refused by the pattern itself, so no
+#: conversion of the sender's number can be large — and ``int()`` of a very long digit string
+#: is not merely slow, it raises ``ValueError`` on Python 3.11+ (the int-string conversion
+#: limit), which would turn a peer's fragment into an exception in the inbound path (#29
+#: review: cap the total, reject anything above the cap).
+_SPLIT_NUMBER = r"\d{1,3}"
+_SPLIT_FIRST_RE = re.compile(
+    r"^(?P<body>.*)\n\n\(1/(?P<total>" + _SPLIT_NUMBER + r")(?: #(?P<ref>\w{1,16}))?\)[ \t]*\Z",
+    re.S)
+#: Part k > 1: the marker first (after the sender's banner and the @handles that delivered
+#: it), then the reply from where the previous part was cut.
+_SPLIT_PART_RE = re.compile(
+    r"^(?:@\w+[:,]?\s*)*(?:\[[^\]\n]{1,64}\]\s*)?"
+    r"↪ \((?P<index>" + _SPLIT_NUMBER + r")/(?P<total>" + _SPLIT_NUMBER
+    + r")(?: #(?P<ref>\w{1,16}))?\)[ \t]?(?P<body>.*)\Z", re.S)
+#: How long the receiver holds the first part(s) of a split reply for the rest. A whole reply
+#: is a few consecutive posts (seconds apart); longer than this and the rest is not coming.
+SPLIT_TIMEOUT_SECONDS = 30.0
+#: Most replies held at once, one per sender. A new sender's reply evicts the oldest held one
+#: (delivered as what arrived), so neither the buffer map nor the timer set can grow with the
+#: number of bots that post numbered fragments.
+MAX_PENDING_SPLITS = 32
+#: Most parts one reply may claim. This is the number the sender splits into as well
+#: (``config.MAX_REPLY_PARTS``, which ``limits.max_reply_parts`` is clamped to), so whatever one
+#: transport emits, the other reassembles; a header asking for billions of parts is not a reply:
+#: the buffer it would reserve is the sender's instruction, and it is refused rather than
+#: believed.
+MAX_SPLIT_PARTS = MAX_REPLY_PARTS
+
+
+class SplitPart(NamedTuple):
+    """One part of a split reply: where it sits, the text it carries, and its reply's token."""
+
+    index: int
+    total: int
+    body: str
+    ref: Optional[str] = None           # the reply's correlation token, when the sender wrote one
+
+
+def split_part(text: str) -> Optional[SplitPart]:
+    """The part *text* is, else ``None``.
+
+    The cut markers are removed and nothing else is: the sender's banner and delivering
+    @handles stay on part 1 (as on any message), and each later part keeps exactly the text
+    that followed the cut, so the parts concatenate back to the reply that was sent. A part 1
+    whose body is empty is not a split reply, and neither is ``(1/1)``. A total above
+    :data:`MAX_SPLIT_PARTS` is not a split reply either: it is refused as ordinary text, so no
+    header can make the receiver hold parts that will never come. A total written with more
+    than three digits does not even match, so the sender's number is never converted at that
+    size (#29 review).
+    """
+    if not text:
+        return None
+    tail = _SPLIT_PART_RE.match(text)
+    if tail is not None:
+        index, total = int(tail.group("index")), int(tail.group("total"))
+        if 1 < index <= total <= MAX_SPLIT_PARTS:
+            return SplitPart(index, total, tail.group("body"), tail.group("ref"))
+        return None
+    first = _SPLIT_FIRST_RE.match(text)
+    if first is not None:
+        total = int(first.group("total"))
+        body = first.group("body")
+        if 1 < total <= MAX_SPLIT_PARTS and body.strip():
+            return SplitPart(1, total, body, first.group("ref"))
+    return None
+
+
+@dataclass
+class _PendingSplit:
+    """The parts of one split reply that have arrived, and where they came from."""
+
+    total: int
+    bodies: Dict[int, str] = field(default_factory=dict)
+    #: part index -> the event it arrived in: chat, topic, author, message id.
+    events: Dict[int, ChannelEvent] = field(default_factory=dict)
+    opened: float = 0.0                        # clock the first part arrived, for the timeout
+    #: The timeout task holding this reply, so it can be stopped when the reply is delivered.
+    timer: Optional[asyncio.Task] = field(default=None, repr=False, compare=False)
+
+    @property
+    def event(self) -> Optional[ChannelEvent]:
+        """The earliest part's event: the turn runs as if that message had arrived whole."""
+        return self.events[min(self.events)] if self.events else None
+
+    def accepts(self, index: int, total: int, body: str) -> bool:
+        """Whether a part can belong to this reply.
+
+        Parts are held per token, so they are one reply unless the sender contradicts itself: a
+        token that names a different total, or different text at an index already held, is not
+        the same message, and joining it would put two messages into one turn (#29 QA)."""
+        if total != self.total:
+            return False
+        if index == 1:
+            return self.bodies.get(1, body) == body
+        seen = self.bodies.get(index)
+        return seen is None or seen == body
+
+    def disarm(self) -> None:
+        """Stop the timeout. Never cancels the task calling this, so a flush from inside the
+        timer still delivers the reply."""
+        task = self.timer
+        self.timer = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def joined(self) -> str:
+        return "".join(self.bodies[index] for index in sorted(self.bodies))
+
+    def missing(self) -> List[int]:
+        return [index for index in range(1, self.total + 1) if index not in self.bodies]
+
+    def note(self) -> str:
+        """What the turn is told when the rest of the reply never arrived."""
+        missing = ", ".join(str(index) for index in self.missing())
+        return (f"\n\n(parts {missing} of this {self.total}-part reply never arrived; this is "
+                "what did)")
 
 
 #: A pull request link, whose own repository is what the watch uses: a bot may report on a PR

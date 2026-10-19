@@ -171,7 +171,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
             "mirror_handoffs"),
     "fallback": ("gitbus_root", "gitbus_ref", "gitbus_poll_minutes"),
     "projects": ("repo", "cwd", "topics", "worktrees"),
-    "github": ("login", "token_env", "poll_minutes", "mark_read"),
+    "github": ("login", "token_env", "poll_minutes", "mark_read", "tracking_label"),
 }
 
 
@@ -546,6 +546,10 @@ SINGLE_SESSION_ADAPTERS = ("antigravity", "antigravity_thread", "codex_thread")
 #: ``limits.allow_shared_cwd``.
 NO_FILES_ADAPTERS = ("echo",)
 MAX_PARALLEL_TURNS = 8
+#: Most parts one reply may be split into, shared by the sender (`split_outgoing`) and the
+#: receiver's reassembly (`split_part`), so whatever a transport emits, the other accepts. The
+#: default is 4; a larger configured value is clamped here rather than refused at startup.
+MAX_REPLY_PARTS = 20
 
 
 @dataclass
@@ -566,6 +570,7 @@ class ChannelLimits:
     commands_enabled: bool = True                       # v1.1 §6: answer /ping /status /diag without waking the adapter
     auto_freeze_on_quota: bool = True                   # #49: self-freeze after repeated quota-signature adapter failures
     quota_freeze_threshold: int = 3                     # consecutive quota failures before the auto-freeze
+    quota_retry_minutes: float = 60.0                   # a quota freeze whose error gives no reset time ends after this
     overdue_alert_cap: int = 2                          # #49: max overdue alerts per ticket
     overdue_digest_threshold: int = 3                   # #49: one digest alert when this many tickets are open for one recipient
     busy_behavior: str = "queue"                        # addressed msg during an in-flight turn: "queue" (run it next), "drop" (silent) or "notice" (drop, one log line/window)
@@ -619,6 +624,14 @@ class ChannelLimits:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ConfigError(f"limits.{key} must be a whole number of at least 1 "
                                   f"(got {value!r}).")
+        # #29 review: a reply is split into at most MAX_REPLY_PARTS parts, and the receiver
+        # refuses a part header above that. Clamping here keeps the two ends agreeing: a larger
+        # configured value loses the tail to the existing truncation instead of having every
+        # part after the cap ignored by the receiver.
+        if self.max_reply_parts > MAX_REPLY_PARTS:
+            logger.warning("limits.max_reply_parts=%s is above the %s-part protocol cap; using %s",
+                           self.max_reply_parts, MAX_REPLY_PARTS, MAX_REPLY_PARTS)
+            self.max_reply_parts = MAX_REPLY_PARTS
         cap = self.max_peer_turns_per_topic
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
             raise ConfigError("limits.max_peer_turns_per_topic must be a whole number, 0 for "
@@ -736,6 +749,9 @@ class GitHubSettings:
     token_env: str = "GH_TOKEN"
     poll_minutes: int = 5
     mark_read: bool = True
+    #: The label that marks a tracking issue (round end): closing one wakes the coordinator
+    #: to post the round report (issue #25). "" disables the watch.
+    tracking_label: str = "tracking"
 
 
 @dataclass
@@ -1045,11 +1061,13 @@ class AgentConfig:
             gtoken_env = str(github_raw.get("token_env") or "GH_TOKEN").strip()
             gpoll = _parse_int("github.poll_minutes", github_raw.get("poll_minutes"), 5)
             gmark = _parse_bool("github.mark_read", github_raw.get("mark_read", True))
+            glabel = str(github_raw.get("tracking_label", "tracking") or "").strip()
             github = GitHubSettings(
                 login=glogin,
                 token_env=gtoken_env,
                 poll_minutes=gpoll,
                 mark_read=gmark,
+                tracking_label=glabel,
             )
         elif github_raw is not None:
             raise ConfigError("'github' must be a mapping")

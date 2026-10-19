@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from swarmly.github.client import GitHubClient, GitHubError, Notification, PRChecks
 from swarmly.telegram.adapters.base import IncomingMessage
-from swarmly.telegram.config import AgentConfig
+from swarmly.telegram.config import AgentConfig, ProjectSettings
 from swarmly.telegram.projects import ProjectRouter
 from swarmly.telegram.redact import Redactor
 
@@ -69,6 +69,18 @@ class NotificationState:
     #: The notification stays unread and is retried after ``retry_after``, or given up once
     #: ``attempts`` reaches ``MAX_TURN_ATTEMPTS``.
     failures: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: repo -> the issue numbers last seen OPEN carrying ``github.tracking_label``. A number
+    #: that leaves this set as CLOSED is a round that just ended (issue #25): closing is not
+    #: a notification, so the poller has to remember what was open to notice it went away.
+    tracking_open: Dict[str, List[int]] = field(default_factory=dict)
+    #: "repo#number" -> the title of a tracking issue whose closure has not been reported
+    #: yet. A failed report turn leaves the entry queued for a later poll instead of losing
+    #: the round end.
+    pending_reports: Dict[str, str] = field(default_factory=dict)
+    #: "repo#number" -> when the round report was posted for that closure. An issue that
+    #: stays closed wakes the coordinator once, not once per poll; reopening drops the entry
+    #: so a second closure is a second round end.
+    round_reports: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Optional[Path]) -> "NotificationState":
@@ -94,8 +106,30 @@ class NotificationState:
                                                   "retry_after": str(value.get("retry_after") or "")}
                         except (TypeError, ValueError):
                             continue
+            tracking_open: Dict[str, List[int]] = {}
+            raw_tracking = data.get("tracking_open")
+            if isinstance(raw_tracking, dict):
+                for repo, numbers in raw_tracking.items():
+                    if not isinstance(numbers, list):
+                        continue
+                    kept: List[int] = []
+                    for number in numbers:
+                        try:
+                            kept.append(int(number))
+                        except (TypeError, ValueError):
+                            continue
+                    tracking_open[str(repo)] = kept
+            round_reports: Dict[str, str] = {}
+            raw_reports = data.get("round_reports")
+            if isinstance(raw_reports, dict):
+                round_reports = {str(k): str(v) for k, v in raw_reports.items()}
+            pending_reports: Dict[str, str] = {}
+            raw_pending = data.get("pending_reports")
+            if isinstance(raw_pending, dict):
+                pending_reports = {str(k): str(v) for k, v in raw_pending.items()}
             return cls(processed_ids=processed, last_poll=data.get("last_poll"),
-                       failures=failures)
+                       failures=failures, tracking_open=tracking_open,
+                       round_reports=round_reports, pending_reports=pending_reports)
         except Exception as exc:
             logger.warning("could not load notification state from %s: %s", path, exc)
             return cls()
@@ -109,6 +143,9 @@ class NotificationState:
                 "processed_ids": self.processed_ids,
                 "last_poll": self.last_poll or _utc(),
                 "failures": self.failures,
+                "tracking_open": self.tracking_open,
+                "round_reports": self.round_reports,
+                "pending_reports": self.pending_reports,
             }
             tmp = path.with_suffix(f".tmp-{os.getpid()}-{int(time.time())}")
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -358,6 +395,171 @@ class GitHubWatcher:
         self.ci_state = CIWatchState.load(self.ci_state_path)
         self._router: Optional[ProjectRouter] = None
 
+    def _is_coordinator(self) -> bool:
+        """Only the coordinator posts the round report; a developer's watcher stays quiet."""
+        return (self.config.identity.role or "").strip().lower() == "coordinator"
+
+    async def _deliver(self, project: Optional[ProjectSettings], incoming: IncomingMessage,
+                       chat_id: int, thread_id: Optional[int],
+                       router: Optional[ProjectRouter]) -> Any:
+        """Run one GitHub-driven turn in the project's topic and post its answer."""
+        if self.channel is None:                 # the CLI path: no topic to post into
+            return await self._standalone_reply(project, incoming, thread_id, router)
+        adapter = (
+            self.channel._adapter_for(chat_id, thread_id)
+            if hasattr(self.channel, "_adapter_for")
+            else self.channel.adapter
+        )
+        admitted = getattr(self.channel, "admitted", None)
+        if admitted is not None:
+            # The topic's turn lock and a parallel-turn slot, like a chat turn:
+            # never two turns at once in one checkout.
+            async with admitted(chat_id, thread_id):
+                reply = await adapter.respond(incoming)
+        else:
+            reply = await adapter.respond(incoming)
+        if reply and reply.text:
+            await self.channel.send(reply.text, chat_id=chat_id, thread_id=thread_id)
+        return reply
+
+    async def _standalone_reply(self, project: Optional[ProjectSettings],
+                                incoming: IncomingMessage, thread_id: Optional[int],
+                                router: Optional[ProjectRouter]) -> Any:
+        """The same turn with no channel (the CLI path): an adapter for the checkout."""
+        from swarmly.telegram.channel import build_adapter
+        # A CI wake may name no project (the topic is not bound to one): the adapter's own
+        # checkout is then the workdir, as it is for any turn outside a project topic.
+        workdir = (router.workdir_for(project, thread_id or 0)
+                   if project is not None and router is not None else self.config.adapter.cwd)
+        adapter_cfg = dataclasses.replace(self.config.adapter, cwd=str(workdir))
+        cfg = dataclasses.replace(self.config, adapter=adapter_cfg)
+        adapter = build_adapter(cfg, transport=False)
+        try:
+            return await adapter.respond(incoming)
+        finally:
+            await adapter.close()
+
+    async def _wake_on_tracking_close(self, project: ProjectSettings, chat_id: int,
+                                      thread_id: Optional[int], outcome: GitHubPollOutcome,
+                                      router: ProjectRouter) -> None:
+        """Wake the coordinator to post the round report when a tracking issue closes.
+
+        GitHub sends no notification for a closure, so the poller remembers which labelled
+        issues were open and reports a number that is now closed. One report per closure:
+        an issue that stays closed is quiet on the next poll, a reopened-and-closed one is a
+        new round end. A failed turn backs off and is given up loudly, like a notification.
+        """
+        github = self.config.github
+        if not self._is_coordinator() or github is None:
+            return
+        label = (github.tracking_label or "").strip()
+        if not label:
+            return
+        repo = project.repo
+        try:
+            issues = self.client.issues_with_label(repo, label)
+        except GitHubError as exc:
+            # Not "no round ended": a broken gh would silently swallow every round report.
+            outcome.errors.append(f"{repo}: {exc}")
+            return
+
+        open_now = sorted({int(i.number) for i in issues if str(i.state).upper() != "CLOSED"})
+        closed_now = {int(i.number): i for i in issues
+                      if str(i.state).upper() == "CLOSED"}
+        previously_open = set(self.state.tracking_open.get(repo) or [])
+        for number in open_now:
+            # Reopened: the round runs again, so its next closure earns its own report.
+            self.state.round_reports.pop(f"{repo}#{number}", None)
+            self.state.pending_reports.pop(f"{repo}#{number}", None)
+        self.state.tracking_open[repo] = open_now
+
+        # A closure is queued once and stays queued until a report is actually posted, so a
+        # failed turn is retried on a later poll instead of losing the round end.
+        for number in sorted(previously_open & set(closed_now)):
+            report_key = f"{repo}#{number}"
+            if report_key in self.state.round_reports:
+                continue
+            self.state.pending_reports.setdefault(
+                report_key, closed_now[number].title or "(untitled)")
+
+        for report_key in sorted(self.state.pending_reports):
+            repo_key, _, number_text = report_key.rpartition("#")
+            if repo_key != repo:
+                continue
+            number = int(number_text)
+            failure_key = f"tracking:{report_key}"
+            if report_key in self.state.round_reports:
+                self.state.pending_reports.pop(report_key, None)
+                continue
+            if self.state.backing_off(failure_key):
+                logger.debug("round report for %s is backing off after a failed turn",
+                             report_key)
+                outcome.turns_skipped += 1
+                continue
+            title = self.state.pending_reports[report_key] or "(untitled)"
+            turn_text = (
+                f"GitHub tracking issue closed: {repo}#{number} \"{title}\" is CLOSED, so the "
+                f"round is over: post the round report now -- what landed (PRs and merge "
+                f"commits), what is still open, and what the human decides next."
+            )
+            try:
+                from swarmly.telegram.topics import context_block_reason, context_for
+                blocked = context_block_reason(
+                    chat_id, thread_id, self.config.identity.home_channel_id)
+                if blocked:
+                    self.state.pending_reports.pop(report_key, None)
+                    self.state.round_reports[report_key] = _utc()
+                    outcome.errors.append(f"round report for {report_key}: refused: {blocked}")
+                    logger.error("round report for %s refused: %s", report_key, blocked)
+                    continue
+                ctx = context_for(chat_id, thread_id, self.config.identity.home_channel_id)
+                incoming = IncomingMessage(
+                    text=turn_text,
+                    author_alias="GitHub",
+                    context_id=ctx,
+                    project=project.key,
+                    project_repo=repo,
+                )
+                if self.channel is not None:
+                    reply = await self._deliver(project, incoming, chat_id, thread_id, router)
+                else:
+                    reply = await self._standalone_reply(project, incoming, thread_id, router)
+            except Exception as exc:
+                outcome.errors.append(f"round report for {report_key}: {exc}")
+                logger.exception("failed to post the round report for %s: %s", report_key, exc)
+                continue
+
+            if not getattr(reply, "ok", True):
+                failed = str(getattr(reply, "error", "") or "the turn did not complete")
+                attempts = self.state.record_failure(
+                    failure_key, poll_minutes=github.poll_minutes)
+                if attempts >= MAX_TURN_ATTEMPTS:
+                    # Given up loudly, and recorded so one broken round does not retry forever.
+                    self.state.pending_reports.pop(report_key, None)
+                    self.state.round_reports[report_key] = _utc()
+                    outcome.errors.append(
+                        f"round report for {report_key}: gave up after {attempts} failed "
+                        f"turns: {failed}")
+                    logger.error("gave up on the round report for %s after %s failed turns: %s",
+                                 report_key, attempts, failed)
+                else:
+                    outcome.errors.append(
+                        f"round report for {report_key}: turn failed ({failed}); retry "
+                        f"{attempts}/{MAX_TURN_ATTEMPTS}")
+                    logger.warning("round report for %s: turn failed (%s); retry %s/%s",
+                                   report_key, failed, attempts, MAX_TURN_ATTEMPTS)
+                continue
+
+            self.state.clear_failure(failure_key)
+            self.state.pending_reports.pop(report_key, None)
+            self.state.round_reports[report_key] = _utc()
+            outcome.turns_queued += 1
+            outcome.delivered_topics.append((chat_id, thread_id))
+            logger.info("round report queued for %s in %s/%s", report_key, chat_id, thread_id)
+        if len(self.state.round_reports) > 500:
+            for key in list(self.state.round_reports)[:-250]:
+                self.state.round_reports.pop(key, None)
+
     async def poll_once(self) -> GitHubPollOutcome:
         """Execute one polling pass across all configured projects."""
         outcome = GitHubPollOutcome()
@@ -394,6 +596,11 @@ class GitHubWatcher:
             else:
                 chat_id = self.config.identity.home_channel_id or 0
                 thread_id = None
+
+            # A round ends when its tracking issue closes (issue #25). Closing sends no
+            # notification, so the poller watches the labelled open issues and wakes the
+            # coordinator in the project's topic when one goes away.
+            await self._wake_on_tracking_close(project, chat_id, thread_id, outcome, router)
 
             for notif in notifs:
                 if self.state.is_processed(notif.id, notif.updated_at,
@@ -537,33 +744,9 @@ class GitHubWatcher:
             project=getattr(project, "key", None) if project is not None else None,
             project_repo=getattr(project, "repo", None) if project is not None else None,
         )
-        if self.channel is not None:
-            adapter = (
-                self.channel._adapter_for(chat_id, thread_id)
-                if hasattr(self.channel, "_adapter_for")
-                else self.channel.adapter
-            )
-            admitted = getattr(self.channel, "admitted", None)
-            if admitted is not None:
-                async with admitted(chat_id, thread_id):
-                    reply = await adapter.respond(incoming)
-            else:
-                reply = await adapter.respond(incoming)
-            if reply and reply.text:
-                await self.channel.send(reply.text, chat_id=chat_id, thread_id=thread_id)
-            return reply
-
-        from swarmly.telegram.channel import build_adapter
-        workdir = (self._router.workdir_for(project, thread_id or 0)
-                   if project is not None and self._router is not None
-                   else self.config.adapter.cwd)
-        adapter_cfg = dataclasses.replace(self.config.adapter, cwd=str(workdir))
-        cfg = dataclasses.replace(self.config, adapter=adapter_cfg)
-        adapter = build_adapter(cfg, transport=False)
-        try:
-            return await adapter.respond(incoming)
-        finally:
-            await adapter.close()
+        # One delivery path for every GitHub-driven turn (#24, #25): _deliver holds the topic's
+        # turn lock and posts the reply, and the CLI path has no topic to post into.
+        return await self._deliver(project, incoming, chat_id, thread_id, self._router)
 
     async def _poll_ci_watches(self, outcome: GitHubPollOutcome,
                                router: Optional[ProjectRouter] = None) -> None:

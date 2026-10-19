@@ -1081,10 +1081,14 @@ class ChannelTests(unittest.TestCase):
         clock = VirtualClock()
         channel, bot = self.parallel(clock, dead={4}, refuse_text="(the message above")
         limit = channel.config.limits.max_message_chars
-        run(clock.drive(channel.send("x" * (limit - 30) + " word " * (limit // 6),
-                                     chat_id=GROUP, thread_id=4)))
-        self.assertEqual(len(bot.accepted), 2)              # both parts, without the note
-        self.assertIn("(2/2)", bot.accepted[-1]["text"])
+        text = "x" * (limit - 30) + " word " * (limit // 6)
+        run(clock.drive(channel.send(text, chat_id=GROUP, thread_id=4)))
+        # Every part of the split reply went out; only the note about the dead topic failed,
+        # so the part count follows what the split makes of this text (marker width included).
+        self.assertEqual(len(bot.accepted), len(channel.split_outgoing(text)))
+        self.assertGreaterEqual(len(bot.accepted), 2)
+        self.assertRegex(bot.accepted[-1]["text"], r"↪ \(\d+/\d+ #[0-9a-f]{6}\)")
+        self.assertNotIn("the message above", "".join(entry["text"] for entry in bot.accepted))
         self.assertEqual(channel.stats.last_error, "")
 
     def test_flood_waits_do_not_use_up_the_attempts(self):

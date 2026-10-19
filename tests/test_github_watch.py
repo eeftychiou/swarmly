@@ -31,7 +31,7 @@ class FakeAdapter:
         pass
 
 
-def make_test_config(cwd: str, **github_kwargs) -> AgentConfig:
+def make_test_config(cwd: str, role: str | None = None, **github_kwargs) -> AgentConfig:
     data = {
         "agent": {
             "name": "AntigravityBot",
@@ -39,6 +39,7 @@ def make_test_config(cwd: str, **github_kwargs) -> AgentConfig:
             "bot_token": "123:TEST",
             "home_channel_id": -1001234567890,
             "admin_user_id": 99999,
+            **({"role": role} if role else {}),
         },
         "projects": {
             "webapp": {
@@ -526,6 +527,162 @@ class TestBackstopFixes(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reloaded.is_processed("n1"))
         self.assertEqual(len(outcome.errors), 1)
         self.assertIn("gave up", outcome.errors[0])
+
+
+def _tracking(number=34, state="OPEN", title="Round 2 tracking: whole messages"):
+    return Issue(number=number, title=title, body="", author="claude", state=state,
+                 labels=["tracking"])
+
+
+class TestRoundEndReport(unittest.IsolatedAsyncioTestCase):
+    """Issue #25: closing the tracking issue wakes the coordinator to post the round report.
+
+    Closing sends no GitHub notification, so the poller remembers which labelled issues were
+    open and reports the number that is now closed -- once per closure, in the topic bound to
+    the project, and only for the coordinator."""
+
+    def channel(self):
+        ch = MagicMock()
+        ch.adapter = ch._adapter_for.return_value = FakeAdapter()
+        ch.send = AsyncMock()
+        ch.has_recent_ref.return_value = False
+        return ch
+
+    def watcher(self, tmp, client, channel, role="coordinator"):
+        cfg = make_test_config(tmp, role=role)
+        return GitHubWatcher(cfg, client=client, state_path=Path(tmp) / "s.json",
+                             channel=channel)
+
+    def client(self, *states):
+        client = MagicMock(spec=GitHubClient)
+        client.notifications.return_value = []
+        client.issues_with_label.side_effect = [[_tracking(state=s)] for s in states]
+        return client
+
+    async def test_closing_the_tracking_issue_asks_for_the_round_report_now(self):
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED")
+            ch = self.channel()
+            first = await self.watcher(tmp, client, ch).poll_once()
+            second = await self.watcher(tmp, client, ch).poll_once()
+        adapter = ch._adapter_for.return_value
+        self.assertEqual((first.turns_queued, second.turns_queued), (0, 1))
+        self.assertEqual(len(adapter.received), 1)
+        turn = adapter.received[0]
+        self.assertIn("post the round report now", turn.text)
+        self.assertIn("example-org/webapp#34", turn.text)
+        self.assertIn("Round 2 tracking", turn.text)
+        self.assertEqual(turn.project, "webapp")
+        self.assertEqual(turn.context_id, "tg-12")
+        ch.send.assert_called_once()
+        kwargs = ch.send.call_args.kwargs
+        self.assertEqual((kwargs.get("chat_id"), kwargs.get("thread_id")), (-1001234567890, 12))
+        # The label is what marks a tracking issue, and the poll asks for it.
+        client.issues_with_label.assert_called_with("example-org/webapp", "tracking")
+
+    async def test_an_issue_that_stays_closed_reports_once(self):
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED", "CLOSED", "CLOSED")
+            ch = self.channel()
+            for _ in range(4):
+                await self.watcher(tmp, client, ch).poll_once()
+        self.assertEqual(len(ch._adapter_for.return_value.received), 1)
+
+    async def test_an_issue_closed_before_the_first_poll_is_not_reported(self):
+        """A repo's old labelled issues must not each wake the coordinator on the first poll."""
+        with TemporaryDirectory() as tmp:
+            client = self.client("CLOSED")
+            ch = self.channel()
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+        self.assertEqual((outcome.turns_queued, len(ch._adapter_for.return_value.received)),
+                         (0, 0))
+
+    async def test_a_developer_is_not_woken_by_a_closed_tracking_issue(self):
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED")
+            ch = self.channel()
+            await self.watcher(tmp, client, ch, role="developer").poll_once()
+            outcome = await self.watcher(tmp, client, ch, role="developer").poll_once()
+        self.assertEqual(outcome.turns_queued, 0)
+        client.issues_with_label.assert_not_called()
+
+    async def test_a_reopened_tracking_issue_reports_again_when_it_closes(self):
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED", "OPEN", "CLOSED")
+            ch = self.channel()
+            for _ in range(4):
+                await self.watcher(tmp, client, ch).poll_once()
+        self.assertEqual(len(ch._adapter_for.return_value.received), 2)
+
+    async def test_a_recent_mention_in_the_topic_does_not_suppress_the_report(self):
+        """The coordinator closed the issue from a turn in this topic; that is not the report."""
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED")
+            ch = self.channel()
+            ch.has_recent_ref.return_value = True
+            await self.watcher(tmp, client, ch).poll_once()
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+        self.assertEqual(outcome.turns_queued, 1)
+
+    async def test_a_failed_report_turn_is_retried_and_not_recorded_as_posted(self):
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED", "CLOSED")
+            failing = MagicMock()
+            failing.adapter = failing._adapter_for.return_value = MagicMock()
+            failing.adapter.respond = AsyncMock(
+                return_value=AdapterReply(text="", ok=False, error="the runtime exited 1"))
+            failing.send = AsyncMock()
+            failing.has_recent_ref.return_value = False
+            await self.watcher(tmp, client, failing).poll_once()          # still open
+            failed = await self.watcher(tmp, client, failing).poll_once()  # closes: turn fails
+            waiting = await self.watcher(tmp, client, failing).poll_once()  # backed off
+            state = NotificationState.load(Path(tmp) / "s.json")
+        self.assertEqual(failed.turns_queued, 0)
+        self.assertIn("retry 1/", failed.errors[0])
+        # Backed off, so the next poll does not burn another failed turn.
+        self.assertEqual(waiting.turns_skipped, 1)
+        self.assertEqual(state.round_reports, {})
+        self.assertEqual(state.attempts("tracking:example-org/webapp#34"), 1)
+        self.assertEqual(list(state.pending_reports), ["example-org/webapp#34"])
+
+    async def test_a_report_lost_to_a_failed_turn_is_posted_on_a_later_poll(self):
+        """The closure stays queued: a broken runtime must not swallow the round end."""
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED", "CLOSED")
+            failing = self.channel()
+            failing.adapter = failing._adapter_for.return_value = MagicMock()
+            failing.adapter.respond = AsyncMock(
+                return_value=AdapterReply(text="", ok=False, error="the runtime exited 1"))
+            await self.watcher(tmp, client, failing).poll_once()          # still open
+            await self.watcher(tmp, client, failing).poll_once()          # closes: turn fails
+            state = NotificationState.load(Path(tmp) / "s.json")
+            state.failures.clear()                                        # the backoff window passes
+            state.save(Path(tmp) / "s.json")
+            ch = self.channel()
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+            final = NotificationState.load(Path(tmp) / "s.json")
+        self.assertEqual(outcome.turns_queued, 1)
+        self.assertIn("post the round report now", ch._adapter_for.return_value.received[0].text)
+        self.assertEqual(final.pending_reports, {})
+
+    async def test_the_tracking_label_can_be_configured(self):
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.notifications.return_value = []
+            client.issues_with_label.return_value = []
+            cfg = make_test_config(tmp, role="coordinator", tracking_label="round")
+            watcher = GitHubWatcher(cfg, client=client, state_path=Path(tmp) / "s.json",
+                                    channel=self.channel())
+            await watcher.poll_once()
+        client.issues_with_label.assert_called_with("example-org/webapp", "round")
+
+    async def test_an_unreachable_github_is_an_error_not_a_quiet_round_end(self):
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.notifications.return_value = []
+            client.issues_with_label.side_effect = GitHubError("HTTP 401: Bad credentials")
+            outcome = await self.watcher(tmp, client, self.channel()).poll_once()
+        self.assertTrue(any("Bad credentials" in e for e in outcome.errors))
 
 
 class TestAgentGitHubToken(unittest.TestCase):
