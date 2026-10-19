@@ -153,6 +153,15 @@ class RegistryTests(unittest.TestCase):
         self.path.write_text("{not json", encoding="utf-8")
         self.assertEqual(ChildRegistry(self.path).load(), [])
 
+    def test_a_process_without_a_pid_is_quietly_not_recorded(self):
+        """Review of PR #77: an injected runner or a failed spawn has no pid; no traceback."""
+        registry = ChildRegistry(self.path)
+        for pid in (None, "5151", True, 0, -1):
+            registry.add(pid, "agy", identity=lambda value: "t1")
+            registry.remove(pid)
+        self.assertEqual(registry.load(), [])
+        self.assertFalse(self.path.exists())
+
     def test_a_registry_without_a_path_keeps_nothing(self):
         registry = ChildRegistry(None)
         registry.add(CHILD, "agy", identity=lambda pid: "t1")

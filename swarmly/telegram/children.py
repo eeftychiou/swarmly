@@ -144,6 +144,11 @@ class Child:
                    command=str(data.get("command") or "")[:200], recorded=recorded)
 
 
+def _usable_pid(pid: Any) -> bool:
+    """A pid we can record or drop: a positive int, never a bool."""
+    return isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+
+
 class ChildRegistry:
     """The child pids one transport started, in its state directory.
 
@@ -185,9 +190,15 @@ class ChildRegistry:
         except OSError as exc:
             logger.warning("children: could not save the registry to %s: %s", self.path, exc)
 
-    def add(self, pid: int, command: str = "",
+    def add(self, pid: Any, command: str = "",
             identity: Optional[Callable[[int], Optional[str]]] = None) -> None:
-        """Record a just-started child, with the identity of it and of this transport."""
+        """Record a just-started child, with the identity of it and of this transport.
+
+        A process object with no pid (an injected runner in a test, a spawn that failed) is
+        not an error: there is simply nothing to record, so nothing is.
+        """
+        if not _usable_pid(pid):
+            return
         read = identity or process_identity
         child = Child(pid=int(pid), transport_pid=os.getpid(),
                       transport_identity=read(os.getpid()), identity=read(int(pid)),
@@ -196,8 +207,10 @@ class ChildRegistry:
         children.append(child)
         self.save(children)
 
-    def remove(self, pid: int) -> None:
+    def remove(self, pid: Any) -> None:
         """The child exited: forget it (a missing file is not an error)."""
+        if not _usable_pid(pid):
+            return
         children = self.load()
         kept = [c for c in children if c.pid != int(pid)]
         if len(kept) != len(children):
@@ -233,9 +246,9 @@ def reap_orphans(path: Optional[Path], *,
             parent_identity = read(child.transport_pid)
             if (parent_identity is not None and child.transport_identity is not None
                     and parent_identity != child.transport_identity):
-                logger.info("children: transport pid %s was reused by another process; "
-                            "its recorded children are not ours to end",
-                            child.transport_pid)
+                logger.info("children: transport pid %s now belongs to another process, so "
+                            "the one that spawned child %s is gone; treating it as an orphan",
+                            child.transport_pid, child.pid)
             else:
                 keep.append(child)                  # a live transport still reads its child
                 continue
