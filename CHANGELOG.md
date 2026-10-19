@@ -45,6 +45,12 @@ All notable changes to this project are documented here. The format follows
   every other role reports the stall to the coordinator instead of chasing the peer, so a
   stalled agent is not pinged by three bots at once (`#33`).
 
+- `docs/telegram/PROTOCOL.md` and `docs/ROLES.md` say where the line runs: the ACK-less
+  delivery retry (re-send a REQUEST, `/ping` at its `ttl`, mirror to the bus, escalate) belongs
+  to whoever sent that REQUEST, while chasing an owner whose *work* has stalled is the
+  coordinator's alone. `ROLES.md` calls the two role-wide rules "cross-role" and loses a stray
+  blank line (`#55`).
+
 ### Fixed
 
 - A bot whose provider says the quota is gone *and* when it comes back freezes on the first
