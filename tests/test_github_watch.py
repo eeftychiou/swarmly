@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from swarmly.github.client import GitHubClient, GitHubError, Issue, IssueComment, Notification, PR
 from swarmly.github.watch import (MAX_TURN_ATTEMPTS, GitHubWatcher, NotificationState,
-                                  github_poll_once)
+                                  github_poll_once, item_blocker, tracking_item_refs)
 from swarmly.telegram.adapters.base import AdapterReply, IncomingMessage
 from swarmly.telegram.channel import AgentChannel
 from swarmly.telegram.config import AgentConfig
@@ -529,8 +529,8 @@ class TestBackstopFixes(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gave up", outcome.errors[0])
 
 
-def _tracking(number=34, state="OPEN", title="Round 2 tracking: whole messages"):
-    return Issue(number=number, title=title, body="", author="claude", state=state,
+def _tracking(number=34, state="OPEN", title="Round 2 tracking: whole messages", body=""):
+    return Issue(number=number, title=title, body=body, author="claude", state=state,
                  labels=["tracking"])
 
 
@@ -685,7 +685,163 @@ class TestRoundEndReport(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("Bad credentials" in e for e in outcome.errors))
 
 
-class TestAgentGitHubToken(unittest.TestCase):
+class TestARoundEndsOnlyWhenEveryItemIsDone(unittest.IsolatedAsyncioTestCase):
+    """Issue #65: a tracking issue closed with work still open is not a round end.
+
+    Round 2 closed its tracking issue while two items were still open, and the coordinator
+    posted a report over unfinished work. The close is now refused -- no report turn -- and
+    the coordinator is told, once, which items are still open."""
+
+    BODY = "- [x] #65\n- [ ] #68\n- [ ] #71\n"
+
+    def channel(self):
+        ch = MagicMock()
+        ch.adapter = ch._adapter_for.return_value = FakeAdapter()
+        ch.send = AsyncMock()
+        ch.has_recent_ref.return_value = False
+        return ch
+
+    def watcher(self, tmp, client, channel):
+        cfg = make_test_config(tmp, role="coordinator")
+        return GitHubWatcher(cfg, client=client, state_path=Path(tmp) / "s.json",
+                             channel=channel)
+
+    def client(self, *states, body=None, items=None):
+        """A client whose tracking issue closes on the states given, and whose items are
+        the ``items`` map ``{number: ("issue"|"pr", state)}``."""
+        client = MagicMock(spec=GitHubClient)
+        client.notifications.return_value = []
+        client.issues_with_label.side_effect = [
+            [_tracking(state=s, body=self.BODY if body is None else body)] for s in states]
+        items = items or {}
+
+        def issue_view(repo, number):
+            kind, state = items.get(int(number), ("issue", "CLOSED"))
+            if kind == "pr":
+                return None
+            return Issue(number=int(number), title=f"#{number}", body="", author="claude",
+                         state=state)
+
+        def pr_view(repo, number):
+            kind, state = items.get(int(number), ("issue", "CLOSED"))
+            if kind != "pr":
+                return None
+            return PR(number=int(number), title=f"#{number}", body="", author="claude",
+                      state=state)
+
+        client.issue_view.side_effect = issue_view
+        client.pr_view.side_effect = pr_view
+        return client
+
+    async def test_a_close_with_an_open_item_gets_no_report_and_names_the_item(self):
+        items = {65: ("issue", "CLOSED"), 68: ("issue", "OPEN"), 71: ("pr", "MERGED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED", "CLOSED", items=items)
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()          # open
+            closing = await self.watcher(tmp, client, ch).poll_once()  # closes with #68 open
+            again = await self.watcher(tmp, client, ch).poll_once()    # no repeat
+            state = NotificationState.load(Path(tmp) / "s.json")
+        sent = ch._adapter_for.return_value.received
+        self.assertEqual(len(sent), 1)
+        self.assertIn("the round is not over", sent[0].text)
+        self.assertIn("#68 open", sent[0].text)
+        self.assertNotIn("#71", sent[0].text)                       # merged: not a blocker
+        self.assertNotIn("post the round report now", sent[0].text)
+        self.assertEqual((closing.turns_queued, again.turns_queued), (1, 0))
+        self.assertEqual(state.round_reports, {})                   # no round report recorded
+        self.assertEqual(list(state.blocked_reported), ["example-org/webapp#34"])
+
+    async def test_an_unmerged_pull_request_blocks_the_report(self):
+        items = {65: ("issue", "CLOSED"), 68: ("issue", "CLOSED"), 71: ("pr", "OPEN")}
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED", items=items)
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+            await self.watcher(tmp, client, ch).poll_once()
+        text = ch._adapter_for.return_value.received[0].text
+        self.assertIn("#71 open", text)
+        self.assertNotIn("post the round report now", text)
+
+    async def test_a_close_with_every_item_merged_asks_for_the_report_once(self):
+        items = {65: ("issue", "CLOSED"), 68: ("issue", "CLOSED"), 71: ("pr", "MERGED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED", "CLOSED", "CLOSED", items=items)
+            ch = self.channel()
+            for _ in range(4):
+                await self.watcher(tmp, client, ch).poll_once()
+        sent = ch._adapter_for.return_value.received
+        self.assertEqual(len(sent), 1)
+        self.assertIn("post the round report now", sent[0].text)
+        self.assertNotIn("the round is not over", sent[0].text)
+
+    async def test_a_pull_request_closed_without_merging_blocks_the_report(self):
+        """Review of PR #76: gh says CLOSED for a PR that never merged, and that is not done."""
+        items = {65: ("issue", "CLOSED"), 68: ("issue", "CLOSED"), 71: ("pr", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED", items=items)
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+            await self.watcher(tmp, client, ch).poll_once()
+        text = ch._adapter_for.return_value.received[0].text
+        self.assertIn("the round is not over", text)
+        self.assertIn("#71 closed, unmerged", text)
+
+    async def test_an_item_github_cannot_read_counts_as_not_done(self):
+        client = self.client("OPEN", "CLOSED", body="- [x] #65\n")
+        client.issue_view.side_effect = None
+        client.issue_view.return_value = None
+        client.pr_view.return_value = None
+        with TemporaryDirectory() as tmp:
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+            await self.watcher(tmp, client, ch).poll_once()
+        self.assertIn("#65 unchecked", ch._adapter_for.return_value.received[0].text)
+
+    async def test_a_reopen_after_a_refused_close_reports_on_the_next_valid_close(self):
+        open_items = {65: ("issue", "OPEN")}
+        done_items = {65: ("issue", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            ch = self.channel()
+            # closed with #65 open, reopened, then closed with everything merged
+            for state, items in (("OPEN", open_items), ("CLOSED", open_items),
+                                 ("OPEN", done_items), ("CLOSED", done_items)):
+                client = MagicMock(spec=GitHubClient)
+                client.notifications.return_value = []
+                client.issues_with_label.return_value = [_tracking(state=state, body=self.BODY)]
+                client.issue_view.side_effect = lambda repo, number, items=items: Issue(
+                    number=int(number), title="", body="", author="claude",
+                    state=items.get(int(number), ("issue", "CLOSED"))[1])
+                client.pr_view.return_value = None
+                await self.watcher(tmp, client, ch).poll_once()
+        sent = ch._adapter_for.return_value.received
+        self.assertEqual(len(sent), 2)
+        self.assertIn("the round is not over", sent[0].text)
+        self.assertIn("post the round report now", sent[1].text)
+
+
+class TestTrackingItemRefs(unittest.TestCase):
+    def test_the_checklist_is_the_item_list(self):
+        self.assertEqual(tracking_item_refs("- [x] #65\n- [ ] #68\n", own=69), [65, 68])
+
+    def test_without_a_checklist_every_reference_counts(self):
+        self.assertEqual(tracking_item_refs("items: #65, #68 and #71", own=69), [65, 68, 71])
+
+    def test_the_tracking_issue_itself_is_never_an_item(self):
+        self.assertEqual(tracking_item_refs("- [ ] #69\n- [ ] #68\n", own=69), [68])
+
+    def test_a_closed_issue_is_done_but_a_closed_pull_request_is_not(self):
+        # Review of PR #76: a PR closed without merging also reads CLOSED, so the kind decides.
+        self.assertEqual(item_blocker("MERGED"), None)
+        self.assertEqual(item_blocker("CLOSED"), None)                       # an issue
+        self.assertEqual(item_blocker("CLOSED", is_pr=True), "closed, unmerged")
+        self.assertEqual(item_blocker("MERGED", is_pr=True), None)
+        self.assertEqual(item_blocker("OPEN", is_pr=True), "open")
+        self.assertEqual(item_blocker(""), "unchecked")
+        self.assertEqual(item_blocker(None, is_pr=True), "unchecked")
+
+
+
     def test_the_agent_runtime_gets_its_own_token_as_gh_token(self):
         from swarmly.telegram.adapters import build_adapter
         with TemporaryDirectory() as tmp:
