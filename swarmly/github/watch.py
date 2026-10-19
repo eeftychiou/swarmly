@@ -59,6 +59,47 @@ def _utc(now: Optional[float] = None) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+#: A task-list line in a tracking issue body: ``- [ ] #65`` / ``- [x] #68``.
+_CHECKBOX_LINE = re.compile(r"^\s*[-*]\s*\[[ xX]\]\s*(.*)$", re.M)
+_ISSUE_REF = re.compile(r"#(\d+)")
+
+
+def tracking_item_refs(body: str, own: int) -> List[int]:
+    """The issues and PRs a tracking issue lists as its items (issue #65).
+
+    The checklist is the list when the body has one -- a ticked box is not proof, the state
+    of the item it names decides -- and otherwise every ``#N`` in the body counts. The
+    tracking issue's own number never does.
+    """
+    text = body or ""
+    boxes = _CHECKBOX_LINE.findall(text)
+    chunks = boxes if boxes else [text]
+    refs: List[int] = []
+    for chunk in chunks:
+        for match in _ISSUE_REF.finditer(chunk):
+            number = int(match.group(1))
+            if number != int(own) and number not in refs:
+                refs.append(number)
+    return refs
+
+
+def item_blocker(state: Optional[str]) -> Optional[str]:
+    """Why an item's state blocks a round end, or None when it does not.
+
+    Done is ``CLOSED`` for an issue and ``MERGED`` for a pull request -- a closed-but-not-
+    merged PR is work that never landed. A state GitHub could not tell us is treated as
+    *not done*: refusing a report is recoverable, reporting a half-finished round is not.
+    """
+    word = (state or "").upper()
+    if word == "MERGED":
+        return None
+    if word == "CLOSED":
+        return None
+    if not word:
+        return "unchecked"
+    return "open" if word == "OPEN" else word.lower()
+
+
 @dataclass
 class NotificationState:
     """Tracks processed notification IDs and last poll timestamp."""
@@ -81,6 +122,13 @@ class NotificationState:
     #: stays closed wakes the coordinator once, not once per poll; reopening drops the entry
     #: so a second closure is a second round end.
     round_reports: Dict[str, str] = field(default_factory=dict)
+    #: "repo#number" -> the item list of a tracking issue that was closed while some of its
+    #: items were still open or unmerged (issue #65). Such a close is **not** a round end:
+    #: the report is refused and the coordinator is told what is still open, once.
+    blocked_closes: Dict[str, str] = field(default_factory=dict)
+    #: "repo#number" -> when a refused close was reported. Stops a still-closed issue from
+    #: re-announcing its refusal on every poll; a reopen clears it.
+    blocked_reported: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Optional[Path]) -> "NotificationState":
@@ -127,9 +175,18 @@ class NotificationState:
             raw_pending = data.get("pending_reports")
             if isinstance(raw_pending, dict):
                 pending_reports = {str(k): str(v) for k, v in raw_pending.items()}
+            blocked_closes: Dict[str, str] = {}
+            raw_blocked = data.get("blocked_closes")
+            if isinstance(raw_blocked, dict):
+                blocked_closes = {str(k): str(v) for k, v in raw_blocked.items()}
+            blocked_reported: Dict[str, str] = {}
+            raw_reported = data.get("blocked_reported")
+            if isinstance(raw_reported, dict):
+                blocked_reported = {str(k): str(v) for k, v in raw_reported.items()}
             return cls(processed_ids=processed, last_poll=data.get("last_poll"),
                        failures=failures, tracking_open=tracking_open,
-                       round_reports=round_reports, pending_reports=pending_reports)
+                       round_reports=round_reports, pending_reports=pending_reports,
+                       blocked_closes=blocked_closes, blocked_reported=blocked_reported)
         except Exception as exc:
             logger.warning("could not load notification state from %s: %s", path, exc)
             return cls()
@@ -146,6 +203,8 @@ class NotificationState:
                 "tracking_open": self.tracking_open,
                 "round_reports": self.round_reports,
                 "pending_reports": self.pending_reports,
+                "blocked_closes": self.blocked_closes,
+                "blocked_reported": self.blocked_reported,
             }
             tmp = path.with_suffix(f".tmp-{os.getpid()}-{int(time.time())}")
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -439,6 +498,32 @@ class GitHubWatcher:
         finally:
             await adapter.close()
 
+    def _open_items(self, repo: str, issue: Any) -> List[str]:
+        """The items of a tracking issue that still block its close (#65), as ``#12 open``.
+
+        Every item the body lists has its own state read: a pull request has to be *merged*
+        (a closed one never landed), an issue *closed*. Reading it is a `gh` call per item,
+        which is why this runs only when a tracking issue actually closes.
+        """
+        blockers: List[str] = []
+        for number in tracking_item_refs(getattr(issue, "body", "") or "",
+                                         int(getattr(issue, "number", 0) or 0)):
+            state: Optional[str] = None
+            try:
+                pr = self.client.pr_view(repo, number)
+                if pr is not None:
+                    state = str(getattr(pr, "state", "") or "")
+                else:
+                    item = self.client.issue_view(repo, number)
+                    state = str(getattr(item, "state", "") or "") if item is not None else ""
+            except GitHubError as exc:
+                logger.warning("could not read item #%s of %s: %s", number, repo, exc)
+                state = ""
+            reason = item_blocker(state)
+            if reason:
+                blockers.append(f"#{number} {reason}")
+        return blockers
+
     async def _wake_on_tracking_close(self, project: ProjectSettings, chat_id: int,
                                       thread_id: Optional[int], outcome: GitHubPollOutcome,
                                       router: ProjectRouter) -> None:
@@ -469,8 +554,11 @@ class GitHubWatcher:
         previously_open = set(self.state.tracking_open.get(repo) or [])
         for number in open_now:
             # Reopened: the round runs again, so its next closure earns its own report.
-            self.state.round_reports.pop(f"{repo}#{number}", None)
-            self.state.pending_reports.pop(f"{repo}#{number}", None)
+            report_key = f"{repo}#{number}"
+            self.state.round_reports.pop(report_key, None)
+            self.state.pending_reports.pop(report_key, None)
+            self.state.blocked_closes.pop(report_key, None)
+            self.state.blocked_reported.pop(report_key, None)
         self.state.tracking_open[repo] = open_now
 
         # A closure is queued once and stays queued until a report is actually posted, so a
@@ -479,8 +567,19 @@ class GitHubWatcher:
             report_key = f"{repo}#{number}"
             if report_key in self.state.round_reports:
                 continue
-            self.state.pending_reports.setdefault(
-                report_key, closed_now[number].title or "(untitled)")
+            issue = closed_now[number]
+            blockers = self._open_items(repo, issue)
+            if blockers:
+                # Issue #65: a tracking issue closed with work still open is not a round
+                # end. Nothing is reported; the coordinator is told what is missing, once.
+                self.state.blocked_closes[report_key] = ", ".join(blockers)
+                self.state.pending_reports.setdefault(report_key, issue.title or "(untitled)")
+                logger.warning("tracking issue %s closed with items still open: %s",
+                               report_key, ", ".join(blockers))
+                continue
+            self.state.blocked_closes.pop(report_key, None)
+            self.state.blocked_reported.pop(report_key, None)
+            self.state.pending_reports.setdefault(report_key, issue.title or "(untitled)")
 
         for report_key in sorted(self.state.pending_reports):
             repo_key, _, number_text = report_key.rpartition("#")
@@ -497,11 +596,21 @@ class GitHubWatcher:
                 outcome.turns_skipped += 1
                 continue
             title = self.state.pending_reports[report_key] or "(untitled)"
-            turn_text = (
-                f"GitHub tracking issue closed: {repo}#{number} \"{title}\" is CLOSED, so the "
-                f"round is over: post the round report now -- what landed (PRs and merge "
-                f"commits), what is still open, and what the human decides next."
-            )
+            still_open = self.state.blocked_closes.get(report_key)
+            if still_open:
+                turn_text = (
+                    f"GitHub tracking issue {repo}#{number} \"{title}\" was CLOSED, but the "
+                    f"round is not over: {still_open} -- so there is no round report to post "
+                    f"yet. Reopen the issue and keep it open until every item is merged (the "
+                    f"report fires on the close that has none left), or say here why the "
+                    f"issue should stay closed."
+                )
+            else:
+                turn_text = (
+                    f"GitHub tracking issue closed: {repo}#{number} \"{title}\" is CLOSED, so "
+                    f"the round is over: post the round report now -- what landed (PRs and "
+                    f"merge commits), what is still open, and what the human decides next."
+                )
             try:
                 from swarmly.telegram.topics import context_block_reason, context_for
                 blocked = context_block_reason(
@@ -552,7 +661,12 @@ class GitHubWatcher:
 
             self.state.clear_failure(failure_key)
             self.state.pending_reports.pop(report_key, None)
-            self.state.round_reports[report_key] = _utc()
+            if still_open:
+                # Announced once; the issue stays closed and quiet until it is reopened.
+                self.state.blocked_reported[report_key] = _utc()
+                self.state.blocked_closes.pop(report_key, None)
+            else:
+                self.state.round_reports[report_key] = _utc()
             outcome.turns_queued += 1
             outcome.delivered_topics.append((chat_id, thread_id))
             logger.info("round report queued for %s in %s/%s", report_key, chat_id, thread_id)
