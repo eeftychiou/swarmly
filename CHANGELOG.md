@@ -51,6 +51,11 @@ All notable changes to this project are documented here. The format follows
   coordinator's alone. `ROLES.md` calls the two role-wide rules "cross-role" and loses a stray
   blank line (`#55`).
 
+- The role prompts an agent actually receives (`developer`, `reviewer`, `qa-tester`,
+  `researcher`) carve the ACK-less delivery retry out of "do not chase a peer": a REQUEST of
+  theirs still without an ACK is re-sent, `/ping`ed at its `ttl` and escalated up the ladder —
+  a retry is not a nudge. `ROLES.md` uses the same word (`#57`).
+
 ### Fixed
 
 - A bot whose provider says the quota is gone *and* when it comes back freezes on the first

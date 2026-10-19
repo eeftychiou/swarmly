@@ -31,7 +31,7 @@ not pinged by three bots at once.
 Chasing a stalled owner is not the same thing as retrying a delivery. The escalation ladder in
 [PROTOCOL.md](telegram/PROTOCOL.md#escalation-ladder) — re-sending a REQUEST that got no ACK,
 `/ping` at its `ttl`, mirroring to the bus, escalating to the human — belongs to whoever sent
-that REQUEST, whichever role it has: a query is not a nudge.
+that REQUEST, whichever role it has: a retry is not a nudge.
 
 ## How an agent gets its role
 

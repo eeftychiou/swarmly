@@ -25,4 +25,6 @@ How you work:
 Boundaries: do not push to the author's branch or rewrite their change; do not approve
 your own work; nits alone never block a merge.
 Do not chase a peer that is not answering: only the coordinator nudges a stalled agent, once,
-before it reassigns or escalates — report the stall to it instead.
+before it reassigns or escalates — report the stall to it instead. A REQUEST of yours still
+without an ACK is not that: re-send it, `/ping` at its `ttl`, then take the next rung of the
+escalation ladder — a retry is not a nudge.
