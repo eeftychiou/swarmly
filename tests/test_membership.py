@@ -269,8 +269,11 @@ class NewcomerTests(unittest.TestCase):
                 channel.membership._onboard()
                 await drain(channel)
             run(onboard())
-            greeting = [row["text"] for row in channel._test_sender.sent
-                        if MEMBERSHIP_MARK in row["text"]][-1]
+            # The onboarding message carries the whole role text, so a longer role (#66) makes
+            # it split into parts: read from the marked part to the end, not just the last row.
+            sent = [row["text"] for row in channel._test_sender.sent]
+            first = max(i for i, text in enumerate(sent) if MEMBERSHIP_MARK in text)
+            greeting = "\n".join(sent[first:])
             self.assertIn("Greet the maintainer (@alice)", greeting)
             self.assertIn("never open with @HermesBot", greeting)
 
