@@ -245,8 +245,18 @@ is host-specific and must be announced as `intent=OFFLINE` before stopping the s
 config (`<config>.freeze.json`): a transport restarted while frozen comes back frozen and
 re-announces `intent=FROZEN` once, so a restart cannot silently release automation. A transport
 that fails `limits.quota_freeze_threshold` (default 3) consecutive adapter runs whose error text
-carries a quota/429 signature freezes itself with `intent=FROZEN ref=quota` — no human needed,
-`RESUME` is the way back. Overdue alerts are capped per ticket
+carries a quota/429 signature freezes itself with `intent=FROZEN ref=quota` — no human needed.
+A quota freeze ends by itself: at the reset time the provider's error gives ("try again at
+Nov 16th, 2026 10:06 PM", "retry in 2h", `Retry-After: 120`), else after
+`limits.quota_retry_minutes` (default 60), and the next turn is the probe (repeated quota
+failures freeze it again). The `FROZEN` envelope carries `ttl=<minutes>m` for how long, and its
+body says why and how to resume in words. While frozen the bot answers a person who addresses
+it, once per topic per 10 minutes, instead of staying silent; `/status` names the freeze as its
+blocker, and the admin ends it sooner with `/resume@<bot>`, `RESUME`, or, for a quota freeze,
+by switching to another model with `/model@<bot> <name>`. Every way out of a quota freeze
+broadcasts `intent=RESUMED`. Peers keep the `FROZEN`/`RESUMED` statuses they see (and drop one
+past its `ttl`, or when that peer says `ONLINE` again), list them in `/status` as `frozen_peers=`,
+and every turn's prompt names the frozen peers so work is handed to someone who can take it. Overdue alerts are capped per ticket
 (`limits.overdue_alert_cap`, default 2) and more than `limits.overdue_digest_threshold`
 (default 3) open tickets for one recipient collapse into a single `ALERT intent=OVERDUE_DIGEST`
 line; a `NOTE intent=CLOSED ref=<ticket>` from the ticket's originating author resolves it

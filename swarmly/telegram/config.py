@@ -566,6 +566,7 @@ class ChannelLimits:
     commands_enabled: bool = True                       # v1.1 §6: answer /ping /status /diag without waking the adapter
     auto_freeze_on_quota: bool = True                   # #49: self-freeze after repeated quota-signature adapter failures
     quota_freeze_threshold: int = 3                     # consecutive quota failures before the auto-freeze
+    quota_retry_minutes: float = 60.0                   # a quota freeze whose error gives no reset time ends after this
     overdue_alert_cap: int = 2                          # #49: max overdue alerts per ticket
     overdue_digest_threshold: int = 3                   # #49: one digest alert when this many tickets are open for one recipient
     busy_behavior: str = "queue"                        # addressed msg during an in-flight turn: "queue" (run it next), "drop" (silent) or "notice" (drop, one log line/window)
