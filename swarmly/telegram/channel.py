@@ -29,6 +29,7 @@ import html
 import json
 import logging
 import re
+import secrets
 import socket
 import subprocess
 import time
@@ -36,7 +37,7 @@ import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -52,7 +53,8 @@ from swarmly.telegram.commands import (
     status_reply,
     where_reply,
 )
-from swarmly.telegram.config import EFFORT_LEVELS, AgentConfig, effort_problem, model_problem
+from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig,
+                                     effort_problem, model_problem)
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.projects import ProjectRouter
 from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
@@ -325,6 +327,7 @@ class ChannelEvent:
     handoff: bool = False                  # set by routing: an expected hand-off, no cooldown
     cooldown_left: float = 0.0             # set by routing: a message to this bot the cooldown dropped
     self_task: bool = False                # a brief this agent gave itself (topic or membership)
+    reassembled: bool = False              # #29: the split parts of one reply, joined already
 
 
 @dataclass
@@ -479,6 +482,9 @@ class AgentChannel:
         self._topics_reported: Set[Tuple[int, Optional[int]]] = set()   # sent REPORT_BACK
         self._report_asked: Set[Tuple[int, Optional[int]]] = set()      # REPORT_NOTE sent
         self._self_tasks: Set[asyncio.Task] = set()
+        # #29: sender+chat+topic -> the parts of a split reply already here, and their timers.
+        self._split_pending: Dict[Tuple[Any, ...], _PendingSplit] = {}
+        self._split_tasks: Set[asyncio.Task] = set()
         self._gone_topics: set = set()             # topics a reply in flight found closed
         # Whether a post to a closed or deleted topic goes to General with a note (a reply
         # must land somewhere); ``swarmly-telegram send --topic`` turns it off so a wrong
@@ -1966,6 +1972,21 @@ class AgentChannel:
                          event.chat_id, event.thread_id, blocked)
             return None
 
+        # Issue #29: a reply that arrives as ↪ (k/n) parts is one message. The parts are held
+        # until the rest are here, then the one turn runs with the whole message — never a turn
+        # per fragment, and never an answer to a third of a brief.
+        held, split = await self._absorb_split(event)
+        if held:
+            self.stats.ignored += 1
+            return None
+        if split is not None:
+            # The turn runs from part 1, whichever part completed the reply (#29 QA): part 1 is
+            # the message the sender wrote, so its id, its reply target and its raw message are
+            # the ones the answer goes back to. Out-of-order parts lose none of that.
+            event = split.event or event
+            event.text = split.joined()
+            event.reassembled = True
+
         # Every message that names its topic teaches the name, addressed to us or not.
         if event.thread_id is not None:
             self.topics.remember(event.chat_id, event.thread_id, event.topic_name,
@@ -2262,6 +2283,7 @@ class AgentChannel:
             general_is_for_setup=self._work_moves_to_topics(event),
             role_brief=self._role_brief(),
             fresh_text=self._fresh_text(event, text[len(recap):]),
+            reassembled=event.reassembled,
         )
 
         try:
@@ -3741,11 +3763,20 @@ class AgentChannel:
         the envelope header and the peer addressing and ends with ``(1/n)``; later parts start
         with ``↪ (k/n)``, which receiving transports treat as a continuation, never a new
         turn. Text that still remains after the last part is clamped as before.
+
+        The pieces are exact slices of *text* -- the whitespace a cut falls on stays at the end
+        of the piece before it -- so the receiving transport reassembles the original message
+        character for character (:func:`split_part`, ``AgentChannel._absorb_split``, issue #29).
         """
-        max_parts = max(int(getattr(self.config.limits, "max_reply_parts", 1) or 1), 1)
+        max_parts = min(max(int(getattr(self.config.limits, "max_reply_parts", 1) or 1), 1),
+                        MAX_SPLIT_PARTS)
         if max_parts == 1 or self._fits(text):
             return [text]
-        worst = f"{max_parts}/{max_parts}"
+        # One token per reply: it is what the receiver joins the parts on, so two replies by one
+        # sender can never be joined into one mixed message (#29 review, #29 QA). It rides inside
+        # the marker, which is part of what the cut has to leave room for.
+        ref = secrets.token_hex(3)
+        worst = f"{max_parts}/{max_parts} #{ref}"
         head_room, tail_room = f"\n\n({worst})", f"↪ ({worst}) "
         pieces: List[str] = []
         rest = text
@@ -3755,15 +3786,16 @@ class AgentChannel:
                 break
             cut = self._split_point(rest, lambda p: self._fits(
                 (p + head_room) if first else (tail_room + p)))
-            pieces.append(rest[:cut].rstrip())
-            rest = rest[cut:].lstrip("\n")
+            pieces.append(rest[:cut])
+            rest = rest[cut:]
         if rest.strip():
             pieces.append(rest)
         if len(pieces) == 1:
             return pieces
         total = len(pieces)
-        parts = [f"{pieces[0]}\n\n(1/{total})"]
-        parts += [f"↪ ({index}/{total}) {piece}" for index, piece in enumerate(pieces[1:], 2)]
+        parts = [f"{pieces[0]}\n\n(1/{total} #{ref})"]
+        parts += [f"↪ ({index}/{total} #{ref}) {piece}"
+                  for index, piece in enumerate(pieces[1:], 2)]
         return parts
 
     def _fits(self, text: str) -> bool:
@@ -3789,6 +3821,202 @@ class AgentChannel:
             if at > 0:
                 return at + len(separator)
         return low
+
+    # ----------------------------------------------------------------------------------
+    # Split replies (issue #29)
+    # ----------------------------------------------------------------------------------
+    @staticmethod
+    def _split_key(event: ChannelEvent, ref: str) -> Tuple[Any, ...]:
+        """Which reply a part belongs to: one sender, in one chat and discussion, and the
+        reply's own correlation token. The token is part of the key, so two replies by one
+        sender that interleave are held apart and each comes out whole (#29 review)."""
+        return (event.chat_id, event.thread_id, event.author_id,
+                (event.author_username or "").lower(), ref)
+
+    async def _absorb_split(self, event: ChannelEvent) -> Tuple[bool, Optional[_PendingSplit]]:
+        """Hold the parts of a split reply until the whole message is here, then join it.
+
+        Returns ``(held, split)``: ``held`` means the part was stored and this event must not
+        run a turn; ``split`` holds every part (and part 1's event) when the last missing part
+        arrived, for the caller to run the one turn from part 1. Parts are matched by index, so
+        they may arrive out of order; a reply whose parts never all arrive is delivered as what
+        did arrive, with a note naming the missing ones (``_flush_split``), never silently
+        dropped and never answered twice.
+
+        Parts are only ever joined when the sender's marker carries the reply's own token, and
+        a token names exactly one reply: what is held is that reply, and nothing else can be
+        joined to it. Without a token a part cannot be attributed at all — ``A1, B2, B1, A2``
+        from one sender (two replies, same total, no tokens) is indistinguishable from one
+        reply arriving out of order, and joining it puts two messages into one turn (#29 QA).
+        So a sender that writes no token (an older transport) is not joined: its part 1 runs
+        its turn as it did before #29, and its continuations stay continuations, which start no
+        turn. Bounded, so a stranger cannot make the transport hold parts that never complete.
+        """
+        if not event.author_is_bot or not event.text or not self._may_reassemble(event):
+            return False, None
+        if event.reassembled:
+            # A reply this transport already joined goes on through the inbound path; its text
+            # is the sender's whole message, not another part to hold (#29 QA).
+            return False, None
+        part = split_part(event.text)
+        if part is None:
+            # Not a part at all: nothing to hold. A reply held past its window still goes out
+            # here, so an unrelated message is enough to sweep a dead buffer.
+            await self._flush_expired_splits()
+            return False, None
+        if not part.ref:
+            # No token, no attribution: joining a tokenless part is a guess, and the guess
+            # mixes two interleaved replies into one turn (A1, B2, B1, A2 — #29 QA). Such a
+            # part is left to the rest of the inbound path, where part 1 is an ordinary
+            # message and a continuation is filtered out and starts no turn.
+            return False, None
+        index, total, body = part.index, part.total, part.body
+        key = self._split_key(event, part.ref)
+        # The buffer is claimed before this part awaits anything, and the part goes into it with
+        # no await in between: delivering a held reply awaits a turn, and another part can
+        # arrive while that runs, but it joins this state instead of opening a rival one that
+        # would later be overwritten and lose the reply (#29 review).
+        pending = await self._claim_split(key, total, index, body)
+        if index in pending.bodies:
+            return True, None                       # a repeated part: nothing new to add
+        pending.bodies[index] = body
+        pending.events[index] = event
+        if pending.missing():
+            logger.info("%s: holding part %d/%d of a split reply from @%s (%d/%d arrived)",
+                        self.config.identity.alias, index, total,
+                        event.author_username or "unknown", len(pending.bodies), total)
+            # A reply past its window goes out as what arrived; this one is not, so it is kept
+            # out of the sweep however long the delivery of another reply takes.
+            await self._flush_expired_splits(keep=key)
+            return True, None
+        self._split_pending.pop(key, None)
+        pending.disarm()
+        logger.info("%s: reassembled a %d-part reply from @%s", self.config.identity.alias,
+                    total, event.author_username or "unknown")
+        return False, pending
+
+    async def _claim_split(self, key: Tuple[Any, ...], total: int, index: int,
+                           body: str) -> _PendingSplit:
+        """The buffer this part belongs to, claimed before the caller awaits anything.
+
+        When the map has room the state is created and stored with no await at all, so a part
+        that arrives while this coroutine is suspended elsewhere can only join it, never be
+        replaced by a fresh buffer holding half the reply (#29 review). Only when something
+        must be delivered to make room, or a held reply the sender contradicted (or that has
+        waited out its window) must go out first, does this await — and it then re-reads the
+        map and joins whatever is there, the delivery's own awaits included.
+        """
+        while True:
+            pending = self._split_pending.get(key)
+            if pending is not None:
+                if self._split_expired(pending):
+                    # Parts came too late to be joined: what arrived goes out now, and this
+                    # part opens the next buffer rather than reviving a dead reply.
+                    await self._drop_split(key, pending)
+                    continue                         # re-read: that delivery awaited
+                if pending.accepts(index, total, body):
+                    return pending
+                # The same token naming a different total, or different text at an index
+                # already held: the sender contradicted itself, so these parts are not one
+                # message. What is held goes out now and this part opens the next buffer —
+                # never joined.
+                await self._drop_split(key, pending)
+                continue                             # re-read: that delivery awaited
+            if self._split_pending and len(self._split_pending) >= MAX_PENDING_SPLITS:
+                await self._evict_oldest_split()
+                continue                             # re-read: the eviction awaited as well
+            # A later part can arrive first; it is held the same way, and the turn (when it
+            # runs, or when the window closes) takes the earliest part's chat and topic.
+            pending = _PendingSplit(total=total, opened=self._clock())
+            self._split_pending[key] = pending
+            self._arm_split_timeout(key, pending)
+            return pending
+
+    def _split_expired(self, pending: _PendingSplit) -> bool:
+        """Whether a held reply has waited out ``SPLIT_TIMEOUT_SECONDS`` for its missing parts."""
+        return self._clock() - pending.opened >= SPLIT_TIMEOUT_SECONDS
+
+    def _may_reassemble(self, event: ChannelEvent) -> bool:
+        """Whether a bot's split reply is worth holding parts for.
+
+        Under ``limits.strangers: ignore`` a bot this transport does not know gets no turn, so
+        it gets no buffer and no timer either: otherwise 100 numbered fragments would leave 100
+        live timers behind and change nothing (#29 review). With ``strangers: answer`` any bot
+        may be answered, so any bot's reply may be joined."""
+        if getattr(self.config.limits, "strangers", "ignore") != "ignore":
+            return True
+        return self.roster.knows(event.author_username)
+
+    def _arm_split_timeout(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
+        """Deliver what arrived if the rest of a held reply does not come."""
+
+        async def expire() -> None:
+            await asyncio.sleep(SPLIT_TIMEOUT_SECONDS)
+            await self._flush_split(key, pending)
+
+        task = asyncio.create_task(expire())
+        pending.timer = task
+        self._split_tasks.add(task)
+        task.add_done_callback(self._split_tasks.discard)
+
+    async def _flush_expired_splits(self, keep: Optional[Tuple[Any, ...]] = None) -> None:
+        """Deliver the held parts of replies that have waited out ``SPLIT_TIMEOUT_SECONDS``,
+        except the one under *keep*: the reply the caller is in the middle of taking a part
+        for is not swept even if the delivery of another reply takes longer than the window."""
+        if not self._split_pending:
+            return
+        now = self._clock()
+        for key, pending in list(self._split_pending.items()):
+            if key == keep:
+                continue
+            if now - pending.opened >= SPLIT_TIMEOUT_SECONDS:
+                await self._flush_split(key, pending)
+
+    async def _drop_split(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
+        """Forget a held reply, stop its timer, and deliver what arrived."""
+        if self._split_pending.get(key) is pending:
+            self._split_pending.pop(key, None)
+        pending.disarm()
+        await self._deliver_split(pending)
+
+    async def _evict_oldest_split(self) -> None:
+        """Make room for a new reply: the oldest held one goes out as what arrived, so the
+        buffer count and the live timer count stay bounded however many senders split."""
+        if not self._split_pending:
+            return                                   # pragma: no cover - guarded by the caller
+        key, pending = min(self._split_pending.items(), key=lambda item: item[1].opened)
+        await self._drop_split(key, pending)
+
+    async def _flush_split(self, key: Tuple[Any, ...], pending: _PendingSplit) -> None:
+        """Deliver a held reply as what arrived. The first caller wins, so the timer and the
+        sweep cannot both run the turn."""
+        if self._split_pending.get(key) is not pending:
+            pending.disarm()
+            return
+        await self._drop_split(key, pending)
+
+    async def _deliver_split(self, pending: _PendingSplit) -> None:
+        """Run the one turn for what arrived of a reply, saying which parts are missing."""
+        event = pending.event
+        if event is None or not pending.bodies:
+            return
+        text = pending.joined()
+        if pending.missing():
+            logger.warning("%s: a %d-part reply from @%s is missing part(s) %s; delivering "
+                           "what arrived", self.config.identity.alias, pending.total,
+                           event.author_username or "unknown",
+                           ", ".join(str(i) for i in pending.missing()))
+            text += pending.note()
+        if 1 not in pending.bodies:
+            # Nothing arrived but the sender's later parts: that is a fragment, not a message.
+            # Keeping its marker means the rest of the inbound path still recognises it as the
+            # continuation of a reply whose first part never came, so it can start no turn
+            # (#29 QA) — the alternative is a third of a brief answered as a brief.
+            text = f"↪ ({min(pending.bodies)}/{pending.total}) {text}"
+        event.text = text
+        event.reassembled = True
+        # It runs the rest of the inbound path, so it is one turn with one message.
+        await self.handle_event(event)
 
     async def send(self, text: Union[str, Callable[[], Optional[str]]],
                    reply_to_message_id: Optional[int] = None,
@@ -4475,7 +4703,134 @@ def _current_task_cancelling() -> bool:
 
 # A later part of a split message, as received: optional leading mentions, the sender's
 # "[Alias]" banner, then the "↪ (k/n)" marker that split_outgoing puts on parts 2..n.
-_CONTINUATION_RE = re.compile(r"^(?:@\w+\s+)*(?:\[[^\]\n]{1,64}\]\s*)?↪ \(\d+/\d+\)")
+_CONTINUATION_RE = re.compile(
+    r"^(?:@\w+\s+)*(?:\[[^\]\n]{1,64}\]\s*)?↪ \(\d+/\d+(?: #\w{1,16})?\)")
+
+# --------------------------------------------------------------------------------------
+# Split replies (issue #29): ↪ (k/n) parts are one message at the receiver
+# --------------------------------------------------------------------------------------
+#: Part 1 of a split reply: the reply first, then "(1/n)" appended by ``split_outgoing``. The
+#: optional ``#token`` inside the parentheses correlates the parts of one reply: it is what a
+#: receiver joins on, so two replies by one sender that interleave are never joined into one
+#: mixed message (#29 review), and a part written without one is not joined at all (#29 QA).
+#: The numbers in a header are read with a bounded digit width (``_SPLIT_NUMBER``), never with
+#: ``\d+``: a header carrying a thousand digits is refused by the pattern itself, so no
+#: conversion of the sender's number can be large — and ``int()`` of a very long digit string
+#: is not merely slow, it raises ``ValueError`` on Python 3.11+ (the int-string conversion
+#: limit), which would turn a peer's fragment into an exception in the inbound path (#29
+#: review: cap the total, reject anything above the cap).
+_SPLIT_NUMBER = r"\d{1,3}"
+_SPLIT_FIRST_RE = re.compile(
+    r"^(?P<body>.*)\n\n\(1/(?P<total>" + _SPLIT_NUMBER + r")(?: #(?P<ref>\w{1,16}))?\)[ \t]*\Z",
+    re.S)
+#: Part k > 1: the marker first (after the sender's banner and the @handles that delivered
+#: it), then the reply from where the previous part was cut.
+_SPLIT_PART_RE = re.compile(
+    r"^(?:@\w+[:,]?\s*)*(?:\[[^\]\n]{1,64}\]\s*)?"
+    r"↪ \((?P<index>" + _SPLIT_NUMBER + r")/(?P<total>" + _SPLIT_NUMBER
+    + r")(?: #(?P<ref>\w{1,16}))?\)[ \t]?(?P<body>.*)\Z", re.S)
+#: How long the receiver holds the first part(s) of a split reply for the rest. A whole reply
+#: is a few consecutive posts (seconds apart); longer than this and the rest is not coming.
+SPLIT_TIMEOUT_SECONDS = 30.0
+#: Most replies held at once, one per sender. A new sender's reply evicts the oldest held one
+#: (delivered as what arrived), so neither the buffer map nor the timer set can grow with the
+#: number of bots that post numbered fragments.
+MAX_PENDING_SPLITS = 32
+#: Most parts one reply may claim. This is the number the sender splits into as well
+#: (``config.MAX_REPLY_PARTS``, which ``limits.max_reply_parts`` is clamped to), so whatever one
+#: transport emits, the other reassembles; a header asking for billions of parts is not a reply:
+#: the buffer it would reserve is the sender's instruction, and it is refused rather than
+#: believed.
+MAX_SPLIT_PARTS = MAX_REPLY_PARTS
+
+
+class SplitPart(NamedTuple):
+    """One part of a split reply: where it sits, the text it carries, and its reply's token."""
+
+    index: int
+    total: int
+    body: str
+    ref: Optional[str] = None           # the reply's correlation token, when the sender wrote one
+
+
+def split_part(text: str) -> Optional[SplitPart]:
+    """The part *text* is, else ``None``.
+
+    The cut markers are removed and nothing else is: the sender's banner and delivering
+    @handles stay on part 1 (as on any message), and each later part keeps exactly the text
+    that followed the cut, so the parts concatenate back to the reply that was sent. A part 1
+    whose body is empty is not a split reply, and neither is ``(1/1)``. A total above
+    :data:`MAX_SPLIT_PARTS` is not a split reply either: it is refused as ordinary text, so no
+    header can make the receiver hold parts that will never come. A total written with more
+    than three digits does not even match, so the sender's number is never converted at that
+    size (#29 review).
+    """
+    if not text:
+        return None
+    tail = _SPLIT_PART_RE.match(text)
+    if tail is not None:
+        index, total = int(tail.group("index")), int(tail.group("total"))
+        if 1 < index <= total <= MAX_SPLIT_PARTS:
+            return SplitPart(index, total, tail.group("body"), tail.group("ref"))
+        return None
+    first = _SPLIT_FIRST_RE.match(text)
+    if first is not None:
+        total = int(first.group("total"))
+        body = first.group("body")
+        if 1 < total <= MAX_SPLIT_PARTS and body.strip():
+            return SplitPart(1, total, body, first.group("ref"))
+    return None
+
+
+@dataclass
+class _PendingSplit:
+    """The parts of one split reply that have arrived, and where they came from."""
+
+    total: int
+    bodies: Dict[int, str] = field(default_factory=dict)
+    #: part index -> the event it arrived in: chat, topic, author, message id.
+    events: Dict[int, ChannelEvent] = field(default_factory=dict)
+    opened: float = 0.0                        # clock the first part arrived, for the timeout
+    #: The timeout task holding this reply, so it can be stopped when the reply is delivered.
+    timer: Optional[asyncio.Task] = field(default=None, repr=False, compare=False)
+
+    @property
+    def event(self) -> Optional[ChannelEvent]:
+        """The earliest part's event: the turn runs as if that message had arrived whole."""
+        return self.events[min(self.events)] if self.events else None
+
+    def accepts(self, index: int, total: int, body: str) -> bool:
+        """Whether a part can belong to this reply.
+
+        Parts are held per token, so they are one reply unless the sender contradicts itself: a
+        token that names a different total, or different text at an index already held, is not
+        the same message, and joining it would put two messages into one turn (#29 QA)."""
+        if total != self.total:
+            return False
+        if index == 1:
+            return self.bodies.get(1, body) == body
+        seen = self.bodies.get(index)
+        return seen is None or seen == body
+
+    def disarm(self) -> None:
+        """Stop the timeout. Never cancels the task calling this, so a flush from inside the
+        timer still delivers the reply."""
+        task = self.timer
+        self.timer = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def joined(self) -> str:
+        return "".join(self.bodies[index] for index in sorted(self.bodies))
+
+    def missing(self) -> List[int]:
+        return [index for index in range(1, self.total + 1) if index not in self.bodies]
+
+    def note(self) -> str:
+        """What the turn is told when the rest of the reply never arrived."""
+        missing = ", ".join(str(index) for index in self.missing())
+        return (f"\n\n(parts {missing} of this {self.total}-part reply never arrived; this is "
+                "what did)")
 
 
 async def _maybe_await(value: Any) -> Any:

@@ -323,9 +323,13 @@ Routing and the rate limits do different jobs; neither substitutes for the other
 **Long messages are split, not cut.** A message longer than one Telegram message goes out as
 up to `max_reply_parts` consecutive messages. Part 1 carries the envelope header and the peer
 addressing and ends with `(1/n)`; parts 2..n start with `↪ (k/n)` and carry no mentions. A
-receiving transport never starts a turn on a `↪ (k/n)` part from a peer bot. A peer that needs
-the full text of a long handoff should read it from the durable record (`bus=`), since its
-adapter sees part 1 only.
+receiving transport never starts a turn on a `↪ (k/n)` part from a peer bot; instead it holds
+the parts and joins them back into the one message the sender wrote, then runs one turn from
+part 1 (issue #29). Each marker carries the reply's own token (`↪ (2/3 #9fa0c1)`), and the token
+is what the parts are joined on, so two replies by one sender that interleave never mix; a part
+written without a token cannot be attributed to a reply, so it is not joined — its part 1 stands
+alone and its continuations start no turn. A peer that needs the full text of a long
+handoff should still read it from the durable record (`bus=`).
 
 **Messages that arrive mid-turn are queued.** With `busy_behavior: queue` (the default) an
 addressed message that arrives while a turn is running waits, up to `busy_queue_max`, and runs

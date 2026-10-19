@@ -11,6 +11,7 @@ The busy queue and long-reply splitting, both ported from ductor's Telegram tran
 from __future__ import annotations
 
 import asyncio
+import re
 import unittest
 from html import escape
 
@@ -123,6 +124,16 @@ class TestBusyQueue(unittest.TestCase):
                 make_config(limits=bad)
         self.assertEqual(ChannelLimits().max_reply_parts, 4)
 
+    def test_max_reply_parts_is_clamped_to_the_protocol_cap(self):
+        """Review of #29: the sender and the receiver share one cap, so a configured value above
+        it is clamped here instead of emitting parts the receiver refuses."""
+        from swarmly.telegram.config import MAX_REPLY_PARTS
+
+        self.assertEqual(ChannelLimits(max_reply_parts=MAX_REPLY_PARTS + 5).max_reply_parts,
+                         MAX_REPLY_PARTS)
+        self.assertEqual(make_config(limits={"max_reply_parts": 25}).limits.max_reply_parts,
+                         MAX_REPLY_PARTS)
+
 
 class TestReplySplitting(unittest.TestCase):
     LIMIT = 4096
@@ -147,9 +158,12 @@ class TestReplySplitting(unittest.TestCase):
         text = "x" * 9000
         parts = channel.split_outgoing(text)
         self.assertEqual(len(parts), 3)
-        self.assertTrue(parts[0].endswith("\n\n(1/3)"))
-        self.assertTrue(parts[1].startswith("↪ (2/3) "))
-        self.assertTrue(parts[2].startswith("↪ (3/3) "))
+        # Each part carries the reply's correlation token inside its marker (#29 review).
+        self.assertRegex(parts[0], r"\n\n\(1/3 #[0-9a-f]{6}\)\Z")
+        self.assertRegex(parts[1], r"\A↪ \(2/3 #[0-9a-f]{6}\) ")
+        self.assertRegex(parts[2], r"\A↪ \(3/3 #[0-9a-f]{6}\) ")
+        refs = {re.search(r"#[0-9a-f]{6}", part).group(0) for part in parts}
+        self.assertEqual(len(refs), 1, refs)          # one reply, one token
         self.assertEqual("".join(self.strip_markers(parts)), text)
         self.assert_each_part_fits(channel, parts)
 
@@ -167,7 +181,9 @@ class TestReplySplitting(unittest.TestCase):
         parts = channel.split_outgoing("\n\n".join(paragraphs))
         self.assertGreater(len(parts), 1)
         for body in self.strip_markers(parts):
-            for chunk in body.split("\n\n"):
+            # A cut keeps the whitespace it fell on (issue #29: the parts must join back to
+            # the original), so a body may end in the blank line the next part starts after.
+            for chunk in (c for c in body.split("\n\n") if c.strip()):
                 self.assertIn(chunk, paragraphs, "a paragraph was cut in the middle")
 
     def test_html_escaping_is_counted(self):
