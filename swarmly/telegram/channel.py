@@ -494,6 +494,12 @@ class AgentChannel:
         self._freeze_ref: Optional[str] = None
         self._freeze_until: Optional[float] = None   # wall time a quota freeze lifts itself
         self._quota_failures = 0  # #49: consecutive quota-signature adapter failures
+        # Issue #32: the revision this process runs from, resolved once at start. /status and
+        # every envelope carry this, not whatever the checkout says later: after an admin
+        # switches the deploy dir the checkout moves, and a process still running the old code
+        # must not claim the new revision. /status flags that drift instead.
+        self._running_revision = _local_revision()
+        self._running_revision_full = _local_revision_full()
         self._wall: Callable[[], float] = time.time
         self._frozen_told: Dict[Tuple[int, Optional[int]], float] = {}   # topic -> clock
         self._announce_resumed = False             # a /model lifted a quota freeze
@@ -1066,7 +1072,7 @@ class AgentChannel:
             self.roster.start_sync()
             await self.send(format_message(
                 Envelope(type=MessageType.HELLO, to="*", intent="SYNC",
-                         ref=self._alias_ref(), rev=_local_revision()),
+                         ref=self._alias_ref(), rev=self._running_revision),
                 f"🔄 {self.config.identity.alias} peers: {self.roster.sync_list() or 'none'}"),
                 chat_id=event.chat_id, thread_id=event.thread_id, silent=True,
                 allow_when_frozen=True)
@@ -1079,7 +1085,7 @@ class AgentChannel:
         for alias, username in self.roster.admit(handles):
             await self.send(format_message(
                 Envelope(type=MessageType.HELLO, to=alias, intent="WELCOME",
-                         ref=self._alias_ref(), rev=_local_revision()),
+                         ref=self._alias_ref(), rev=self._running_revision),
                 f"👋 @{username} {self.config.identity.alias} has added {alias} as a peer"),
                 chat_id=event.chat_id, thread_id=event.thread_id, silent=True,
                 allow_when_frozen=True)
@@ -1091,6 +1097,13 @@ class AgentChannel:
             return ping_reply(alias, state="online")   # wall-clock time; _clock is monotonic
         if command == "status":
             result = f"handled={self.stats.handled} machine={self.stats.machine_events}"
+            # Issue #32: the revision the process really runs, and the checkout's own HEAD when
+            # the two disagree -- an admin switch moves the deploy dir while this process keeps
+            # the code it started with, and "rev:" alone would look current.
+            result += f" rev={self._running_revision}"
+            checkout = _local_revision()
+            if checkout != self._running_revision:
+                result += f" checkout={checkout} drift=restart-needed"
             # #93(1): busy drops are counted inside `seen` (they bump `ignored`, which /diag sums
             # into it) and additionally surfaced here as their own `busy_dropped=` token. /status is
             # the lighter surface where a loss anomaly is first noticed, so it must not hide it.
@@ -1406,7 +1419,7 @@ class AgentChannel:
                 and not self.config.is_admin(event.author_id)):
             return format_message(Envelope(
                 type=MessageType.BLOCKED, to=self._alias_for(event), intent="UNAUTHORIZED",
-                ref=envelope.ref, rev=_local_revision()))
+                ref=envelope.ref, rev=self._running_revision))
         intent = (envelope.intent or "").upper()
         if intent == "FREEZE":
             self._set_frozen(True, envelope.ref)
@@ -1416,7 +1429,7 @@ class AgentChannel:
             ack_intent = "RESUMED"
         return format_message(Envelope(
             type=MessageType.STATUS, to="*", intent=ack_intent,
-            ref=envelope.ref, rev=_local_revision()))
+            ref=envelope.ref, rev=self._running_revision))
 
     # ------------------------------------------------------------------------------
     # #49: freeze persistence, auto-freeze on quota exhaustion, alert discipline
@@ -1514,13 +1527,13 @@ class AgentChannel:
         """The FROZEN broadcast: machine header for peers (``ttl`` = how long), words for people."""
         return format_message(Envelope(
             type=MessageType.STATUS, to="*", intent="FROZEN", ref=self._freeze_ref,
-            ttl=ttl_for(self._freeze_until, self._wall()), rev=_local_revision()),
+            ttl=ttl_for(self._freeze_until, self._wall()), rev=self._running_revision),
             self._frozen_line())
 
     def _resumed_notice(self, why: str) -> str:
         return format_message(Envelope(
             type=MessageType.STATUS, to="*", intent="RESUMED", ref="quota",
-            rev=_local_revision()), f"▶ {self.config.identity.alias} resumed: {why}.")
+            rev=self._running_revision), f"▶ {self.config.identity.alias} resumed: {why}.")
 
     async def _lift_expired_freeze(self) -> bool:
         """A quota freeze ends at the time the provider gave (or after the retry interval):
@@ -4321,9 +4334,9 @@ class AgentChannel:
         role = f", role: {self._role_name()}" if self.config.identity.role else ""
         return format_message(
             Envelope(type=MessageType.HELLO, to="*", intent="ONLINE",
-                     ref=self._alias_ref(), rev=_local_revision()),
+                     ref=self._alias_ref(), rev=self._running_revision),
             f"🟢 {self.config.identity.alias} online "
-            f"(adapter: {self.config.adapter.type}{role}, rev: {_local_revision()})",
+            f"(adapter: {self.config.adapter.type}{role}, rev: {self._running_revision})",
         )
 
     def _role(self) -> Any:
@@ -4378,7 +4391,7 @@ class AgentChannel:
         # rolling upgrade. Full sha, and a direct logger.info (never the
         # payload[:120]-capped outbound path).
         logger.info("A2A_ONLINE_NOTICE rev=%s alias=%s chat=%s",
-                    _local_revision_full(), self.config.identity.alias,
+                    self._running_revision_full, self.config.identity.alias,
                     self.config.identity.home_channel_id)
         try:
             await self.send(self.online_notice(), silent=True)    # machine traffic: no sound

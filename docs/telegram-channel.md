@@ -240,6 +240,11 @@ An uncertain queue receipt is alerted separately with its persisted failure deta
 receipt alert cannot consume the later task-deadline alert; completed legacy reservations are
 migrated without generating a false warning.
 
+`/status` also reports **which revision the transport runs** (`rev=`), resolved at process
+start, and compares it with the checkout's own HEAD: after a deploy repoints the checkout under
+a live transport, the running process keeps its code and `/status` answers
+`rev=<running> checkout=<head> drift=restart-needed` until it is restarted (`#32`).
+
 State is stored beside the config as `<config-stem>.replies.sqlite3`, or at an explicit
 `adapter.reply_state_path` (relative paths resolve beside the config). Protect this file
 like chat history and do not commit it. It persists across restarts. Run only one bridge
