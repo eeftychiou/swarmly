@@ -619,6 +619,10 @@ class ChannelLimits:
     cleanup_idle_hours: float = 24.0
     #: Topic ids ``/cleanup topics all`` must never delete (General is always kept).
     cleanup_keep: List[int] = field(default_factory=list)
+    #: Issue #64: this transport deletes its own machine notices in General (ONLINE, SEEN,
+    #: busy, moved, reminders) once they are this many minutes old. The sweep is a timer of
+    #: its own; 0 disables it and leaves the notices standing for /cleanup or the admin.
+    ephemeral_notices_minutes: float = 60.0
 
     def __post_init__(self) -> None:
         if self.busy_behavior not in BUSY_BEHAVIORS:
@@ -638,7 +642,8 @@ class ChannelLimits:
             raise ConfigError("limits.max_attachment_mb must be a positive number of megabytes "
                               f"(got {attachment_mb!r}).")
         for key in ("min_seconds_between_messages", "min_seconds_between_agent_turns",
-                    "handoff_nudge_minutes", "cleanup_idle_hours"):
+                    "handoff_nudge_minutes", "cleanup_idle_hours",
+                    "ephemeral_notices_minutes"):
             value = getattr(self, key)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):

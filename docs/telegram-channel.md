@@ -872,6 +872,16 @@ recorded while running: a per-chat ledger keeps them with their timestamps and p
 past 48 h, and the dry run says how many it can no longer reach. Older General messages stay
 the admin's to delete by hand.
 
+**Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
+restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt
+failures. Each transport deletes **its own** notices from General once they are older than
+`limits.ephemeral_notices_minutes` (default 60; `0` disables the sweep). Only messages that
+transport itself posted *and* marked as machine notices are recorded — never a person's
+message, never a model reply, never a peer's post — and only while they are inside
+Telegram's 48-hour delete window. The sweep runs on its own one-minute timer, so a notice
+disappears at most a minute after its limit. What the transport cannot delete stays for
+`/cleanup` or the admin.
+
 ## 6. Durable bus poller (`bus-poll --once`) — scheduling per host, gates
 
 When the Telegram transport is unreachable (daemon down, host offline, network partition), agents
