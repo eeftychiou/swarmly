@@ -784,7 +784,10 @@ to N topics run a turn at the same time.
   never looks ignored (`ack_reaction: true`).
 - A turn that fails on a passing provider error ("model is at capacity", overloaded, a 5xx)
   is tried again after 30 s and then 2 min before the bot posts ❌. Quota and usage limits
-  are not retried: they last hours, and repeated ones freeze the bot instead. The freeze ends
+  are not retried: they last hours, and repeated ones freeze the bot instead — an error that
+  says the quota is gone and when it returns (`try again at Nov 16th`, `retry in 2h`) freezes
+  it on the first failure, while a plain `429`/`Retry-After` still needs
+  `quota_freeze_threshold` in a row. The freeze ends
   by itself at the reset time the error gives (else after `quota_retry_minutes: 60`), the bot
   answers a person who addresses it with why it is frozen and how to resume, and the admin can
   end it sooner with `/resume@<bot>` or by switching it to another model with `/model@<bot>`.
