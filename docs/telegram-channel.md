@@ -544,6 +544,13 @@ Any post by that bot in the discussion counts as an answer, except its "⏳ busy
 restarts the clock instead. When another bot already posted the reminder or the notice for
 the same silent peer, the others don't repeat it. `0` turns it off.
 
+Only the coordinator posts the reminder and the notice. Another bot that handed work off
+posts neither: after twice the time it only runs its own turn to decide what happens to the
+work. (A swarm with no known coordinator, such as one set up by hand, keeps the behaviour
+above for every bot.) A hand-off to a peer that is frozen (quota or pause) gets no reminder
+and no notice at all: the bot that handed it off is asked straight away to give the work to
+someone else or to wait until the peer resumes.
+
 **Busy is not gone.** A message that queues behind a turn running for two minutes or more
 gets one "⏳ <alias> is busy with a turn running since HH:MM UTC" line in its topic (at
 most one per topic per five minutes), so peers and people see a working bot rather than a
