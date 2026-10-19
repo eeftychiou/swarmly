@@ -10,6 +10,7 @@ import types
 import unittest
 from unittest import mock
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Sequence
 
 from swarmly.telegram.adapters import ClaudeThreadAdapter
@@ -214,12 +215,55 @@ class ChannelTests(unittest.TestCase):
 
     def test_parallel_needs_an_adapter_with_a_session_per_discussion(self):
         from swarmly.telegram.config import ConfigError
-        for kind in ("antigravity", "antigravity_thread", "codex_thread"):
+        for kind in ("antigravity_thread", "codex_thread"):
             with self.assertRaises(ConfigError):
                 make_config(limits={"max_parallel_turns": 2, "allow_shared_cwd": True},
                             adapter={"type": kind})
         make_config(limits={"max_parallel_turns": 2, "allow_shared_cwd": True},
                     adapter={"type": "claude_thread"})
+
+    def test_antigravity_takes_parallel_turns(self):
+        """#67: the adapter keeps one conversation per topic, so >1 is not interleaving."""
+        config = make_config(limits={"max_parallel_turns": 2, "allow_shared_cwd": True},
+                             adapter={"type": "antigravity"})
+        self.assertEqual(config.limits.max_parallel_turns, 2)
+        self.assertEqual(config.adapter.type, "antigravity")
+
+    def test_antigravity_with_a_pinned_conversation_is_clamped(self):
+        """#67: a pinned conversation is one context for every topic -- refuse >1 there."""
+        from swarmly.telegram.config import ConfigError
+        limits = {"max_parallel_turns": 2, "allow_shared_cwd": True}
+        with TemporaryDirectory() as tmp:
+            pinned = (
+                ("adapter.conversation is set",
+                 {"type": "antigravity", "conversation": "12345678-1234-5678-1234-567812345678"}),
+                ("adapter.command names a conversation",
+                 {"type": "antigravity", "command": "agy -p {prompt} -c"}),
+                ("adapter.command names a conversation",
+                 {"type": "antigravity", "command": "agy -p {prompt} --continue"}),
+                ("adapter.command names a conversation",
+                 {"type": "antigravity",
+                  "command": "agy -p {prompt} --conversation 12345678-1234-5678-1234-567812345678"}),
+            )
+            for reason, adapter in pinned:
+                with self.assertRaises(ConfigError, msg=reason) as caught:
+                    make_config(limits=limits, adapter=adapter)
+                self.assertIn("pins a single one", str(caught.exception), reason)
+                self.assertIn(reason, str(caught.exception), reason)
+
+            # The .active_conversation file in the working folder pins one just as firmly.
+            cwd = Path(tmp)
+            (cwd / ".active_conversation").write_text("12345678-1234-5678-1234-567812345678",
+                                                      encoding="utf-8")
+            with self.assertRaises(ConfigError) as caught:
+                make_config(limits=limits, adapter={"type": "antigravity", "cwd": str(cwd)})
+            self.assertIn(".active_conversation", str(caught.exception))
+
+            # Without the file (same folder, pin gone) the same config loads.
+            (cwd / ".active_conversation").unlink()
+            self.assertEqual(
+                make_config(limits=limits, adapter={"type": "antigravity", "cwd": str(cwd)})
+                .limits.max_parallel_turns, 2)
 
     def test_parallel_turns_in_one_folder_need_consent(self):
         from swarmly.telegram.config import ConfigError
