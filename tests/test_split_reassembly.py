@@ -10,6 +10,7 @@ never arrives, what did arrive is delivered with a note naming the missing parts
 from __future__ import annotations
 
 import asyncio
+import itertools
 import unittest
 from unittest.mock import patch
 
@@ -296,6 +297,60 @@ class TestReassembly(unittest.TestCase):
         for text in texts:                                  # neither continuation answered
             self.assertNotIn("alpha two", text)
             self.assertNotIn("bravo two", text)
+
+    def test_no_order_of_tokenless_parts_mixes_two_replies(self):
+        """QA review of #29, every order: two tokenless replies from one sender (``alpha`` and
+        ``bravo``, both ``(k/2)``) in all 24 arrival orders. Nothing is joined without a token,
+        so each part 1 runs its own turn, no continuation is answered, and no turn carries
+        text from both replies — the mixing measured was ``"alpha onebravo two"``."""
+        alpha = ["@HermesBot [Codex] alpha one\n\n(1/2)", "[Codex] ↪ (2/2) alpha two"]
+        bravo = ["@HermesBot [Codex] bravo one\n\n(1/2)", "[Codex] ↪ (2/2) bravo two"]
+        for order in itertools.permutations([alpha[0], alpha[1], bravo[0], bravo[1]]):
+            with self.subTest(order=[part[-12:] for part in order]):
+                channel, adapter = receiver()
+
+                async def replay():
+                    for message_id, part in enumerate(order, 1):
+                        await channel.handle_event(event(part, message_id=message_id))
+                    channel._test_clock["t"] += 3600
+                    await channel.handle_event(
+                        event("[Codex] unrelated, no mention", message_id=99))
+
+                run(replay())
+                texts = [message.text for message in adapter.seen]
+                self.assertEqual(len(texts), 2, texts)         # one turn per part 1
+                self.assertTrue(any("alpha one" in text for text in texts), texts)
+                self.assertTrue(any("bravo one" in text for text in texts), texts)
+                for text in texts:                             # neither continuation answered
+                    self.assertNotIn("alpha two", text)
+                    self.assertNotIn("bravo two", text)
+                for text in texts:                             # and never both replies at once
+                    self.assertFalse("alpha" in text and "bravo" in text, text)
+
+    def test_no_order_of_tokenized_parts_mixes_two_replies(self):
+        """The same 24 orders with the token this branch's sender writes: each reply carries
+        its own token, so whichever way the parts interleave each comes out whole and no turn
+        mixes the two (issue #29 review)."""
+        alpha, bravo = outgoing(ALPHA), outgoing(BRAVO)
+        self.assertEqual((len(alpha), len(bravo)), (2, 2), (alpha, bravo))
+        self.assertNotEqual(split_part(alpha[0]).ref, split_part(bravo[0]).ref)
+        for order in itertools.permutations([alpha[0], alpha[1], bravo[0], bravo[1]]):
+            with self.subTest(order=[part[:14] for part in order]):
+                channel, adapter = receiver()
+
+                async def replay():
+                    for message_id, part in enumerate(order, 1):
+                        await channel.handle_event(event(part, message_id=message_id))
+
+                run(replay())
+                texts = [message.text for message in adapter.seen]
+                self.assertEqual(len(texts), 2, [text[:40] for text in texts])
+                self.assertTrue(any(text.endswith(ALPHA) for text in texts),
+                                [text[:40] for text in texts])
+                self.assertTrue(any(text.endswith(BRAVO) for text in texts),
+                                [text[:40] for text in texts])
+                for text in texts:
+                    self.assertFalse("alpha-start" in text and "bravo-start" in text, text[:80])
 
     def test_interleaved_replies_that_start_out_of_order_are_never_mixed(self):
         """Review of #29: A1, B2, B1, A2 — part 2 of one reply arriving before that reply's
