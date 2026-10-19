@@ -55,7 +55,9 @@ from swarmly.telegram.adapters.base import (
     turn_card,
 )
 from swarmly.telegram import endpoint as endpoint_probe
-from swarmly.telegram.config import AdapterSettings, ConfigError
+from swarmly.telegram.config import (ACTIVE_CONVERSATION_FILENAME,
+                                       CONVERSATION_FLAGS, AdapterSettings, ConfigError,
+                                       command_words, names_a_conversation)
 
 
 #: Fragments that mark agentapi's refusal as an ENDPOINT problem -- the live
@@ -141,9 +143,6 @@ class _ConversationDb:
     immutable: bool = False
 
 logger = logging.getLogger("swarmly.telegram.antigravity")
-
-ACTIVE_CONVERSATION_FILENAME = ".active_conversation"
-
 
 def agentapi_title(message: Any) -> str:
     """The ``--title`` for agentapi: the author's name with shell characters removed
@@ -540,24 +539,10 @@ def _unquote_model(argv: List[str]) -> List[str]:
 
 
 def _command_words(settings: AdapterSettings) -> List[str]:
-    """``adapter.command`` split the way the argv builder splits it: shlex, in non-POSIX
-    mode on Windows (review R5-1), with the quotes that mode keeps removed."""
-    try:
-        words = shlex.split(settings.command or "", posix=(os.name != "nt"))
-    except ValueError:
-        words = (settings.command or "").split()
-    return [word.strip("'\"") for word in words]
-
-
-#: The ways an ``agy`` command line names a conversation. ``-c`` is the short alias for
-#: ``--continue`` and takes no value, so it is not one of the "next token is the id" forms.
-CONVERSATION_FLAGS = ("--conversation", "-c", "--continue")
-
-
-def names_a_conversation(words: Sequence[str]) -> bool:
-    """Whether an ``agy`` argv/command already picks a conversation (by id or ``--continue``)."""
-    return any(word in CONVERSATION_FLAGS or word.startswith("--conversation=")
-               for word in words)
+    """``adapter.command`` split the way the argv builder splits it (kept as this module's
+    name for it; the split itself lives in :mod:`swarmly.telegram.config`, where the loader
+    needs it too -- #67)."""
+    return command_words(settings.command or "")
 
 
 def argv_conversation(argv: List[str]) -> Optional[Tuple[str, str]]:

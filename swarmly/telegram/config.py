@@ -38,6 +38,7 @@ import logging
 import math
 import os
 import re
+import shlex
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
@@ -564,8 +565,57 @@ STRANGERS = ("ignore", "answer")
 #: Adapters whose every turn continues one shared conversation: no parallel topics.
 #: ``antigravity`` is deliberately not here (#67): the adapter keeps one conversation per
 #: topic (``_topic_conversations``), exactly as ``claude_thread`` and Reasonix do, so
-#: ``max_parallel_turns > 1`` is safe for it.
+#: ``max_parallel_turns > 1`` is safe for it -- unless a single conversation is *pinned*,
+#: which :func:`pinned_conversation` catches below.
 SINGLE_SESSION_ADAPTERS = ("antigravity_thread", "codex_thread")
+#: Adapters that keep one conversation per topic, so parallel turns are safe while nothing
+#: pins a single conversation.
+PER_TOPIC_CONVERSATION_ADAPTERS = ("antigravity",)
+#: Where an Antigravity/Claude adapter notes the conversation the CLI is working in.
+ACTIVE_CONVERSATION_FILENAME = ".active_conversation"
+#: The ways an ``agy`` command line names a conversation. ``-c`` is the short alias for
+#: ``--continue`` and takes no value, so it is not one of the "next token is the id" forms.
+#: Defined here, not in the adapter, so the loader can refuse parallel topics for a pinned
+#: conversation without importing an adapter (which imports this module).
+CONVERSATION_FLAGS = ("--conversation", "-c", "--continue")
+
+
+def command_words(command: str) -> List[str]:
+    """``adapter.command`` split the way the argv builder splits it: shlex, in non-POSIX
+    mode on Windows (review R5-1), with the quotes that mode keeps removed."""
+    try:
+        words = shlex.split(command or "", posix=(os.name != "nt"))
+    except ValueError:
+        words = (command or "").split()
+    return [word.strip("'\"") for word in words]
+
+
+def names_a_conversation(words: Sequence[str]) -> bool:
+    """Whether an ``agy`` argv/command already picks a conversation (by id or ``--continue``)."""
+    return any(word in CONVERSATION_FLAGS or word.startswith("--conversation=")
+               for word in words)
+
+
+def pinned_conversation(adapter: "AdapterSettings") -> Optional[str]:
+    """Why this adapter runs one conversation for everything, or None if it does not.
+
+    An Antigravity-like adapter is per topic only while nothing pins a conversation:
+    ``adapter.conversation``, an ``.active_conversation`` file in its working folder, or a
+    ``-c``/``--continue``/``--conversation`` flag in ``adapter.command`` all make every topic
+    continue the same context, where parallel turns would interleave.
+    """
+    if (adapter.conversation or "").strip():
+        return "adapter.conversation is set"
+    cwd = (adapter.cwd or "").strip()
+    if cwd:
+        try:
+            if (Path(cwd) / ACTIVE_CONVERSATION_FILENAME).is_file():
+                return f"{ACTIVE_CONVERSATION_FILENAME} is in {cwd}"
+        except OSError:                            # unreadable folder: not a pin we can prove
+            pass
+    if names_a_conversation(command_words(adapter.command or "")):
+        return "adapter.command names a conversation (-c/--continue/--conversation)"
+    return None
 #: Adapters that never touch the working directory: parallel topics are safe without
 #: ``limits.allow_shared_cwd``.
 NO_FILES_ADAPTERS = ("echo",)
@@ -1068,6 +1118,14 @@ class AgentConfig:
                 f"limits.max_parallel_turns > 1 needs an adapter that keeps one session per "
                 f"discussion (or none); {adapter.type!r} keeps a single conversation, so "
                 "parallel turns would interleave in it. Use 1.")
+        if limits.max_parallel_turns > 1 and adapter.type in PER_TOPIC_CONVERSATION_ADAPTERS:
+            pinned = pinned_conversation(adapter)
+            if pinned:
+                raise ConfigError(
+                    f"limits.max_parallel_turns > 1 needs one conversation per discussion, "
+                    f"but this {adapter.type!r} adapter pins a single one ({pinned}), so "
+                    "parallel turns would interleave in it. Use 1, or drop the pinned "
+                    "conversation.")
         if (limits.max_parallel_turns > 1 and adapter.type not in NO_FILES_ADAPTERS
                 and not limits.allow_shared_cwd):
             raise ConfigError(

@@ -780,8 +780,11 @@ to N topics run a turn at the same time.
   `/stop@<bot> all` (the word right after the command), it stops everything.
 - N above 1 is refused for `antigravity_thread` and `codex_thread`, which keep one
   conversation for everything. `antigravity` is allowed: it keeps one conversation per topic
-  (`--conversation`), like `claude_thread` and Reasonix. A `custom` adapter is allowed too:
-  only set N above 1 if each run is independent.
+  (`--conversation`), like `claude_thread` and Reasonix — but not when a single conversation
+  is *pinned* (`adapter.conversation`, an `.active_conversation` file in `adapter.cwd`, or
+  `-c`/`--continue`/`--conversation` in `adapter.command`), because then every topic
+  continues the same context. A `custom` adapter is allowed too: only set N above 1 if each
+  run is independent.
 - **All topics share `adapter.cwd`,** so parallel turns can overwrite each other's edits. N
   above 1 is refused unless you also set `limits.allow_shared_cwd: true` (not needed for
   `echo`), and the transport logs a warning naming the folder at start. Per-topic worktrees are
