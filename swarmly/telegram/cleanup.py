@@ -103,9 +103,24 @@ class GeneralLedger:
         self.path = path
         self.ttl = float(ttl)
         self._ids: Dict[int, List[Tuple[int, float]]] = {}
+        self._notices: Dict[int, List[Tuple[int, float]]] = {}
         self._expired: Dict[int, int] = {}
         data = load_state(path, "general message ledger") if path is not None else {}
-        for chat, entries in (data.get("chats") or {}).items():
+        self._ids = self._load_entries(data.get("chats"))
+        # Issue #64: the notices this transport itself posted in General, and when. Only these
+        # are ever swept on a timer; everything else here is merely deletable by /cleanup.
+        self._notices = self._load_entries(data.get("notices"))
+        for chat, count in (data.get("expired") or {}).items():
+            try:
+                self._expired[int(chat)] = int(count)
+            except (TypeError, ValueError):
+                continue
+
+    @staticmethod
+    def _load_entries(raw: Any) -> Dict[int, List[Tuple[int, float]]]:
+        """``{chat: [(message_id, at), …]}`` from the saved shape, skipping what is malformed."""
+        loaded: Dict[int, List[Tuple[int, float]]] = {}
+        for chat, entries in (raw or {}).items():
             try:
                 key = int(chat)
             except (TypeError, ValueError):
@@ -116,12 +131,9 @@ class GeneralLedger:
                         and isinstance(entry[0], int) and not isinstance(entry[0], bool) \
                         and isinstance(entry[1], (int, float)):
                     kept.append((int(entry[0]), float(entry[1])))
-            self._ids[key] = kept[-LEDGER_MAX_PER_CHAT:]
-        for chat, count in (data.get("expired") or {}).items():
-            try:
-                self._expired[int(chat)] = int(count)
-            except (TypeError, ValueError):
-                continue
+            if kept:
+                loaded[key] = kept[-LEDGER_MAX_PER_CHAT:]
+        return loaded
 
     # -- recording -----------------------------------------------------------------------
 
@@ -161,7 +173,7 @@ class GeneralLedger:
         return True
 
     def drop(self, chat_id: int, ids: Sequence[int]) -> None:
-        """The ids are deleted: stop offering them."""
+        """The ids are deleted: stop offering them (and stop counting them as notices)."""
         key = int(chat_id)
         gone = {int(i) for i in ids}
         entries = [entry for entry in self._ids.get(key, []) if entry[0] not in gone]
@@ -169,7 +181,74 @@ class GeneralLedger:
             self._ids[key] = entries
         else:
             self._ids.pop(key, None)
+        notices = [entry for entry in self._notices.get(key, []) if entry[0] not in gone]
+        if notices:
+            self._notices[key] = notices
+        else:
+            self._notices.pop(key, None)
         self.save()
+
+    # -- this transport's own notices (issue #64) ----------------------------------------
+
+    def note_notice(self, chat_id: int, message_id: Optional[int],
+                    now: Optional[float] = None) -> None:
+        """Record one machine notice this transport itself posted in General.
+
+        Only what the transport marked as a notice goes here -- never a human message and
+        never a model reply -- and only these ids are swept once they are older than
+        ``limits.ephemeral_notices_minutes``. The entry is bounded by the same 48-hour window
+        as the rest of the ledger: past it Telegram refuses the delete anyway.
+        """
+        if not isinstance(message_id, int) or isinstance(message_id, bool):
+            return
+        moment = float(now if now is not None else time.time())
+        key = int(chat_id)
+        entries = self._notices.setdefault(key, [])
+        if any(known == message_id for known, _ in entries):
+            return
+        entries.append((int(message_id), moment))
+        self._prune_notices(key, moment)
+        entries = self._notices.setdefault(key, [])
+        del entries[:-LEDGER_MAX_PER_CHAT]
+        self.save()
+
+    def _prune_notices(self, chat_id: int, now: float) -> bool:
+        """Drop the notices past the delete window; True when any went."""
+        key = int(chat_id)
+        entries = self._notices.get(key) or []
+        kept = [(message_id, at) for message_id, at in entries if now - at <= self.ttl]
+        if len(kept) == len(entries):
+            return False
+        if kept:
+            self._notices[key] = kept
+        else:
+            self._notices.pop(key, None)
+        return True
+
+    def notices_due(self, chat_id: int, minutes: float,
+                    now: Optional[float] = None) -> List[int]:
+        """Own notices older than ``minutes``, oldest first: what the sweep deletes.
+
+        ``minutes <= 0`` disables the sweep and offers nothing.
+        """
+        if minutes is None or float(minutes) <= 0:
+            return []
+        moment = float(now if now is not None else time.time())
+        key = int(chat_id)
+        if self._prune_notices(key, moment):
+            self.save()
+        age_limit = float(minutes) * 60.0
+        entries = sorted(self._notices.get(key, []), key=lambda pair: (pair[1], pair[0]))
+        return [message_id for message_id, at in entries if moment - at >= age_limit]
+
+    def notices(self, chat_id: int, now: Optional[float] = None) -> List[int]:
+        """Every own notice still inside the window, oldest first (tests and the dry run)."""
+        moment = float(now if now is not None else time.time())
+        key = int(chat_id)
+        if self._prune_notices(key, moment):
+            self.save()
+        entries = sorted(self._notices.get(key, []), key=lambda pair: (pair[1], pair[0]))
+        return [message_id for message_id, _ in entries]
 
     # -- reading -------------------------------------------------------------------------
 
@@ -190,6 +269,8 @@ class GeneralLedger:
             return
         state = {"chats": {str(chat): [list(entry) for entry in entries]
                            for chat, entries in self._ids.items()},
+                 "notices": {str(chat): [list(entry) for entry in entries]
+                             for chat, entries in self._notices.items()},
                  "expired": {str(chat): count for chat, count in self._expired.items()}}
         save_state(self.path, state, "general message ledger")
 

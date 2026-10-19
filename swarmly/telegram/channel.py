@@ -43,7 +43,7 @@ from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
 from swarmly.telegram.adapters.base import (AdapterReply, is_silent_reply, load_state,
                                            save_state, topic_mode)
-from swarmly.telegram.cleanup import Cleanup, GeneralLedger, TopicInfo
+from swarmly.telegram.cleanup import DELETE_BATCH, Cleanup, GeneralLedger, TopicInfo
 from swarmly.telegram.commands import (
     DIAG_COMMANDS,
     command_args,
@@ -141,6 +141,11 @@ def _local_revision_full() -> str:
 
 #: Messages older than this when the transport starts are a backlog, not a conversation.
 _MAX_BACKLOG_SECONDS = 30 * 60
+
+#: How often the transport sweeps its own expired notices out of General (#64). A notice is
+#: deleted on the first tick after ``limits.ephemeral_notices_minutes``, so it lingers at
+#: most this long past that.
+_EPHEMERAL_SWEEP_SECONDS = 60.0
 
 # Retained ids in the gitbus seen-ledger; oldest are pruned first (insertion order).
 _GITBUS_SEEN_MAX = 5000
@@ -542,6 +547,8 @@ class AgentChannel:
         self._ack_announced: Dict[str, int] = {}
         self._ack_attempted: Dict[str, int] = {}
         self._ack_task: Optional[asyncio.Task] = None
+        #: Issue #64: the timer that deletes this transport's own expired notices in General.
+        self._ephemeral_task: Optional[asyncio.Task] = None
         from swarmly.telegram.selftest import PeerSelfTest
         self.selftest = PeerSelfTest(self)       # startup check that the bots see each other
         from swarmly.telegram.roster import Roster
@@ -1092,7 +1099,7 @@ class AgentChannel:
                          ref=self._alias_ref(), rev=self._running_revision),
                 f"🔄 {self.config.identity.alias} peers: {self.roster.sync_list() or 'none'}"),
                 chat_id=event.chat_id, thread_id=event.thread_id, silent=True,
-                allow_when_frozen=True)
+                allow_when_frozen=True, notice=True)
             return True
         handles = self.roster.handles(event.text or "")
         if command == "remove":
@@ -1105,7 +1112,7 @@ class AgentChannel:
                          ref=self._alias_ref(), rev=self._running_revision),
                 f"👋 @{username} {self.config.identity.alias} has added {alias} as a peer"),
                 chat_id=event.chat_id, thread_id=event.thread_id, silent=True,
-                allow_when_frozen=True)
+                allow_when_frozen=True, notice=True)
         return True
 
     def _command_reply(self, command: str, event: Optional[ChannelEvent] = None) -> str:
@@ -1421,11 +1428,19 @@ class AgentChannel:
     # -- what /cleanup needs from the channel -------------------------------------------
 
     def _note_general_message(self, chat_id: int, message_id: Optional[int],
-                              thread_id: Optional[int]) -> None:
-        """Record a General message id, the only kind /cleanup could still delete (#63)."""
+                              thread_id: Optional[int], notice: bool = False) -> None:
+        """Record a General message id, the only kind /cleanup could still delete (#63).
+
+        ``notice`` marks the message as a machine notice this transport posted itself, which
+        is what the ephemeral sweep may delete on a timer (#64). Nothing else is ever marked:
+        a human's message is not ours to delete, and a model reply is the answer someone is
+        reading.
+        """
         if thread_id is not None or message_id is None:
             return
         self.ledger.note(int(chat_id), [int(message_id)])
+        if notice:
+            self.ledger.note_notice(int(chat_id), int(message_id))
 
     def cleanup_home_chat(self) -> Optional[int]:
         home = self.config.identity.home_channel_id
@@ -1537,6 +1552,61 @@ class AgentChannel:
         logger.info("deleted %d General message(s) in chat %s", len(ids), chat_id)
         return len(ids)
 
+    # -- short-lived notices (issue #64) --------------------------------------------------
+
+    def ephemeral_notices_minutes(self) -> float:
+        """``limits.ephemeral_notices_minutes``: 0 (or less) turns the sweep off."""
+        value = getattr(self.config.limits, "ephemeral_notices_minutes", 0.0)
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def sweep_ephemeral_notices(self, now: Optional[float] = None) -> int:
+        """Delete this transport's own General notices older than the limit (#64).
+
+        Only the ids this transport itself posted *and* marked as machine notices are
+        offered -- never a person's message and never a model reply -- and only inside
+        Telegram's 48-hour delete window (the ledger prunes what is past it). Returns how
+        many messages went.
+        """
+        minutes = self.ephemeral_notices_minutes()
+        home = self.cleanup_home_chat()
+        if minutes <= 0 or home is None:
+            return 0
+        due = self.ledger.notices_due(home, minutes, now)
+        if not due:
+            return 0
+        deleted = 0
+        for start in range(0, len(due), DELETE_BATCH):
+            batch = due[start:start + DELETE_BATCH]
+            try:
+                got = int(await self.cleanup_delete_messages(home, batch) or 0)
+            except Exception:                              # noqa: BLE001 - the tick goes on
+                logger.exception("could not delete %d expired notice(s)", len(batch))
+                break
+            if got > 0:
+                self.ledger.drop(home, batch[:got])
+                deleted += got
+            if got < len(batch):
+                # Telegram refused the rest (already gone, or out of reach): stop offering
+                # them, or every tick retries the same dead ids.
+                self.ledger.drop(home, batch[got:])
+                break
+        if deleted:
+            logger.info("deleted %d expired notice(s) in chat %s", deleted, home)
+        return deleted
+
+    async def _ephemeral_tick(self) -> None:
+        """Sweep on a timer; the interval is short enough that a notice never lingers long."""
+        while True:
+            try:
+                await self.sweep_ephemeral_notices()
+            except Exception:                              # noqa: BLE001 - never dies
+                self.stats.errors += 1
+                logger.exception("ephemeral notice sweep failed; retrying next tick")
+            await asyncio.sleep(_EPHEMERAL_SWEEP_SECONDS)
+
     async def cleanup_forget_topic(self, chat_id: int, thread_id: int) -> None:
         """A topic was deleted here: forget it, then say so on the machine plane (#63)."""
         self.forget_topic_state(chat_id, thread_id)
@@ -1548,7 +1618,8 @@ class AgentChannel:
             await self.send(format_message(Envelope(
                 type=MessageType.NOTE, to="*", intent="TOPIC_GONE", ref=str(thread_id),
                 rev=self._running_revision)),
-                chat_id=int(chat_id), thread_id=None, silent=True, allow_when_frozen=True)
+                chat_id=int(chat_id), thread_id=None, silent=True, allow_when_frozen=True,
+                notice=True)
         except Exception:                                  # noqa: BLE001 - best effort
             logger.exception("could not announce the deletion of topic %s", thread_id)
 
@@ -1637,7 +1708,8 @@ class AgentChannel:
         ref = str(envelope.id) if envelope.id else (
             str(event.message_id) if event.message_id is not None else "unknown")
         ack = Envelope(type=MessageType.ACK, to=self._alias_for(event), ref=ref, id=self._short_id())
-        await self.send(format_message(ack), chat_id=event.chat_id, thread_id=event.thread_id)
+        await self.send(format_message(ack), chat_id=event.chat_id, thread_id=event.thread_id,
+                        notice=True)
 
     def _freeze_status_for_me(self, envelope: Envelope) -> bool:
         target = (envelope.to or "*").strip().lstrip("@").lower()
@@ -1738,7 +1810,7 @@ class AgentChannel:
         self._freeze_ref = ref
         self._freeze_until = until
         logger.info("freeze state restored from %s (ref=%s)", path, ref)
-        await self.send(self._frozen_notice(), allow_when_frozen=True)
+        await self.send(self._frozen_notice(), allow_when_frozen=True, notice=True)
 
     def _quota_retry_seconds(self) -> float:
         return max(1.0, float(getattr(self.config.limits, "quota_retry_minutes", 60.0))) * 60
@@ -1781,7 +1853,7 @@ class AgentChannel:
         self._set_frozen(False, None)
         logger.info("quota freeze ended; resuming")
         await self.send(self._resumed_notice("its quota freeze has ended"),
-                        allow_when_frozen=True)
+                        allow_when_frozen=True, notice=True)
         return True
 
     async def _tell_frozen(self, event: ChannelEvent) -> None:
@@ -1798,7 +1870,7 @@ class AgentChannel:
         self._frozen_told[key] = self._clock()
         await self.send(self._frozen_line(), reply_to_message_id=event.message_id,
                         chat_id=event.chat_id, thread_id=event.thread_id,
-                        allow_when_frozen=True)
+                        allow_when_frozen=True, notice=True)
 
     async def _note_adapter_failure(self, detail: str) -> None:
         """#49.E: repeated quota-signature failures freeze the channel before the ticket storm.
@@ -1831,7 +1903,7 @@ class AgentChannel:
             until = resets or now + self._quota_retry_seconds()
             self._set_frozen(True, "quota", until)
             self.stats.last_error = "auto-frozen: adapter quota exhausted"
-            await self.send(self._frozen_notice(), allow_when_frozen=True)
+            await self.send(self._frozen_notice(), allow_when_frozen=True, notice=True)
 
     def _track_peer_freeze(self, envelope: Envelope, event: ChannelEvent) -> None:
         """Remember which peers said they are frozen, so turns can route around them."""
@@ -2037,6 +2109,7 @@ class AgentChannel:
             sent = await self.send(
                 line,
                 on_attempt=mark_attempted,
+                notice=True,
             )
             if sent is None:
                 return posted
@@ -2242,7 +2315,8 @@ class AgentChannel:
                 try:
                     await self.send(f"⚠️ {self.config.identity.alias}: the GitHub backstop "
                                     f"cannot poll: {outcome.errors[0][:300]} (check `gh auth "
-                                    "status` and github.token_env on this host)", silent=True)
+                                    "status` and github.token_env on this host)", silent=True,
+                                    notice=True)
                 except Exception:                              # noqa: BLE001 - best effort
                     logger.exception("could not post the github backstop alert")
         return outcome
@@ -2391,7 +2465,7 @@ class AgentChannel:
             if self._announce_resumed:              # /resume ended a quota freeze
                 self._announce_resumed = False
                 await self.send(self._resumed_notice("the admin resumed it"),
-                                allow_when_frozen=True)
+                                allow_when_frozen=True, notice=True)
             return sent
 
         if self._frozen:
@@ -2409,7 +2483,7 @@ class AgentChannel:
                 if self._announce_resumed:          # a /model switch lifted a quota freeze
                     self._announce_resumed = False
                     await self.send(self._resumed_notice("switched to another model"),
-                                    allow_when_frozen=True)
+                                    allow_when_frozen=True, notice=True)
                 return sent
             logger.info("routing decision: respond=False (reason: transport frozen)")
             await self._tell_frozen(event)
@@ -2535,7 +2609,7 @@ class AgentChannel:
                         f"dropped this message from {event.author_username or 'someone'}. "
                         "Send it again once it has answered.",
                         reply_to_message_id=event.message_id, chat_id=event.chat_id,
-                        thread_id=event.thread_id, silent=True)
+                        thread_id=event.thread_id, silent=True, notice=True)
             else:
                 logger.warning("turn already in progress for %s; ignoring concurrent event from @%s",
                                self.config.identity.alias, event.author_username)
@@ -2709,7 +2783,7 @@ class AgentChannel:
         chat_id, thread_id = self._pause_where
         await self.send(f"⏸ {self.config.identity.alias} paused. /resume to continue.",
                         chat_id=chat_id, thread_id=thread_id, allow_when_frozen=True,
-                        silent=True)
+                        silent=True, notice=True)
 
     def _handle_pause(self, event: ChannelEvent) -> Optional[str]:
         """``/pause`` and ``/resume`` from the admin: a bare one reaches every bot, and
@@ -2811,7 +2885,7 @@ class AgentChannel:
         await self.send(f"⏳ {self.config.identity.alias} is busy with a turn running since "
                         f"{since} UTC; {waiting} message(s) here wait for it and get one "
                         "answer when it ends.", chat_id=event.chat_id,
-                        thread_id=event.thread_id, silent=True)
+                        thread_id=event.thread_id, silent=True, notice=True)
 
     def _with_folded(self, incoming: IncomingMessage, key: Any) -> IncomingMessage:
         """The queued messages folded into this turn go first, so one answer covers them."""
@@ -2887,7 +2961,8 @@ class AgentChannel:
                 await self.send("⚠️ still paused here: a person needs to post in this topic "
                                 "before bots take more turns.", chat_id=event.chat_id,
                                 thread_id=event.thread_id,
-                                reply_to_message_id=event.message_id, silent=True)
+                                reply_to_message_id=event.message_id, silent=True,
+                                notice=True)
             return None
         self._paused_topics.add(key)
         self._pause_reminded[key] = self._clock()     # the notice is this window's reminder
@@ -2895,7 +2970,7 @@ class AgentChannel:
         # send() adds the [alias] banner
         await self.send(f"⚠️ paused after {cap} bot turns in a row in this topic. "
                         "Post here to continue.",
-                        chat_id=event.chat_id, thread_id=event.thread_id)
+                        chat_id=event.chat_id, thread_id=event.thread_id, notice=True)
         return None
 
     def _lock_for(self, event: ChannelEvent) -> asyncio.Lock:
@@ -3038,7 +3113,7 @@ class AgentChannel:
                     await self.send(f"♻️ {self.config.identity.alias} wrote a handover and "
                                     "starts a new session for this topic from it next turn.",
                                     chat_id=event.chat_id, thread_id=event.thread_id,
-                                    silent=True)
+                                    silent=True, notice=True)
             else:
                 logger.warning("turn end: message %s FAILED in %.1fs: %s (meta %s)",
                                event.message_id, time.monotonic() - started, reply.error,
@@ -3176,7 +3251,7 @@ class AgentChannel:
             self.stats.last_error = str(exc)
             logger.exception("adapter failure")
             await self.send(f"❌ internal error: {exc}",
-                            chat_id=event.chat_id, thread_id=event.thread_id)
+                            chat_id=event.chat_id, thread_id=event.thread_id, notice=True)
             return None
         finally:
             self._last_agent_turn = self._clock()
@@ -3216,7 +3291,7 @@ class AgentChannel:
             await self.send(f"⏳ {reply.error}; it continues where it stopped in its next turn."
                             if resume else f"❌ {reply.error}",
                             chat_id=event.chat_id, thread_id=event.thread_id,
-                            reply_to_message_id=event.message_id)
+                            reply_to_message_id=event.message_id, notice=True)
             if resume and not self._busy_waiting_by.get((event.chat_id, event.thread_id)):
                 self._run_own_task(CONTINUE_NOTE, event.chat_id, event.thread_id,
                                    self.topics.name(event.chat_id, event.thread_id))
@@ -3351,7 +3426,7 @@ class AgentChannel:
             "it can't be told apart from any other admin's. Turn off \"Remain anonymous\" "
             "(group settings, Administrators, your entry) and send it again.",
             reply_to_message_id=event.message_id, chat_id=event.chat_id,
-            thread_id=event.thread_id, silent=True)
+            thread_id=event.thread_id, silent=True, notice=True)
 
     async def _mention_drop_notice(self, event: ChannelEvent, reason: str) -> None:
         """Tell a peer bot which of its handles this bot left unanswered, and why (issue #27).
@@ -3382,7 +3457,7 @@ class AgentChannel:
             f"{', '.join(handles)}, but {reason}. Address one of those handles alone if the "
             "work is meant for me.",
             reply_to_message_id=event.message_id, chat_id=event.chat_id,
-            thread_id=event.thread_id, silent=True)
+            thread_id=event.thread_id, silent=True, notice=True)
 
     async def _cooldown_notice(self, event: ChannelEvent) -> None:
         """Say once per cooldown window that a message to this bot was dropped, so the sender's
@@ -3408,7 +3483,8 @@ class AgentChannel:
             f"⚠️ {self.config.identity.alias} skipped this message from {sender}:{named} the "
             f"bot-to-bot cooldown in General is on, {event.cooldown_left:.0f}s left. Send it "
             "again after that, or use a topic (topics have no cooldown).",
-            reply_to_message_id=event.message_id, chat_id=event.chat_id, silent=True)
+            reply_to_message_id=event.message_id, chat_id=event.chat_id, silent=True,
+            notice=True)
 
     def _learn_topic_refs(self, chat_id: int, thread_id: int, text: str) -> None:
         """Remember which topic first talked about each issue or PR (any bot's topic: every
@@ -3470,7 +3546,8 @@ class AgentChannel:
         self._mirror_handoffs(body, chat_id, thread_id, self.last_first_message_id,
                               asker=self._asker(event))
         return await self.send(f"↪ moved this to {topic_link(chat_id, thread_id)}",
-                               chat_id=event.chat_id, reply_to_message_id=event.message_id)
+                               chat_id=event.chat_id, reply_to_message_id=event.message_id,
+                               notice=True)
 
     def _work_moves_to_topics(self, event: ChannelEvent) -> bool:
         """Whether this message is in the home group's General with limits.work_in_topics on
@@ -3547,7 +3624,8 @@ class AgentChannel:
         verb = "moved this to" if moved else "opened"
         sent = await self.send(f"↪ {verb} topic «{name}»: {topic_link(home, thread_id)}",
                                chat_id=event.chat_id, thread_id=event.thread_id,
-                               reply_to_message_id=event.message_id if moved else None)
+                               reply_to_message_id=event.message_id if moved else None,
+                               notice=True)
         if moved:
             return sent
         if not hands_over(brief, self._peer_handle()):
@@ -3570,7 +3648,7 @@ class AgentChannel:
         if not here:
             sent = await self.send(
                 f"↪ continued in {topic_link(chat_id, thread_id)}, already about this item",
-                chat_id=event.chat_id, thread_id=event.thread_id)
+                chat_id=event.chat_id, thread_id=event.thread_id, notice=True)
         if not hands_over(brief, self._peer_handle()):
             self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", chat_id, thread_id,
                                self.topics.name(chat_id, thread_id))
@@ -3768,7 +3846,7 @@ class AgentChannel:
                 await self.send(f"@{handle} reminder: the hand-off above is still waiting for "
                                 "you. Answer it, or say why you can't.",
                                 chat_id=chat_id, thread_id=thread_id,
-                                reply_to_message_id=entry.get("message_id"))
+                                reply_to_message_id=entry.get("message_id"), notice=True)
             elif entry["nudged"] and age >= 2 * wait:
                 self._pending_handoffs.pop(key, None)
                 logger.warning("hand-off to %s in %s is still unanswered after %.0f min",
@@ -3778,7 +3856,8 @@ class AgentChannel:
                 await self.send(f"⚠️ {lead}{alias} has not answered the hand-off above for "
                                 f"{age / 60:.0f} minutes. It may be stopped or stuck.",
                                 chat_id=chat_id, thread_id=thread_id,
-                                reply_to_message_id=entry.get("message_id"), silent=True)
+                                reply_to_message_id=entry.get("message_id"), silent=True,
+                                notice=True)
                 # The bot that handed the work over decides what happens to it now: a peer
                 # that is down must not hold the task (live run: nobody reassigned it).
                 self._run_own_task(REASSIGN_NOTE.format(alias=alias, minutes=round(age / 60)),
@@ -4353,7 +4432,8 @@ class AgentChannel:
                    reply_to_message_id: Optional[int] = None,
                    *, chat_id: Optional[int] = None, thread_id: Optional[int] = None,
                    on_attempt=None, return_message_id: bool = False,
-                   allow_when_frozen: bool = False, silent: bool = False):
+                   allow_when_frozen: bool = False, silent: bool = False,
+                   notice: bool = False):
         """Post to the home channel, paced, escaped, and split when it is too long.
 
         A split message goes out as consecutive parts under one hold of the send lock, so
@@ -4362,6 +4442,11 @@ class AgentChannel:
         ``text`` may be a callable: it is called once the pacing slot is free, just before
         the send, so the message says what is true when it goes out; returning None or ""
         sends nothing. ``silent`` sends without a notification sound.
+
+        ``notice=True`` marks machine traffic this transport generated itself -- an ONLINE or
+        SEEN answer, a busy/paused line, a "moved this to" note, a reminder (#64) -- so it can
+        be deleted once ``limits.ephemeral_notices_minutes`` have passed. It is never set for
+        a model reply, a command answer or anything a person posted.
         """
         destination = self.config.identity.home_channel_id if chat_id is None else chat_id
         if not callable(text):
@@ -4385,14 +4470,14 @@ class AgentChannel:
                     # One lock for the bot: the first part was rerouted in place.
                     await self._send_rest_in_general(parts[index:], index, chat_id,
                                                      return_message_id, allow_when_frozen,
-                                                     silent)
+                                                     silent, notice=notice)
                     break
                 try:
                     result = await self._send_locked(
                         part, reply_to_message_id if index == 0 else None, chat_id,
                         on_attempt if index == 0 else None, return_message_id,
                         allow_when_frozen, address_peers=index == 0, thread_id=thread_id,
-                        silent=silent,
+                        silent=silent, notice=notice,
                     )
                 except TopicGone:
                     if not self.reroute_gone_topics:
@@ -4401,7 +4486,7 @@ class AgentChannel:
                     # to the last under General's own lock, so nothing interleaves there.
                     result = await self._send_rest_in_general(
                         parts[index:], index, chat_id, return_message_id, allow_when_frozen,
-                        silent, gone_from=thread_id)
+                        silent, gone_from=thread_id, notice=notice)
                     if index == 0:
                         first = result
                     break
@@ -4416,7 +4501,8 @@ class AgentChannel:
     async def _send_rest_in_general(self, parts: List[str], start: int,
                                     chat_id: Optional[int], return_message_id: bool,
                                     allow_when_frozen: bool, silent: bool,
-                                    gone_from: Optional[int] = None) -> Any:
+                                    gone_from: Optional[int] = None,
+                                    notice: bool = False) -> Any:
         """Post ``parts`` (from index ``start`` of a reply) in General; ``gone_from`` names
         the topic for the note on the first of them."""
         destination = self.config.identity.home_channel_id if chat_id is None else chat_id
@@ -4427,7 +4513,7 @@ class AgentChannel:
                 result = await self._send_locked(
                     part, None, chat_id, None, return_message_id, allow_when_frozen,
                     address_peers=start + offset == 0, thread_id=None, silent=silent,
-                    note_for=gone_from if offset == 0 else None)
+                    note_for=gone_from if offset == 0 else None, notice=notice)
                 if offset == 0:
                     first = result
                 if result is _SEND_SUPPRESSED:
@@ -4443,7 +4529,7 @@ class AgentChannel:
                            return_message_id: bool = False,
                            allow_when_frozen: bool = False, *, address_peers: bool = True,
                            thread_id: Optional[int] = None, silent: bool = False,
-                           note_for: Optional[int] = None):
+                           note_for: Optional[int] = None, notice: bool = False):
         if self._frozen and not allow_when_frozen:
             logger.info("outbound automation suppressed while transport is frozen")
             return _SEND_SUPPRESSED if return_message_id else None
@@ -4486,7 +4572,8 @@ class AgentChannel:
             raise RuntimeError("channel has no bot: call start() or inject a sender")
         self.stats.sent += 1
         self.last_sent_message_id = getattr(result, "message_id", None)
-        self._note_general_message(destination, self.last_sent_message_id, thread_id)
+        self._note_general_message(destination, self.last_sent_message_id, thread_id,
+                                   notice=notice)
         logger.info("Telegram accepted outbound message id=%s", self.last_sent_message_id)
         return self.last_sent_message_id if return_message_id else payload
 
@@ -4647,7 +4734,8 @@ class AgentChannel:
                     self._running_revision_full, self.config.identity.alias,
                     self.config.identity.home_channel_id)
         try:
-            await self.send(self.online_notice(), silent=True)    # machine traffic: no sound
+            await self.send(self.online_notice(), silent=True,     # machine traffic: no sound
+                            notice=True)
         except Exception as exc:
             if "chat not found" in str(exc).lower():
                 raise RuntimeError(
@@ -4665,6 +4753,8 @@ class AgentChannel:
             self._reply_task = asyncio.create_task(self._reply_tick())
         if self._ack_task is None:
             self._ack_task = asyncio.create_task(self._ack_tick())
+        if self._ephemeral_task is None and self.ephemeral_notices_minutes() > 0:
+            self._ephemeral_task = asyncio.create_task(self._ephemeral_tick())
         if self._bus_task is None and self.config.fallback.gitbus_poll_minutes > 0 \
                 and self.config.bus.enabled:
             self._bus_task = asyncio.create_task(self._bus_tick())
@@ -4714,6 +4804,9 @@ class AgentChannel:
             if self._ack_task is not None:
                 self._ack_task.cancel()
                 self._ack_task = None
+            if self._ephemeral_task is not None:
+                self._ephemeral_task.cancel()
+                self._ephemeral_task = None
             if self._bus_task is not None:
                 self._bus_task.cancel()
                 self._bus_task = None
@@ -4774,7 +4867,8 @@ class AgentChannel:
             if self._frozen:
                 return
             try:
-                sent = await self.send(self._digest_alert(digest), chat_id=digest[0]["chat_id"])
+                sent = await self.send(self._digest_alert(digest),
+                                       chat_id=digest[0]["chat_id"], notice=True)
                 if sent is None:
                     return
             except Exception:
@@ -4813,7 +4907,8 @@ class AgentChannel:
                 mark_notified = self.replies.notified
             try:
                 try:
-                    sent = await self.send(notice, reply_to_message_id=row['message_id'], chat_id=row['chat_id'])
+                    sent = await self.send(notice, reply_to_message_id=row['message_id'],
+                                           chat_id=row['chat_id'], notice=True)
                     if sent is None:
                         return
                 except Exception as exc:
@@ -4823,7 +4918,8 @@ class AgentChannel:
                     if not _is_missing_reply_target(exc):
                         raise
                     logger.warning("reply target missing for ticket %s; sending unthreaded alert", row['id'][:8])
-                    sent = await self.send(notice, reply_to_message_id=None, chat_id=row['chat_id'])
+                    sent = await self.send(notice, reply_to_message_id=None,
+                                           chat_id=row['chat_id'], notice=True)
                     if sent is None:
                         return
                 mark_notified(row['id'])

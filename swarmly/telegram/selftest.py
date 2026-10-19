@@ -212,7 +212,8 @@ class PeerSelfTest:
                                  ref=",".join(names)),
                         f"\U0001F440 {self.cfg.identity.alias} sees {', '.join(names)}")
                 try:
-                    await self.channel.send(compose, allow_when_frozen=True, silent=True)
+                    await self.channel.send(compose, allow_when_frozen=True, silent=True,
+                                            notice=True)   # #64: a SEEN is a notice
                 except Exception:                      # noqa: BLE001 - diagnostics only
                     logger.warning("self-test: could not answer %s", ", ".join(taken),
                                    exc_info=True)
@@ -391,7 +392,7 @@ class PeerSelfTest:
             Envelope(type=MessageType.NOTE, to="*", intent="FYI", ref="selftest"),
             "⚠️ self-test: " + "\n".join(lines))
         try:
-            await self.channel.send(line, allow_when_frozen=True, silent=True)
+            await self.channel.send(line, allow_when_frozen=True, silent=True, notice=True)
             self.warned = {"signature": signature, "at": now}
             result["warned"] = self.warned
         except Exception:                              # noqa: BLE001 - the log has it

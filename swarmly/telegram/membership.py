@@ -525,7 +525,7 @@ class Membership:
         self.cancel()
         await self.ch.send(format_message(
             Envelope(type=MessageType.BYE, to="*", intent="OFFLINE", ref=self.ch._alias_ref()),
-            f"🔴 {self.alias} offline"), silent=True, allow_when_frozen=True)
+            f"🔴 {self.alias} offline"), silent=True, allow_when_frozen=True, notice=True)
 
     # -- inbound --------------------------------------------------------------------------
     async def handle(self, envelope: Envelope, body: str, event: "ChannelEvent") -> bool:
@@ -585,7 +585,7 @@ class Membership:
         if not self._add_peer(known or alias, username, event.author_id, fields.get("role")):
             await self.ch.send(f"⚠️ @{username} the alias {alias} is taken in this swarm; "
                                "restart it with another --alias.", silent=True,
-                               reply_to_message_id=event.message_id)
+                               reply_to_message_id=event.message_id, notice=True)
             return
         alias = known or alias
         self.seen(alias)
@@ -1041,7 +1041,7 @@ class Membership:
             Envelope(type=MessageType.HELLO, to=alias, intent="ROLE", ref=role),
             f"🎭 @{handle.lstrip('@')} you are the swarm's {role}." + (f" {reason}" if reason
                                                                         else "")),
-            silent=True, allow_when_frozen=True)
+            silent=True, allow_when_frozen=True, notice=True)
         return True
 
 

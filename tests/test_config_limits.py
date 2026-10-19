@@ -105,6 +105,22 @@ class CleanupLimitsLoaderTests(unittest.TestCase):
                 cfg_with_limits({"cleanup_idle_hours": bad})
             self.assertIn("limits.cleanup_idle_hours", str(caught.exception), bad)
 
+    def test_ephemeral_notices_minutes_loads_and_zero_stays_zero(self):
+        """#64: default 60, and an explicit 0 disables the sweep instead of restoring 60."""
+        self.assertEqual(cfg_with_limits({}).limits.ephemeral_notices_minutes, 60.0)
+        self.assertEqual(cfg_with_limits({"ephemeral_notices_minutes": 15})
+                         .limits.ephemeral_notices_minutes, 15.0)
+        self.assertEqual(cfg_with_limits({"ephemeral_notices_minutes": "45"})
+                         .limits.ephemeral_notices_minutes, 45.0)
+        self.assertEqual(cfg_with_limits({"ephemeral_notices_minutes": 0})
+                         .limits.ephemeral_notices_minutes, 0.0)
+
+    def test_a_bad_ephemeral_notices_minutes_is_refused_with_the_key_named(self):
+        for bad in ("soon", -1, True, None):
+            with self.assertRaises(ConfigError) as caught:
+                cfg_with_limits({"ephemeral_notices_minutes": bad})
+            self.assertIn("limits.ephemeral_notices_minutes", str(caught.exception), bad)
+
 
 class LoadEnvBomTests(unittest.TestCase):
     def test_bom_in_env_does_not_drop_the_first_key(self):
