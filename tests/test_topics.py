@@ -214,12 +214,19 @@ class ChannelTests(unittest.TestCase):
 
     def test_parallel_needs_an_adapter_with_a_session_per_discussion(self):
         from swarmly.telegram.config import ConfigError
-        for kind in ("antigravity", "antigravity_thread", "codex_thread"):
+        for kind in ("antigravity_thread", "codex_thread"):
             with self.assertRaises(ConfigError):
                 make_config(limits={"max_parallel_turns": 2, "allow_shared_cwd": True},
                             adapter={"type": kind})
         make_config(limits={"max_parallel_turns": 2, "allow_shared_cwd": True},
                     adapter={"type": "claude_thread"})
+
+    def test_antigravity_takes_parallel_turns(self):
+        """#67: the adapter keeps one conversation per topic, so >1 is not interleaving."""
+        config = make_config(limits={"max_parallel_turns": 2, "allow_shared_cwd": True},
+                             adapter={"type": "antigravity"})
+        self.assertEqual(config.limits.max_parallel_turns, 2)
+        self.assertEqual(config.adapter.type, "antigravity")
 
     def test_parallel_turns_in_one_folder_need_consent(self):
         from swarmly.telegram.config import ConfigError

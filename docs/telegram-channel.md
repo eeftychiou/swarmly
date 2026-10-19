@@ -778,9 +778,10 @@ to N topics run a turn at the same time.
   topic id, under General's own pacing, so it never interleaves with a General reply.
 - `/stop@<bot>` in a topic stops that topic's turn and queue only; in General, or as
   `/stop@<bot> all` (the word right after the command), it stops everything.
-- N above 1 is refused for `antigravity`, `antigravity_thread` and `codex_thread`, which keep
-  one conversation for everything. A `custom` adapter is allowed: only set N above 1 if each
-  run is independent.
+- N above 1 is refused for `antigravity_thread` and `codex_thread`, which keep one
+  conversation for everything. `antigravity` is allowed: it keeps one conversation per topic
+  (`--conversation`), like `claude_thread` and Reasonix. A `custom` adapter is allowed too:
+  only set N above 1 if each run is independent.
 - **All topics share `adapter.cwd`,** so parallel turns can overwrite each other's edits. N
   above 1 is refused unless you also set `limits.allow_shared_cwd: true` (not needed for
   `echo`), and the transport logs a warning naming the folder at start. Per-topic worktrees are

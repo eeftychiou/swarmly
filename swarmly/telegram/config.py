@@ -562,7 +562,10 @@ MULTI_MENTIONS = ("first", "all")
 #: commands on its machine (adapter.permissions), so by default they cannot.
 STRANGERS = ("ignore", "answer")
 #: Adapters whose every turn continues one shared conversation: no parallel topics.
-SINGLE_SESSION_ADAPTERS = ("antigravity", "antigravity_thread", "codex_thread")
+#: ``antigravity`` is deliberately not here (#67): the adapter keeps one conversation per
+#: topic (``_topic_conversations``), exactly as ``claude_thread`` and Reasonix do, so
+#: ``max_parallel_turns > 1`` is safe for it.
+SINGLE_SESSION_ADAPTERS = ("antigravity_thread", "codex_thread")
 #: Adapters that never touch the working directory: parallel topics are safe without
 #: ``limits.allow_shared_cwd``.
 NO_FILES_ADAPTERS = ("echo",)
