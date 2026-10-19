@@ -15,6 +15,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
+#: The channel's default reply budget, shared with the turn rules (issue #31). Imported here
+#: rather than duplicated so one number cannot drift from the other.
+from swarmly.telegram.adapters.base import DEFAULT_REPLY_CHARS
+
 
 def reply_state_path(config) -> Path:
     if config.adapter.reply_state_path:
@@ -52,7 +56,8 @@ class ReplyStore:
         #: Issue #31: the reply budget a ticket's answer is held to. A ticket has no topic,
         #: so this is the channel's ``limits.reply_chars`` (500 unless changed); a project's
         #: per-topic override reaches the turn rules, not this sender.
-        self.reply_chars = reply_chars if reply_chars and reply_chars > 0 else 500
+        self.reply_chars = (reply_chars if reply_chars and reply_chars > 0
+                            else DEFAULT_REPLY_CHARS)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             try:
@@ -84,10 +89,13 @@ class ReplyStore:
             if "reply_chars" not in {row[1] for row in db.execute("PRAGMA table_info(replies)")}:
                 try:
                     db.execute("ALTER TABLE replies ADD COLUMN reply_chars INTEGER")
-                except sqlite3.OperationalError:
+                except sqlite3.OperationalError as exc:
                     # Another opener added it between the check and the ALTER: same column,
-                    # same schema, no work left (the concurrent-openers case).
-                    pass
+                    # same schema, no work left. Anything else ("database is locked", a
+                    # corrupt file) must not be swallowed -- the next register would fail
+                    # with "no such column" far from the cause (review of #31).
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
             # Existing stores predate the atomic receipt claim. Inspect the schema
             # once so normal CLI startup does not rely on exception-driven ALTERs.
             columns = {row['name'] for row in db.execute("PRAGMA table_info(replies)")}
@@ -351,7 +359,8 @@ def reply_instructions(config, row, workdir: Optional[Union[str, Path]] = None):
     command = [sys.executable, "-m", "swarmly.telegram.cli", "--config", str(config.source_path.resolve()),
                "reply", row['id'], "--text", "your concise answer or blocker", "--wait", "45"]
     cwd = workdir or config.adapter.cwd or Path.cwd()
-    budget = int(row["reply_chars"]) if row and row.get("reply_chars") else         int(config.limits.reply_chars)
+    budget = (int(row["reply_chars"]) if row and row.get("reply_chars")
+              else int(config.limits.reply_chars))
     return (
         f"[A2A REPLY TICKET {row['id']}]\n"
         f"This was routed to YOU ({config.identity.username}). Original mentions below are intact.\n"

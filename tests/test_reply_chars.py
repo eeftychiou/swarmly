@@ -78,6 +78,12 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(ConfigError):
             project_config(reply_chars=4097)
 
+    def test_an_explicit_500_follows_the_cap_too(self):
+        """Review of #31: the clamp is for the default; a written-down 500 is an operated
+        number and an error when it cannot be delivered."""
+        with self.assertRaises(ConfigError):
+            make_config(limits={"max_message_chars": 400, "reply_chars": 500})
+
     def test_a_lowered_message_cap_does_not_break_the_default(self):
         """Review of #31: max_message_chars below the *default* 500 must still load, clamped."""
         config = make_config(limits={"max_message_chars": 400})
@@ -138,6 +144,38 @@ class TestTurnRules(unittest.TestCase):
         run(channel.handle_event(event("@HermesBot hello", message_id=1, thread_id=OTHER_TOPIC,
                                        author_id=202, username="CodexBot")))
         self.assertEqual(adapter.seen[0].reply_chars, 800)
+
+
+class TestTheChannelHandsItOver(unittest.TestCase):
+    def test_handle_event_passes_the_projects_budget_to_the_ticket(self):
+        """Review of #31: removing the argument at channel.py:2295 would silently bring back
+        "rules say 1500, the store rejects at 500", and every other test would still pass."""
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        class Store:
+            def __init__(self):
+                self.kwargs = None
+
+            def register(self, **kwargs):
+                self.kwargs = kwargs
+                return ({"id": "t1", "recipient": kwargs.get("recipient"),
+                         "reply_chars": kwargs.get("reply_chars"), "state": "pending"}, True)
+
+        with TemporaryDirectory() as tmp:
+            config = project_config(reply_chars=1500)
+            config.source_path = Path(tmp) / "config.yaml"
+            config.source_path.write_text("agent: {}")
+            channel, _ = receiver(config)
+            channel.replies = Store()
+            run(channel.handle_event(event("@HermesBot plan it", message_id=1, thread_id=TOPIC,
+                                           author_id=202, username="CodexBot")))
+            self.assertEqual(channel.replies.kwargs["reply_chars"], 1500)
+
+            channel.replies = Store()
+            run(channel.handle_event(event("@HermesBot general", message_id=2, thread_id=None,
+                                           author_id=202, username="CodexBot")))
+            self.assertEqual(channel.replies.kwargs["reply_chars"], 500)   # the global one
 
 
 class TestTheBus(unittest.TestCase):
@@ -203,6 +241,24 @@ class TestTheSender(unittest.TestCase):
             ticket = self.ticket(store)                           # registered without one
             self.assertIsNone(store.get(ticket)["reply_chars"])
             self.assertEqual(store.budget_for(store.get(ticket)), 500)
+
+    def test_a_legacy_store_gets_the_column_and_keeps_its_tickets(self):
+        """Review of #31: a database written before this change must migrate in place, and its
+        tickets fall back to the store's budget."""
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            store = self.store(tmp, reply_chars=700)
+            ticket = self.ticket(store)
+            # Make it look like a database from before the column existed (through the
+            # store's own connection, so no handle outlives the change on Windows).
+            with store._db() as db:
+                db.execute("ALTER TABLE replies DROP COLUMN reply_chars")
+            reopened = self.store(tmp, reply_chars=700)
+            row = reopened.get(ticket)
+            self.assertIsNone(row["reply_chars"])
+            self.assertEqual(reopened.budget_for(row), 700)
+            reopened.submit(ticket, text="x" * 100)
+            self.assertEqual(reopened.get(ticket)["state"], "ready")
 
     def test_the_ticket_instructions_state_the_budget(self):
         """Review of #31: the CLI hint hardcoded 500, so a turn told 1500 was contradicted."""

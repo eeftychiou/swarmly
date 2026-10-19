@@ -893,6 +893,12 @@ class AgentConfig:
                     kind = f"a {type(default).__name__}"
                 raise ConfigError(f"limits.{key} must be {kind} (got {value!r})")
         limits = ChannelLimits(**_limits_coerced)
+        # Issue #31: the clamp above is for the *default* budget meeting a lowered
+        # max_message_chars. A budget the operator wrote down is not clamped -- an explicit
+        # number that cannot be delivered is a config error, not something to silently move.
+        if "reply_chars" in limits_raw and limits.reply_chars != _limits_coerced.get("reply_chars"):
+            raise ConfigError(f"limits.reply_chars must be at most max_message_chars "
+                              f"({limits.max_message_chars}); got {limits_raw['reply_chars']}")
 
         # A peer is "username" (or a numeric user id), or {username: ..., role: ...}.
         peers: Dict[str, str] = {}
