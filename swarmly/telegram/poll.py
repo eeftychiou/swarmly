@@ -1016,7 +1016,7 @@ class MachineEventClassifier:
     """
 
     STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED"})
-    NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT"})
+    NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE"})
 
     def __init__(self, channel: Any = None) -> None:
         # A channel may carry overridden sets (e.g. tests); fall back to the

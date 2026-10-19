@@ -140,6 +140,18 @@ class TopicMemory:
 
     # -- reading -------------------------------------------------------------------------
 
+    def forget(self, chat_id: int, thread_id: Optional[int]) -> bool:
+        """Drop a discussion's task, progress and messages: the topic is gone (issue #63).
+
+        A new topic gets a new thread id, so nothing else can be meant by the same key; a
+        kept recap would only be shown to a topic that no longer exists.
+        """
+        key = (int(chat_id), thread_id)
+        if self._topics.pop(key, None) is None:
+            return False
+        self.save()
+        return True
+
     def opening(self, chat_id: int, thread_id: Optional[int]) -> Optional[Entry]:
         topic = self._topics.get((int(chat_id), thread_id))
         return topic["opening"] if topic else None

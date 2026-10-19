@@ -458,6 +458,15 @@ class AgentAdapter(ABC):
             return "session"
         return "fresh" if self.WANTS_TOPIC_RECAP else ""
 
+    def forget_session(self, context_id: Optional[str]) -> bool:
+        """Drop the session this discussion resumed, if this runtime keeps one (issue #63).
+
+        Called when a topic is deleted: the discussion it stood for is gone, so a session
+        kept for its id can only be resumed by a topic that no longer exists. Returns whether
+        anything was dropped; an adapter that keeps no per-topic session drops nothing.
+        """
+        return False
+
     def __init__(self, alias: str, settings: Optional[AdapterSettings] = None,
                  git_identity: Optional[Tuple[str, str]] = None):
         self.alias = alias

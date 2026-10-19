@@ -169,6 +169,13 @@ class CodexAdapter(SubprocessAdapter):
     def thread_for(self, context_id: Optional[str]) -> Optional[str]:
         return self._threads.get(context_id) if context_id else None
 
+    def forget_session(self, context_id: Optional[str]) -> bool:
+        """A deleted topic's thread is dropped (issue #63): nothing can resume it again."""
+        if not context_id or context_id not in self._threads:
+            return False
+        self._remember(context_id, None)
+        return True
+
     def _sessions_supported(self) -> bool:
         """Only a ``codex exec`` command can be resumed (not a custom wrapper)."""
         template = shlex.split(self.settings.command_template(), posix=(os.name != "nt"))

@@ -839,6 +839,39 @@ user prompts. Agents in interactive sessions must maintain a recurring heartbeat
 interval via `schedule(CronExpression="*/5 * * * *")` or `/schedule`) to periodically wake up, inspect daemon
 logs, sync the git bus, and process peer tasks without requiring manual human prompts.
 
+**Tidying the group — `/cleanup` (admin only).** A round leaves one-off topics and machine
+notices behind, and the bots are group admins, so the transport can clear them itself.
+`/cleanup@<bot>` is answered by the transport, never by a model turn, and only for the admin:
+anyone else gets a refusal. The coordinator is the bot that runs it; the peers act on its
+`TOPIC_GONE` note instead of running one of their own.
+
+- `/cleanup@<bot>` — a dry run. Every topic this transport knows, with its id, name, idle
+  time, linked issue/PR and that item's state, plus the General messages it can still delete;
+  and how many it can no longer reach. Nothing changes.
+- `/cleanup@<bot> topics done` — the topics whose linked issue or PR is closed or merged and
+  that have been idle at least `limits.cleanup_idle_hours` (default 24).
+- `/cleanup@<bot> topic <id>` — that one topic. `/cleanup@<bot> topics all` — every topic
+  except General and the ids in `limits.cleanup_keep`.
+- `/cleanup@<bot> general` — the General messages this bot can still delete, oldest first,
+  in batches of 100.
+- Every deleting form first replies with what it will remove and a one-use code; nothing is
+  deleted until `/cleanup@<bot> confirm <code>` lands within 5 minutes, because a deletion
+  cannot be undone.
+
+**After a delete** the bot forgets that topic — its topic memory, the topic's CLI session,
+the issue/PR → topic map, its per-topic `/model` and `/reasoning` choices, pending hand-offs
+and the topic-name cache — and posts one machine `NOTE intent=TOPIC_GONE ref=<topic>` so the
+peers forget it too, with no model turn on either side. When a round's tracking issue closes,
+the coordinator posts the dry run once in General and asks the admin whether to delete it.
+
+**Two Telegram limits shape this.** `deleteForumTopic` reaches a topic of any age, but the
+Bot API cannot *list* a group's topics, so the topics offered are the ones the transports
+know (`topics-<alias>.json`). `deleteMessage` works only on messages younger than 48 hours
+and history cannot be listed either, so General cleanup covers only the ids a transport
+recorded while running: a per-chat ledger keeps them with their timestamps and prunes those
+past 48 h, and the dry run says how many it can no longer reach. Older General messages stay
+the admin's to delete by hand.
+
 ## 6. Durable bus poller (`bus-poll --once`) — scheduling per host, gates
 
 When the Telegram transport is unreachable (daemon down, host offline, network partition), agents

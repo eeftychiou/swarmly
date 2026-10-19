@@ -269,6 +269,23 @@ class ClaudeThreadAdapter(ClaudeAdapter):
             return self.session_id
         return self.derived_session_id(self.alias, self.settings.cwd, context_id)
 
+    def forget_session(self, context_id: Optional[str]) -> bool:
+        """A deleted topic's Claude session is dropped (issue #63).
+
+        The session id is derived from the discussion, so there is nothing to keep: dropping
+        the id from the known set means the topic -- if a new one ever reused the id, which it
+        cannot -- would start fresh rather than resume a discussion that is gone.
+        """
+        if not context_id:
+            return False
+        session = self.derived_session_id(self.alias, self.settings.cwd, context_id)
+        if session not in self._known and session not in self._rules_held:
+            return False
+        self._known.discard(session)
+        self._rules_held.pop(session, None)
+        save_state(self._state_path, self._rules_held, f"{self.alias}: Claude sessions")
+        return True
+
     def _can_create(self, session_id: Optional[str] = None) -> bool:
         try:
             uuid.UUID(session_id or self._session.get())

@@ -659,6 +659,13 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
     def conversation_for(self, context_id: Optional[str]) -> Optional[str]:
         return self._topic_conversations.get(context_id) if context_id else None
 
+    def forget_session(self, context_id: Optional[str]) -> bool:
+        """A deleted topic's conversation is dropped (issue #63): nothing resumes it again."""
+        if not context_id or context_id not in self._topic_conversations:
+            return False
+        self._remember_conversation(context_id, None)
+        return True
+
     def _remember_conversation(self, context_id: str, conv: Optional[str],
                                rules: Optional[str] = None) -> None:
         if conv:

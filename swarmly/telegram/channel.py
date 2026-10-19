@@ -43,6 +43,7 @@ from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
 from swarmly.telegram.adapters.base import (AdapterReply, is_silent_reply, load_state,
                                            save_state, topic_mode)
+from swarmly.telegram.cleanup import Cleanup, GeneralLedger, TopicInfo
 from swarmly.telegram.commands import (
     DIAG_COMMANDS,
     command_args,
@@ -104,6 +105,12 @@ def _git_head(*rev_parse_args: str) -> str:
     except Exception:  # pragma: no cover - defensive: never block startup
         pass
     return "unknown"
+
+
+def _ref_state(state: Optional[str]) -> Optional[str]:
+    """An issue or PR state from ``gh`` as /cleanup reads it: open, closed or merged."""
+    word = (state or "").strip().lower()
+    return word if word in ("open", "closed", "merged") else None
 
 
 def _local_revision() -> str:
@@ -580,6 +587,16 @@ class AgentChannel:
 
         self.router = ProjectRouter(list(config.projects.values()), config.identity.home_channel_id)
         self._project_adapters: Dict[str, AgentAdapter] = {}
+        # Issue #63: /cleanup. The ledger is the only record of the General message ids this
+        # transport could still delete (the Bot API cannot list a chat's history), and the
+        # command deletes topics and messages only after one explicit confirmation.
+        self.ledger = GeneralLedger(_state_file(config, "general"))
+        self.cleanup = Cleanup(
+            self, self.ledger,
+            handle=f"@{config.identity.name.lstrip('@')}",
+            idle_hours=float(getattr(config.limits, "cleanup_idle_hours", 24.0)),
+            keep=getattr(config.limits, "cleanup_keep", ()) or ())
+        self._gh_client: Any = None
         self._github_task: Optional[asyncio.Task] = None
         self._github_last_poll: Optional[str] = None
         self._github_alert_at: Optional[float] = None
@@ -1370,6 +1387,226 @@ class AgentChannel:
             return self._reasoning_command(event)
         return self._command_reply(command, event)
 
+    # ------------------------------------------------------------------------------
+    # /cleanup (issue #63): the admin's tidy-up of the group
+    # ------------------------------------------------------------------------------
+
+    async def _handle_cleanup(self, event: ChannelEvent) -> Optional[str]:
+        """Answer ``/cleanup`` here, without a model turn; None when it is not one for us.
+
+        Admin only: anyone else gets one line saying so (issue #63). A command aimed at
+        another bot gets nothing, exactly like /status.
+        """
+        if not self._commands_enabled():
+            return None
+        parsed = parse_command(event.text or "")
+        if not parsed or parsed[0] != "cleanup":
+            return None
+        target = parsed[1]
+        if target:
+            if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
+                return None
+        elif not (self.mentions_me(event.text or "") or event.replies_to_bot
+                  or self._direct_chat(event)):
+            return None
+        return await self.cleanup.handle_args(
+            command_args(event.text or ""),
+            is_admin=self.config.is_admin(event.author_id), chat_id=event.chat_id)
+
+    async def _transport_command(self, event: ChannelEvent) -> Optional[str]:
+        """A command answered by the transport: /cleanup first (it awaits), then the rest."""
+        reply = await self._handle_cleanup(event)
+        return reply if reply is not None else self._handle_command(event)
+
+    # -- what /cleanup needs from the channel -------------------------------------------
+
+    def _note_general_message(self, chat_id: int, message_id: Optional[int],
+                              thread_id: Optional[int]) -> None:
+        """Record a General message id, the only kind /cleanup could still delete (#63)."""
+        if thread_id is not None or message_id is None:
+            return
+        self.ledger.note(int(chat_id), [int(message_id)])
+
+    def cleanup_home_chat(self) -> Optional[int]:
+        home = self.config.identity.home_channel_id
+        return int(home) if home is not None else None
+
+    def cleanup_topics(self) -> List[TopicInfo]:
+        """Every topic this transport knows in the home group, with what /cleanup decided from.
+
+        Telegram cannot list a group's topics, so these are the ones the transports recorded
+        (``topics-<alias>.json``): names, when each was last active, and the issue or PR its
+        name or its messages point at.
+        """
+        home = self.cleanup_home_chat()
+        topics: List[TopicInfo] = []
+        for chat_id, thread_id, name in self.topics.entries():
+            if home is not None and int(chat_id) != int(home):
+                continue
+            refs = list(dict.fromkeys(
+                list(issue_refs(name or "")) + self._refs_of_topic(chat_id, thread_id)))
+            topics.append(TopicInfo(
+                chat_id=int(chat_id), thread_id=int(thread_id), title=name,
+                last_activity=self.topics.last_seen(chat_id, thread_id),
+                refs=tuple(refs), states=self._ref_states(refs, chat_id, thread_id)))
+        return topics
+
+    def _refs_of_topic(self, chat_id: int, thread_id: int) -> List[str]:
+        """The issues and PRs this transport learned the topic is about."""
+        return [ref for ref, topic in self._ref_topics.items()
+                if topic == (int(chat_id), int(thread_id))]
+
+    def _cleanup_repo(self, chat_id: int, thread_id: Optional[int]) -> Optional[str]:
+        """The repo whose issues decide a topic's state: its project's, else the first."""
+        project = self.router.project_for(chat_id, thread_id)
+        if project is not None and project.repo:
+            return project.repo
+        for settings in self.config.projects.values():
+            if settings.repo:
+                return settings.repo
+        return None
+
+    def _github_client(self) -> Any:
+        if self._gh_client is None:
+            from swarmly.github.client import GitHubClient
+            self._gh_client = GitHubClient(
+                token_env=(self.config.github.token_env if self.config.github
+                           else "GH_TOKEN"),
+                alias=self.config.identity.alias,
+                redact=Redactor.from_config(self.config).text)
+        return self._gh_client
+
+    def _ref_states(self, refs: List[str], chat_id: int,
+                    thread_id: Optional[int]) -> Dict[str, Optional[str]]:
+        """Each ref's state (``open``/``closed``/``merged``), or None when gh cannot say.
+
+        A topic is only ever called *done* when every item it links is known to be closed or
+        merged, so an unreachable GitHub keeps its topics: a deletion cannot be undone, and a
+        failure to check is not a reason to delete.
+        """
+        if not refs:
+            return {}
+        repo = self._cleanup_repo(chat_id, thread_id)
+        if not repo or self.config.github is None:
+            return {ref: None for ref in refs}
+        client = self._github_client()
+        states: Dict[str, Optional[str]] = {}
+        for ref in refs:
+            try:
+                number = int(str(ref).lstrip("#"))
+            except (TypeError, ValueError):
+                continue
+            state = None
+            pr = client.pr_view(repo, number)          # a PR first: only it can be merged
+            if pr is not None:
+                state = _ref_state(pr.state)
+            if state is None:
+                issue = client.issue_view(repo, number)
+                if issue is not None:
+                    state = _ref_state(issue.state)
+            states[ref] = state
+        return states
+
+    async def cleanup_delete_topic(self, chat_id: int, thread_id: int) -> bool:
+        """Delete one forum topic with all its messages (any age: that is deleteForumTopic)."""
+        if self.bot is None:
+            logger.warning("cannot delete topic %s: no Telegram bot attached", thread_id)
+            return False
+        try:
+            await self.bot.delete_forum_topic(chat_id=int(chat_id),
+                                              message_thread_id=int(thread_id))
+        except Exception as exc:                           # noqa: BLE001 - report it
+            logger.warning("could not delete topic %s: %s", thread_id, exc)
+            return False
+        logger.info("deleted topic %s in chat %s", thread_id, chat_id)
+        return True
+
+    async def cleanup_delete_messages(self, chat_id: int, ids: List[int]) -> int:
+        """Delete General message ids; returns how many went (all of them, or none)."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return 0
+        if self.bot is None:
+            logger.warning("cannot delete messages %s: no Telegram bot attached", ids)
+            return 0
+        try:
+            await self.bot.delete_messages(chat_id=int(chat_id), message_ids=ids)
+        except Exception as exc:                           # noqa: BLE001 - report it
+            logger.warning("could not delete %d message(s): %s", len(ids), exc)
+            return 0
+        logger.info("deleted %d General message(s) in chat %s", len(ids), chat_id)
+        return len(ids)
+
+    async def cleanup_forget_topic(self, chat_id: int, thread_id: int) -> None:
+        """A topic was deleted here: forget it, then say so on the machine plane (#63)."""
+        self.forget_topic_state(chat_id, thread_id)
+        await self._announce_topic_gone(chat_id, thread_id)
+
+    async def _announce_topic_gone(self, chat_id: int, thread_id: int) -> None:
+        """One ``NOTE intent=TOPIC_GONE ref=<topic>``: the peers forget it too (issue #63)."""
+        try:
+            await self.send(format_message(Envelope(
+                type=MessageType.NOTE, to="*", intent="TOPIC_GONE", ref=str(thread_id),
+                rev=self._running_revision)),
+                chat_id=int(chat_id), thread_id=None, silent=True, allow_when_frozen=True)
+        except Exception:                                  # noqa: BLE001 - best effort
+            logger.exception("could not announce the deletion of topic %s", thread_id)
+
+    def forget_topic_state(self, chat_id: int, thread_id: Optional[int]) -> None:
+        """Forget everything this transport kept about a topic that is gone (issue #63).
+
+        The topic's memory and recap, its CLI session, the issue/PR -> topic map, its /model
+        and /reasoning choices, pending hand-offs, its turn bookkeeping and its name are all
+        keyed by the topic: a deleted topic's keys can only leak into whatever reuses the
+        space, so all of them go.
+        """
+        if thread_id is None:
+            return                       # General is not a topic and is never deleted
+        chat_id, thread_id = int(chat_id), int(thread_id)
+        key = (chat_id, thread_id)
+        context = self.topics.context(chat_id, thread_id)
+        self.topics.forget(chat_id, thread_id)
+        self._topic_memory.forget(chat_id, thread_id)
+        self._forget_topic_refs(chat_id, thread_id)
+        if context:
+            dropped = False
+            for book, path, what in ((self._models, self._models_path, "model choices"),
+                                     (self._efforts, self._efforts_path, "effort choices")):
+                if book.pop(context, None) is not None:
+                    save_state(path, book, what)
+                    dropped = True
+            if dropped:
+                logger.info("dropped the /model and /reasoning choices for %s", context)
+        for gone in [k for k in self._pending_handoffs if k[:2] == key]:
+            del self._pending_handoffs[gone]
+        for book in (self._peer_turns, self._pause_reminded, self._busy_since,
+                     self._busy_noticed, self._busy_waiting_by, self._queue_seq,
+                     self._folded, self._progress_marks, self._handoff_notes,
+                     self._topic_recent_mentions, self._topic_origins, self._frozen_told,
+                     self._last_turn_at, self._stop_topic_generation, self._turn_locks):
+            book.pop(key, None)
+        for book in (self._cooldown_notices, self._drop_notices):
+            for gone in [k for k in book if k[:2] == key]:
+                del book[gone]
+        for book in (self._topic_send_locks, self._topic_paces):
+            for gone in [k for k in book if k[1] == thread_id]:
+                del book[gone]
+        self._paused_topics.discard(key)
+        self._topics_reported.discard(key)
+        self._report_asked.discard(key)
+        self._gone_topics.discard(key)
+        if context:
+            for adapter in [self.adapter, *self._project_adapters.values()]:
+                forget = getattr(adapter, "forget_session", None)
+                if not callable(forget):
+                    continue
+                try:
+                    forget(context)
+                except Exception:                          # noqa: BLE001 - best effort
+                    logger.exception("could not drop the session for %s", context)
+        self._save_turn_state()
+        logger.info("forgot topic %s/%s: it was deleted", chat_id, thread_id)
+
     def _envelope_addressed_to_me(self, envelope: Envelope) -> bool:
         target = (envelope.to or "").strip().lstrip("@").lower()
         if not target or target == "*":
@@ -1638,7 +1875,7 @@ class AgentChannel:
     # Machine-class envelope kinds recorded as state without waking the adapter (token
     # economy, issue #43). REQUEST/RESPONSE/BLOCKED are never machine-class.
     _MACHINE_STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED"})
-    _MACHINE_NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT"})
+    _MACHINE_NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE"})
 
     def _machine_event_class(self, envelope: Envelope) -> Optional[str]:
         """Classify a machine-only envelope; ``None`` means it follows the normal path.
@@ -1674,6 +1911,18 @@ class AgentChannel:
         self.stats.machine_events += 1
         logger.info("machine event recorded without dispatch: kind=%s from=%s ref=%s",
                     kind, alias, envelope.ref)
+        if (envelope.type == MessageType.NOTE
+                and (envelope.intent or "").upper() == "TOPIC_GONE" and envelope.ref):
+            # Issue #63: one bot ran /cleanup and deleted a topic; every peer forgets it here,
+            # so no transport keeps a recap, a session or a /model choice for a topic that no
+            # longer exists. A topic this bot never knew is simply nothing to forget.
+            try:
+                gone = int(str(envelope.ref).lstrip("#"))
+            except (TypeError, ValueError):
+                gone = None
+            if gone is not None:
+                logger.info("peer @%s deleted topic %s: forgetting it", alias, gone)
+                self.forget_topic_state(event.chat_id, gone)
         if (envelope.type == MessageType.NOTE and (envelope.intent or "").upper() == "CLOSED"
                 and envelope.ref and self.replies is not None):
             resolved = self.replies.resolve_prefix(str(envelope.ref), author=event.author_username)
@@ -2043,6 +2292,9 @@ class AgentChannel:
         if event.thread_id is not None:
             self.topics.remember(event.chat_id, event.thread_id, event.topic_name,
                                  current=event.topic_name_current)
+            # Issue #63: when each topic was last active, for /cleanup's idle test.
+            self.topics.touch(event.chat_id, event.thread_id)
+        self._note_general_message(event.chat_id, event.message_id, event.thread_id)
         self.record_topic_turn(event.chat_id, event.thread_id, event.text or "")
         self._note_progress(event)
         if in_home_channel and event.text and self._anonymous_admin_post(event) \
@@ -2147,7 +2399,7 @@ class AgentChannel:
         if self._frozen or self._pause_pending:
             if self._may_start_turns(event):
                 await self._look_up_models(event)
-            command_reply = (self._handle_command(event)
+            command_reply = (await self._transport_command(event)
                              if self._may_start_turns(event) else None)
             if command_reply is not None:
                 self.stats.handled += 1
@@ -2198,7 +2450,7 @@ class AgentChannel:
 
         # §6: /ping /status /diag are transport-level liveness — answered without a runtime turn.
         await self._look_up_models(event)
-        command_reply = self._handle_command(event)
+        command_reply = await self._transport_command(event)
         if command_reply is not None:
             self.stats.handled += 1
             return await self.send(command_reply, reply_to_message_id=event.message_id,
@@ -4234,6 +4486,7 @@ class AgentChannel:
             raise RuntimeError("channel has no bot: call start() or inject a sender")
         self.stats.sent += 1
         self.last_sent_message_id = getattr(result, "message_id", None)
+        self._note_general_message(destination, self.last_sent_message_id, thread_id)
         logger.info("Telegram accepted outbound message id=%s", self.last_sent_message_id)
         return self.last_sent_message_id if return_message_id else payload
 

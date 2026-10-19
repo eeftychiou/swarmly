@@ -136,6 +136,27 @@ def _coerce_bool_limit(key: str, value: Any) -> bool:
     return _parse_bool(f"limits.{key}", value)
 
 
+def _coerce_int_list(key: str, value: Any) -> List[int]:
+    """A list-of-integers ``limits`` entry (``limits.cleanup_keep``).
+
+    A bare integer is accepted as a one-item list -- ``cleanup_keep: 42`` is a plausible
+    thing to write -- but a string, a float or a bool is not: those are typos, and a silently
+    mangled keep list would protect the wrong topic or none.
+    """
+    if isinstance(value, bool):
+        raise ConfigError(f"limits.{key} must be a list of topic ids (got {value!r})")
+    if isinstance(value, int):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(f"limits.{key} must be a list of topic ids (got {value!r})")
+    ids: List[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ConfigError(f"limits.{key} must be a list of topic ids (got {item!r})")
+        ids.append(int(item))
+    return ids
+
+
 def _parse_int(where: str, value: Any, default: int, *, positive: bool = False) -> int:
     """An integer config value, ``default`` when unset. A YAML ``true`` is not a number,
     and ``0`` stays ``0`` (it used to become the default through ``or``)."""
@@ -592,6 +613,12 @@ class ChannelLimits:
     selftest_seconds: float = 180.0                     # startup check that bots see each other; 0 = off
     multi_mention: str = "first"                        # a person names several bots: "first" or "all" act
     strangers: str = "ignore"                           # outside the swarm: "ignore" or "answer"
+    #: Issue #63: ``/cleanup topics done`` deletes a topic whose linked issue or PR is closed
+    #: or merged only once it has been idle this many hours. 0 offers it as soon as the item
+    #: is done.
+    cleanup_idle_hours: float = 24.0
+    #: Topic ids ``/cleanup topics all`` must never delete (General is always kept).
+    cleanup_keep: List[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.busy_behavior not in BUSY_BEHAVIORS:
@@ -611,11 +638,12 @@ class ChannelLimits:
             raise ConfigError("limits.max_attachment_mb must be a positive number of megabytes "
                               f"(got {attachment_mb!r}).")
         for key in ("min_seconds_between_messages", "min_seconds_between_agent_turns",
-                    "handoff_nudge_minutes"):
+                    "handoff_nudge_minutes", "cleanup_idle_hours"):
             value = getattr(self, key)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):
-                unit = "minutes" if key.endswith("_minutes") else "seconds"
+                unit = ("minutes" if key.endswith("_minutes")
+                        else "hours" if key.endswith("_hours") else "seconds")
                 raise ConfigError(f"limits.{key} must be a number of {unit}, 0 or more "
                                   f"(got {value!r}).")
         rate = self.max_messages_per_minute     # 0: use max_group_messages_per_minute
@@ -878,6 +906,10 @@ class AgentConfig:
             if isinstance(default, bool):
                 # Issue #109: bool fields get an explicit parser; never bool(value).
                 _limits_coerced[key] = _coerce_bool_limit(key, value)
+                continue
+            if isinstance(default, (list, tuple)):
+                # Issue #63: limits.cleanup_keep is a list of topic ids, read as one.
+                _limits_coerced[key] = _coerce_int_list(key, value)
                 continue
             try:
                 if isinstance(value, bool):          # review P1-7: YAML true is not 1
