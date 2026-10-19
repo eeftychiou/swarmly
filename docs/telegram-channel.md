@@ -783,8 +783,10 @@ to N topics run a turn at the same time.
   (`--conversation`), like `claude_thread` and Reasonix — but not when a single conversation
   is *pinned* (`adapter.conversation`, an `.active_conversation` file in `adapter.cwd`, or
   `-c`/`--continue`/`--conversation` in `adapter.command`), because then every topic
-  continues the same context. A `custom` adapter is allowed too: only set N above 1 if each
-  run is independent.
+  continues the same context. The in-chat `switch context to <id>` command is refused for
+  the same reason while N is above 1 — it replies why, writes no `.active_conversation`, and
+  `switch context to per-topic` still takes the bot back to one conversation per topic. A
+  `custom` adapter is allowed too: only set N above 1 if each run is independent.
 - **All topics share `adapter.cwd`,** so parallel turns can overwrite each other's edits. N
   above 1 is refused unless you also set `limits.allow_shared_cwd: true` (not needed for
   `echo`), and the transport logs a warning naming the folder at start. Per-topic worktrees are
