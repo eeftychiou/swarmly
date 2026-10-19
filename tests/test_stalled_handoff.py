@@ -84,6 +84,35 @@ class TestStalledHandoff(unittest.TestCase):
         channel = handed_off(handoff_nudge_minutes=0)
         self.assertEqual(tick(channel, 60), [])
 
+    def test_only_the_coordinator_nudges(self):
+        # Round 2: every bot reminded every other one; the rule is one nudge, by the
+        # coordinator. Another bot decides about its own hand-off, silently.
+        channel = handed_off()
+        channel.membership.state.coordinator = "Claude"           # someone else
+        tasks = []
+        channel._run_own_task = lambda text, chat, thread, name: tasks.append(text)
+        self.assertEqual(tick(channel, 11), [])
+        self.assertEqual(tick(channel, 21), [])
+        self.assertEqual(len(tasks), 1)
+        self.assertIn("Codex has not answered your hand-off", tasks[0])
+        self.assertEqual(channel._pending_handoffs, {})
+
+    def test_the_coordinator_still_nudges(self):
+        channel = handed_off()
+        channel.membership.state.role = "coordinator"
+        channel.membership.state.coordinator = "Hermes"
+        self.assertIn("@CodexBot reminder", str(tick(channel, 11)[-1]))
+
+    def test_a_frozen_peer_is_not_nudged_and_its_work_goes_back_at_once(self):
+        channel = handed_off()
+        channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        tasks = []
+        channel._run_own_task = lambda text, chat, thread, name: tasks.append(text)
+        self.assertEqual(tick(channel, 1), [])                     # no reminder, no notice
+        self.assertEqual(len(tasks), 1)
+        self.assertIn("Codex is frozen", tasks[0])
+        self.assertEqual(channel._pending_handoffs, {})
+
     def test_an_answer_to_the_asker_is_not_tracked(self):
         channel = make_channel()
         channel.bot = object()
