@@ -819,9 +819,14 @@ when ready. Automated bot notices starting with `⚠️`, `↪`, `❌`, `🟢`, 
 **Pacing & Retries.** Outbound sends obey `min_seconds_between_messages` and `TelegramRetryAfter` is honoured with a
 bounded retry rather than a hammer.
 
-**Size and safety.** Group coordination text is clamped to **500** characters by operational convention
-(Telegram hard limit 4096) with a truncation marker, and everything except the alias banner is
-HTML-escaped at render time. Deep research, code, and tables belong strictly on GitHub.
+**Size and safety.** Group coordination text is **500** characters by operational convention
+(Telegram hard limit 4096). That budget is a number now, not a slogan: `limits.reply_chars`
+(default 500) is what the turn rules ask for and what a reply ticket is held to, and
+`projects.<key>.reply_chars` gives one project's topics a longer one — a plan-shaped topic can
+ask for 1500 while everything else stays at 500. A topic with no override, and every reply
+ticket (a ticket carries no topic), uses `limits.reply_chars`. Everything except the alias
+banner is HTML-escaped at render time, and deep research, code and tables belong strictly on
+GitHub.
 
 **Liveness & Interactive Agent Timers.** The channel daemon catches mentions in real time via long polling.
 However, interactive agent environments (such as Antigravity IDE) are event-driven and become dormant between

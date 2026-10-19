@@ -1136,6 +1136,9 @@ def _bus_incoming(text: str, sender: str, cfg: Any, token: str,
         author_username=f"{sender} (gitbus)",
         response_instructions=inject_planted_token("", token),
         model=model, effort=effort,
+        # Issue #31: a bus turn is held to the channel's reply budget too. The bus names no
+        # topic, so this is the global number; a project override applies to its topics.
+        reply_chars=cfg.limits.reply_chars,
     )
 
 

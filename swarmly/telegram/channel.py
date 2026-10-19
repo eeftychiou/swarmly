@@ -569,7 +569,8 @@ class AgentChannel:
             from swarmly.telegram.replies import ReplyStore, reply_state_path
             if config.source_path is None:
                 raise ValueError("codex_thread reply tickets require config.source_path")
-            self.replies = ReplyStore(reply_state_path(config))
+            self.replies = ReplyStore(reply_state_path(config),
+                                      reply_chars=config.limits.reply_chars)
 
         self.router = ProjectRouter(list(config.projects.values()), config.identity.home_channel_id)
         self._project_adapters: Dict[str, AgentAdapter] = {}
@@ -2291,6 +2292,10 @@ class AgentChannel:
                 chat_id=event.chat_id, message_id=event.message_id,
                 recipient=author_username or peer_username, text=event.text,
                 timeout=self.config.adapter.reply_timeout_seconds,
+                # Issue #31 review: the ticket is judged by the budget this turn was given,
+                # so a reply that follows the rules is not refused at submit time.
+                reply_chars=((project_settings.reply_chars if project_settings is not None
+                              else None) or self.config.limits.reply_chars),
             )
             if not created:
                 self.stats.ignored += 1
@@ -2318,6 +2323,9 @@ class AgentChannel:
             effort=self._efforts.get(self._model_key(event)),
             project=project_settings.key if project_settings else None,
             project_repo=project_settings.repo if project_settings else None,
+            # Issue #31: this topic's reply budget -- the project's own, else the channel's.
+            reply_chars=((project_settings.reply_chars if project_settings is not None else None)
+                         or self.config.limits.reply_chars),
             general_is_for_setup=self._work_moves_to_topics(event),
             role_brief=self._role_brief(),
             fresh_text=self._fresh_text(event, text[len(recap):]),

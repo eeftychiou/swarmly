@@ -676,7 +676,8 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
     def _rules_digest(self, message: IncomingMessage) -> str:
         return rules_digest(channel_rules(getattr(message, "mentions", None),
                                           getattr(message, "maintainer_username", None),
-                                          role=self.role_text))
+                                          role=self.role_text,
+                                          reply_chars=getattr(message, "reply_chars", None)))
 
     async def _respond_in_topic(self, message: IncomingMessage,
                                 context_id: str) -> Optional[AdapterReply]:
@@ -767,6 +768,7 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
             project=project_line(message),
             role=self.role_text,
             card=turn_card(message),
+            reply_chars=getattr(message, "reply_chars", None),
         )
 
     # -- execution hooks ---------------------------------------------------------------
@@ -1011,6 +1013,7 @@ class AntigravityThreadAdapter(AntigravityContextMixin, AgentAdapter):
             project=project_line(message),
             role=self.role_text,
             card=turn_card(message),
+            reply_chars=getattr(message, "reply_chars", None),
         )
 
         # Review round 2 (B3): the planted delivery token travels in
