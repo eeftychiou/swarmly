@@ -8,7 +8,11 @@ gives one project's topics a different one. Nothing configured means 500, as bef
 
 from __future__ import annotations
 
+import atexit
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from swarmly.telegram.adapters import EchoAdapter
@@ -36,10 +40,25 @@ class RecordingEcho(EchoAdapter):
         return AdapterReply(text="ok")
 
 
+#: The state root every config in this module points at (#72). The transport derives
+#: ``<root>/.agents/state`` from ``bus.repo``, and with none set it falls back to *the
+#: checkout* -- so a `topic-turns-<alias>.json` a live run left in the clone used to be read
+#: by these tests, and one of them failed on a machine that had run a transport. A throwaway
+#: root keeps every run self-contained.
+_STATE_ROOT = Path(tempfile.mkdtemp(prefix="reply-chars-state-"))
+atexit.register(shutil.rmtree, _STATE_ROOT, True)
+
+
+def isolated_config(**overrides) -> object:
+    """``make_config``, with the transport's state pinned to a throwaway folder (#72)."""
+    overrides.setdefault("bus", {"repo": str(_STATE_ROOT)})
+    return make_config(**overrides)
+
+
 def project_config(**project) -> object:
     settings = {"repo": "example-org/webapp", "cwd": ".", "topics": [TOPIC]}
     settings.update(project)
-    return make_config(projects={"webapp": settings})
+    return isolated_config(projects={"webapp": settings})
 
 
 def receiver(config):
@@ -51,12 +70,12 @@ def receiver(config):
 
 class TestConfig(unittest.TestCase):
     def test_nothing_configured_is_500(self):
-        config = make_config()
+        config = isolated_config()
         self.assertEqual(config.limits.reply_chars, DEFAULT_REPLY_CHARS)
         self.assertIsNone(config.projects.get("webapp"))
 
     def test_the_global_limit_is_configurable(self):
-        config = make_config(limits={"reply_chars": 800})
+        config = isolated_config(limits={"reply_chars": 800})
         self.assertEqual(config.limits.reply_chars, 800)
 
     def test_a_project_can_set_its_own(self):
@@ -68,13 +87,13 @@ class TestConfig(unittest.TestCase):
         for value in (0, -5, "abc", True):
             with self.subTest(value=value):
                 with self.assertRaises(ConfigError):
-                    make_config(limits={"reply_chars": value})
+                    isolated_config(limits={"reply_chars": value})
                 with self.assertRaises(ConfigError):
                     project_config(reply_chars=value)
 
     def test_a_reply_budget_cannot_exceed_one_telegram_message(self):
         with self.assertRaises(ConfigError):
-            make_config(limits={"reply_chars": 4097})
+            isolated_config(limits={"reply_chars": 4097})
         with self.assertRaises(ConfigError):
             project_config(reply_chars=4097)
 
@@ -82,16 +101,16 @@ class TestConfig(unittest.TestCase):
         """Review of #31: the clamp is for the default; a written-down 500 is an operated
         number and an error when it cannot be delivered."""
         with self.assertRaises(ConfigError):
-            make_config(limits={"max_message_chars": 400, "reply_chars": 500})
+            isolated_config(limits={"max_message_chars": 400, "reply_chars": 500})
 
     def test_a_lowered_message_cap_does_not_break_the_default(self):
         """Review of #31: max_message_chars below the *default* 500 must still load, clamped."""
-        config = make_config(limits={"max_message_chars": 400})
+        config = isolated_config(limits={"max_message_chars": 400})
         self.assertEqual(config.limits.reply_chars, 400)
 
     def test_an_explicit_budget_above_the_message_cap_is_refused(self):
         with self.assertRaises(ConfigError):
-            make_config(limits={"max_message_chars": 400, "reply_chars": 800})
+            isolated_config(limits={"max_message_chars": 400, "reply_chars": 800})
 
     def test_the_example_configs_document_the_keys(self):
         from pathlib import Path
@@ -121,7 +140,7 @@ class TestTurnRules(unittest.TestCase):
 
     def test_a_topic_override_reaches_only_that_topic(self):
         # Two projects: one sets a budget, the other does not.
-        config = make_config(projects={
+        config = isolated_config(projects={
             "plan": {"repo": "o/plan", "cwd": ".", "topics": [TOPIC], "reply_chars": 1500},
             "webapp": {"repo": "o/webapp", "cwd": ".", "topics": [OTHER_TOPIC]},
         })
@@ -140,7 +159,7 @@ class TestTurnRules(unittest.TestCase):
         self.assertEqual([message.reply_chars for message in adapter.seen], [1500, 500])
 
     def test_the_global_limit_reaches_an_unbound_topic(self):
-        channel, adapter = receiver(make_config(limits={"reply_chars": 800}))
+        channel, adapter = receiver(isolated_config(limits={"reply_chars": 800}))
         run(channel.handle_event(event("@HermesBot hello", message_id=1, thread_id=OTHER_TOPIC,
                                        author_id=202, username="CodexBot")))
         self.assertEqual(adapter.seen[0].reply_chars, 800)
@@ -183,7 +202,7 @@ class TestTheBus(unittest.TestCase):
         """Review of #31: `_bus_incoming` left reply_chars unset, so a gitbus turn fell back
         to 500 even when the channel was configured for something else."""
         from swarmly.telegram.poll import _bus_incoming
-        config = make_config(limits={"reply_chars": 800})
+        config = isolated_config(limits={"reply_chars": 800})
         incoming = _bus_incoming("do the thing", "Codex", config, "token")
         self.assertEqual(incoming.reply_chars, 800)
         self.assertIn("under 800 characters", turn_card(incoming))
@@ -280,3 +299,20 @@ class TestTheSender(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheStateIsThrowaway(unittest.TestCase):
+    """Issue #72: the transport derives its state dir from ``bus.repo``, and with none set it
+    falls back to the checkout -- so a live run's ``topic-turns-<alias>.json`` (a topic left
+    "paused") used to reach these tests and fail one of them on a machine that runs a
+    transport. Every config here pins a throwaway root instead."""
+
+    def test_the_state_dir_is_the_throwaway_root(self):
+        from swarmly.telegram.poll import state_dir
+        self.assertEqual(state_dir(isolated_config()).resolve(),
+                         (_STATE_ROOT / ".agents" / "state").resolve())
+
+    def test_the_state_dir_is_never_the_checkout(self):
+        from swarmly.telegram.poll import transport_state_root
+        checkout = Path(__file__).resolve().parents[1]
+        self.assertNotEqual(transport_state_root(isolated_config()).resolve(), checkout)
