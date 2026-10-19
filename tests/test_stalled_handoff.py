@@ -80,6 +80,19 @@ class TestStalledHandoff(unittest.TestCase):
         self.assertIn("another peer whose role fits", tasks[0][0])
         self.assertEqual(tasks[0][1], 307)
 
+    def test_a_frozen_peer_is_not_reminded_and_the_work_goes_back_at_once(self):
+        channel = handed_off()
+        tasks = []
+        channel._run_own_task = lambda text, chat, thread, name: tasks.append((text, thread))
+        run(channel.handle_event(event("[A2A v1.1] STATUS to=* intent=FROZEN ref=quota ttl=600m",
+                                       username="CodexBot", message_id=56)))
+        self.assertEqual(tick(channel, 1), [])               # no @CodexBot reminder, ever
+        self.assertEqual(len(tasks), 1)
+        self.assertIn("Codex is frozen", tasks[0][0])
+        self.assertEqual(tasks[0][1], 307)
+        self.assertEqual(channel._pending_handoffs, {})
+        self.assertEqual(tick(channel, 30), [])
+
     def test_off_with_zero(self):
         channel = handed_off(handoff_nudge_minutes=0)
         self.assertEqual(tick(channel, 60), [])

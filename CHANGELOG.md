@@ -24,6 +24,9 @@ All notable changes to this project are documented here. The format follows
   bots, show them in `/status`, and every turn's prompt names them so work goes to a bot that
   can take it.
 
+- A hand-off to a peer that says it is frozen gets no reminders: the bot that handed it over
+  is asked at once to give the work to another peer, do it itself, or tell the admin.
+
 ## [0.10.1] - 2026-10-17
 
 A correctness round: the suite is hermetic on hosts that run an agent, and the bugs that each

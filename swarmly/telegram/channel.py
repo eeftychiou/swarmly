@@ -3392,10 +3392,21 @@ class AgentChannel:
         if minutes <= 0 or not self._pending_handoffs:
             return
         now, wait = self._clock(), minutes * 60.0
+        frozen = self.frozen_peers()
         for key, entry in list(self._pending_handoffs.items()):
             chat_id, thread_id, alias = key
             handle = str(self.config.peers.get(alias, alias)).lstrip("@")
             age = now - float(entry["at"])
+            if alias in frozen:
+                # A frozen peer takes no work until it resumes: reminding it only adds noise
+                # (live run: "Pinging Antigravity again" while it was frozen on quota). The
+                # bot that handed the work over decides at once where it goes instead.
+                self._pending_handoffs.pop(key, None)
+                logger.warning("hand-off to %s in %s: %s is frozen; reassigning",
+                               alias, thread_id or "General", alias)
+                self._run_own_task(FROZEN_REASSIGN_NOTE.format(alias=alias),
+                                   chat_id, thread_id, self.topics.name(chat_id, thread_id))
+                continue
             if not entry["nudged"] and age >= wait:
                 entry["nudged"] = True
                 logger.warning("hand-off to %s in %s has had no answer for %.0f min: reminding",
@@ -4373,6 +4384,12 @@ REASSIGN_NOTE = ("{alias} has not answered your hand-off in this topic for {minu
                  "has not said it is busy, so it may be down. Decide what happens to the work "
                  "now: hand it to another peer whose role fits, or do it yourself, and say so "
                  "here. If it can wait for {alias}, reply exactly NO_REPLY.")
+#: Run when a peer this bot handed work to says it is frozen.
+FROZEN_REASSIGN_NOTE = ("{alias} is frozen and takes no work until it resumes, so your hand-off "
+                        "in this topic will not be answered. Decide what happens to the work "
+                        "now: hand it to another peer whose role fits, or do it yourself, and "
+                        "say so here; if no one else can do it, tell the admin. If it can "
+                        "wait for {alias}, reply exactly NO_REPLY.")
 #: Run after a topic turn hit the time limit in a resumable session.
 CONTINUE_NOTE = ("Your previous turn in this topic hit the time limit and was stopped. Your "
                  "session still holds the work so far: continue the task from where it "

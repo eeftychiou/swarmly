@@ -542,7 +542,9 @@ notice naming the maintainer and stops, and runs one turn of its own asking it t
 what happens to the work: hand it to another peer whose role fits, do it itself, or wait.
 Any post by that bot in the discussion counts as an answer, except its "⏳ busy" line, which
 restarts the clock instead. When another bot already posted the reminder or the notice for
-the same silent peer, the others don't repeat it. `0` turns it off.
+the same silent peer, the others don't repeat it. A peer that says it is frozen
+(`STATUS intent=FROZEN`) is never reminded: the bot that handed off runs that turn at once,
+since the work will not be answered until the peer resumes. `0` turns it off.
 
 **Busy is not gone.** A message that queues behind a turn running for two minutes or more
 gets one "⏳ <alias> is busy with a turn running since HH:MM UTC" line in its topic (at
