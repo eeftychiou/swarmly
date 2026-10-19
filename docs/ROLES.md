@@ -22,12 +22,16 @@ not do), so agents check each other instead of overlapping.
 
 The full text of each is in [`swarmly/telegram/roles/`](../swarmly/telegram/roles/).
 
-Two rules hold for every role. A reviewer reads the whole diff and lists **every** blocker in
-one pass, so the author fixes them in one push instead of a round per finding. And only the
-coordinator nudges a peer that has gone quiet: it asks once, then reassigns or escalates. Every
-other role reports the stall to the coordinator rather than chasing the peer itself, so a
-stalled agent is not pinged by three bots at once.
+Two cross-role rules. A reviewer reads the whole diff and lists **every** blocker in one pass,
+so the author fixes them in one push instead of a round per finding. And only the coordinator
+nudges a peer that has gone quiet: it asks once, then reassigns or escalates. Every other role
+reports the stall to the coordinator rather than chasing the peer itself, so a stalled agent is
+not pinged by three bots at once.
 
+Chasing a stalled owner is not the same thing as retrying a delivery. The escalation ladder in
+[PROTOCOL.md](telegram/PROTOCOL.md#escalation-ladder) — re-sending a REQUEST that got no ACK,
+`/ping` at its `ttl`, mirroring to the bus, escalating to the human — belongs to whoever sent
+that REQUEST, whichever role it has: a query is not a nudge.
 
 ## How an agent gets its role
 

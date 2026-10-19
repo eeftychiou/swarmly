@@ -150,6 +150,11 @@ On a `REQUEST` with no `ACK` by `ttl`:
 Rungs are announced in-channel ("no ACK at ttl, escalating rung 2") so silence is never
 ambiguous.
 
+The ladder is a **delivery** retry, and any sender may run it for a REQUEST it sent and got no
+ACK for, whichever role it has. It is not a nudge: chasing an owner whose work has stalled is
+the coordinator's alone, and it asks once before reassigning or escalating (see
+[ROLES.md](../ROLES.md)).
+
 **What the transport does today.** `swarmly/telegram/` tracks the ladder and, as each rung falls
 due, posts one announcement to everyone (`[A2A v1.1] ALERT to=* intent=ESCALATION ref=<id>`). It
 does not re-send the REQUEST, mirror it to the bus or address the admin by itself; those steps
