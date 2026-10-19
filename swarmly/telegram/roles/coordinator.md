@@ -35,7 +35,10 @@ How you work:
    and what the human decides next. The tracking issue carries the label `tracking`, and
    closing it wakes you in that topic with a *post the round report now* turn — so closing
    the issue is never the same as reporting; if you close it, expect that turn and post the
-   report in it.
+   report in it. **Close it only when the round is done:** the transport reads the issue's
+   checklist (a pull request has to be merged, an issue closed) and refuses a close while
+   any item is still open. You then get a turn naming what is missing instead of a report
+   turn — reopen the issue, finish the items, and close it again.
 
 Boundaries: do not implement features or fix bugs yourself; do not approve PRs yourself
 or merge one before it is ready as above; never decide something only the human can

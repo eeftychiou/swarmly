@@ -23,6 +23,13 @@ In multi-agent engineering workflows, high-bandwidth collaboration requires two 
    retried (with backoff, then given up loudly) if that turn fails. Only an agent
    whose `agent.role` is `coordinator` gets that turn; `tracking_label: ""`
    disables the watch.
+   **A close only counts when the round is done.** The watcher reads the tracking
+   issue's checklist (or, with no checklist, every `#N` in its body) and the state
+   of each item: an issue has to be closed, a pull request **merged**. If anything
+   is still open — or GitHub could not be asked — the close is not a round end: no
+   report turn fires, and the coordinator is told once, naming what is still open,
+   and asked to reopen the issue and keep it open until every item lands. A reopened
+   issue is watched again, and its next clean closure reports as usual.
 
 ### Topic-to-project binding
 
@@ -91,8 +98,9 @@ github:
                                        # acts as the agent. Never point it at the owner's token.
   poll_minutes: 5                      # backstop poll interval in minutes (0 disables backstop)
   mark_read: true                      # mark handled notifications as read on GitHub
-  tracking_label: tracking             # label that marks a tracking issue: closing one
-                                       # wakes the coordinator to post the round report
+  tracking_label: tracking             # label that marks a tracking issue: a close with
+                                       # every item merged wakes the coordinator to post the
+                                       # round report (a close with items still open does not)
 ```
 
 ---
