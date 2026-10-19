@@ -296,10 +296,11 @@ it the CLI's own default applies. The admin can switch a
 bot's model at runtime, per topic:
 
 - `/model@<bot>` shows the model the bot runs in this topic, and the models it can switch to:
-  Claude Code's aliases; what `agy models` prints for Antigravity; the ids `codex app-server`
-  lists for Codex. The CLI is asked once and its answer kept for an hour. Reasonix keeps its
-  providers in its own `reasonix.toml`, which swarmly does not read, so it names that file
-  instead.
+  Claude Code's aliases; what `agy models` prints for Antigravity (id and engine name); the
+  models Codex's own picker shows (from `~/.codex/models_cache.json`); every provider model
+  `reasonix doctor --json` reports for Reasonix. The CLI is asked once and its answer kept
+  for an hour. Switch with the exact id from that list, such as
+  `/model@<bot> gemini-3.8-flash-medium` for Antigravity.
 - `/model@<bot> <name>` (admin only) switches it from the next turn. The conversation carries
   on: the next turn resumes the same session on the new model.
 - `/model@<bot> default` goes back to `adapter.model`.
