@@ -1172,6 +1172,8 @@ class AgentChannel:
             return (f"{alias} runs {current or 'its CLI default model'} here ({source}). "
                     f"The admin can switch it with /model@{self.config.identity.name} <name>."
                     f"{self._model_choices()}")
+        if len(args) > 1 and adapter.type.startswith("antigravity"):
+            args = [" ".join(args)]            # an engine name: Gemini 3.8 Flash (Medium)
         if len(args) > 1:
             return f"{alias}: /model takes one model name (or default)."
         if not self.config.is_admin(event.author_id):
@@ -1198,11 +1200,12 @@ class AgentChannel:
         adapter_type = self.config.adapter.type
         names = cached_models(adapter_type)
         if names:
-            return f"\n\nModels it can switch to:\n{format_list(names)}"
-        if adapter_type == "reasonix":
-            return ("\n\nIt switches between the providers in its reasonix.toml, e.g. "
-                    "deepseek-flash or deepseek-pro.")
-        return "\n\n(Its CLI did not list its models just now.)"
+            extra = "\n(or any claude-* name)" if adapter_type.startswith("claude") else ""
+            return f"\n\nModels it can switch to:\n{format_list(names)}{extra}"
+        where = ("`agy models`" if adapter_type.startswith("antigravity")
+                 else "its reasonix.toml" if adapter_type == "reasonix"
+                 else "its CLI")
+        return f"\n\n(Its models could not be listed just now; see {where}.)"
 
     async def _look_up_models(self, event: ChannelEvent) -> None:
         """Before a bare /model for this bot is answered: ask the CLI which models it has
