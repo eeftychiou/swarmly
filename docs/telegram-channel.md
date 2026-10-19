@@ -299,8 +299,8 @@ bot's model at runtime, per topic:
   Claude Code's aliases; what `agy models` prints for Antigravity (id and engine name); the
   models Codex's own picker shows (from `~/.codex/models_cache.json`); every provider model
   `reasonix doctor --json` reports for Reasonix. The CLI is asked once and its answer kept
-  for an hour. An Antigravity engine name may be given whole, spaces included:
-  `/model@<bot> Gemini 3.8 Flash (Medium)`.
+  for an hour. Switch with the exact id from that list, such as
+  `/model@<bot> gemini-3.8-flash-medium` for Antigravity.
 - `/model@<bot> <name>` (admin only) switches it from the next turn. The conversation carries
   on: the next turn resumes the same session on the new model.
 - `/model@<bot> default` goes back to `adapter.model`.

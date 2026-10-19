@@ -1172,8 +1172,6 @@ class AgentChannel:
             return (f"{alias} runs {current or 'its CLI default model'} here ({source}). "
                     f"The admin can switch it with /model@{self.config.identity.name} <name>."
                     f"{self._model_choices()}")
-        if len(args) > 1 and adapter.type.startswith("antigravity"):
-            args = [" ".join(args)]            # an engine name: Gemini 3.8 Flash (Medium)
         if len(args) > 1:
             return f"{alias}: /model takes one model name (or default)."
         if not self.config.is_admin(event.author_id):

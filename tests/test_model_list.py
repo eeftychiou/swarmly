@@ -138,13 +138,16 @@ class TestModelCommandLists(unittest.TestCase):
         self.assertIn("could not be listed", reply)
         self.assertIn("agy models", reply)
 
-    def test_an_engine_name_with_spaces_is_one_name(self):
+    def test_antigravity_switches_by_exact_id(self):
         channel = make_channel(make_config(adapter={"type": "antigravity"}))
         calls = []
         with mock.patch.object(model_list, "_spawn", spawner(FakeProcess(), calls)):
-            reply = self._say(channel, "/model@HermesBot Gemini 3.8 Flash (Medium)")
-        self.assertIn("runs Gemini 3.8 Flash (Medium) here", reply)
-        self.assertEqual(channel._models, {"general": "Gemini 3.8 Flash (Medium)"})
+            reply = self._say(channel, "/model@HermesBot gemini-3.8-flash-medium")
+            spaced = self._say(channel, "/model@HermesBot Gemini 3.8 Flash (Medium)",
+                               message_id=2)
+        self.assertIn("runs gemini-3.8-flash-medium here", reply)
+        self.assertIn("one model name", spaced)        # free-form names are refused
+        self.assertEqual(channel._models, {"general": "gemini-3.8-flash-medium"})
         self.assertEqual(calls, [])                    # switching never asks the CLI
 
     def test_other_clis_still_take_one_name(self):
