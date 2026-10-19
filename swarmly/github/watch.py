@@ -83,20 +83,21 @@ def tracking_item_refs(body: str, own: int) -> List[int]:
     return refs
 
 
-def item_blocker(state: Optional[str]) -> Optional[str]:
+def item_blocker(state: Optional[str], *, is_pr: bool = False) -> Optional[str]:
     """Why an item's state blocks a round end, or None when it does not.
 
-    Done is ``CLOSED`` for an issue and ``MERGED`` for a pull request -- a closed-but-not-
-    merged PR is work that never landed. A state GitHub could not tell us is treated as
-    *not done*: refusing a report is recoverable, reporting a half-finished round is not.
+    Done is ``CLOSED`` for an issue but ``MERGED`` for a pull request: a PR that was closed
+    without being merged is work that never landed, and it reads as ``CLOSED`` too -- which
+    is why the kind has to be known here (review of PR #76). A state GitHub could not tell us
+    is *not done*: refusing a report is recoverable, reporting a half-finished round is not.
     """
     word = (state or "").upper()
+    if not word:
+        return "unchecked"
     if word == "MERGED":
         return None
     if word == "CLOSED":
-        return None
-    if not word:
-        return "unchecked"
+        return "closed, unmerged" if is_pr else None
     return "open" if word == "OPEN" else word.lower()
 
 
@@ -509,9 +510,11 @@ class GitHubWatcher:
         for number in tracking_item_refs(getattr(issue, "body", "") or "",
                                          int(getattr(issue, "number", 0) or 0)):
             state: Optional[str] = None
+            is_pr = False
             try:
                 pr = self.client.pr_view(repo, number)
                 if pr is not None:
+                    is_pr = True
                     state = str(getattr(pr, "state", "") or "")
                 else:
                     item = self.client.issue_view(repo, number)
@@ -519,7 +522,7 @@ class GitHubWatcher:
             except GitHubError as exc:
                 logger.warning("could not read item #%s of %s: %s", number, repo, exc)
                 state = ""
-            reason = item_blocker(state)
+            reason = item_blocker(state, is_pr=is_pr)
             if reason:
                 blockers.append(f"#{number} {reason}")
         return blockers

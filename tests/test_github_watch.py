@@ -775,6 +775,18 @@ class TestARoundEndsOnlyWhenEveryItemIsDone(unittest.IsolatedAsyncioTestCase):
         self.assertIn("post the round report now", sent[0].text)
         self.assertNotIn("the round is not over", sent[0].text)
 
+    async def test_a_pull_request_closed_without_merging_blocks_the_report(self):
+        """Review of PR #76: gh says CLOSED for a PR that never merged, and that is not done."""
+        items = {65: ("issue", "CLOSED"), 68: ("issue", "CLOSED"), 71: ("pr", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client("OPEN", "CLOSED", items=items)
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+            await self.watcher(tmp, client, ch).poll_once()
+        text = ch._adapter_for.return_value.received[0].text
+        self.assertIn("the round is not over", text)
+        self.assertIn("#71 closed, unmerged", text)
+
     async def test_an_item_github_cannot_read_counts_as_not_done(self):
         client = self.client("OPEN", "CLOSED", body="- [x] #65\n")
         client.issue_view.side_effect = None
@@ -818,12 +830,15 @@ class TestTrackingItemRefs(unittest.TestCase):
     def test_the_tracking_issue_itself_is_never_an_item(self):
         self.assertEqual(tracking_item_refs("- [ ] #69\n- [ ] #68\n", own=69), [68])
 
-    def test_a_closed_but_unmerged_pull_request_is_not_done(self):
+    def test_a_closed_issue_is_done_but_a_closed_pull_request_is_not(self):
+        # Review of PR #76: a PR closed without merging also reads CLOSED, so the kind decides.
         self.assertEqual(item_blocker("MERGED"), None)
-        self.assertEqual(item_blocker("CLOSED"), None)
-        self.assertEqual(item_blocker("OPEN"), "open")
+        self.assertEqual(item_blocker("CLOSED"), None)                       # an issue
+        self.assertEqual(item_blocker("CLOSED", is_pr=True), "closed, unmerged")
+        self.assertEqual(item_blocker("MERGED", is_pr=True), None)
+        self.assertEqual(item_blocker("OPEN", is_pr=True), "open")
         self.assertEqual(item_blocker(""), "unchecked")
-        self.assertEqual(item_blocker(None), "unchecked")
+        self.assertEqual(item_blocker(None, is_pr=True), "unchecked")
 
 
 
