@@ -710,6 +710,23 @@ class AgentChannel:
         mentions = re.findall(rf"(?i)@(?:{mine})\b", text)
         return len(delegated.findall(text)) >= len(mentions)
 
+    def _routing_text(self, text: Optional[str]) -> str:
+        """*text* as routing reads it: without the trailer of handles a transport appended (#28).
+
+        ``wire.addressed`` appends a peer's ``@username`` to a message that addresses it by
+        alias only, so Telegram delivers it. That trailer says how the message arrives, not who
+        it is for: when the body already addresses another bot, a run of handles closing the
+        message must not hand the message to this one (live: a report that mentioned a peer in
+        prose went out with that peer's handle appended and pulled it into the exchange). A
+        hand-off (issue #27) names its recipients in the body, where they stay.
+        """
+        if not text:
+            return ""
+        trailer = _APPENDED_HANDLES.search(text)
+        if trailer is None or not self._mentions_other_peer(text[:trailer.start()]):
+            return text
+        return text[:trailer.start()]
+
     def _mentions_other_peer(self, text: str) -> bool:
         if not text:
             return False
@@ -876,6 +893,10 @@ class AgentChannel:
         if not self._may_start_turns(event):
             return False, "not a member of the swarm (limits.strangers: ignore)"
 
+        # A peer transport delivers an alias-addressed message by appending its peer's handle;
+        # that trailer must not pick the recipient (issue #28).
+        text = self._routing_text(event.text) if event.author_is_bot else (event.text or "")
+
         # The second and later parts of a split reply complete a message already delivered;
         # on their own they are fragments, so they never start a turn (not even a stateful one).
         if event.author_is_bot and event.text and _CONTINUATION_RE.match(event.text.strip()):
@@ -902,7 +923,7 @@ class AgentChannel:
         # the addressed message belongs in the active conversation.
         adapter = self._adapter_for(event.chat_id, event.thread_id)
         explicit_username_delivery = (
-            self.mentions_me(event.text)
+            self.mentions_me(text)
             and adapter.accepts_explicit_username_delivery()
         )
 
@@ -935,10 +956,10 @@ class AgentChannel:
             if min_cooldown > 0 and event.thread_id is None:
                 elapsed = self._clock() - self._last_turn_for(event)
                 if elapsed < min_cooldown:
-                    if self.mentions_me(event.text) and self._is_expected_handoff(event):
+                    if self.mentions_me(text) and self._is_expected_handoff(event):
                         event.handoff = True
                     else:
-                        if self.mentions_me(event.text):
+                        if self.mentions_me(text):
                             event.cooldown_left = min_cooldown - elapsed
                         return False, f"cooldown active ({elapsed:.1f}s < {min_cooldown}s)"
 
@@ -948,17 +969,17 @@ class AgentChannel:
         # A person naming several bots in one message gets one turn: the first bot named acts
         # and the others wait to be handed the work with an @mention. /stop and the liveness
         # commands are not turns: every bot they name answers them.
-        if not event.author_is_bot and not is_control and self.mentions_me(event.text):
-            first = self._peer_named_first(event.text)
+        if not event.author_is_bot and not is_control and self.mentions_me(text):
+            first = self._peer_named_first(text)
             if first is not None:
                 self._expect_handoff(event, first)
                 return False, f"{first} is named first (limits.multi_mention: first)"
 
         # If this agent is mentioned, ALWAYS DELIVER to current conversation!
-        if self.mentions_me(event.text):
+        if self.mentions_me(text):
             return True, "mentioned"
 
-        if self._mentions_other_peer(event.text):
+        if self._mentions_other_peer(text):
             return False, "addressed to another peer"
 
         if not event.author_is_bot and self.config.limits.respond_without_mention:
@@ -3749,7 +3770,7 @@ class AgentChannel:
         for alias, username in targets.items():
             if not username:
                 continue
-            body, entities = addressed(body, username, alias=alias)
+            body, entities = addressed(body, username, alias=alias, aliases=targets)
             found.extend(entities)
 
         banner = f"[{self.config.identity.alias}] "
@@ -4895,6 +4916,10 @@ def pr_refs(text: str, default_repo: str = "") -> List[Tuple[str, int]]:
         for number in re.findall(r"(?:(?<![\w/])#|/pull/)(\d{1,7})\b", bare):
             found.append((default_repo, int(number)))
     return list(dict.fromkeys(found))
+
+# The handles ``wire.addressed`` appends to a message that addresses a peer by alias, so
+# Telegram delivers it: a run of "@username" tokens closing the text (issue #28).
+_APPENDED_HANDLES = re.compile(r"(?:[ \t]+@[A-Za-z0-9_]{3,})+\s*$")
 
 
 async def _maybe_await(value: Any) -> Any:

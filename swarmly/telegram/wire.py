@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 PREFIX = "[A2A v1.1]"
 
@@ -196,7 +196,8 @@ def utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def addressed(text: str, username: str, alias: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
+def addressed(text: str, username: str, alias: Optional[str] = None,
+              aliases: Iterable[str] = ()) -> Tuple[str, List[Dict[str, Any]]]:
     """Return ``(text, entities)`` for a message meant to reach *username*'s bot.
 
     Telegram resolves neither aliases nor plain-text usernames: a mention only exists as an
@@ -204,6 +205,9 @@ def addressed(text: str, username: str, alias: Optional[str] = None) -> Tuple[st
     only, the handle is appended — visible, deliberate, and greppable — rather than inventing an
     entity over characters that do not mention anything (spec rule 4: alias in the body,
     username in the entity).
+
+    *aliases* is the swarm's whole alias set, used to tell an addressee list ("Codex and
+    Antigravity, …") from prose that merely names a bot (issue #28).
     """
     handle = "@" + username.lstrip("@")
     if not text:
@@ -211,15 +215,48 @@ def addressed(text: str, username: str, alias: Optional[str] = None) -> Tuple[st
     body = text
     # An entity can only cover characters that exist: the handle must be in the text before a
     # mention can be built over it, so an alias-addressed message gets it appended.
-    if handle.lower() not in body.lower() and _addresses_alias(body, alias):
+    if handle.lower() not in body.lower() and _addresses_alias(body, alias, aliases):
         body = f"{body.rstrip()} {handle}"
     return body, mention_entities(body, username)
 
 
-def _addresses_alias(text: str, alias: Optional[str]) -> bool:
+def _addresses_alias(text: str, alias: Optional[str], aliases: Iterable[str] = ()) -> bool:
+    """Whether *text* addresses some bot by the swarm alias *alias* (issue #28).
+
+    Two forms address. The alias written as a handle, ``@Codex``, wherever it appears; and the
+    alias as an addressee opening a line — ``Codex, …``, ``Hermes: …``, or a list of aliases
+    closed by that punctuation, ``Codex and Antigravity, …``.
+
+    A bare alias loose in prose — "Codex said the diff is fine" — names the bot without
+    addressing it. Counting it used to append ``@codex_bot`` to the message, and that appended
+    handle is what the peer's transport routes on: a report that mentioned a peer in passing
+    pulled that peer into another bot's exchange.
+    """
     if not alias:
         return False
-    return re.search(rf"\b{re.escape(alias)}\b", text, re.IGNORECASE) is not None
+    if re.search(rf"(?i)@{re.escape(alias)}\b", text):
+        return True
+    # A field line whose whole value is the alias is structured, not prose: a JOIN's
+    # "coordinator: Claude" is how a newcomer names the bot it reports to, and it must still
+    # reach it.
+    if re.search(rf"(?im)^[ \t]*[A-Za-z][\w.-]*[ \t]*:[ \t]*@?{re.escape(alias)}"
+                 rf"[ \t]*(?:@\w+[ \t]*)*$", text):
+        return True
+    known = {a.strip().lower() for a in aliases if a}
+    known |= {alias.strip().lower()}
+    for match in _OPENING_ADDRESSEES.finditer(text):
+        words = [w.lstrip("@").lower() for w in _WORD.findall(match.group(1))]
+        words = [w for w in words if w not in _LIST_JOINERS]
+        if words and alias.strip().lower() in words and all(w in known for w in words):
+            return True
+    return False
+
+
+#: The phrase that opens a line, up to the punctuation that closes an addressee ("Codex, …",
+#: "Codex and Antigravity: …"). Bounded so a paragraph is never read as one long addressee.
+_OPENING_ADDRESSEES = re.compile(r"(?i)(?:^|[\r\n])[ \t]*([^:\n]{0,120}?)[:,]")
+_WORD = re.compile(r"[A-Za-z0-9_.@-]+")
+_LIST_JOINERS = {"and", "or", "amp"}
 
 
 def mention_entities(text: str, username: str,

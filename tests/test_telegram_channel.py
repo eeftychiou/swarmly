@@ -1029,6 +1029,31 @@ class TestHandoffAddressing(unittest.TestCase):
         self.assertIn("AntigravityBot", notices[1]["text"])
 
 
+class TestAppendedHandleRouting(unittest.TestCase):
+    """Issue #28: the handle a transport appends for delivery must not pick the recipient."""
+
+    def test_a_trailing_appended_handle_does_not_route_to_a_bot_named_in_prose(self):
+        channel = make_channel()
+        # A peer report that mentions this bot in passing, so its transport appended the
+        # handle: the body's addressee is Antigravity, not Hermes.
+        text = ("[Antigravity] @AntigravityBot QA passed on #44. Hermes wrote the fix. "
+                "@HermesBot")
+        decision, reason = channel.should_respond(event(text))
+        self.assertFalse(decision, reason)
+
+    def test_an_appended_handle_still_routes_when_the_body_addresses_nobody(self):
+        channel = make_channel()
+        decision, reason = channel.should_respond(
+            event("[Codex] shipped, needs a look when you can. @HermesBot"))
+        self.assertTrue(decision, reason)
+
+    def test_a_real_handle_in_the_body_still_routes(self):
+        channel = make_channel()
+        decision, reason = channel.should_respond(
+            event("[Codex] @HermesBot take #30 please; @CodexBot reviews it. @HermesBot"))
+        self.assertTrue(decision, reason)
+
+
 # --------------------------------------------------------------------------------------
 # 4. Loop guard and pacing (Telegram requires both for bot-to-bot mode)
 # --------------------------------------------------------------------------------------

@@ -289,6 +289,20 @@ class TestChannelAddressing(unittest.TestCase):
                                         (int(entities[0]["offset"]) + int(entities[0]["length"])) * 2]
         self.assertEqual(covered.decode("utf-16-le"), "@example_codex_bot")
 
+    def test_a_bare_alias_in_prose_is_not_an_address(self):
+        """Issue #28: naming a bot in passing must not append a handle that routes to it."""
+        rendered, entities = self._channel().addressed_payload(
+            "Codex said the diff is fine, so merge it")
+        self.assertEqual(rendered, "[Hermes] Codex said the diff is fine, so merge it")
+        self.assertEqual(entities, [])
+
+    def test_an_alias_opening_a_line_or_a_list_still_addresses(self):
+        channel = self._channel(peers={"Codex": "example_codex_bot", "Antigravity": "agy_bot"})
+        for text in ("Codex, status?", "Codex: status?", "Codex and Antigravity, sync please"):
+            rendered, entities = channel.addressed_payload(text)
+            self.assertIn("@example_codex_bot", rendered, text)
+            self.assertIn("mention", [e["type"] for e in entities], text)
+
     def test_unaddressed_message_is_left_alone(self):
         rendered, entities = self._channel().addressed_payload("morning, all clear")
         self.assertEqual(rendered, "[Hermes] morning, all clear")
