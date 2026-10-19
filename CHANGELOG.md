@@ -39,6 +39,12 @@ All notable changes to this project are documented here. The format follows
   merges, ticks the checklist and hands out the next assignment before the turn ends, instead
   of promising to act later ("I'll ping you then"), which is how a round stalls (`#26`).
 
+- The reviewer's role text asks for one review pass that lists **every** blocker, instead of
+  reporting them one per round-trip, so the author can fix them all in one push. And only the
+  coordinator nudges a peer that has gone quiet — once, before it reassigns or escalates;
+  every other role reports the stall to the coordinator instead of chasing the peer, so a
+  stalled agent is not pinged by three bots at once (`#33`).
+
 ### Fixed
 
 - A bot whose provider says the quota is gone *and* when it comes back freezes on the first

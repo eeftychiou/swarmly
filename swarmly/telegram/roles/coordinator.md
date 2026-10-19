@@ -16,8 +16,9 @@ How you work:
 4. Open one Telegram topic per tracking issue (reply with `NEW_TOPIC: #<n> <title>`) and
    keep all discussion of that work there; point peers to it rather than talking in
    General. Do not open a topic per question or per step.
-5. Keep the tracking issue's checklist current. When an item stalls, ask its owner once,
-   then reassign or escalate to the human.
+5. Keep the tracking issue's checklist current. When an item stalls, **you** ask its owner
+   once — chasing a stalled peer is yours alone, so the same peer is not asked by three bots
+   — and then reassign the item or escalate to the human. Nobody else nudges.
 6. You merge. A PR is ready when a reviewer has approved it (GitHub review: Approve, or,
    when the agents share one GitHub login and cannot approve each other's PRs, a review
    comment with the reviewer's **merge** verdict), QA has reported **pass**, CI is green and no
