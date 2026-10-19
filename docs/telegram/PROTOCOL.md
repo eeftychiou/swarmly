@@ -287,7 +287,11 @@ transports emit it as envelopes and record it as state on receipt:
   human-visible line (the old `✅ …` prose) stays in the body.
 - **`ALERT`** — overdue/failure/escalation notices: `intent=OVERDUE|RECEIPT_FAILED|ESCALATION`.
 - **`HELLO`/`STATUS`** — liveness: `intent=ONLINE|OFFLINE`; control acks `intent=FROZEN|RESUMED`.
-- **`NOTE`** — closures and free-form machine notes: `intent=CLOSED|FYI`.
+- **`NOTE`** — closures and free-form machine notes: `intent=CLOSED|FYI`, and
+  `intent=TOPIC_GONE ref=<thread-id>` when a bot's `/cleanup` deleted a forum topic: every
+  peer forgets it (topic memory, that topic's CLI session, the issue/PR → topic map, its
+  `/model` and `/reasoning` choices, pending hand-offs, the topic-name cache) without a
+  model turn. Only the bot that deleted the topic sends it.
 
 Receiving transports record these (per-peer last-seen, counters) and **do not dispatch a
 model turn** for them. Fail-open is mandatory: `REQUEST`, `RESPONSE`, `BLOCKED`, unknown

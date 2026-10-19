@@ -136,6 +136,13 @@ class ReasonixAdapter(SubprocessAdapter):
     def session_for(self, context_id: Optional[str]) -> Optional[str]:
         return self._sessions.get(context_id) if context_id else None
 
+    def forget_session(self, context_id: Optional[str]) -> bool:
+        """A deleted topic's session is dropped (issue #63): nothing can resume it again."""
+        if not context_id or context_id not in self._sessions:
+            return False
+        self._remember(context_id, None)
+        return True
+
     def _remember(self, context_id: str, session: Optional[str],
                   rules: Optional[str] = None) -> None:
         if session:

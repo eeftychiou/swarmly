@@ -132,13 +132,23 @@ def name_from_message(message: Any) -> Tuple[Optional[str], bool]:
 
 
 class TopicMap:
-    """Topic names this transport has seen, per chat, persisted as JSON."""
+    """Topic names, and when each was last active, per chat, persisted as JSON.
+
+    The activity timestamp is what ``/cleanup`` (issue #63) reads to decide that a topic has
+    been idle long enough to offer for deletion: Telegram tells a bot nothing about a topic's
+    last message, so the transport records it as it sees the messages go by.
+    """
+
+    #: Saving on every message would rewrite the file per post; an activity stamp is worth a
+    #: rewrite only once it moved this far (the idle test in /cleanup counts hours).
+    ACTIVITY_SAVE_SECONDS = 300.0
 
     def __init__(self, path: Optional[Path] = None,
                  home_chat_id: Optional[int] = None) -> None:
         self.path = path
         self.home_chat_id = home_chat_id
         self._names: Dict[str, str] = {}
+        self._seen: Dict[str, float] = {}
         if path is not None:
             self._load(path)
 
@@ -148,6 +158,9 @@ class TopicMap:
             if not isinstance(data, dict) or not isinstance(data.get("names") or {}, dict):
                 raise ValueError("not a topic map")
             self._names = {str(k): str(v) for k, v in (data.get("names") or {}).items()}
+            for key, when in (data.get("seen") or {}).items():
+                if isinstance(when, (int, float)) and not isinstance(when, bool):
+                    self._seen[str(key)] = float(when)
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as exc:
@@ -185,13 +198,57 @@ class TopicMap:
     def context(self, chat_id: int, thread_id: Optional[int]) -> Optional[str]:
         return context_for(chat_id, thread_id, self.home_chat_id)
 
+    # -- activity, and forgetting a topic that is gone (issue #63) ----------------------
+
+    def touch(self, chat_id: int, thread_id: Optional[int],
+              when: Optional[float] = None) -> None:
+        """Record that a topic was active now (a message in it was seen)."""
+        if thread_id is None:
+            return
+        moment = float(when if when is not None else time.time())
+        key = self._key(chat_id, thread_id)
+        previous = self._seen.get(key)
+        self._seen[key] = moment
+        if previous is None or moment - previous >= self.ACTIVITY_SAVE_SECONDS:
+            self._save()
+
+    def last_seen(self, chat_id: int, thread_id: Optional[int]) -> Optional[float]:
+        """When this transport last saw a message in the topic, or None if never."""
+        if thread_id is None:
+            return None
+        return self._seen.get(self._key(chat_id, thread_id))
+
+    def entries(self) -> list:
+        """``(chat_id, thread_id, name)`` for every topic this transport knows, oldest id
+        first; the chat id is parsed back out of the key, so an unreadable one is skipped."""
+        found = []
+        for key, name in self._names.items():
+            chat, _, thread = key.partition(":")
+            try:
+                found.append((int(chat), int(thread), name))
+            except ValueError:
+                continue
+        return sorted(found, key=lambda item: (item[0], item[1]))
+
+    def forget(self, chat_id: int, thread_id: Optional[int]) -> bool:
+        """Drop a topic's name and activity: it was deleted, so it is no longer known."""
+        if thread_id is None:
+            return False
+        key = self._key(chat_id, thread_id)
+        had = key in self._names or key in self._seen
+        self._names.pop(key, None)
+        self._seen.pop(key, None)
+        if had:
+            self._save()
+        return had
+
     def _save(self) -> None:
         if self.path is None:
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            text = json.dumps({"names": self._names}, ensure_ascii=False, indent=1,
-                              sort_keys=True)
+            text = json.dumps({"names": self._names, "seen": self._seen},
+                              ensure_ascii=False, indent=1, sort_keys=True)
             fd, tmp = tempfile.mkstemp(prefix=".topics-", dir=str(self.path.parent))
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:

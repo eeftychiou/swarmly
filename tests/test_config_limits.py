@@ -64,6 +64,48 @@ class BoolLimitCoercionTests(unittest.TestCase):
         self.assertIn("limits.max_message_chars", str(caught2.exception))
 
 
+class CleanupLimitsLoaderTests(unittest.TestCase):
+    """#63: ``limits.cleanup_keep`` / ``limits.cleanup_idle_hours`` really load.
+
+    ``cleanup_keep`` is the first ``default_factory`` field in ``ChannelLimits``, and the
+    loader used to test ``hasattr(ChannelLimits, key)`` -- false for such fields -- so a
+    configured keep list was dropped in silence and ``/cleanup topics all`` deleted the
+    topics it named. These pin the round trip, not just the coercer.
+    """
+
+    def test_a_keep_list_of_topic_ids_is_loaded(self):
+        cfg = cfg_with_limits({"cleanup_keep": [42, 43]})
+        self.assertEqual(cfg.limits.cleanup_keep, [42, 43])
+
+    def test_a_bare_integer_keep_is_a_one_item_list(self):
+        self.assertEqual(cfg_with_limits({"cleanup_keep": 42}).limits.cleanup_keep, [42])
+
+    def test_an_empty_keep_list_is_kept(self):
+        self.assertEqual(cfg_with_limits({"cleanup_keep": []}).limits.cleanup_keep, [])
+
+    def test_unset_keep_is_empty(self):
+        self.assertEqual(cfg_with_limits({}).limits.cleanup_keep, [])
+
+    def test_a_mistyped_keep_list_is_refused_with_the_key_named(self):
+        for bad in ("42", 4.5, True, {"42": 1}, [42, "43"], [True], [None]):
+            with self.assertRaises(ConfigError) as caught:
+                cfg_with_limits({"cleanup_keep": bad})
+            self.assertIn("limits.cleanup_keep", str(caught.exception), bad)
+
+    def test_cleanup_idle_hours_loads_as_a_number(self):
+        self.assertEqual(cfg_with_limits({"cleanup_idle_hours": 12})
+                         .limits.cleanup_idle_hours, 12.0)
+        self.assertEqual(cfg_with_limits({"cleanup_idle_hours": "12.5"})
+                         .limits.cleanup_idle_hours, 12.5)
+        self.assertEqual(cfg_with_limits({}).limits.cleanup_idle_hours, 24.0)
+
+    def test_a_bad_idle_hours_is_refused_with_the_key_named(self):
+        for bad in ("soon", -1, True, None):
+            with self.assertRaises(ConfigError) as caught:
+                cfg_with_limits({"cleanup_idle_hours": bad})
+            self.assertIn("limits.cleanup_idle_hours", str(caught.exception), bad)
+
+
 class LoadEnvBomTests(unittest.TestCase):
     def test_bom_in_env_does_not_drop_the_first_key(self):
         """#113: a Notepad-style BOM turned the first key into '\\ufeffKEY'."""
