@@ -253,6 +253,56 @@ class GitHubClient:
             logger.warning("failed to parse notifications json: %s", exc)
             raise GitHubError(f"gh api {endpoint}: unreadable answer ({exc})") from exc
 
+    def issues_with_label(self, repo: str, label: str, state: str = "all") -> List[Issue]:
+        """List a repository's issues carrying *label*, in any state.
+
+        Raises :class:`GitHubError` when gh cannot answer, so an empty list always means
+        "no issue carries this label" and never "gh is missing or logged out" -- a closed
+        tracking issue must not be missed because the poll could not run."""
+        fields = "number,title,body,author,state,labels,assignees"
+        code, out, err = self._run(
+            ["issue", "list", "--repo", repo, "--label", label, "--state", state,
+             "--json", fields, "--limit", "200"])
+        if code != 0:
+            logger.warning("issues_with_label(%s, %s) failed (code %d): %s",
+                           repo, label, code, err.strip())
+            raise GitHubError(f"gh issue list --repo {repo} --label {label} failed "
+                              f"(exit {code}): {(err.strip() or out.strip())[:300]}")
+        try:
+            data = json.loads(out)
+            if not isinstance(data, list):
+                raise GitHubError(f"gh issue list --label {label}: expected a JSON list")
+            result: List[Issue] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                author_val = item.get("author")
+                author = (author_val.get("login", "") if isinstance(author_val, dict)
+                          else str(author_val or ""))
+                labels = [
+                    lb.get("name", "") if isinstance(lb, dict) else str(lb)
+                    for lb in (item.get("labels") or [])
+                ]
+                assignees = [
+                    a.get("login", "") if isinstance(a, dict) else str(a)
+                    for a in (item.get("assignees") or [])
+                ]
+                result.append(Issue(
+                    number=int(item.get("number") or 0),
+                    title=str(item.get("title") or ""),
+                    body=str(item.get("body") or ""),
+                    author=author,
+                    state=str(item.get("state") or ""),
+                    labels=labels,
+                    assignees=assignees,
+                ))
+            return result
+        except GitHubError:
+            raise
+        except Exception as exc:
+            logger.warning("failed to parse issues json: %s", exc)
+            raise GitHubError(f"gh issue list --label {label}: unreadable answer ({exc})") from exc
+
     def comment(self, repo: str, number: int, body: str) -> bool:
         """Post a comment signed with the agent's identity."""
         body = self.redact(body)

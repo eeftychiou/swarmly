@@ -54,6 +54,8 @@ adapter:
 #   token_env: GH_TOKEN             # environment variable holding its GitHub token
 #   poll_minutes: 5                 # check notifications every N minutes (0 disables backstop)
 #   mark_read: true                 # mark handled notifications read on GitHub
+#   tracking_label: tracking        # the label that marks a tracking issue: closing one
+#                                   # wakes the coordinator to post the round report
 
 limits:
   max_message_chars: 4096          # Telegram's hard limit for text messages
