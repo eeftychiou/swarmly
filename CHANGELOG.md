@@ -43,7 +43,10 @@ All notable changes to this project are documented here. The format follows
   the turn rules ask for and what a reply ticket is held to, and `projects.<key>.reply_chars`
   gives one project's topics their own — a plan-shaped topic can ask for 1500 while the rest of
   the swarm stays at 500. A topic with no override, and every reply ticket (it carries no
-  topic), uses the global number; a value above `max_message_chars` is refused at load. Both
+  topic), uses the global number; an explicit value above `max_message_chars` is refused at
+  load, while the default is clamped to it. A reply ticket carries the budget of the turn that
+  raised it, so a topic allowed 1500 is not refused for following its own rules, and the
+  ticket's CLI hint states that same number; gitbus turns are held to the global one too. Both
   example configs and `docs/telegram-channel.md` show it (`#31`).
 
 - The reviewer's role text asks for one review pass that lists **every** blocker, instead of

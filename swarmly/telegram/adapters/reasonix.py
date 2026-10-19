@@ -186,7 +186,7 @@ class ReasonixAdapter(SubprocessAdapter):
         return rules_digest(channel_rules(getattr(message, "mentions", None),
                                           getattr(message, "maintainer_username", None),
                                           role=self.role_text,
-                             reply_chars=getattr(message, "reply_chars", None)))
+                                          reply_chars=getattr(message, "reply_chars", None)))
 
     async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
         context_id = getattr(message, "context_id", None)

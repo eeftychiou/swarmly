@@ -76,7 +76,18 @@ class ReplyStore:
                 receipt_notified INTEGER NOT NULL DEFAULT 0,
                 receipt_message_id INTEGER,
                 alerts INTEGER NOT NULL DEFAULT 0,
+                reply_chars INTEGER,
                 UNIQUE(chat_id, message_id))""")
+            # Issue #31 review: a ticket raised in a topic with its own reply budget must be
+            # judged by that budget, so the number travels with the ticket. An older database
+            # has no such column yet; add it in place (NULL = the store's budget).
+            if "reply_chars" not in {row[1] for row in db.execute("PRAGMA table_info(replies)")}:
+                try:
+                    db.execute("ALTER TABLE replies ADD COLUMN reply_chars INTEGER")
+                except sqlite3.OperationalError:
+                    # Another opener added it between the check and the ALTER: same column,
+                    # same schema, no work left (the concurrent-openers case).
+                    pass
             # Existing stores predate the atomic receipt claim. Inspect the schema
             # once so normal CLI startup does not rely on exception-driven ALTERs.
             columns = {row['name'] for row in db.execute("PRAGMA table_info(replies)")}
@@ -121,7 +132,8 @@ class ReplyStore:
         finally:
             db.close()
 
-    def register(self, *, chat_id, message_id, recipient, text, timeout=600, now=None):
+    def register(self, *, chat_id, message_id, recipient, text, timeout=600, now=None,
+                 reply_chars: Optional[int] = None):
         if message_id is None:
             raise ValueError("reply tickets require a Telegram message_id for deduplication")
         now = time.time() if now is None else now
@@ -131,14 +143,28 @@ class ReplyStore:
         request_id = uuid.uuid4().hex
         with self._db() as db:
             cursor = db.execute("""INSERT OR IGNORE INTO replies
-                (id,chat_id,message_id,recipient,original,created,deadline,state)
-                VALUES (?,?,?,?,?,?,?,'pending')""",
-                (request_id, chat_id, message_id, recipient, text, now, now + timeout))
+                (id,chat_id,message_id,recipient,original,created,deadline,state,reply_chars)
+                VALUES (?,?,?,?,?,?,?,'pending',?)""",
+                (request_id, chat_id, message_id, recipient, text, now, now + timeout,
+                 reply_chars))
             if cursor.rowcount:
                 return dict(db.execute("SELECT * FROM replies WHERE id=?", (request_id,)).fetchone()), True
             row = db.execute("SELECT * FROM replies WHERE chat_id=? AND message_id=?",
                              (chat_id, message_id)).fetchone()
             return dict(row), False
+
+    def budget_for(self, row: Any) -> int:
+        """The reply budget a ticket is held to: the topic's own when it came from one.
+
+        Issue #31 review: a ticket raised in a project topic whose ``reply_chars`` is larger
+        than the channel's would otherwise be refused for following the turn rules it was
+        given. The number rides on the ticket; an older ticket (or General) has none.
+        """
+        try:
+            own = row["reply_chars"]
+        except (KeyError, IndexError, TypeError):
+            own = None
+        return int(own) if own else self.reply_chars
 
     def get(self, request_id):
         with self._db() as db:
@@ -198,11 +224,12 @@ class ReplyStore:
                 tag = f"@{row['recipient']}" if row['recipient'] else ""
                 if tag and not body.lower().startswith(tag.lower() + ":"):
                     body = f"{tag}: {body}"
-                if len(body) >= self.reply_chars:
+                limit = self.budget_for(row)
+                if len(body) >= limit:
                     # The budget is "under N": N itself is already over it, as it always was
                     # for the default 500 (issue #31 keeps that boundary, only the number moves).
                     raise ValueError(
-                        f"Telegram reply must be under {self.reply_chars} characters including "
+                        f"Telegram reply must be under {limit} characters including "
                         f"recipient (got {len(body)})")
             if row['state'] in ('ready', 'claimed', 'sending', 'sent', 'skipped'):
                 if row['text'] == body and (state != 'skipped' or row['detail'] == detail):
@@ -324,13 +351,15 @@ def reply_instructions(config, row, workdir: Optional[Union[str, Path]] = None):
     command = [sys.executable, "-m", "swarmly.telegram.cli", "--config", str(config.source_path.resolve()),
                "reply", row['id'], "--text", "your concise answer or blocker", "--wait", "45"]
     cwd = workdir or config.adapter.cwd or Path.cwd()
+    budget = int(row["reply_chars"]) if row and row.get("reply_chars") else         int(config.limits.reply_chars)
     return (
         f"[A2A REPLY TICKET {row['id']}]\n"
         f"This was routed to YOU ({config.identity.username}). Original mentions below are intact.\n"
         "A local final answer is NOT sent to Telegram. Before finishing, submit an explicit reply using the local CLI.\n"
         f"Working directory: {cwd}\n"
         f"Command argument vector (quote each argument for your shell; this is JSON, not shell code): {json.dumps(command)}\n"
-        "Use the configured Python environment. Keep the answer under 500 characters; the sender's mention is added automatically. "
+        f"Use the configured Python environment. Keep the answer under {budget} characters; "
+        "the sender's mention is added automatically. "
         "Do not include private task content. Post substantive findings on GitHub first.\n"
         f"For a PURE ACK/status/sign-off with no question or action, use reply {row['id']} --skip \"reason no reply is needed\" instead (no Telegram post).\n"
         f"Check delivery with reply-status {row['id']}. Only state=sent proves Telegram accepted the reply; queued/ready is not completion. "

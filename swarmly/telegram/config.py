@@ -629,10 +629,17 @@ class ChannelLimits:
                 raise ConfigError(f"limits.{key} must be a whole number of at least 1 "
                                   f"(got {value!r}).")
         # Issue #31: a reply budget above one Telegram message cannot be delivered as one
-        # message, so it is refused rather than promised to the agent and then split.
+        # message, so it is refused rather than promised to the agent and then split. The
+        # *default* is not an operated setting: a host that lowered max_message_chars below
+        # 500 keeps loading, with the budget clamped to what one message can hold (review).
         if self.reply_chars > self.max_message_chars:
-            raise ConfigError(f"limits.reply_chars must be at most max_message_chars "
-                              f"({self.max_message_chars}); got {self.reply_chars}")
+            if self.reply_chars == ChannelLimits.__dataclass_fields__["reply_chars"].default:
+                logger.warning("limits.reply_chars defaults to 500, above max_message_chars=%s; "
+                               "using %s", self.max_message_chars, self.max_message_chars)
+                self.reply_chars = self.max_message_chars
+            else:
+                raise ConfigError(f"limits.reply_chars must be at most max_message_chars "
+                                  f"({self.max_message_chars}); got {self.reply_chars}")
         # #29 review: a reply is split into at most MAX_REPLY_PARTS parts, and the receiver
         # refuses a part header above that. Clamping here keeps the two ends agreeing: a larger
         # configured value loses the tail to the existing truncation instead of having every

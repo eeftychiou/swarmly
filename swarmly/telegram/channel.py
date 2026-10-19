@@ -2292,6 +2292,10 @@ class AgentChannel:
                 chat_id=event.chat_id, message_id=event.message_id,
                 recipient=author_username or peer_username, text=event.text,
                 timeout=self.config.adapter.reply_timeout_seconds,
+                # Issue #31 review: the ticket is judged by the budget this turn was given,
+                # so a reply that follows the rules is not refused at submit time.
+                reply_chars=((project_settings.reply_chars if project_settings is not None
+                              else None) or self.config.limits.reply_chars),
             )
             if not created:
                 self.stats.ignored += 1

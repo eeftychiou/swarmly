@@ -677,7 +677,7 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
         return rules_digest(channel_rules(getattr(message, "mentions", None),
                                           getattr(message, "maintainer_username", None),
                                           role=self.role_text,
-                             reply_chars=getattr(message, "reply_chars", None)))
+                                          reply_chars=getattr(message, "reply_chars", None)))
 
     async def _respond_in_topic(self, message: IncomingMessage,
                                 context_id: str) -> Optional[AdapterReply]:

@@ -78,6 +78,15 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(ConfigError):
             project_config(reply_chars=4097)
 
+    def test_a_lowered_message_cap_does_not_break_the_default(self):
+        """Review of #31: max_message_chars below the *default* 500 must still load, clamped."""
+        config = make_config(limits={"max_message_chars": 400})
+        self.assertEqual(config.limits.reply_chars, 400)
+
+    def test_an_explicit_budget_above_the_message_cap_is_refused(self):
+        with self.assertRaises(ConfigError):
+            make_config(limits={"max_message_chars": 400, "reply_chars": 800})
+
     def test_the_example_configs_document_the_keys(self):
         from pathlib import Path
         for path in (Path("config/telegram.example.yaml"),
@@ -131,31 +140,86 @@ class TestTurnRules(unittest.TestCase):
         self.assertEqual(adapter.seen[0].reply_chars, 800)
 
 
+class TestTheBus(unittest.TestCase):
+    def test_a_bus_turn_is_held_too(self):
+        """Review of #31: `_bus_incoming` left reply_chars unset, so a gitbus turn fell back
+        to 500 even when the channel was configured for something else."""
+        from swarmly.telegram.poll import _bus_incoming
+        config = make_config(limits={"reply_chars": 800})
+        incoming = _bus_incoming("do the thing", "Codex", config, "token")
+        self.assertEqual(incoming.reply_chars, 800)
+        self.assertIn("under 800 characters", turn_card(incoming))
+
+
 class TestTheSender(unittest.TestCase):
+    def store(self, tmp, **kwargs):
+        from pathlib import Path
+        return ReplyStore(Path(tmp) / "replies.sqlite3", **kwargs)
+
+    def ticket(self, store, message_id=1, **kwargs):
+        row, _ = store.register(chat_id=GROUP, message_id=message_id, recipient="CodexBot",
+                                text="do the thing", **kwargs)
+        return row["id"]
+
+    def assert_refused(self, store, ticket, text, limit):
+        """Refused *for the budget*, and says which budget (a second submit raises anyway)."""
+        with self.assertRaises(ValueError) as raised:
+            store.submit(ticket, text=text)
+        self.assertIn(f"under {limit} characters", str(raised.exception))
+        self.assertNotIn("already has a different response", str(raised.exception))
+
     def test_a_ticket_is_held_to_the_configured_budget(self):
         from tempfile import TemporaryDirectory
         with TemporaryDirectory() as tmp:
-            from pathlib import Path
-            store = ReplyStore(Path(tmp) / "replies.sqlite3", reply_chars=700)
-            row, _ = store.register(chat_id=GROUP, message_id=1, recipient="CodexBot",
-                                    text="do the thing")
-            ticket = row["id"]
+            store = self.store(tmp, reply_chars=700)
+            ticket = self.ticket(store)
             store.submit(ticket, text="x" * 640)                  # the @handle plus the text: 651
-            with self.assertRaises(ValueError):
-                store.submit(ticket, text="x" * 700)              # 711 with the @handle: over
+            self.assertEqual(store.get(ticket)["state"], "ready")
+            # 711 with the @handle: over a 700 budget, and it says so.
+            self.assert_refused(store, ticket, "x" * 700, 700)
 
     def test_the_default_budget_is_unchanged(self):
         from tempfile import TemporaryDirectory
         with TemporaryDirectory() as tmp:
-            from pathlib import Path
-            store = ReplyStore(Path(tmp) / "replies.sqlite3")
+            store = self.store(tmp)
             self.assertEqual(store.reply_chars, 500)
-            row, _ = store.register(chat_id=GROUP, message_id=1, recipient="CodexBot",
-                                    text="do the thing")
-            ticket = row["id"]
-            with self.assertRaises(ValueError) as raised:
-                store.submit(ticket, text="y" * 500)               # 500 was already over it
-            self.assertIn("under 500 characters", str(raised.exception))
+            self.assert_refused(store, self.ticket(store), "y" * 500, 500)
+
+    def test_a_ticket_carries_its_topics_budget(self):
+        """Review of #31: a ticket raised in a topic whose project allows 1500 must accept a
+        1500-character reply, though the channel's own budget is 500."""
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            store = self.store(tmp)
+            ticket = self.ticket(store, reply_chars=1500)
+            self.assertEqual(store.budget_for(store.get(ticket)), 1500)
+            store.submit(ticket, text="z" * 1200)                 # over 500, well under 1500
+            self.assertEqual(store.get(ticket)["state"], "ready")
+
+    def test_an_old_ticket_without_a_budget_falls_back_to_the_store(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            store = self.store(tmp)
+            ticket = self.ticket(store)                           # registered without one
+            self.assertIsNone(store.get(ticket)["reply_chars"])
+            self.assertEqual(store.budget_for(store.get(ticket)), 500)
+
+    def test_the_ticket_instructions_state_the_budget(self):
+        """Review of #31: the CLI hint hardcoded 500, so a turn told 1500 was contradicted."""
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from swarmly.telegram.replies import reply_instructions
+        with TemporaryDirectory() as tmp:
+            config = project_config(reply_chars=1500)
+            config.source_path = Path(tmp) / "config.yaml"
+            config.source_path.write_text("agent: {}\n")
+            store = self.store(tmp)
+            ticket = self.ticket(store, reply_chars=1500)
+            instructions = reply_instructions(config, store.get(ticket))
+            self.assertIn("under 1500 characters", instructions)
+            plain_ticket = self.ticket(store, message_id=2)       # no topic: the global budget
+            self.assertIn("under 500 characters",
+                          reply_instructions(config, store.get(plain_ticket)))
 
 
 if __name__ == "__main__":
