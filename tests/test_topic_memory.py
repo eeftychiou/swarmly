@@ -67,6 +67,59 @@ class TestTopicMemory(unittest.TestCase):
             self.assertIsNone(TopicMemory(path).opening(1, 7))
 
 
+class TestStoreWholeRenderCut(unittest.TestCase):
+    """The brief is kept whole and cut only when a recap is rendered (#30)."""
+
+    def test_the_opening_brief_is_stored_whole_and_rendered_cut(self):
+        from swarmly.telegram import topic_memory as tm
+        memory = TopicMemory()
+        brief = ("task " * 600).strip()                  # ~3k: past every render limit
+        memory.record(1, 7, "admin", brief, 10)
+        self.assertEqual(memory.opening(1, 7)[2], brief)
+        fresh = memory.recap(1, 7, current_id=99, fresh=True, own_alias="Hermes")
+        self.assertIn("> " + brief[:tm.FRESH_TASK] + "…", fresh)
+        self.assertNotIn(brief[:tm.FRESH_TASK + 40], fresh)
+        session = memory.recap(1, 7, current_id=99, fresh=False, own_alias="Hermes")
+        self.assertIn("> " + brief[:tm.SESSION_TASK] + "…", session)
+        self.assertNotIn(brief[:tm.SESSION_TASK + 40], session)
+
+    def test_progress_and_log_entries_are_stored_whole(self):
+        from swarmly.telegram import topic_memory as tm
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "topic-memory.json"
+            memory = TopicMemory(path)
+            memory.record(1, 7, "admin", "the task", 10)
+            progress = ("opened PR #42 for the counter, " + "detail " * 120).strip()
+            chatter = ("chatter " * 200).strip()
+            memory.record(1, 7, "Hermes", progress, 11)
+            memory.record(1, 7, "Codex", chatter, 12)
+            memory.save()
+            saved = json.loads(path.read_text(encoding="utf-8"))["topics"][0]
+            self.assertEqual(saved["progress"][0][2], progress)
+            self.assertEqual(saved["log"][-1][2], chatter)
+            recap = TopicMemory(path).recap(1, 7, current_id=None, fresh=True,
+                                            own_alias="x")
+            self.assertNotIn(progress, recap)               # shown cut, stored whole
+            self.assertIn(progress[:tm.FRESH_CHARS] + "…", recap)
+            self.assertIn(chatter[:tm.FRESH_CHARS] + "…", recap)
+
+    def test_a_memory_file_written_before_the_split_still_loads(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "topic-memory.json"
+            path.write_text(json.dumps({"topics": [{
+                "chat": 1, "thread": 7,
+                "opening": [10, "admin", "short brief"],
+                "progress": [[11, "Hermes", "opened PR #42"]],
+                "log": [[10, "admin", "short brief"], [11, "Hermes", "opened PR #42"]],
+                "count": 2, "seen": None,
+            }]}), encoding="utf-8")
+            memory = TopicMemory(path)
+            self.assertEqual(memory.opening(1, 7)[2], "short brief")
+            recap = memory.recap(1, 7, current_id=99, fresh=True, own_alias="x")
+            self.assertIn("> short brief", recap)
+            self.assertIn("- Hermes: opened PR #42", recap)
+
+
 class TestAntigravityPerTopic(unittest.TestCase):
 
     def make(self, folder, **settings):

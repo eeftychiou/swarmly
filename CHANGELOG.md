@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Topic memory keeps each brief whole and applies its length cuts only when a recap is
+  rendered, so a task posted at length still reads as the full task in the stored record
+  rather than being truncated on the way in (`#30`).
 - Every @handle in a peer bot's hand-off counts as addressed, on one line or over several,
   whether it opens the message or sits in a list of three or more bots: a list a bot writes
   is a hand-off, not a roster, so nothing in it is second-guessed. A mention that is still

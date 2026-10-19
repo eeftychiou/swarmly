@@ -29,12 +29,14 @@ from swarmly.telegram.topic_open import issue_refs
 Key = Tuple[int, Optional[int]]
 Entry = Tuple[Optional[int], str, str]            # (telegram message id, who, text)
 
-#: How much is kept. A fresh runtime pays for the whole recap on every turn (nothing is
-#: cached), so what it is shown stays near 2k characters; a session runtime gets the task
-#: once, when its session starts, and then only the messages it has not seen.
-TASK_CHARS = 1500
-PROGRESS_ITEMS, PROGRESS_CHARS = 20, 240
-LOG_ITEMS, LOG_CHARS = 30, 600
+#: What is kept, and what is shown. Messages are stored whole -- a brief cut on the way in
+#: cannot be recovered, and the task is the one thing a fresh turn must not lose -- and the
+#: length cuts are applied only when the recap is rendered. A fresh runtime pays for the
+#: whole recap on every turn (nothing is cached), so what it is *shown* stays near 2k
+#: characters; a session runtime gets the task once, when its session starts, then only the
+#: messages it has not seen.
+PROGRESS_ITEMS = 20
+LOG_ITEMS = 30
 TOPICS_KEPT = 80
 SAVE_DELAY = 2.0
 #: A topic's first message has an id just above the topic's own (its creation service
@@ -96,12 +98,12 @@ class TopicMemory:
         if message_id is not None and any(e[0] == message_id for e in topic["log"]):
             return                                    # already seen (bus copy, retry)
         if topic["opening"] is None and thread_id is not None:
-            topic["opening"] = (message_id, who, _cut(text, TASK_CHARS))
+            topic["opening"] = (message_id, who, text)
         elif self._is_progress(text):
             progress: List[Entry] = topic["progress"]
-            progress.append((message_id, who, _cut(text, PROGRESS_CHARS)))
+            progress.append((message_id, who, text))
             del progress[:-PROGRESS_ITEMS]
-        topic["log"].append((message_id, who, _cut(text, LOG_CHARS)))
+        topic["log"].append((message_id, who, text))
         topic["count"] += 1
         while len(self._topics) > TOPICS_KEPT:
             self._topics.pop(next(iter(self._topics)))
