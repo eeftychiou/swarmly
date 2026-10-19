@@ -226,6 +226,12 @@ the HELLO notice is sent, so a restart whose notice send fails is still recorded
 the receipt contract of `scripts/upgrade_transport.sh` gate 3 — the upgrade gate reads *this*
 line to confirm which revision came back up, never a substring of the notice payload.
 
+`rev=` is the revision the process **runs**, resolved once at start. A deploy that repoints
+the checkout under a live transport does not change what that process executes, so it keeps
+reporting the revision it started with; `/status` adds the checkout's own HEAD and flags
+`drift=restart-needed` when the two disagree (`#32`). An operator reading `rev=` after a switch
+is reading the code that answered, not the code on disk.
+
 ### Channel-reversible freeze
 
 To protect quota without taking the transport offline, an operator may broadcast:

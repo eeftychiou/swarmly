@@ -1595,6 +1595,35 @@ class TestOnlineNoticeRevision(unittest.TestCase):
         else:
             self.assertEqual(rev, "unknown")
 
+    def test_status_reports_the_revision_the_process_runs(self):
+        """Issue #32: /status names the running revision, not just a task line."""
+        channel = make_channel()
+        status = channel._command_reply("status")
+        self.assertIn(f"rev={channel._running_revision}", status)
+        self.assertNotIn("drift=restart-needed", status)      # checkout has not moved
+
+    def test_status_flags_a_checkout_that_moved_without_a_restart(self):
+        """The deploy dir can be switched under a running process: it keeps its code, so the
+        checkout's new HEAD is drift to act on, not the revision it runs."""
+        from unittest.mock import patch
+        channel = make_channel()
+        running = channel._running_revision
+        with patch("swarmly.telegram.channel._local_revision", return_value="deadbee"):
+            status = channel._command_reply("status")
+        self.assertIn(f"rev={running}", status)
+        self.assertIn("checkout=deadbee", status)
+        self.assertIn("drift=restart-needed", status)
+
+    def test_the_online_notice_keeps_the_running_revision(self):
+        """A notice posted after the checkout moved must not claim the new revision."""
+        from unittest.mock import patch
+        channel = make_channel()
+        running = channel._running_revision
+        with patch("swarmly.telegram.channel._local_revision", return_value="deadbee"):
+            notice = channel.online_notice()
+        self.assertIn(f"rev={running}", notice)
+        self.assertNotIn("deadbee", notice)
+
     def test_start_emits_the_machine_receipt_before_the_human_notice(self):
         """Issue #70: AgentChannel.start() itself logs the gate-3 receipt.
 

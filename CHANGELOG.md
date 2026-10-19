@@ -39,6 +39,13 @@ All notable changes to this project are documented here. The format follows
   merges, ticks the checklist and hands out the next assignment before the turn ends, instead
   of promising to act later ("I'll ping you then"), which is how a round stalls (`#26`).
 
+- `/status` reports the revision the transport **runs** (`rev=`), resolved once at process
+  start, and compares it with the checkout's own `HEAD`: after a deploy repoints the checkout
+  under a live transport, the process keeps its code and the status answers
+  `rev=<running> checkout=<head> drift=restart-needed` until it is restarted. Every envelope
+  the process emits carries the same running revision, so the online notice cannot claim a
+  revision the process is not executing (`#32`).
+
 - The reply budget is a setting now, not a slogan: `limits.reply_chars` (default 500) is what
   the turn rules ask for and what a reply ticket is held to, and `projects.<key>.reply_chars`
   gives one project's topics their own — a plan-shaped topic can ask for 1500 while the rest of
