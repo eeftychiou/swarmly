@@ -813,6 +813,15 @@ to N topics run a turn at the same time.
   Unaddressed files are never downloaded.
 - `/stop@<bot>` from the admin cancels the running turn, ends the CLI process and clears the
   queue (in a forum topic, that topic's only; `/stop@<bot> all` stops everything). A turn that times out also ends its CLI process now, instead of leaving it running.
+- **Orphaned CLIs are reaped on start.** `/stop` and a timeout end the CLI, but a transport
+  that is *killed* (a crash, a power cut, a service restart) cannot: its children keep
+  running against the same conversation. So each CLI's pid is recorded in the state
+  directory (`children-<alias>.json`, with project worktrees adding theirs) together with
+  the start time of the child and of the transport that spawned it. On start the transport
+  ends the children whose transport is dead — the process tree on Windows, the group on
+  POSIX — and leaves alone a live transport's children, a pid whose start time no longer
+  matches (the pid was reused), and anything whose identity it cannot read. The record is
+  dropped when the child exits, so the file only ever holds live pids.
 - `/pause` from the admin holds every bot (`/pause@<bot>` holds one): a turn already running
   finishes and posts its answer, then the bot takes no more turns, from Telegram or the bus,
   and says "paused". The hold survives restarts. `/resume` (or `/resume@<bot>`) lifts it.
