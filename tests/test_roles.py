@@ -285,5 +285,23 @@ class TestBuiltinRolesNameTheMerger(unittest.TestCase):
         self.assertIn("Request changes", load_role("reviewer").instructions)
 
 
+class TestTheAdminDeploys(unittest.TestCase):
+    """Issue #66: the coordinator never tells a peer to install, upgrade, pull or switch the
+    swarmly it runs on -- the admin deploys, and a merge notice only says what landed."""
+
+    def test_the_rendered_coordinator_prompt_carries_the_rule(self):
+        prompt = " ".join(load_role("coordinator").prompt().split())
+        self.assertIn("The admin deploys; you do not", prompt)
+        self.assertIn("Never tell a peer to install, upgrade, pull or switch the swarmly it "
+                      "runs on", prompt)
+        self.assertIn("A post-merge notice says what landed", prompt)
+
+    def test_other_roles_do_not_carry_the_coordinator_rule(self):
+        for name in ("developer", "reviewer", "qa-tester", "researcher"):
+            with self.subTest(role=name):
+                self.assertNotIn("The admin deploys; you do not",
+                                 load_role(name).instructions)
+
+
 if __name__ == "__main__":
     unittest.main()

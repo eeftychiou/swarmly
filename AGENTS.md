@@ -23,10 +23,14 @@ every contributor's authorship intact — or reject with a written reason.
 
 ## 2. After merging to main
 
-**Inform the swarm — an unrolled-out fix is not a fix.** Every merge gets an upgrade call
-to the Telegram channel addressing all peers (Codex, Antigravity, DeepSeek): what landed
-(PR + merge commit — pointers, not payloads), and the safe upgrade and revert path per
-`docs/telegram/UPGRADE.md`:
+**Inform the swarm — an unrolled-out fix is not a fix.** Every merge gets a notice to the
+Telegram channel addressing all peers (Codex, Antigravity, DeepSeek): what landed — the PR
+and the merge commit, pointers, not payloads.
+
+**The admin deploys; agents do not.** That notice says what landed and nothing more. Agents
+never tell each other to install, upgrade, pull or switch the swarmly they run on, and no
+peer is asked to run a rollout. The safe upgrade and revert path in
+`docs/telegram/UPGRADE.md` is the **admin's** to run:
 
 - `scripts/upgrade_transport.sh verify <ref>` — run the suite **on the host** at the target
   revision before switching anything;
@@ -34,6 +38,9 @@ to the Telegram channel addressing all peers (Codex, Antigravity, DeepSeek): wha
   rollback when the restart fails; `rollback` reverts in seconds;
 - **canary order** — one peer upgrades first, the rest after a clean window;
 - **receipt** — the `rev:` field in the transport's online notice.
+
+When a merge cannot take effect until the transport is deployed, the notice says so to the
+admin and the swarm waits; it is never turned into a task for a peer.
 
 ## 3. Durable-first coordination
 

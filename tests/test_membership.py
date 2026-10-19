@@ -269,10 +269,37 @@ class NewcomerTests(unittest.TestCase):
                 channel.membership._onboard()
                 await drain(channel)
             run(onboard())
-            greeting = [row["text"] for row in channel._test_sender.sent
-                        if MEMBERSHIP_MARK in row["text"]][-1]
+            greeting = self.reassembled_onboarding(channel)
             self.assertIn("Greet the maintainer (@alice)", greeting)
             self.assertIn("never open with @HermesBot", greeting)
+
+    @staticmethod
+    def reassembled_onboarding(channel) -> str:
+        """The onboarding message as one string, joined from its split parts (#66).
+
+        The greeting carries the whole role text, so a longer role makes it go out as a split
+        reply: part 1 holds the membership mark and the last part the "greet the maintainer"
+        hint. Joining on ``split_part`` is what the receiving side does, so the test reads the
+        message the way a person does, not just the row that happens to carry the mark. A
+        message that went out whole (no split) is returned as it is.
+        """
+        from swarmly.telegram.channel import split_part
+        texts = [row["text"] for row in channel._test_sender.sent]
+        pieces = [split_part(text) for text in texts]
+        starts = [index for index, piece in enumerate(pieces)
+                  if piece is not None and piece.index == 1
+                  and MEMBERSHIP_MARK in piece.body]
+        if not starts:
+            whole = [text for text in texts if MEMBERSHIP_MARK in text]
+            return whole[-1] if whole else ""
+        start = starts[-1]
+        first = pieces[start]
+        body = first.body
+        for piece in pieces[start + 1:]:
+            if piece is None or piece.total != first.total or piece.ref != first.ref:
+                break
+            body += piece.body
+        return body
 
     def test_a_restart_keeps_the_agreed_role(self):
         with tempfile.TemporaryDirectory() as folder:
