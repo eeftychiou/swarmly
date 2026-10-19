@@ -255,6 +255,24 @@ class TestOnlyTheCoordinatorNudges(unittest.TestCase):
                 self.assertIn("report the stall to it instead", instructions)
 
 
+class TestTheDeliveryRetryIsNotANudge(unittest.TestCase):
+    """Issue #57: the prompts said "do not chase a peer that is not answering", which an agent
+    can read as "no ACK, so skip the ladder". The ACK-less retry is carved out explicitly."""
+
+    def test_every_prompt_that_forbids_chasing_allows_the_retry(self):
+        for name in ("developer", "reviewer", "qa-tester", "researcher"):
+            with self.subTest(role=name):
+                instructions = flat(name)
+                self.assertIn("A REQUEST of yours still without an ACK is not that", instructions)
+                self.assertIn("re-send it, `/ping` at its `ttl`, then take the next rung of the "
+                              "escalation ladder", instructions)
+                self.assertIn("a retry is not a nudge", instructions)
+
+    def test_the_retry_is_only_carved_out_where_chasing_is_forbidden(self):
+        self.assertNotIn("do not chase a peer", flat("coordinator").lower())
+        self.assertIn("chasing a stalled peer is yours alone", flat("coordinator"))
+
+
 class TestBuiltinRolesNameTheMerger(unittest.TestCase):
     def test_the_coordinator_merges_and_nobody_else_does(self):
         self.assertIn("You merge", load_role("coordinator").instructions)
