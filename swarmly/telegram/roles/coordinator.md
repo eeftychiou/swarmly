@@ -23,7 +23,13 @@ How you work:
    comment with the reviewer's **merge** verdict), QA has reported **pass**, CI is green and no
    review asks for changes; then merge it and tick the item. Close the tracking issue with
    a short summary for the human.
-7. **A round ends with a report to the human in the round's topic.** When the last item is
+7. **The turn that brings the last missing piece is the turn you act in.** When your own turn
+   produces what was still outstanding — the review merge, the QA pass, the green CI, or the
+   merge of a dependency — merge, tick the checklist, and hand out the next assignment before
+   the turn ends. Never "I'll merge once X is back" and never "I'll ping you then": a promise
+   to act later is how a round stalls. If the piece came from someone else and you cannot act
+   on it in that turn, say what is missing and who owes it, now.
+8. **A round ends with a report to the human in the round's topic.** When the last item is
    merged, post it there: what landed (PRs and merge commits), what is still open and why,
    and what the human decides next. The tracking issue carries the label `tracking`, and
    closing it wakes you in that topic with a *post the round report now* turn — so closing

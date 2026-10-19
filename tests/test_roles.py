@@ -192,6 +192,26 @@ class TestRoleTrustAndRobustness(unittest.TestCase):
             self.assertEqual(AgentConfig.load(path).role().name, "lead")
 
 
+class TestTheCoordinatorActsInTheTurnThatUnblocksIt(unittest.TestCase):
+    """Issue #26: the coordinator role says to act in the turn that brings the last missing
+    piece, so a round cannot stall on "I'll merge once X is back"."""
+
+    def test_the_role_says_to_act_in_that_turn(self):
+        # Whitespace is flattened: the role text wraps, the rule is what matters.
+        instructions = " ".join(load_role("coordinator").instructions.split())
+        self.assertIn("The turn that brings the last missing piece is the turn you act in",
+                      instructions)
+        self.assertIn("merge, tick the checklist, and hand out the next assignment before "
+                      "the turn ends", instructions)
+        self.assertIn("Never \"I'll merge once X is back\"", instructions)
+        self.assertIn("a promise to act later is how a round stalls", instructions)
+
+    def test_only_the_coordinator_carries_the_rule(self):
+        for name in ("developer", "reviewer", "qa-tester", "researcher"):
+            with self.subTest(role=name):
+                self.assertNotIn("the turn you act in", load_role(name).instructions)
+
+
 class TestBuiltinRolesNameTheMerger(unittest.TestCase):
     def test_the_coordinator_merges_and_nobody_else_does(self):
         self.assertIn("You merge", load_role("coordinator").instructions)

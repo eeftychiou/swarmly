@@ -32,6 +32,13 @@ All notable changes to this project are documented here. The format follows
   registered by a reply during a wake survives that poll, and a wake in a topic with no
   context id is refused instead of running in the shared General session (`#24` review).
 
+### Changed
+
+- The coordinator's role text now says to act in the turn that brings the last missing piece:
+  when that turn produces the review merge, the QA pass or the green CI, the coordinator
+  merges, ticks the checklist and hands out the next assignment before the turn ends, instead
+  of promising to act later ("I'll ping you then"), which is how a round stalls (`#26`).
+
 ### Fixed
 
 - A bot whose provider says the quota is gone *and* when it comes back freezes on the first
