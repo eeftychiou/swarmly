@@ -246,6 +246,10 @@ config (`<config>.freeze.json`): a transport restarted while frozen comes back f
 re-announces `intent=FROZEN` once, so a restart cannot silently release automation. A transport
 that fails `limits.quota_freeze_threshold` (default 3) consecutive adapter runs whose error text
 carries a quota/429 signature freezes itself with `intent=FROZEN ref=quota` — no human needed.
+An error that says the quota itself is gone (`usage limit`, `quota exceeded`, `token plan`) *and*
+when it comes back freezes on the first failure instead of the third: the peers learn at once, so
+the work moves rather than waiting two more turns to fail. A plain `429` / rate limit keeps the
+threshold however long its `Retry-After` is — that is a blip the next turn retries.
 A quota freeze ends by itself: at the reset time the provider's error gives ("try again at
 Nov 16th, 2026 10:06 PM", "retry in 2h", `Retry-After: 120`), else after
 `limits.quota_retry_minutes` (default 60), and the next turn is the probe (repeated quota

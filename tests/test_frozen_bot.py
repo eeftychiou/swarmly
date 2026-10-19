@@ -56,6 +56,26 @@ class TestQuotaFreeze(unittest.TestCase):
         run(channel._note_adapter_failure("429 Too Many Requests"))
         self.assertFalse(channel._frozen)
 
+    def test_a_plain_429_with_a_retry_after_waits_for_the_threshold(self):
+        """Review of #51: `Retry-After: 30` is a rate limit, not a quota that is gone. Freezing
+        on it would announce FROZEN and hand the bot's work to its peers for half a minute."""
+        channel = make_channel(make_config(adapter={"type": "codex"}))
+        channel._wall = lambda: NOW
+        run(channel._note_adapter_failure("429 Too Many Requests. Retry-After: 30"))
+        self.assertFalse(channel._frozen)
+        run(channel._note_adapter_failure("Rate limit reached. Please retry in 30s."))
+        self.assertFalse(channel._frozen)                  # two of three: still not frozen
+        run(channel._note_adapter_failure("429 Too Many Requests. Retry-After: 30"))
+        self.assertTrue(channel._frozen)                   # the threshold still freezes it
+        self.assertEqual(channel._freeze_until, NOW + 30)  # until the reset it named
+
+    def test_a_quota_error_with_a_reset_time_still_freezes_at_once(self):
+        channel = make_channel(make_config(adapter={"type": "codex"}))
+        channel._wall = lambda: NOW
+        run(channel._note_adapter_failure("Quota exceeded. Retry-After: 120"))
+        self.assertTrue(channel._frozen)
+        self.assertEqual(channel._freeze_until, NOW + 120)
+
     def test_without_a_reset_time_it_is_retried_after_the_interval(self):
         channel = frozen_channel(detail="429 Too Many Requests")
         self.assertEqual(channel._freeze_until, NOW + 60 * 60)

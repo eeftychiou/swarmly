@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A bot whose provider says the quota is gone *and* when it comes back freezes on the first
+  failure, instead of after `limits.quota_freeze_threshold` failed runs: the peers get
+  `FROZEN` while the work can still move, and the notice of the failed turn now replies to the
+  message that failed. A plain `429`/rate limit still takes the threshold however long its
+  `Retry-After` is, so a half-minute blip does not hand the bot's work away (`#51`).
+
 - Every @handle in a peer bot's hand-off counts as addressed, on one line or over several,
   whether it opens the message or sits in a list of three or more bots: a list a bot writes
   is a hand-off, not a roster, so nothing in it is second-guessed. A mention that is still

@@ -1394,7 +1394,14 @@ class AgentChannel:
     # #49: freeze persistence, auto-freeze on quota exhaustion, alert discipline
     # ------------------------------------------------------------------------------
 
+    #: Failure text that counts toward the quota-freeze threshold: a rate limit is retried by
+    #: the next turn, so a few in a row mean the provider is not answering this bot at all.
     _QUOTA_SIGNATURE = re.compile(r"429|quota|usage limit|token plan|rate limit", re.IGNORECASE)
+    #: Failure text saying the quota itself is gone. Only these freeze on the first failure,
+    #: and only with a reset time: a plain 429 with `Retry-After: 30` is a blip, and declaring
+    #: the bot FROZEN over it hands its work to its peers for half a minute (#51 review).
+    _QUOTA_EXHAUSTED_SIGNATURE = re.compile(
+        r"quota|usage limit|token plan|out of credits|credit balance|insufficient", re.IGNORECASE)
 
     def _freeze_state_path(self) -> Optional[Path]:
         """Where the freeze flag persists next to the config (survives restarts, #49.F)."""
@@ -1521,7 +1528,10 @@ class AgentChannel:
         Deliberately narrow: only failure text carrying a known quota/429 signature counts,
         a non-quota failure resets the streak, and the freeze never fires twice. It ends at
         the reset time the error gives, else after ``limits.quota_retry_minutes``; /resume
-        and a /model switch end it sooner.
+        and a /model switch end it sooner. An error naming the quota itself (not a plain
+        429/rate limit) that also states when it resets freezes on the first failure, because
+        waiting out the threshold only delays telling the peers (see
+        :data:`_QUOTA_EXHAUSTED_SIGNATURE`).
         """
         if self._frozen or not self.config.limits.auto_freeze_on_quota:
             return
@@ -1533,10 +1543,13 @@ class AgentChannel:
         logger.warning("quota-signature adapter failure %d/%d", self._quota_failures, threshold)
         now = self._wall()
         resets = quota_resets_at(detail, now)
-        # An error that says when the quota comes back is not a blip: freeze at once, so the
-        # FROZEN status reaches the peers and the coordinator hands the work elsewhere (live
-        # run: Codex took a hand-off weeks before its quota reset and only posted a ❌).
-        if resets is not None or self._quota_failures >= threshold:
+        # An error that says the quota itself is gone, and when it comes back, freezes at once:
+        # the FROZEN status reaches the peers and the coordinator hands the work elsewhere
+        # (live run: Codex took a hand-off weeks before its quota reset and only posted a ❌).
+        # A plain 429 rate limit keeps the threshold however long its Retry-After is.
+        exhausted = resets is not None and bool(
+            self._QUOTA_EXHAUSTED_SIGNATURE.search(detail or ""))
+        if exhausted or self._quota_failures >= threshold:
             until = resets or now + self._quota_retry_seconds()
             self._set_frozen(True, "quota", until)
             self.stats.last_error = "auto-frozen: adapter quota exhausted"
