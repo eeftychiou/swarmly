@@ -4677,13 +4677,22 @@ _CONTINUATION_RE = re.compile(
 #: optional ``#token`` inside the parentheses correlates the parts of one reply: it is what a
 #: receiver joins on, so two replies by one sender that interleave are never joined into one
 #: mixed message (#29 review), and a part written without one is not joined at all (#29 QA).
+#: The numbers in a header are read with a bounded digit width (``_SPLIT_NUMBER``), never with
+#: ``\d+``: a header carrying a thousand digits is refused by the pattern itself, so no
+#: conversion of the sender's number can be large — and ``int()`` of a very long digit string
+#: is not merely slow, it raises ``ValueError`` on Python 3.11+ (the int-string conversion
+#: limit), which would turn a peer's fragment into an exception in the inbound path (#29
+#: review: cap the total, reject anything above the cap).
+_SPLIT_NUMBER = r"\d{1,3}"
 _SPLIT_FIRST_RE = re.compile(
-    r"^(?P<body>.*)\n\n\(1/(?P<total>\d+)(?: #(?P<ref>\w{1,16}))?\)[ \t]*\Z", re.S)
+    r"^(?P<body>.*)\n\n\(1/(?P<total>" + _SPLIT_NUMBER + r")(?: #(?P<ref>\w{1,16}))?\)[ \t]*\Z",
+    re.S)
 #: Part k > 1: the marker first (after the sender's banner and the @handles that delivered
 #: it), then the reply from where the previous part was cut.
 _SPLIT_PART_RE = re.compile(
     r"^(?:@\w+[:,]?\s*)*(?:\[[^\]\n]{1,64}\]\s*)?"
-    r"↪ \((?P<index>\d+)/(?P<total>\d+)(?: #(?P<ref>\w{1,16}))?\)[ \t]?(?P<body>.*)\Z", re.S)
+    r"↪ \((?P<index>" + _SPLIT_NUMBER + r")/(?P<total>" + _SPLIT_NUMBER
+    + r")(?: #(?P<ref>\w{1,16}))?\)[ \t]?(?P<body>.*)\Z", re.S)
 #: How long the receiver holds the first part(s) of a split reply for the rest. A whole reply
 #: is a few consecutive posts (seconds apart); longer than this and the rest is not coming.
 SPLIT_TIMEOUT_SECONDS = 30.0
@@ -4716,7 +4725,9 @@ def split_part(text: str) -> Optional[SplitPart]:
     that followed the cut, so the parts concatenate back to the reply that was sent. A part 1
     whose body is empty is not a split reply, and neither is ``(1/1)``. A total above
     :data:`MAX_SPLIT_PARTS` is not a split reply either: it is refused as ordinary text, so no
-    header can make the receiver hold parts that will never come.
+    header can make the receiver hold parts that will never come. A total written with more
+    than three digits does not even match, so the sender's number is never converted at that
+    size (#29 review).
     """
     if not text:
         return None

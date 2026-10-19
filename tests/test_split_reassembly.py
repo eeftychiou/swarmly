@@ -121,6 +121,38 @@ class TestSplitPart(unittest.TestCase):
                          SplitPart(1, MAX_SPLIT_PARTS, "body"))   # the cap is allowed
         self.assertIsNone(split_part(f"body\n\n(1/{MAX_SPLIT_PARTS + 1})"))
 
+    def test_an_absurdly_long_number_is_refused_without_being_converted(self):
+        """Codex's re-review of #29: the total has an upper *bound*, not just a comparison — a
+        thousand-digit number is refused by the marker's own pattern, so the receiver neither
+        reserves the buffer it names nor converts a number that size (``int()`` of a digit
+        string past Python's conversion limit raises rather than returning)."""
+        huge = "9" * 5000
+        for text in (f"body\n\n(1/{huge})", f"[Codex] ↪ (2/{huge}) more",
+                     f"[Codex] ↪ ({huge}/{huge}) more"):
+            self.assertIsNone(split_part(text), text[:40])
+        # The cap is still reachable, and the number just above it is still refused.
+        self.assertEqual(split_part(f"body\n\n(1/{MAX_SPLIT_PARTS})"),
+                         SplitPart(1, MAX_SPLIT_PARTS, "body"))
+        self.assertIsNone(split_part(f"body\n\n(1/{MAX_SPLIT_PARTS + 1})"))
+
+    def test_an_absurd_header_holds_no_buffer_and_arms_no_timer(self):
+        """Codex's re-review of #29: the absurd header is a message, not a claim — no buffer,
+        no timer, and part 1 is still answered whole."""
+        huge = "9" * 5000
+        channel, adapter = receiver()
+
+        async def replay():
+            await channel.handle_event(event(f"@HermesBot whole message\n\n(1/{huge})",
+                                             message_id=11))
+            await channel.handle_event(event(f"[Codex] ↪ (2/{huge}) the rest", message_id=12))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            self.assertEqual(channel._split_pending, {})
+            self.assertEqual([task for task in channel._split_tasks if not task.done()], [])
+
+        run(replay())
+        self.assertEqual(len(adapter.seen), 1)
+
 
 class TestReassembly(unittest.TestCase):
     def test_a_12000_character_reply_arrives_as_one_message(self):
@@ -246,19 +278,34 @@ class TestReassembly(unittest.TestCase):
         self.assertEqual([task for task in channel._split_tasks if not task.done()], [])
 
     def test_a_held_reply_arms_a_timer_that_delivers_what_arrived(self):
-        """Review of #29: the timeout is scheduled and it fires — the held part is delivered
-        with the missing-part note even when no later message comes along to sweep it out."""
+        """Review of #29: the timeout is *scheduled* — a live task on the running loop, awaiting
+        the window rather than just a comment — and it fires, delivering the held part with the
+        missing-part note even when no later message comes along to sweep it out.
+
+        Codex's re-review: the earlier version of this test only checked that some task existed;
+        it now checks the held reply's own ``timer`` is that task, that the loop has it, that it
+        does not fire early, and that firing empties the buffer."""
         parts = outgoing(ORIGINAL)
         self.assertGreaterEqual(len(parts), 3)
         channel, adapter = receiver()
 
         async def hold_then_wait_out_the_window():
-            with patch("swarmly.telegram.channel.SPLIT_TIMEOUT_SECONDS", 0.0):
+            with patch("swarmly.telegram.channel.SPLIT_TIMEOUT_SECONDS", 0.05):
                 await channel.handle_event(event(parts[0], message_id=1))
-                timers = [task for task in channel._split_tasks if not task.done()]
-                self.assertEqual(len(timers), 1)        # the timer exists, not just a comment
-                for _ in range(20):                    # let it come due and deliver
+                [(_, pending)] = channel._split_pending.items()
+                timer = pending.timer
+                self.assertIsNotNone(timer)                 # a timer, not just a comment
+                self.assertIs(timer, next(iter(channel._split_tasks)))
+                self.assertIn(timer, asyncio.all_tasks())    # scheduled on the running loop
+                self.assertFalse(timer.done())
+                for _ in range(5):                          # it is awaiting the window,
+                    await asyncio.sleep(0)                  # not already finished
+                self.assertFalse(timer.done())
+                self.assertEqual(adapter.seen, [])          # nothing delivered early
+                for _ in range(40):                         # let it come due and deliver
                     await asyncio.sleep(0.01)
+                self.assertTrue(timer.done())               # it fired
+                self.assertEqual(channel._split_pending, {})  # and took its buffer with it
 
         run(hold_then_wait_out_the_window())
         self.assertEqual(len(adapter.seen), 1)

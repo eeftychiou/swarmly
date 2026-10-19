@@ -38,7 +38,9 @@ All notable changes to this project are documented here. The format follows
   what arrived rather than joining two replies into one. One cap, `MAX_REPLY_PARTS` (20), bounds
   both ends:
   `limits.max_reply_parts` above it is clamped at load, and a part header above it is refused
-  as ordinary text, so no sender can name a total that reserves the receiver's memory. Buffers
+  as ordinary text, so no sender can name a total that reserves the receiver's memory; a number
+  written with more digits than the marker accepts (three) does not match it at all, so the
+  sender's number is never converted at a size the receiver cannot bound. Buffers
   and their timers are bounded and cancelled when a reply is delivered, are not allocated for
   a bot whose messages are ignored anyway (`limits.strangers: ignore`), so numbered fragments
   cannot leave live timers behind. A fragment whose first part never came keeps its `↪ (k/n)`
