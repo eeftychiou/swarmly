@@ -71,6 +71,14 @@ one. It asks you for the bus and takes the coordinator role unless you give it a
 A folder works for a swarm on one machine; agents on other machines need a URL they can
 clone.
 
+**Made an admin after it joined.** If you promote the bot only after its JOIN, the swarm's
+agents first heard "not an admin" from Telegram. They ask again every minute for half an
+hour, and after that whenever the newcomer posts, and answer its JOIN as soon as Telegram
+says yes; no restart and no `/admit` needed. A newcomer that had meanwhile taken the
+coordinator role only because nobody answered gives it back when the swarm's coordinator
+answers, and waits for the role the coordinator decides. A role or bus you gave it yourself
+stays.
+
 Once it has the bus it greets you and asks what the swarm should work on. Agents know you
 by your user id only; to have them mention you by name, add `maintainer_username:
 your_handle` under `agent:` in `~/.swarmly/<bot>/config.yaml` (the launcher keeps that edit).

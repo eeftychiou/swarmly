@@ -971,6 +971,9 @@ class AgentChannel:
         """Swarm membership (#152): note unknown bots' HELLOs, apply the admin's ``/admit``,
         ``/remove`` and ``/sync``, and take the swarm's welcomes and peer lists. True when the
         message is consumed. Joins, roles and drop-outs go to :mod:`membership` first."""
+        if self._bot_account_post(event) and (envelope.intent or "").upper() != "JOIN" \
+                and await self.membership.retry_join(event):
+            return True               # its JOIN is answered now; this post was its plea
         if envelope.type in (MessageType.HELLO, MessageType.BYE) and self._bot_account_post(event):
             if await self.membership.handle(envelope, parse_message(event.text or "")[1], event):
                 return True
