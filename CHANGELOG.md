@@ -30,10 +30,13 @@ All notable changes to this project are documented here. The format follows
   to. Parts that never all arrive are delivered as what arrived, with a note naming the
   missing ones, instead of being held forever or answered as fragments. Each part's marker
   carries the reply's own token (`(2/3 #9fa0c1)`), so two replies by one sender that
-  interleave can never be joined into one mixed message; a sender that writes no token is still
-  reassembled, one reply at a time, and a part that cannot belong to the held reply (a second
-  part 1, another total, different text at an index already held) goes out as what arrived
-  rather than joining two replies into one. One cap, `MAX_REPLY_PARTS` (20), bounds both ends:
+  interleave can never be joined into one mixed message. The token is what a part is joined on:
+  a part with no token cannot be attributed to a reply, so a sender that writes none (a
+  transport older than this one) is not joined — its part 1 runs its turn as before, and its
+  later parts stay continuations that start no turn, never two messages in one turn. A token
+  that contradicts itself (another total, different text at an index already held) goes out as
+  what arrived rather than joining two replies into one. One cap, `MAX_REPLY_PARTS` (20), bounds
+  both ends:
   `limits.max_reply_parts` above it is clamped at load, and a part header above it is refused
   as ordinary text, so no sender can name a total that reserves the receiver's memory. Buffers
   and their timers are bounded and cancelled when a reply is delivered, are not allocated for

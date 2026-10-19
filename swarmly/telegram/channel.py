@@ -3741,10 +3741,9 @@ class AgentChannel:
                         MAX_SPLIT_PARTS)
         if max_parts == 1 or self._fits(text):
             return [text]
-        # One token per reply, so a receiver can tell two replies by one sender apart even when
-        # their parts interleave (#29 review). It rides inside the marker, so a receiver that
-        # predates it still sees "↪ (k/n" and treats the part as a continuation. The token is
-        # part of the marker the cut has to leave room for.
+        # One token per reply: it is what the receiver joins the parts on, so two replies by one
+        # sender can never be joined into one mixed message (#29 review, #29 QA). It rides inside
+        # the marker, which is part of what the cut has to leave room for.
         ref = secrets.token_hex(3)
         worst = f"{max_parts}/{max_parts} #{ref}"
         head_room, tail_room = f"\n\n({worst})", f"↪ ({worst}) "
@@ -3796,10 +3795,10 @@ class AgentChannel:
     # Split replies (issue #29)
     # ----------------------------------------------------------------------------------
     @staticmethod
-    def _split_key(event: ChannelEvent, ref: str = "") -> Tuple[Any, ...]:
+    def _split_key(event: ChannelEvent, ref: str) -> Tuple[Any, ...]:
         """Which reply a part belongs to: one sender, in one chat and discussion, and the
-        reply's own correlation token when the sender wrote one. Without a token the sender's
-        held reply is the only candidate, which is what an older transport gets (#29 review)."""
+        reply's own correlation token. The token is part of the key, so two replies by one
+        sender that interleave are held apart and each comes out whole (#29 review)."""
         return (event.chat_id, event.thread_id, event.author_id,
                 (event.author_username or "").lower(), ref)
 
@@ -3813,12 +3812,14 @@ class AgentChannel:
         did arrive, with a note naming the missing ones (``_flush_split``), never silently
         dropped and never answered twice.
 
-        Only one reply per sender is held at a time, and a part that cannot belong to it (a
-        second part 1, a different total, different text at an index already held) is a
-        different reply: the held one goes out as what arrived instead of the two being joined
-        into one mixed message (#29 review). Buffers are never allocated for a sender whose
-        messages this bot ignores anyway, and their number is bounded, so a stranger cannot
-        make the transport hold parts that never complete.
+        Parts are only ever joined when the sender's marker carries the reply's own token, and
+        a token names exactly one reply: what is held is that reply, and nothing else can be
+        joined to it. Without a token a part cannot be attributed at all — ``A1, B2, B1, A2``
+        from one sender (two replies, same total, no tokens) is indistinguishable from one
+        reply arriving out of order, and joining it puts two messages into one turn (#29 QA).
+        So a sender that writes no token (an older transport) is not joined: its part 1 runs
+        its turn as it did before #29, and its continuations stay continuations, which start no
+        turn. Bounded, so a stranger cannot make the transport hold parts that never complete.
         """
         if not event.author_is_bot or not event.text or not self._may_reassemble(event):
             return False, None
@@ -3831,8 +3832,14 @@ class AgentChannel:
         part = split_part(event.text)
         if part is None:
             return False, None
+        if not part.ref:
+            # No token, no attribution: joining a tokenless part is a guess, and the guess
+            # mixes two interleaved replies into one turn (A1, B2, B1, A2 — #29 QA). Such a
+            # part is left to the rest of the inbound path, where part 1 is an ordinary
+            # message and a continuation is filtered out and starts no turn.
+            return False, None
         index, total, body = part.index, part.total, part.body
-        key = self._split_key(event, part.ref or "")
+        key = self._split_key(event, part.ref)
         # Delivering a held reply awaits a turn, and another part of this sender can arrive
         # while it runs. The state is read again after every await, and a buffer is only
         # created when the map still has none for this key: a part that opened one meanwhile
@@ -3851,8 +3858,9 @@ class AgentChannel:
                 break
             if pending.accepts(index, total, body):
                 break
-            # Another reply by the same bot started before this one finished: the held parts
-            # are not one message any more, so they go out now and this part opens the next.
+            # The same token naming a different total, or different text at an index already
+            # held: the sender contradicted itself, so these parts are not one message. What is
+            # held goes out now and this part opens the next buffer — never joined.
             await self._drop_split(key, pending)
         if index in pending.bodies:
             return True, None                       # a repeated part: nothing new to add
@@ -4634,9 +4642,9 @@ _CONTINUATION_RE = re.compile(
 # Split replies (issue #29): ↪ (k/n) parts are one message at the receiver
 # --------------------------------------------------------------------------------------
 #: Part 1 of a split reply: the reply first, then "(1/n)" appended by ``split_outgoing``. The
-#: optional ``#token`` inside the parentheses correlates the parts of one reply, so two replies
-#: by one sender that interleave cannot be joined into one mixed message (#29 review). A sender
-#: that writes none (an older transport) is still reassembled, one reply at a time.
+#: optional ``#token`` inside the parentheses correlates the parts of one reply: it is what a
+#: receiver joins on, so two replies by one sender that interleave are never joined into one
+#: mixed message (#29 review), and a part written without one is not joined at all (#29 QA).
 _SPLIT_FIRST_RE = re.compile(
     r"^(?P<body>.*)\n\n\(1/(?P<total>\d+)(?: #(?P<ref>\w{1,16}))?\)[ \t]*\Z", re.S)
 #: Part k > 1: the marker first (after the sender's banner and the @handles that delivered
@@ -4715,9 +4723,9 @@ class _PendingSplit:
     def accepts(self, index: int, total: int, body: str) -> bool:
         """Whether a part can belong to this reply.
 
-        A different total, a second part 1 with other text, or different text at an index
-        already held is a *different reply* from the same sender: joining it here would put
-        two messages into one turn (#29 review)."""
+        Parts are held per token, so they are one reply unless the sender contradicts itself: a
+        token that names a different total, or different text at an index already held, is not
+        the same message, and joining it would put two messages into one turn (#29 QA)."""
         if total != self.total:
             return False
         if index == 1:

@@ -55,6 +55,13 @@ BRAVO = ("bravo-start\n\n" + "\n\n".join("b" * 300 for _ in range(20))
          + "\n\nbravo-end")
 
 
+def marked(pieces, ref: str = "a1b2c3", total: int = None) -> list:
+    """A reply cut into *pieces*: the parts, with the marker and token a sender writes."""
+    total = len(pieces) if total is None else total
+    return [f"{pieces[0]}\n\n(1/{total} #{ref})"] + [
+        f"↪ ({index}/{total} #{ref}) {piece}" for index, piece in enumerate(pieces[1:], 2)]
+
+
 class TestSplitPart(unittest.TestCase):
     def test_the_markers_are_read_off_each_part(self):
         self.assertEqual(split_part("body\n\n(1/3)"), SplitPart(1, 3, "body"))
@@ -208,7 +215,8 @@ class TestReassembly(unittest.TestCase):
         async def orphan():
             with patch("swarmly.telegram.channel.SPLIT_TIMEOUT_SECONDS", 0.0):
                 await channel.handle_event(
-                    event("[Codex] ↪ (2/3) @HermesBot please also check this", message_id=4))
+                    event("[Codex] ↪ (2/3 #a1b2c3) @HermesBot please also check this",
+                          message_id=4))
                 for _ in range(20):
                     await asyncio.sleep(0.01)
 
@@ -217,6 +225,23 @@ class TestReassembly(unittest.TestCase):
         self.assertTrue(delivered)
         self.assertTrue(delivered[-1].startswith("↪ (2/3) "), delivered[-1])
         self.assertIn("never arrived", delivered[-1])
+
+    def test_an_orphan_fragment_without_a_token_starts_no_turn(self):
+        """QA review of #29: the same fragment written by a sender that marks no token — its
+        body names the bot, so it must not answer either, and nothing is held for it."""
+        channel, adapter = receiver()
+
+        async def orphan():
+            with patch("swarmly.telegram.channel.SPLIT_TIMEOUT_SECONDS", 0.0):
+                await channel.handle_event(
+                    event("[Codex] ↪ (2/3) @HermesBot please also check this", message_id=4))
+                for _ in range(20):
+                    await asyncio.sleep(0.01)
+
+        run(orphan())
+        self.assertEqual(adapter.seen, [])
+        self.assertEqual(channel._split_pending, {})
+        self.assertEqual([task for task in channel._split_tasks if not task.done()], [])
 
     def test_a_held_reply_arms_a_timer_that_delivers_what_arrived(self):
         """Review of #29: the timeout is scheduled and it fires — the held part is delivered
@@ -246,23 +271,31 @@ class TestReassembly(unittest.TestCase):
         self.assertEqual(len(adapter.seen), 1)              # part 1 is answered, whole
 
     def test_two_interleaved_replies_from_one_sender_are_never_mixed(self):
-        """Review of #29: without a token (an older sender) a part that cannot belong to the
-        held reply opens the next one, so two interleaved replies stay two messages."""
+        """QA review of #29: A1, B2, B1, A2 from one sender, no tokens (an older transport).
+
+        Nothing correlates a tokenless part with a reply, so nothing is joined: each part 1
+        runs its own turn and each continuation starts none. Two replies, never one mixed
+        turn — the alternative measured is ``"alpha onebravo two"`` in a single turn."""
         alpha = ["@HermesBot [Codex] alpha one\n\n(1/2)", "[Codex] ↪ (2/2) alpha two"]
         bravo = ["@HermesBot [Codex] bravo one\n\n(1/2)", "[Codex] ↪ (2/2) bravo two"]
         channel, adapter = receiver()
 
         async def replay():
-            for message_id, part in enumerate([alpha[0], bravo[0], bravo[1], alpha[1]], 1):
+            for message_id, part in enumerate([alpha[0], bravo[1], bravo[0], alpha[1]], 1):
                 await channel.handle_event(event(part, message_id=message_id))
             channel._test_clock["t"] += 3600         # whatever is still held goes out now
             await channel.handle_event(event("[Codex] unrelated, no mention", message_id=9))
 
         run(replay())
         texts = [message.text for message in adapter.seen]
-        self.assertTrue(any("bravo one" in text and "bravo two" in text for text in texts), texts)
+        self.assertEqual(len(texts), 2, texts)              # one turn per part 1, no more
+        self.assertTrue(any("alpha one" in text for text in texts), texts)
+        self.assertTrue(any("bravo one" in text for text in texts), texts)
         for text in texts:
             self.assertFalse("alpha" in text and "bravo" in text, text)
+        for text in texts:                                  # neither continuation answered
+            self.assertNotIn("alpha two", text)
+            self.assertNotIn("bravo two", text)
 
     def test_interleaved_replies_that_start_out_of_order_are_never_mixed(self):
         """Review of #29: A1, B2, B1, A2 — part 2 of one reply arriving before that reply's
@@ -285,6 +318,36 @@ class TestReassembly(unittest.TestCase):
         self.assertTrue(any(BRAVO in text for text in texts), [text[:80] for text in texts])
         for text in texts:
             self.assertFalse("alpha-start" in text and "bravo-start" in text, text[:120])
+            self.assertFalse("alpha-end" in text and "bravo-end" in text, text[:120])
+
+    def test_a_token_that_names_another_total_is_not_joined(self):
+        """QA review of #29: the token is a claim the sender can get wrong. A part whose token
+        names a different total (or different text at a held index) is not this message: what
+        arrived goes out as what arrived, and the two are never joined."""
+        channel, adapter = receiver()
+        first = marked(["alpha one"], ref="ee0001", total=2)[0]
+
+        async def replay():
+            await channel.handle_event(event("@HermesBot [Codex] " + first, message_id=1))
+            await channel.handle_event(event("↪ (2/3 #ee0001) alpha two", message_id=2))
+            channel._test_clock["t"] += 3600
+            await channel.handle_event(event("[Codex] unrelated, no mention", message_id=9))
+
+        run(replay())
+        texts = [message.text for message in adapter.seen]
+        self.assertTrue(any("alpha one" in text for text in texts), texts)
+        for text in texts:
+            self.assertNotIn("alpha onealpha two", text)
+
+    def test_a_part_1_without_a_token_runs_its_turn_as_before(self):
+        """The compatibility boundary (#29 QA): a sender older than the token writes
+        ``(1/2)``. Its part 1 is an ordinary message and is answered — what it is not, is a
+        reply that half of someone else's message gets appended to."""
+        channel, adapter = receiver()
+        run(channel.handle_event(event("@HermesBot [Codex] alpha one\n\n(1/2)", message_id=1)))
+        self.assertEqual(len(adapter.seen), 1)
+        self.assertIn("alpha one", adapter.seen[0].text)
+        self.assertEqual(channel._split_pending, {})        # nothing held for a tokenless part
 
     def test_an_unlisted_bot_gets_no_buffer_and_no_timer(self):
         """Review of #29: under ``strangers: ignore`` a bot this transport does not know cannot
@@ -295,7 +358,7 @@ class TestReassembly(unittest.TestCase):
         async def spam():
             for index in range(5):
                 await channel.handle_event(event(
-                    f"[Mystery] ↪ (2/{index + 2}) fragment", username="MysteryBot",
+                    f"[Mystery] ↪ (2/{index + 2} #a1b2c{index}) fragment", username="MysteryBot",
                     author_id=999, message_id=index + 1))
             for _ in range(3):
                 await asyncio.sleep(0)
@@ -328,15 +391,16 @@ class TestReassembly(unittest.TestCase):
         async def many_senders():
             with patch("swarmly.telegram.channel.MAX_PENDING_SPLITS", 2):
                 for index, username in enumerate(("CodexBot", "AntigravityBot")):
-                    await channel.handle_event(event(f"@HermesBot [{username}] first part\n\n(1/2)",
+                    first = marked(["first part"], ref=f"a1b2c{index}", total=2)[0]
+                    await channel.handle_event(event(f"@HermesBot [{username}] {first}",
                                                      username=username, author_id=500 + index,
                                                      message_id=index + 1))
                 self.assertEqual(len(channel._split_pending), 2)
                 # A third sender is a known peer only if configured; add one for the test.
                 channel.config.peers["Hermes2"] = "HermesTwoBot"
-                await channel.handle_event(event("@HermesBot [HermesTwo] first part\n\n(1/2)",
-                                                 username="HermesTwoBot", author_id=502,
-                                                 message_id=3))
+                await channel.handle_event(event(
+                    "@HermesBot [HermesTwo] " + marked(["first part"], ref="a1b2c9", total=2)[0],
+                    username="HermesTwoBot", author_id=502, message_id=3))
                 self.assertEqual(len(channel._split_pending), 2)   # the bound held
 
         run(many_senders())
@@ -356,13 +420,18 @@ class TestReassembly(unittest.TestCase):
             await deliver(pending)
 
         async def scenario():
-            await channel.handle_event(event("@HermesBot [Codex] old one\n\n(1/3)", message_id=1))
+            await channel.handle_event(event(
+                "@HermesBot [Codex] " + marked(["old one"], ref="aa0001", total=3)[0],
+                message_id=1))
             channel._test_clock["t"] += SPLIT_TIMEOUT_SECONDS + 1   # the old reply has expired
             with patch.object(channel, "_deliver_split", gated):
-                first = asyncio.create_task(channel.handle_event(
-                    event("@HermesBot [Codex] new one\n\n(1/2)", message_id=2)))
+                first = asyncio.create_task(channel.handle_event(event(
+                    "@HermesBot [Codex] " + marked(["new one"], ref="bb0002", total=2)[0],
+                    message_id=2)))
                 await gate["entered"].wait()          # part 1 is inside the flush, awaiting
-                await channel.handle_event(event("[Codex] ↪ (2/2) new two", message_id=3))
+                await channel.handle_event(event(
+                    "[Codex] " + marked(["new one", "new two"], ref="bb0002")[1],
+                    message_id=3))
                 gate["release"].set()
                 await first
 
@@ -371,9 +440,10 @@ class TestReassembly(unittest.TestCase):
         self.assertTrue(any("new one" in text and "new two" in text for text in texts), texts)
 
     def test_a_part_of_the_next_reply_survives_the_delivery_of_the_held_one(self):
-        """Codex's re-review of #29: part 1 of a second reply delivers the held one, which
-        awaits a turn. A later part of the *new* reply that arrives during that await must still
-        be joined with it — the flush must not be followed by overwriting the buffer."""
+        """Codex's re-review of #29: part 1 of a second reply makes room by delivering the held
+        one, and that delivery awaits a turn. A later part of the *new* reply that arrives
+        during that await must still be joined with it — the flush must not be followed by
+        overwriting the buffer."""
         channel, adapter = receiver()
         gate = {"entered": asyncio.Event(), "release": asyncio.Event()}
         deliver = channel._deliver_split
@@ -384,12 +454,18 @@ class TestReassembly(unittest.TestCase):
             await deliver(pending)
 
         async def scenario():
-            await channel.handle_event(event("@HermesBot [Codex] alpha one\n\n(1/2)", message_id=1))
-            with patch.object(channel, "_deliver_split", gated):
-                bravo = asyncio.create_task(channel.handle_event(
-                    event("@HermesBot [Codex] bravo one\n\n(1/2)", message_id=2)))
+            await channel.handle_event(event(
+                "@HermesBot [Codex] " + marked(["alpha one"], ref="cc0001", total=2)[0],
+                message_id=1))
+            with patch("swarmly.telegram.channel.MAX_PENDING_SPLITS", 1), \
+                    patch.object(channel, "_deliver_split", gated):
+                bravo = asyncio.create_task(channel.handle_event(event(
+                    "@HermesBot [Codex] " + marked(["bravo one"], ref="dd0002", total=2)[0],
+                    message_id=2)))
                 await gate["entered"].wait()          # alpha is being delivered, awaiting
-                await channel.handle_event(event("[Codex] ↪ (2/2) bravo two", message_id=3))
+                await channel.handle_event(event(
+                    "[Codex] " + marked(["bravo one", "bravo two"], ref="dd0002")[1],
+                    message_id=3))
                 gate["release"].set()
                 await bravo
 
