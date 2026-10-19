@@ -717,6 +717,95 @@ if __name__ == "__main__":
 from tests import envguard  # noqa: E402 - last on purpose: the wrapper stays two lines
 
 
+class TestARuntimePinIsRefusedUnderParallelTurns(unittest.TestCase):
+    """Issue #78: with ``max_parallel_turns > 1`` every topic keeps its own conversation, so
+    the admin's in-chat switch cannot pin one -- it would interleave the parallel turns and
+    leave an ``.active_conversation`` file that makes the next start refuse the config."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.cwd = Path(self.tmpdir.name).resolve()
+        self.active = self.cwd / ACTIVE_CONVERSATION_FILENAME
+
+    def adapter(self, parallel=1, conversation=None):
+        settings = AntigravityAdapter.default_settings(cwd=str(self.cwd),
+                                                       conversation=conversation)
+        adapter = AntigravityAdapter("Antigravity", settings)
+        adapter.use_parallel_limit(parallel)
+        adapter.sync_conversation_to_cli = lambda conv_id: None
+        return adapter
+
+    def test_a_pin_is_refused_and_writes_nothing(self):
+        adapter = self.adapter(parallel=2)
+        with patch.object(adapter, "_lookup_conversation",
+                          return_value=("target-uuid", "My Target Convo")):
+            ok, text = adapter.set_active_conversation("target-uuid")
+        self.assertFalse(ok)
+        self.assertIn("parallel turns", text)
+        self.assertIn("max_parallel_turns", text)
+        self.assertIn(adapter.settings.conversation, (None, ""))
+        self.assertFalse(self.active.exists(), "a refused switch must not pin the workspace")
+
+    def test_auto_is_a_pin_too(self):
+        adapter = self.adapter(parallel=2)
+        ok, text = adapter.set_active_conversation("auto")
+        self.assertFalse(ok)
+        self.assertIn("parallel turns", text)
+        self.assertFalse(self.active.exists())
+
+    def test_unpinning_still_works(self):
+        adapter = self.adapter(parallel=2, conversation="pinned-uuid")
+        self.active.write_text("pinned-uuid", encoding="utf-8")
+        ok, text = adapter.set_active_conversation("per-topic")
+        self.assertTrue(ok)
+        self.assertIn("one conversation per topic", text)
+        self.assertEqual(adapter.settings.conversation, "")
+        self.assertFalse(self.active.exists())
+        self.assertTrue(adapter._per_topic())          # back to one conversation per topic
+
+    def test_at_one_turn_a_switch_is_unchanged(self):
+        adapter = self.adapter(parallel=1)
+        with patch.object(adapter, "_lookup_conversation",
+                          return_value=("target-uuid", "My Target Convo")):
+            ok, text = adapter.set_active_conversation("target-uuid")
+        self.assertTrue(ok)
+        self.assertEqual(adapter.settings.conversation, "target-uuid")
+        self.assertEqual(self.active.read_text(encoding="utf-8"), "target-uuid")
+        ok, _ = adapter.set_active_conversation("auto")
+        self.assertTrue(ok)
+        self.assertEqual(adapter.settings.conversation, "auto")
+
+    def test_the_admin_command_path_is_refused_in_chat(self):
+        adapter = self.adapter(parallel=2)
+        with patch.object(adapter, "_lookup_conversation",
+                          return_value=("target-uuid", "My Target Convo")):
+            reply = asyncio.run(adapter.respond(IncomingMessage(
+                text="switch context to target-uuid", author_alias="Admin", is_admin=True)))
+        self.assertIsNotNone(reply)
+        self.assertFalse(reply.ok)
+        self.assertIn("parallel turns", reply.text)
+        self.assertFalse(self.active.exists())
+
+
+class TestTheChannelTellsTheAdapterTheLimit(unittest.TestCase):
+    """Issue #78: the limit reaches the adapter, so the guard is not a dead default."""
+
+    def test_the_channel_passes_max_parallel_turns_to_the_adapter(self):
+        from swarmly.telegram.channel import AgentChannel
+        from tests.test_telegram_channel import make_config
+        config = make_config(limits={"max_parallel_turns": 3, "allow_shared_cwd": True},
+                             adapter={"type": "antigravity"})
+        channel = AgentChannel(config)
+        self.assertEqual(channel.adapter.max_parallel_turns, 3)
+
+    def test_the_default_limit_leaves_the_adapter_at_one(self):
+        from swarmly.telegram.channel import AgentChannel
+        from tests.test_telegram_channel import make_config
+        channel = AgentChannel(make_config(adapter={"type": "antigravity"}))
+        self.assertEqual(channel.adapter.max_parallel_turns, 1)
+
+
 def load_tests(loader, tests, pattern):
     return envguard.guard(loader, tests, pattern)
 

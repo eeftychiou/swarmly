@@ -246,6 +246,36 @@ class AntigravityContextMixin:
     """Shared conversation discovery, sync, and model resolution logic for Antigravity adapters."""
 
     settings: AdapterSettings
+    #: Issue #78: ``limits.max_parallel_turns`` as the channel set it. Above 1 every topic
+    #: keeps its own conversation, so a *runtime* switch cannot pin a single one -- it would
+    #: interleave the parallel turns that the limit exists to allow.
+    max_parallel_turns: int = 1
+
+    def use_parallel_limit(self, turns: int) -> None:
+        """Tell the adapter how many topics may run at once (`limits.max_parallel_turns`)."""
+        try:
+            self.max_parallel_turns = max(1, int(turns))
+        except (TypeError, ValueError):
+            self.max_parallel_turns = 1
+
+    #: Words that mean "back to one conversation per topic": the unpinning form. ``auto`` is
+    #: *not* one of them -- it pins the workspace's most recent conversation.
+    UNPIN_WORDS = ("per-topic", "pertopic", "per_topic", "none", "off")
+
+    def _unpin_conversation(self) -> Tuple[bool, str]:
+        """Drop the pinned conversation: every topic gets its own again (#78)."""
+        self.settings.conversation = ""
+        removed = False
+        if self.settings.cwd:
+            active_file = Path(self.settings.cwd) / ACTIVE_CONVERSATION_FILENAME
+            try:
+                if active_file.exists():
+                    active_file.unlink()
+                    removed = True
+            except OSError as exc:
+                return False, f"Failed to remove {ACTIVE_CONVERSATION_FILENAME}: {exc}"
+        return True, ("Switched back to one conversation per topic"
+                      + (f" (removed {ACTIVE_CONVERSATION_FILENAME})." if removed else "."))
 
     def _get_summary_dbs(self) -> List[Path]:
         gemini_dir = Path.home() / ".gemini"
@@ -340,8 +370,24 @@ class AntigravityContextMixin:
         return None
 
     def set_active_conversation(self, query: str) -> Tuple[bool, str]:
-        """Switch the active conversation pointer and synchronize to CLI."""
+        """Switch the active conversation pointer and synchronize to CLI.
+
+        With ``limits.max_parallel_turns > 1`` a switch to a fixed conversation (or to
+        ``auto``, which is one conversation too) is refused: the topics run in parallel, so
+        one shared context would interleave them -- and the ``.active_conversation`` file it
+        writes would make the next start refuse to load the config at all. Unpinning, back to
+        one conversation per topic, is always allowed.
+        """
         query_stripped = query.strip()
+        if query_stripped.lower() in self.UNPIN_WORDS:
+            return self._unpin_conversation()
+        if int(getattr(self, "max_parallel_turns", 1) or 1) > 1:
+            return False, (
+                f"Refused: this bot runs parallel turns (limits.max_parallel_turns: "
+                f"{self.max_parallel_turns}), so every topic keeps its own conversation. "
+                "Pinning one conversation would interleave them, and the next start would "
+                "refuse the config. Set limits.max_parallel_turns to 1 first, then switch; "
+                "send 'switch context to per-topic' to stay unpinned.")
         if query_stripped.lower() == "auto":
             self.settings.conversation = "auto"
             if self.settings.cwd:
