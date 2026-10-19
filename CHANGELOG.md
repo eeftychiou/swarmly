@@ -17,6 +17,20 @@ All notable changes to this project are documented here. The format follows
   whose turn fails stays queued, backing off and then given up loudly like a failed
   notification turn, instead of losing the round end. Only an agent whose `agent.role` is
   `coordinator` is woken, and `tracking_label: ""` disables the watch (`#25`).
+- CI wake: while an agent waits on a pull request's checks, the GitHub poll
+  (`github.poll_minutes`) watches that PR's check runs and wakes the agent with exactly one
+  turn when they all reach a terminal state -- pass or fail, with the failing check names on a
+  failure. The agent is watched for a PR it names in a reply (a `.../pull/<n>` link, or a bare
+  `#<n>` in a project topic). The watch and the result reported live in
+  `.agents/state/gh_ci-<alias>.json`, keyed by head commit and check state, so a restart
+  neither forgets a watch nor wakes twice for a run, while a new push is reported again
+  (`#24`). A pull request whose rollup is still empty stays pending rather than waking at
+  once, and a `statusCheckRollup` entry in the `EXPECTED` state counts as still running rather
+  than as passed. The PR's own state is read with the rollup, so a reply that names an
+  already-merged or closed PR (a merge notice, an upgrade call) registers no wake: the check
+  results arrived for work nothing waits on, and the watch is dropped instead. A watch
+  registered by a reply during a wake survives that poll, and a wake in a topic with no
+  context id is refused instead of running in the shared General session (`#24` review).
 
 ### Fixed
 

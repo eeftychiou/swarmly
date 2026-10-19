@@ -64,6 +64,100 @@ class Notification:
     unread: bool = True
 
 
+@dataclass
+class PRChecks:
+    """The check runs of one pull request's current head commit (issue #24).
+
+    ``state`` is ``pending`` while any check is still running, and ``success`` or ``failure``
+    once all of them are done — the terminal states an agent waiting on CI is woken for.
+    """
+
+    number: int
+    head_sha: str
+    state: str                              # "pending" | "success" | "failure"
+    url: str = ""
+    title: str = ""
+    total: int = 0
+    passed: int = 0
+    failed: List[str] = field(default_factory=list)
+    pending: List[str] = field(default_factory=list)
+    #: The pull request's own state: ``OPEN``, ``MERGED`` or ``CLOSED``, empty when gh did not
+    #: say. A merged or closed PR is not waiting on anything, so its checks are not a wake.
+    pr_state: str = ""
+
+    @property
+    def is_open(self) -> bool:
+        """Whether the PR still waits on these checks. Unknown counts as open: waking on a
+        guess is worse than one wake that the next poll corrects."""
+        return self.pr_state.upper() in ("", "OPEN")
+
+    @property
+    def terminal(self) -> bool:
+        return self.state != "pending"
+
+    def summary(self) -> str:
+        """One line for the wake turn: what finished, and what it said."""
+        if self.total == 0:
+            return "no check runs reported"
+        if self.state == "success":
+            return f"all {self.total} check(s) passed"
+        if self.state == "failure":
+            names = ", ".join(self.failed) if self.failed else "unrecorded checks"
+            return f"{self.passed} of {self.total} check(s) passed; failing: {names}"
+        running = ", ".join(self.pending) if self.pending else "checks"
+        return f"{len(self.pending)} of {self.total} check(s) still running ({running})"
+
+
+#: Conclusions that mean a check did not pass. ``NEUTRAL`` and ``SKIPPED`` do not.
+FAILED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED",
+                                "STARTUP_FAILURE", "STALE"})
+#: Check statuses/states that mean "not finished yet".
+PENDING_STATES = frozenset({"QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "PENDING",
+                            "EXPECTED"})
+
+
+def checks_from_rollup(number: int, head_sha: str, url: str, title: str, rollup: Any,
+                       pr_state: str = "") -> PRChecks:
+    """Fold ``gh pr view --json statusCheckRollup`` into one :class:`PRChecks`.
+
+    The rollup mixes ``CheckRun`` entries (``status``/``conclusion``) with ``StatusContext``
+    entries (``state``); both are read here so a PR watched through either API answers the
+    same. An entry the parser cannot read counts as pending: waking on a guess is worse than
+    waiting for the next poll, and the watch's own lifetime bounds the wait. An empty rollup
+    is pending too — a PR pushed a moment ago has no checks until GitHub materialises them,
+    and a wake saying "no checks" would arrive before the run it is waiting for exists.
+    ``pr_state`` is the pull request's own state (``OPEN``/``MERGED``/``CLOSED``): a merged
+    PR's checks are not something to wake anyone for.
+    """
+    checks = PRChecks(number=number, head_sha=head_sha, state="pending", url=url, title=title,
+                      pr_state=pr_state)
+    for entry in rollup if isinstance(rollup, list) else []:
+        if not isinstance(entry, dict):
+            checks.pending.append("?")
+            continue
+        name = str(entry.get("name") or entry.get("context") or entry.get("__typename") or "?")
+        conclusion = str(entry.get("conclusion") or "").upper()
+        status = str(entry.get("status") or "").upper()
+        state = str(entry.get("state") or "").upper()
+        checks.total += 1
+        if conclusion in FAILED_CONCLUSIONS or state in {"FAILURE", "ERROR"}:
+            checks.failed.append(name)
+        elif status in PENDING_STATES or state in PENDING_STATES or \
+                (not conclusion and not state) or (status and status != "COMPLETED"):
+            checks.pending.append(name)
+        else:
+            checks.passed += 1
+    if checks.pending or checks.total == 0:
+        # No checks at all is not "all good": a PR pushed a moment ago has none until GitHub
+        # materialises them, so the run stays pending and the next poll asks again.
+        checks.state = "pending"
+    elif checks.failed:
+        checks.state = "failure"
+    else:
+        checks.state = "success"
+    return checks
+
+
 class GitHubClient:
     """Thin wrapper around ``gh`` CLI with environment injection and safe fallbacks."""
 
@@ -197,6 +291,35 @@ class GitHubClient:
             )
         except Exception as exc:
             logger.warning("failed to parse pr_view json: %s", exc)
+            return None
+
+    def pr_checks(self, repo: str, number: int) -> Optional[PRChecks]:
+        """The check runs of a pull request's current head, or ``None`` when gh cannot say.
+
+        One call (``gh pr view --json headRefOid,statusCheckRollup,state``) gives the head sha,
+        every check on it, and whether the PR is still open, which is what an agent waiting on
+        CI needs to be woken once: the sha says *which* push the result belongs to, so a wake
+        is never repeated for it, and a merged or closed PR wakes nobody.
+        """
+        fields = "number,title,url,headRefOid,statusCheckRollup,state"
+        code, out, err = self._run(["pr", "view", str(number), "--repo", repo, "--json", fields])
+        if code != 0:
+            logger.warning("pr_checks(%s, %s) failed (code %d): %s", repo, number, code, err.strip())
+            return None
+        try:
+            data = json.loads(out)
+            if not isinstance(data, dict):
+                return None
+            return checks_from_rollup(
+                number=int(data.get("number") or number),
+                head_sha=str(data.get("headRefOid") or ""),
+                url=str(data.get("url") or ""),
+                title=str(data.get("title") or ""),
+                rollup=data.get("statusCheckRollup") or [],
+                pr_state=str(data.get("state") or ""),
+            )
+        except Exception as exc:
+            logger.warning("failed to parse pr_checks json: %s", exc)
             return None
 
     def notifications(self, repo: Optional[str] = None) -> List[Notification]:

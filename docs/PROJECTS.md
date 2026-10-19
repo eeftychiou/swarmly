@@ -214,6 +214,29 @@ swarmly-telegram --config config.yaml gh-poll --once --json
   every project shares it; use a per-run adapter (`codex`, `claude_thread`, ...) for
   separate sessions per project.
 
+### CI wake: a PR's checks wake the waiting agent
+- When the agent names a pull request in a reply it posts -- a
+  `https://github.com/<owner>/<repo>/pull/<n>` link, or a bare `#<n>` in a topic bound to a
+  project -- the same backstop poll (`github.poll_minutes`) also asks `gh` for that PR's
+  `statusCheckRollup`.
+- Exactly one turn runs in the topic when every check reaches a terminal state, pass or fail,
+  saying what finished, naming the failing checks on a failure, and linking the PR.
+- A wake is recorded per head commit and check state (`<sha>:<success|failure>`) in
+  `.agents/state/gh_ci-<alias>.json`, next to the notification state: a restart neither
+  forgets a watch nor repeats a wake, and a new push is reported again.
+- A watch is dropped when it fires, when `gh` has no checks for it, or after 12 hours, so a PR
+  with no CI configured does not cost polls forever. `github.poll_minutes: 0` disables it with
+  the rest of the backstop.
+- An empty `statusCheckRollup` counts as pending, not success: a pull request pushed a moment
+  ago has no checks until GitHub materialises them, and a wake then would announce a run that
+  did not exist yet. A `StatusContext` in the `EXPECTED` state is still running, not passed.
+- The pull request's own state is read in the same `gh` call: a PR that is already merged or
+  closed wakes nobody (a merge notice or an upgrade call names landed work), and its watch is
+  dropped on the first poll instead of waiting out the 12-hour TTL.
+- The wake turn is admitted like a notification turn: a bound topic outside the home group with
+  no context id (`SWARMLY_REDACTION_SECRET` unset) is refused and reported in the poll outcome,
+  rather than run into the shared General session.
+
 ### GitHub token permissions
 When generating a Personal Access Token (PAT) for the agent:
 - **Classic token** (needed for the backstop: GitHub's notifications API does not accept

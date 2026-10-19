@@ -3822,6 +3822,25 @@ class AgentChannel:
                 return at + len(separator)
         return low
 
+    def _watch_ci(self, text: str, chat_id: int, thread_id: Optional[int]) -> None:
+        """Watch the checks of a pull request this agent talks about (issue #24).
+
+        A reply that names a PR — a ``github.com/<owner>/<repo>/pull/<n>`` link, or a ``#<n>``
+        ref in a topic bound to a project — means the agent is waiting on that PR's CI. The
+        GitHub poll then asks for the PR's checks and wakes the agent with one turn when they
+        finish; the watch is recorded on disk, so a restart neither forgets it nor repeats it.
+        """
+        if not text or not self.config.github or self.config.github.poll_minutes <= 0:
+            return
+        project = self.router.project_for(chat_id, thread_id)
+        for repo, number in pr_refs(text, project.repo if project is not None else ""):
+            try:
+                from swarmly.github.watch import register_ci_watch
+                register_ci_watch(self.config, repo, number, chat_id, thread_id,
+                                 project=project.key if project is not None else None)
+            except Exception:                              # a send never fails over a watch
+                logger.warning("could not watch %s#%s for CI", repo, number, exc_info=True)
+
     # ----------------------------------------------------------------------------------
     # Split replies (issue #29)
     # ----------------------------------------------------------------------------------
@@ -4033,6 +4052,8 @@ class AgentChannel:
         sends nothing. ``silent`` sends without a notification sound.
         """
         destination = self.config.identity.home_channel_id if chat_id is None else chat_id
+        if not callable(text):
+            self._watch_ci(text, destination, thread_id)
         topic = (destination, thread_id)
         async with self._send_lock_for(topic):
             if callable(text):
@@ -4040,6 +4061,10 @@ class AgentChannel:
                 text = text()
                 if not text:
                     return None
+                # The resolved text is what goes out, so it is what may name a PR: a watch
+                # taken from the callable's source would miss the link it renders
+                # (issue #24 review).
+                self._watch_ci(text, destination, thread_id)
             parts = self.split_outgoing(strip_autolinks(str(text)))
             first = None
             self._gone_topics.discard(topic)
@@ -4831,6 +4856,27 @@ class _PendingSplit:
         missing = ", ".join(str(index) for index in self.missing())
         return (f"\n\n(parts {missing} of this {self.total}-part reply never arrived; this is "
                 "what did)")
+
+
+#: A pull request link, whose own repository is what the watch uses: a bot may report on a PR
+#: in a project this topic is not bound to.
+_PR_URL = re.compile(r"(?i)https?://(?:www\.)?github\.com/([\w.-]+/[\w.-]+)/pull/(\d{1,7})\b")
+
+
+def pr_refs(text: str, default_repo: str = "") -> List[Tuple[str, int]]:
+    """The pull requests *text* names, as ``(repo, number)`` (issue #24).
+
+    A link carries its own repository; a bare ``#12`` or ``/pull/12`` ref is a PR of
+    *default_repo*, the topic's project. Order is kept and duplicates dropped, so one message
+    naming the same PR twice is one watch.
+    """
+    text = text or ""
+    found: List[Tuple[str, int]] = [(repo, int(number)) for repo, number in _PR_URL.findall(text)]
+    if default_repo:
+        bare = _PR_URL.sub(" ", text)
+        for number in re.findall(r"(?:(?<![\w/])#|/pull/)(\d{1,7})\b", bare):
+            found.append((default_repo, int(number)))
+    return list(dict.fromkeys(found))
 
 
 async def _maybe_await(value: Any) -> Any:
