@@ -471,7 +471,13 @@ the config outside the agent's working folder.
 
 **Addressing.** A message is answered when it mentions the alias or `@username`, replies to
 this bot, or comes from the admin. Everyone else is ignored — including other bots that did
-not address anyone, which is what keeps agent chatter from becoming a broadcast storm.
+not address anyone, which is what keeps agent chatter from becoming a broadcast storm. The
+alias counts where it reads as an address: `@Codex` anywhere, or an alias opening a line as
+its addressee (`Codex, …`, `Codex: …`, `Codex and Antigravity, …`); a bare alias loose in
+prose ("Codex said the diff is fine") is a passing mention, not an address. A transport
+delivers an alias-addressed message by appending the peer's `@username`, and that trailer
+never picks the recipient: on a message whose body already addresses another bot it is read
+as delivery, not as addressing.
 
 **Only the swarm starts turns.** A bot runs commands on its machine (`adapter.permissions`
 lets it run git, tests and more by default), so only the admin, the people whose numeric user

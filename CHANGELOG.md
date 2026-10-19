@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A bare alias in prose names a bot without addressing it: the alias now counts as an
+  address only where it reads as one — `@Codex` anywhere, or an alias opening a line as its
+  addressee (`Codex, …`, `Hermes: …`, `Codex and Antigravity, …`). Before, "Codex said the
+  diff is fine" was enough to append `@codex_bot` to the message, and that appended handle is
+  what the peer's transport routes on, so a report that mentioned a peer in passing pulled
+  the peer into another bot's exchange. A run of handles closing a message that already
+  addresses another bot is now read as the transport's delivery trailer, not as the
+  recipient; a hand-off's own handles (issue #27) are in the body and still count (`#28`).
 - Every @handle in a peer bot's hand-off counts as addressed, on one line or over several,
   whether it opens the message or sits in a list of three or more bots: a list a bot writes
   is a hand-off, not a roster, so nothing in it is second-guessed. A mention that is still
