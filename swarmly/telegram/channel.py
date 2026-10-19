@@ -3827,10 +3827,11 @@ class AgentChannel:
             # A reply this transport already joined goes on through the inbound path; its text
             # is the sender's whole message, not another part to hold (#29 QA).
             return False, None
-        # A reply held this long has lost parts: deliver what arrived before taking more.
-        await self._flush_expired_splits()
         part = split_part(event.text)
         if part is None:
+            # Not a part at all: nothing to hold. A reply held past its window still goes out
+            # here, so an unrelated message is enough to sweep a dead buffer.
+            await self._flush_expired_splits()
             return False, None
         if not part.ref:
             # No token, no attribution: joining a tokenless part is a guess, and the guess
@@ -3840,28 +3841,11 @@ class AgentChannel:
             return False, None
         index, total, body = part.index, part.total, part.body
         key = self._split_key(event, part.ref)
-        # Delivering a held reply awaits a turn, and another part of this sender can arrive
-        # while it runs. The state is read again after every await, and a buffer is only
-        # created when the map still has none for this key: a part that opened one meanwhile
-        # is joined, never overwritten (#29 re-review).
-        while True:
-            pending = self._split_pending.get(key)
-            if pending is None:
-                if self._split_pending and len(self._split_pending) >= MAX_PENDING_SPLITS:
-                    await self._evict_oldest_split()
-                    continue                     # re-read: the eviction awaited as well
-                # A later part can arrive first; it is held the same way, and the turn (when
-                # it runs, or when the window closes) takes the earliest part's chat and topic.
-                pending = _PendingSplit(total=total, opened=self._clock())
-                self._split_pending[key] = pending
-                self._arm_split_timeout(key, pending)
-                break
-            if pending.accepts(index, total, body):
-                break
-            # The same token naming a different total, or different text at an index already
-            # held: the sender contradicted itself, so these parts are not one message. What is
-            # held goes out now and this part opens the next buffer — never joined.
-            await self._drop_split(key, pending)
+        # The buffer is claimed before this part awaits anything, and the part goes into it with
+        # no await in between: delivering a held reply awaits a turn, and another part can
+        # arrive while that runs, but it joins this state instead of opening a rival one that
+        # would later be overwritten and lose the reply (#29 review).
+        pending = await self._claim_split(key, total, index, body)
         if index in pending.bodies:
             return True, None                       # a repeated part: nothing new to add
         pending.bodies[index] = body
@@ -3870,12 +3854,56 @@ class AgentChannel:
             logger.info("%s: holding part %d/%d of a split reply from @%s (%d/%d arrived)",
                         self.config.identity.alias, index, total,
                         event.author_username or "unknown", len(pending.bodies), total)
+            # A reply past its window goes out as what arrived; this one is not, so it is kept
+            # out of the sweep however long the delivery of another reply takes.
+            await self._flush_expired_splits(keep=key)
             return True, None
         self._split_pending.pop(key, None)
         pending.disarm()
         logger.info("%s: reassembled a %d-part reply from @%s", self.config.identity.alias,
                     total, event.author_username or "unknown")
         return False, pending
+
+    async def _claim_split(self, key: Tuple[Any, ...], total: int, index: int,
+                           body: str) -> _PendingSplit:
+        """The buffer this part belongs to, claimed before the caller awaits anything.
+
+        When the map has room the state is created and stored with no await at all, so a part
+        that arrives while this coroutine is suspended elsewhere can only join it, never be
+        replaced by a fresh buffer holding half the reply (#29 review). Only when something
+        must be delivered to make room, or a held reply the sender contradicted (or that has
+        waited out its window) must go out first, does this await — and it then re-reads the
+        map and joins whatever is there, the delivery's own awaits included.
+        """
+        while True:
+            pending = self._split_pending.get(key)
+            if pending is not None:
+                if self._split_expired(pending):
+                    # Parts came too late to be joined: what arrived goes out now, and this
+                    # part opens the next buffer rather than reviving a dead reply.
+                    await self._drop_split(key, pending)
+                    continue                         # re-read: that delivery awaited
+                if pending.accepts(index, total, body):
+                    return pending
+                # The same token naming a different total, or different text at an index
+                # already held: the sender contradicted itself, so these parts are not one
+                # message. What is held goes out now and this part opens the next buffer —
+                # never joined.
+                await self._drop_split(key, pending)
+                continue                             # re-read: that delivery awaited
+            if self._split_pending and len(self._split_pending) >= MAX_PENDING_SPLITS:
+                await self._evict_oldest_split()
+                continue                             # re-read: the eviction awaited as well
+            # A later part can arrive first; it is held the same way, and the turn (when it
+            # runs, or when the window closes) takes the earliest part's chat and topic.
+            pending = _PendingSplit(total=total, opened=self._clock())
+            self._split_pending[key] = pending
+            self._arm_split_timeout(key, pending)
+            return pending
+
+    def _split_expired(self, pending: _PendingSplit) -> bool:
+        """Whether a held reply has waited out ``SPLIT_TIMEOUT_SECONDS`` for its missing parts."""
+        return self._clock() - pending.opened >= SPLIT_TIMEOUT_SECONDS
 
     def _may_reassemble(self, event: ChannelEvent) -> bool:
         """Whether a bot's split reply is worth holding parts for.
@@ -3900,12 +3928,16 @@ class AgentChannel:
         self._split_tasks.add(task)
         task.add_done_callback(self._split_tasks.discard)
 
-    async def _flush_expired_splits(self) -> None:
-        """Deliver the held parts of replies that have waited out ``SPLIT_TIMEOUT_SECONDS``."""
+    async def _flush_expired_splits(self, keep: Optional[Tuple[Any, ...]] = None) -> None:
+        """Deliver the held parts of replies that have waited out ``SPLIT_TIMEOUT_SECONDS``,
+        except the one under *keep*: the reply the caller is in the middle of taking a part
+        for is not swept even if the delivery of another reply takes longer than the window."""
         if not self._split_pending:
             return
         now = self._clock()
         for key, pending in list(self._split_pending.items()):
+            if key == keep:
+                continue
             if now - pending.opened >= SPLIT_TIMEOUT_SECONDS:
                 await self._flush_split(key, pending)
 

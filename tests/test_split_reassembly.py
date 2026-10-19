@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import random
 import unittest
 from unittest.mock import patch
 
@@ -527,6 +528,89 @@ class TestReassembly(unittest.TestCase):
         run(scenario())
         texts = [message.text for message in adapter.seen]
         self.assertTrue(any("bravo one" in text and "bravo two" in text for text in texts), texts)
+
+    def test_the_buffer_is_reserved_before_a_part_awaits_anything(self):
+        """Codex's re-review of #29: part 1 waits inside the delivery of an *older* reply. A part
+        of the same reply that arrives during that wait must find the buffer part 1 already
+        reserved, join it, and complete it — the reservation happens before the await, so the
+        reply is not lost to a buffer opened behind part 1's back."""
+        channel, adapter = receiver()
+        gate = {"entered": asyncio.Event(), "release": asyncio.Event()}
+        deliver = channel._deliver_split
+
+        async def gated(pending):
+            gate["entered"].set()
+            await gate["release"].wait()
+            await deliver(pending)
+
+        async def scenario():
+            await channel.handle_event(event(
+                "@HermesBot [Codex] " + marked(["old one"], ref="ee0001", total=2)[0],
+                message_id=1))
+            channel._test_clock["t"] += SPLIT_TIMEOUT_SECONDS + 1   # the old reply has expired
+            with patch.object(channel, "_deliver_split", gated):
+                first = asyncio.create_task(channel.handle_event(event(
+                    "@HermesBot [Codex] " + marked(["new one"], ref="ff0002", total=2)[0],
+                    message_id=2)))
+                await gate["entered"].wait()      # part 1 is suspended, delivering the old one
+                # The buffer is already claimed and already holds part 1: nothing on this
+                # reply's path awaits before several parts can arrive at once.
+                reserved = [item for key, item in channel._split_pending.items()
+                            if key[-1] == "ff0002"]
+                self.assertEqual(len(reserved), 1)
+                self.assertEqual(list(reserved[0].bodies), [1])
+                await channel.handle_event(event(
+                    "[Codex] " + marked(["new one", "new two"], ref="ff0002")[1], message_id=3))
+                gate["release"].set()
+                await first
+
+        run(scenario())
+        texts = [message.text for message in adapter.seen]
+        self.assertTrue(any("new one" in text and "new two" in text for text in texts), texts)
+        self.assertEqual(channel._split_pending, {})            # nothing left held
+
+    def test_no_interleaving_of_concurrent_parts_loses_a_reply(self):
+        """Codex's re-review of #29: parts of several replies arriving at once, while deliveries
+        await turns in between. However they interleave, each reply comes out whole in exactly
+        one turn — no part overwritten, none left held, and no reply lost."""
+        replies = {"aa0001": ["aa one", "aa two", "aa three"],
+                   "bb0002": ["bb one", "bb two"],
+                   "cc0003": ["cc one", "cc two", "cc three"]}
+
+        for order in range(12):
+            channel, adapter = receiver()
+            deliver = channel._deliver_split
+
+            async def slow(pending):
+                for _ in range(3):                   # every delivery yields, so parts interleave
+                    await asyncio.sleep(0)
+                await deliver(pending)
+
+            async def scenario():
+                # A dead reply of another sender, to be swept in the middle of the arrivals.
+                await channel.handle_event(event(
+                    "@HermesBot [Antigravity] " + marked(["stale"], ref="dd0004", total=2)[0],
+                    username="AntigravityBot", author_id=303, message_id=1))
+                channel._test_clock["t"] += SPLIT_TIMEOUT_SECONDS + 1
+                posts = [(ref, part) for ref, pieces in replies.items()
+                         for part in marked(pieces, ref=ref)]
+                random.Random(order).shuffle(posts)
+                with patch.object(channel, "_deliver_split", slow):
+                    await asyncio.gather(*[
+                        channel.handle_event(event(
+                            ("@HermesBot [Codex] " if part.startswith(("aa one", "bb one",
+                                                                       "cc one")) else "[Codex] ")
+                            + part, message_id=100 + index))
+                        for index, (_ref, part) in enumerate(posts)])
+
+            run(scenario())
+            texts = [message.text for message in adapter.seen]
+            for ref, pieces in replies.items():
+                whole = [text for text in texts if all(piece in text for piece in pieces)]
+                self.assertEqual(len(whole), 1, f"order {order}: {ref} came out as {texts}")
+                self.assertNotIn("↪", whole[0])       # joined, not delivered as a fragment
+            self.assertLessEqual(len(texts), len(replies) + 1, f"order {order}: {texts}")
+            self.assertEqual(channel._split_pending, {}, f"order {order}: a buffer was left held")
 
     def test_a_human_message_ending_in_a_part_marker_is_still_one_turn(self):
         channel, adapter = receiver()
