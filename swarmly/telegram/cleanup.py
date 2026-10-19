@@ -73,9 +73,14 @@ class TopicInfo:
 
     @property
     def done(self) -> bool:
-        """Every item this topic links is closed or merged (no linked item: not done)."""
-        return bool(self.states) and all(
-            (state or "").lower() in ("closed", "merged") for state in self.states.values())
+        """Every item this topic links is closed or merged (no linked item: not done).
+
+        Read the *refs*, not ``states``: a ref GitHub could not be asked about can be missing
+        from ``states`` entirely (or its state unknown), and a topic is offered for deletion
+        only when every item it names is provably closed or merged.
+        """
+        return bool(self.refs) and all(
+            (self.states.get(ref) or "").lower() in ("closed", "merged") for ref in self.refs)
 
     def idle_for(self, now: float) -> float:
         """Seconds since this topic was last active; ``UNKNOWN_ACTIVITY_IDLE_SECONDS`` when

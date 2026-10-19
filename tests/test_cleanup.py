@@ -133,6 +133,18 @@ class DryRunTests(CleanupCase):
         self.assertIn("#37 unknown", text)
         self.assertIn("topics done -- 0 topic(s)", text)
 
+    def test_a_topic_linking_a_done_and_an_open_item_is_not_done(self):
+        """#63 re-review: reading ``states`` instead of ``refs`` marked a topic done when only
+        some of the items it names were closed -- and deleted work still in flight."""
+        host = FakeHost([topic(42, "#37, #64", refs=["#37", "#64"],
+                               states={"#37": "merged", "#64": "open"})])
+        text = self.ask(self.cleanup(host))
+        self.assertIn("topics done -- 0 topic(s)", text)
+
+    def test_a_ref_missing_from_states_is_not_done(self):
+        host = FakeHost([topic(42, "#37, #64", refs=["#37", "#64"], states={"#37": "closed"})])
+        self.assertIn("topics done -- 0 topic(s)", self.ask(self.cleanup(host)))
+
     def test_a_topic_with_no_recorded_activity_is_still_offered_once_its_item_is_done(self):
         host = FakeHost([topic(42, "#37 work", activity=None, refs=["#37"],
                                states={"#37": "closed"})])
@@ -358,6 +370,7 @@ class ChannelCase(unittest.TestCase):
             "limits": {"min_seconds_between_messages": 0, "selftest_seconds": 0,
                        "min_seconds_between_agent_turns": 0},
         }
+        self.data = data
         self.config = AgentConfig.from_dict(data, source_path=self.source)
         self.sender = FakeSender()
         self.channel = self.make_channel()
@@ -406,6 +419,24 @@ class ChannelCase(unittest.TestCase):
         reply = run(self.channel.handle_event(event))
         self.assertIn("only the admin runs /cleanup", reply)
         self.assertEqual(self.channel.bot.topics, [])
+
+    def test_a_configured_keep_list_reaches_the_command(self):
+        """#63 re-review: the loader dropped ``limits.cleanup_keep`` (a ``default_factory``
+        field), so ``topics all`` offered the very topics the operator asked to keep."""
+        limits = dict(self.data["limits"], cleanup_keep=[42])
+        config = AgentConfig.from_dict({**self.data, "limits": limits},
+                                       source_path=self.source)
+        self.assertEqual(config.limits.cleanup_keep, [42])
+        self.channel = self.make_channel_from(config)
+        self.channel.bot = FakeBot()
+        self.prompt()
+        self.assertEqual(self.channel.cleanup.keep, {42})
+        ask = self.admin_command("/cleanup@HermesBot topics all")
+        self.assertIn("no topic to delete", ask)        # 42 is the only one, and it is kept
+
+    def make_channel_from(self, config) -> AgentChannel:
+        return AgentChannel(config, adapter=EchoAdapter("Hermes"), sender=self.sender,
+                            clock=lambda: 1000.0, sleeper=lambda seconds: None)
 
     def test_confirming_deletes_the_topic_and_announces_topic_gone(self):
         self.prompt()
@@ -508,10 +539,6 @@ class TopicMemoryForgetTests(unittest.TestCase):
             self.assertEqual(kept["topics"], [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SessionForgetTests(unittest.TestCase):
     """A deleted topic's session goes with it, in every runtime that keeps one."""
 
@@ -568,3 +595,7 @@ def _config_for(root: Path) -> AgentConfig:
         "limits": {"min_seconds_between_messages": 0, "selftest_seconds": 0,
                    "min_seconds_between_agent_turns": 0},
     }, source_path=source)
+
+
+if __name__ == "__main__":
+    unittest.main()

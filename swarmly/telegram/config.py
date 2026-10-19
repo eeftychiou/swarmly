@@ -900,7 +900,10 @@ class AgentConfig:
         _limit_defaults = ChannelLimits()
         _limits_coerced = {}
         for key, value in limits_raw.items():
-            if not hasattr(ChannelLimits, key):
+            # #63 re-review: a field with `default_factory` (limits.cleanup_keep) has no class
+            # attribute, so `hasattr(ChannelLimits, key)` dropped it silently -- the keep list an
+            # operator configured was ignored and `topics all` deleted those topics.
+            if key not in ChannelLimits.__dataclass_fields__:
                 continue
             default = getattr(_limit_defaults, key)
             if isinstance(default, bool):
