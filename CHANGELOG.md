@@ -56,6 +56,11 @@ All notable changes to this project are documented here. The format follows
   theirs still without an ACK is re-sent, `/ping`ed at its `ttl` and escalated up the ladder —
   a retry is not a nudge. `ROLES.md` uses the same word (`#57`).
 
+- Rung 1 of the retry carve-out in the role prompts reads as the single step `PROTOCOL.md`
+  defines — "at `ttl`, re-send the REQUEST with `/ping`" — rather than as two, and the
+  coordinator's test now refuses the carve-out in its own prompt, where it would blur the
+  rule rather than permit anything (`#59`).
+
 ### Fixed
 
 - A bot whose provider says the quota is gone *and* when it comes back freezes on the first
