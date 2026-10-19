@@ -53,6 +53,8 @@ from swarmly.telegram.commands import (
     where_reply,
 )
 from swarmly.telegram.config import EFFORT_LEVELS, AgentConfig, effort_problem, model_problem
+from swarmly.telegram.config import _AGY_MODEL_TYPES as AGY_MODEL_TYPES
+from swarmly.telegram.model_list import available_models, models_line
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.projects import ProjectRouter
 from swarmly.telegram.redact import Redactor
@@ -1154,8 +1156,12 @@ class AgentChannel:
             current = self._model_for(event)
             source = ("/model" if key in self._models
                       else "adapter.model" if adapter.model else "the CLI's default")
+            listed = models_line(adapter.type, available_models(adapter.type))
             return (f"{alias} runs {current or 'its CLI default model'} here ({source}). "
-                    f"The admin can switch it with /model@{self.config.identity.name} <name>.")
+                    f"The admin can switch it with /model@{self.config.identity.name} <name>. "
+                    f"{listed}")
+        if len(args) > 1 and adapter.type in AGY_MODEL_TYPES:
+            args = [" ".join(args)]            # an engine name: 'Gemini 3.8 Flash (Medium)'
         if len(args) > 1:
             return f"{alias}: /model takes one model name (or default)."
         if not self.config.is_admin(event.author_id):

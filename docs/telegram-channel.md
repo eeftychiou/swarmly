@@ -295,9 +295,14 @@ not a boundary: `gh api` reaches the same endpoints.
 it the CLI's own default applies. The admin can switch a
 bot's model at runtime, per topic:
 
-- `/model@<bot>` shows the model the bot runs in this topic.
+- `/model@<bot>` shows the model the bot runs in this topic and the models its CLI offers:
+  `agy models` for Antigravity, the list Codex keeps in `~/.codex/models_cache.json` (what
+  its own picker shows), every provider model in `reasonix doctor --json` for Reasonix, and
+  the aliases for Claude Code (which takes any claude-* name too). A list is reused for ten
+  minutes; one that cannot be read is left out with a pointer to where to look.
 - `/model@<bot> <name>` (admin only) switches it from the next turn. The conversation carries
-  on: the next turn resumes the same session on the new model.
+  on: the next turn resumes the same session on the new model. Antigravity takes the id or
+  the engine name, spaces and all (`/model@<bot> Gemini 3.8 Flash (Medium)`).
 - `/model@<bot> default` goes back to `adapter.model`.
 
 In the admin's private chat with a bot the bare `/model` (and `/model <name>`) is enough, since
