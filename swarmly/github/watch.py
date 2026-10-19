@@ -607,6 +607,17 @@ class GitHubWatcher:
                 continue
             outcome.ci_watched += 1
             watch["head_sha"] = checks.head_sha
+            if not checks.is_open:
+                # The PR was merged or closed after the agent named it (a merge notice, an
+                # upgrade call): its checks are done and nothing waits on them, so this is no
+                # wake — the agent would be told to "review and QA" work that already landed.
+                logger.info("stopped watching %s for CI: the PR is %s", key,
+                            checks.pr_state.lower() or "not open")
+                self.ci_state.drop(key)
+                dropped.add(key)
+                outcome.ci_skipped += 1
+                changed = True
+                continue
             if not checks.terminal:
                 continue
             revision = f"{checks.head_sha}:{checks.state}"

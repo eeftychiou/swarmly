@@ -220,7 +220,10 @@ swarmly-telegram --config config.yaml gh-poll --once --json
   the rest of the backstop.
 - An empty `statusCheckRollup` counts as pending, not success: a pull request pushed a moment
   ago has no checks until GitHub materialises them, and a wake then would announce a run that
-  did not exist yet.
+  did not exist yet. A `StatusContext` in the `EXPECTED` state is still running, not passed.
+- The pull request's own state is read in the same `gh` call: a PR that is already merged or
+  closed wakes nobody (a merge notice or an upgrade call names landed work), and its watch is
+  dropped on the first poll instead of waiting out the 12-hour TTL.
 - The wake turn is admitted like a notification turn: a bound topic outside the home group with
   no context id (`SWARMLY_REDACTION_SECRET` unset) is refused and reported in the poll outcome,
   rather than run into the shared General session.

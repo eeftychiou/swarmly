@@ -16,9 +16,12 @@ All notable changes to this project are documented here. The format follows
   `.agents/state/gh_ci-<alias>.json`, keyed by head commit and check state, so a restart
   neither forgets a watch nor wakes twice for a run, while a new push is reported again
   (`#24`). A pull request whose rollup is still empty stays pending rather than waking at
-  once, a watch registered by a reply during a wake survives that poll, and a wake in a topic
-  with no context id is refused instead of running in the shared General session (`#24`
-  review).
+  once, and a `statusCheckRollup` entry in the `EXPECTED` state counts as still running rather
+  than as passed. The PR's own state is read with the rollup, so a reply that names an
+  already-merged or closed PR (a merge notice, an upgrade call) registers no wake: the check
+  results arrived for work nothing waits on, and the watch is dropped instead. A watch
+  registered by a reply during a wake survives that poll, and a wake in a topic with no
+  context id is refused instead of running in the shared General session (`#24` review).
 
 ### Fixed
 

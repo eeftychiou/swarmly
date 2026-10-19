@@ -7,6 +7,7 @@ the result — once per head commit, and not again after a restart.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -143,6 +144,50 @@ class TestChecksFromRollup(unittest.TestCase):
         self.assertFalse(checks.terminal)
         self.assertIn("no check runs", checks.summary())
 
+    def test_an_expected_status_context_is_still_running(self):
+        """Maintainer review of #24: ``EXPECTED`` is a StatusContext that has not reported
+        yet, so it is pending — not a passed check that would declare the run terminal."""
+        checks = checks_from_rollup(20, "abc", "", "", [
+            {"__typename": "StatusContext", "context": "qa", "state": "EXPECTED"},
+        ])
+        self.assertEqual(checks.state, "pending")
+        self.assertFalse(checks.terminal)
+        self.assertEqual(checks.pending, ["qa"])
+
+    def test_a_merged_pr_is_not_open(self):
+        """Maintainer review of #24: the rollup says nothing about whether the PR still waits
+        on its checks, so the PR's own state is read too."""
+        checks = checks_from_rollup(20, "abc", "", "", [
+            {"__typename": "CheckRun", "name": "build", "status": "COMPLETED",
+             "conclusion": "SUCCESS"},
+        ], pr_state="MERGED")
+        self.assertEqual(checks.state, "success")          # the checks themselves did pass
+        self.assertEqual(checks.pr_state, "MERGED")
+        self.assertFalse(checks.is_open)
+        self.assertTrue(checks_from_rollup(20, "abc", "", "", []).is_open)   # unknown/open
+
+    def test_pr_checks_asks_for_the_pr_state(self):
+        """Maintainer review of #24: one call carries the state, so the watch can tell a
+        merged PR from an open one without a second request."""
+        from swarmly.github.client import GitHubClient
+
+        calls = []
+
+        def fake_run(args, timeout=30.0):
+            calls.append(args)
+            return 0, json.dumps({"number": 20, "state": "MERGED", "headRefOid": "abc",
+                                  "url": "u", "title": "t",
+                                  "statusCheckRollup": [
+                                      {"__typename": "CheckRun", "name": "build",
+                                       "status": "COMPLETED", "conclusion": "SUCCESS"}]}), ""
+
+        client = GitHubClient()
+        with patch.object(client, "_run", fake_run):
+            checks = client.pr_checks(REPO, 20)
+        self.assertIn("state", calls[0][-1])                # the field is requested
+        self.assertEqual(checks.pr_state, "MERGED")
+        self.assertFalse(checks.is_open)
+
 
 class TestCIWake(unittest.IsolatedAsyncioTestCase):
     async def test_a_pending_run_is_not_a_wake(self):
@@ -231,6 +276,53 @@ class TestCIWake(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(outcome.ci_wakes, 1)
             self.assertEqual(len(adapter.received), 2)
+
+    async def test_a_merged_pr_wakes_nobody(self):
+        """Maintainer review of #24: a reply that names an already-merged PR (a merge notice,
+        an upgrade call) must not wake the agent to "review and QA" work that already landed."""
+        with TemporaryDirectory() as tmp:
+            merged = passed()
+            merged.pr_state = "MERGED"
+            client = FakeGitHub([merged])
+            channel, adapter = fake_channel()
+            watcher = watcher_for(tmp, client, channel)
+            watch_pr(watcher)
+
+            outcome = await watcher.poll_once()
+
+            self.assertEqual(outcome.ci_wakes, 0)
+            self.assertEqual(adapter.received, [])
+            self.assertEqual(outcome.errors, [])
+            self.assertEqual(list(CIWatchState.load(watcher.ci_state_path).watches), [])
+
+    async def test_a_closed_pr_with_running_checks_is_dropped_too(self):
+        """A closed PR's checks will never finish, so the watch goes on the first poll rather
+        than waiting out the 12 h TTL."""
+        with TemporaryDirectory() as tmp:
+            closed = pending()
+            closed.pr_state = "CLOSED"
+            watcher = watcher_for(tmp, FakeGitHub([closed]), fake_channel()[0])
+            watch_pr(watcher)
+
+            outcome = await watcher.poll_once()
+
+            self.assertEqual(outcome.ci_wakes, 0)
+            self.assertEqual(list(CIWatchState.load(watcher.ci_state_path).watches), [])
+
+    async def test_an_open_pr_is_still_watched_and_woken(self):
+        """The state is read, but an open PR waits on its checks as before."""
+        with TemporaryDirectory() as tmp:
+            still_open = passed()
+            still_open.pr_state = "OPEN"
+            client = FakeGitHub([still_open])
+            channel, adapter = fake_channel()
+            watcher = watcher_for(tmp, client, channel)
+            watch_pr(watcher)
+
+            outcome = await watcher.poll_once()
+
+            self.assertEqual(outcome.ci_wakes, 1)
+            self.assertEqual(len(adapter.received), 1)
 
     async def test_a_watch_gh_has_no_checks_for_is_dropped_quietly(self):
         with TemporaryDirectory() as tmp:
