@@ -370,13 +370,13 @@ class AgentChannel:
         # Issue #123: only the long-running transport may arm the fail-fast gate;
         # it calls `AgentChannel(config, transport=True)` from cli._run.
         self.adapter = adapter or build_adapter(config, transport=transport)
-        sessions = getattr(self.adapter, "SESSIONS_STATE", None)
-        if adapter is None and sessions and hasattr(self.adapter, "use_state_file"):
-            self.adapter.use_state_file(_state_file(config, sessions))
         if hasattr(self.adapter, "use_parallel_limit"):
             # Issue #78: the adapter refuses a runtime conversation pin while topics run in
             # parallel -- a pinned conversation is one context for all of them.
             self.adapter.use_parallel_limit(config.limits.max_parallel_turns)
+        sessions = getattr(self.adapter, "SESSIONS_STATE", None)
+        if adapter is None and sessions and hasattr(self.adapter, "use_state_file"):
+            self.adapter.use_state_file(_state_file(config, sessions))
         # durable-plane fallback (fallback.gitbus_poll_minutes)
         self._bus_task: Optional[asyncio.Task] = None
         self._lane_poll_task: Optional[asyncio.Task] = None    # one lane poll per doorbell burst
@@ -654,12 +654,12 @@ class AgentChannel:
             cfg_adapter = dataclasses.replace(self.config.adapter, cwd=str(workdir))
             cfg = dataclasses.replace(self.config, adapter=cfg_adapter)
             adapter = build_adapter(cfg, transport=True)
+            if hasattr(adapter, "use_parallel_limit"):
+                adapter.use_parallel_limit(self.config.limits.max_parallel_turns)
             sessions = getattr(adapter, "SESSIONS_STATE", None)
             if sessions and hasattr(adapter, "use_state_file"):
                 suffix = f"{project.key}-t{thread_id}" if project.worktrees else project.key
                 adapter.use_state_file(_state_file(self.config, sessions, suffix=suffix))
-            if hasattr(adapter, "use_parallel_limit"):
-                adapter.use_parallel_limit(self.config.limits.max_parallel_turns)
             self._project_adapters[cache_key] = adapter
         return self._project_adapters[cache_key]
 
