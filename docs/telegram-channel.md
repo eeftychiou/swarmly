@@ -763,7 +763,11 @@ to N topics run a turn at the same time.
   never looks ignored (`ack_reaction: true`).
 - A turn that fails on a passing provider error ("model is at capacity", overloaded, a 5xx)
   is tried again after 30 s and then 2 min before the bot posts ❌. Quota and usage limits
-  are not retried: they last hours, and repeated ones freeze the bot instead.
+  are not retried: they last hours, and repeated ones freeze the bot instead. The freeze ends
+  by itself at the reset time the error gives (else after `quota_retry_minutes: 60`), the bot
+  answers a person who addresses it with why it is frozen and how to resume, and the admin can
+  end it sooner with `/resume@<bot>` or by switching it to another model with `/model@<bot>`.
+  Peers see the freeze, list it in `/status`, and hand its work to someone else.
 - Files, photos, voice notes and videos on an addressed message are downloaded to
   `<adapter.cwd>/.a2a-attachments/` (a folder git ignores), and the prompt names each local path.
   Files over `max_attachment_mb: 20` (the Bot API download limit) are listed but not fetched.

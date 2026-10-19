@@ -55,6 +55,7 @@ from swarmly.telegram.commands import (
 from swarmly.telegram.config import EFFORT_LEVELS, AgentConfig, effort_problem, model_problem
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.projects import ProjectRouter
+from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
 from swarmly.telegram.model_list import available_models, cached_models, format_list
 from swarmly.telegram.redact import Redactor
 from swarmly.telegram.topic_open import (GENERAL_PEER_REPLY_CHARS, GENERAL_REPLY_CHARS,
@@ -187,7 +188,8 @@ def _default_gitbus_read(root: Path, ref: Optional[str] = None) -> List[Any]:
 
 
 _BANNER_AND_MENTIONS = re.compile(r"^(?:\s*(?:\[[^\]\n]{1,40}\]|@\w+)[:,]?)+\s*")
-_NOTICE_PREFIXES = ("⚠️", "↪", "❌", "🟢", "✅", "👀", "⏳", "♻️", "[system]", "[status]")
+_NOTICE_PREFIXES = ("⚠️", "↪", "❌", "🟢", "✅", "👀", "⏳", "♻️", "🧊", "▶", "[system]",
+                    "[status]")
 
 #: Why a peer bot's mention of this bot is dropped without a notice back (#27): machine traffic
 #: never asked for a turn, a bot's own echo is addressed to nobody, and a stranger's or a
@@ -205,6 +207,8 @@ _NO_DROP_NOTICE_REASONS = frozenset({
 #: One drop notice per reason per topic per window: a peer that keeps naming this bot in the
 #: same dropped shape hears it once, not once per message.
 DROP_NOTICE_SECONDS = 600.0
+#: A frozen bot tells a person who addresses it so at most once per topic per window.
+FROZEN_REMINDER_SECONDS = 600.0
 
 
 def machine_prose(text: str) -> str:
@@ -482,7 +486,17 @@ class AgentChannel:
         self.reroute_gone_topics = True
         self._frozen = False
         self._freeze_ref: Optional[str] = None
+        self._freeze_until: Optional[float] = None   # wall time a quota freeze lifts itself
         self._quota_failures = 0  # #49: consecutive quota-signature adapter failures
+        self._wall: Callable[[], float] = time.time
+        self._frozen_told: Dict[Tuple[int, Optional[int]], float] = {}   # topic -> clock
+        self._announce_resumed = False             # a /model lifted a quota freeze
+        # Peers that said they are frozen: alias -> {"ref", "until"} (wall time or None).
+        self._peers_frozen_path = _state_file(config, "peer-freezes")
+        self._peers_frozen: Dict[str, Dict[str, Any]] = {
+            str(alias): dict(entry) for alias, entry in
+            load_state(self._peers_frozen_path, "peer freezes").items()
+            if isinstance(entry, dict)}
         # Token economy (issue #43): machine-class traffic recorded as state, not model turns.
         self._machine_log: deque = deque(maxlen=50)
         self._peer_last_seen: Dict[str, Dict[str, Any]] = {}
@@ -1070,9 +1084,16 @@ class AgentChannel:
                 result += f" github: @{self.config.github.login} (backstop: {self.config.github.poll_minutes}m, last: {last_poll})"
             else:
                 result += " github: disabled"
+            frozen_peers = self.frozen_peers()
+            if frozen_peers:
+                result += " frozen_peers=" + ",".join(
+                    f"{peer}({entry.get('ref') or 'frozen'})"
+                    for peer, entry in sorted(frozen_peers.items()))
+            blocker = self.stats.last_error or "none"
+            if self._frozen:
+                blocker = f"frozen: {self._freeze_reason()} (/resume@{self.config.identity.name})"
             return status_reply(alias, task=f"adapter:{self.config.adapter.type}",
-                                result=result,
-                                blocker=self.stats.last_error or "none")
+                                result=result, blocker=blocker)
         if command == "role":
             role = self._role()
             if role is None:
@@ -1191,9 +1212,10 @@ class AgentChannel:
             current = self._model_for(event)
             source = ("/model" if key in self._models
                       else "adapter.model" if adapter.model else "the CLI's default")
+            frozen = f"\n\n{self._frozen_line()}" if self._frozen else ""
             return (f"{alias} runs {current or 'its CLI default model'} here ({source}). "
                     f"The admin can switch it with /model@{self.config.identity.name} <name>."
-                    f"{self._model_choices()}")
+                    f"{self._model_choices()}{frozen}")
         if len(args) > 1:
             return f"{alias}: /model takes one model name (or default)."
         if not self.config.is_admin(event.author_id):
@@ -1205,7 +1227,7 @@ class AgentChannel:
             self._models.pop(key, None)
             save_state(self._models_path, self._models, "model choices")
             return (f"{alias} goes back to {adapter.model or 'its CLI default model'} here "
-                    "from the next turn.")
+                    f"from the next turn.{self._after_model_switch(adapter.model or 'default')}")
         if name != adapter.model:
             problem = model_problem(adapter.type, name)
             if problem:
@@ -1213,7 +1235,23 @@ class AgentChannel:
         self._models[key] = name
         save_state(self._models_path, self._models, "model choices")
         logger.info("/model: %s now runs %s in %s", alias, name, key)
-        return f"{alias} runs {name} here from the next turn; the conversation carries on."
+        return (f"{alias} runs {name} here from the next turn; the conversation carries on."
+                f"{self._after_model_switch(name)}")
+
+    def _after_model_switch(self, name: str) -> str:
+        """A quota usually belongs to one model, so switching lifts a quota freeze (the next
+        turn is the test; it freezes again if this model's quota is out too). Any other freeze
+        stays, and the reply says so instead of promising a turn that will not come."""
+        if not self._frozen:
+            return ""
+        if self._freeze_ref == "quota":
+            self._set_frozen(False, None)
+            self._announce_resumed = True
+            logger.info("/model lifted the quota freeze to try %s", name)
+            return (f" Its quota freeze is lifted to try {name}; it freezes again if that "
+                    "model's quota is out too.")
+        return (f" It is still frozen ({self._freeze_reason()}): "
+                f"/resume@{self.config.identity.name} to start it.")
 
     def _model_choices(self) -> str:
         """The models /model can switch to, as the end of the bare /model answer."""
@@ -1358,10 +1396,13 @@ class AgentChannel:
             return None
         return Path(source).with_suffix(".freeze.json")
 
-    def _set_frozen(self, frozen: bool, ref: Optional[str]) -> None:
+    def _set_frozen(self, frozen: bool, ref: Optional[str],
+                    until: Optional[float] = None) -> None:
         """Apply and persist the freeze flag so a restart cannot silently release it."""
         self._frozen = frozen
         self._freeze_ref = ref if frozen else None
+        self._freeze_until = until if frozen else None
+        self._frozen_told.clear()
         if not frozen:
             self._quota_failures = 0
         path = self._freeze_state_path()
@@ -1369,14 +1410,18 @@ class AgentChannel:
             return
         try:
             if frozen:
-                path.write_text(json.dumps({"frozen": True, "ref": ref, "at": self._clock()}))
+                path.write_text(json.dumps({"frozen": True, "ref": ref, "at": self._wall(),
+                                            "until": until}))
             elif path.exists():
                 path.unlink()
         except OSError as exc:
             logger.warning("freeze state could not be persisted: %s", exc)
 
     async def _restore_freeze_state(self) -> None:
-        """Re-apply a persisted freeze on startup and re-announce it once."""
+        """Re-apply a persisted freeze on startup and re-announce it once.
+
+        A quota freeze whose end has passed is not restored: the quota is back. One saved
+        before freezes had an end gets the retry interval from now."""
         path = self._freeze_state_path()
         if path is None or not path.exists():
             return
@@ -1387,20 +1432,89 @@ class AgentChannel:
             return
         if not isinstance(data, dict) or not data.get("frozen"):
             return
-        ref = data.get("ref")
+        ref = str(data["ref"]) if data.get("ref") else None
+        until = data.get("until")
+        until = float(until) if isinstance(until, (int, float)) else None
+        if ref == "quota":
+            if until is None:
+                until = self._wall() + self._quota_retry_seconds()
+            elif until <= self._wall():
+                logger.info("quota freeze from %s ended while stopped; not restored", path)
+                self._set_frozen(False, None)
+                return
         self._frozen = True
-        self._freeze_ref = str(ref) if ref else None
+        self._freeze_ref = ref
+        self._freeze_until = until
         logger.info("freeze state restored from %s (ref=%s)", path, ref)
-        await self.send(format_message(Envelope(
-            type=MessageType.STATUS, to="*", intent="FROZEN",
-            ref=self._freeze_ref, rev=_local_revision())), allow_when_frozen=True)
+        await self.send(self._frozen_notice(), allow_when_frozen=True)
+
+    def _quota_retry_seconds(self) -> float:
+        return max(1.0, float(getattr(self.config.limits, "quota_retry_minutes", 60.0))) * 60
+
+    def _freeze_reason(self) -> str:
+        """Why this bot is frozen, in words, with when it ends."""
+        why = {"quota": "its provider's quota ran out",
+               "pause": "the admin paused it"}.get(self._freeze_ref or "",
+                                                 f"it was frozen ({self._freeze_ref or 'no reason'})")
+        until = describe_until(self._freeze_until)
+        return f"{why}, {until}" if until else why
+
+    def _frozen_line(self) -> str:
+        """What a frozen bot tells a person who addresses it."""
+        name = self.config.identity.name
+        line = (f"🧊 {self.config.identity.alias} is frozen: {self._freeze_reason()}. "
+                f"It takes no work until then; the admin can /resume@{name}")
+        if self._freeze_ref == "quota" and self.config.adapter.model_switchable:
+            line += f" or switch it to another model with /model@{name} <name>"
+        return line + "."
+
+    def _frozen_notice(self) -> str:
+        """The FROZEN broadcast: machine header for peers (``ttl`` = how long), words for people."""
+        return format_message(Envelope(
+            type=MessageType.STATUS, to="*", intent="FROZEN", ref=self._freeze_ref,
+            ttl=ttl_for(self._freeze_until, self._wall()), rev=_local_revision()),
+            self._frozen_line())
+
+    def _resumed_notice(self, why: str) -> str:
+        return format_message(Envelope(
+            type=MessageType.STATUS, to="*", intent="RESUMED", ref="quota",
+            rev=_local_revision()), f"▶ {self.config.identity.alias} resumed: {why}.")
+
+    async def _lift_expired_freeze(self) -> bool:
+        """A quota freeze ends at the time the provider gave (or after the retry interval):
+        the next turn is the probe, and repeated quota failures freeze it again."""
+        if not self._frozen or self._freeze_ref != "quota" or self._freeze_until is None \
+                or self._wall() < self._freeze_until:
+            return False
+        self._set_frozen(False, None)
+        logger.info("quota freeze ended; resuming")
+        await self.send(self._resumed_notice("its quota freeze has ended"),
+                        allow_when_frozen=True)
+        return True
+
+    async def _tell_frozen(self, event: ChannelEvent) -> None:
+        """A person who addresses a frozen bot is told so, once per topic in a while,
+        instead of silence."""
+        if event.author_is_bot or not self._frozen or not self._may_start_turns(event):
+            return
+        if not (self.mentions_me(event.text or "") or event.replies_to_bot
+                or self._direct_chat(event)):
+            return
+        key = (event.chat_id, event.thread_id)
+        if self._clock() - self._frozen_told.get(key, float("-inf")) < FROZEN_REMINDER_SECONDS:
+            return
+        self._frozen_told[key] = self._clock()
+        await self.send(self._frozen_line(), reply_to_message_id=event.message_id,
+                        chat_id=event.chat_id, thread_id=event.thread_id,
+                        allow_when_frozen=True)
 
     async def _note_adapter_failure(self, detail: str) -> None:
         """#49.E: repeated quota-signature failures freeze the channel before the ticket storm.
 
         Deliberately narrow: only failure text carrying a known quota/429 signature counts,
-        a non-quota failure resets the streak, and the freeze never fires twice (RESUME or
-        the persisted state is the only way back).
+        a non-quota failure resets the streak, and the freeze never fires twice. It ends at
+        the reset time the error gives, else after ``limits.quota_retry_minutes``; /resume
+        and a /model switch end it sooner.
         """
         if self._frozen or not self.config.limits.auto_freeze_on_quota:
             return
@@ -1411,11 +1525,50 @@ class AgentChannel:
         threshold = max(1, int(self.config.limits.quota_freeze_threshold))
         logger.warning("quota-signature adapter failure %d/%d", self._quota_failures, threshold)
         if self._quota_failures >= threshold:
-            self._set_frozen(True, "quota")
+            now = self._wall()
+            until = quota_resets_at(detail, now) or now + self._quota_retry_seconds()
+            self._set_frozen(True, "quota", until)
             self.stats.last_error = "auto-frozen: adapter quota exhausted"
-            await self.send(format_message(Envelope(
-                type=MessageType.STATUS, to="*", intent="FROZEN", ref="quota",
-                rev=_local_revision())), allow_when_frozen=True)
+            await self.send(self._frozen_notice(), allow_when_frozen=True)
+
+    def _track_peer_freeze(self, envelope: Envelope, event: ChannelEvent) -> None:
+        """Remember which peers said they are frozen, so turns can route around them."""
+        if not event.author_is_bot:
+            return
+        kind, intent = envelope.type, (envelope.intent or "").upper()
+        alias = self._alias_for(event)
+        if kind == MessageType.STATUS and intent == "FROZEN":
+            ttl = parse_ttl(envelope.ttl)
+            self._peers_frozen[alias] = {"ref": envelope.ref,
+                                         "until": self._wall() + ttl if ttl else None}
+        elif (kind == MessageType.STATUS and intent == "RESUMED") or \
+                (kind == MessageType.HELLO and intent == "ONLINE"):
+            # A restarted peer that is still frozen says FROZEN again right after ONLINE.
+            if self._peers_frozen.pop(alias, None) is None:
+                return
+        else:
+            return
+        save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
+
+    def frozen_peers(self) -> Dict[str, Dict[str, Any]]:
+        """Peers frozen now (ones whose freeze has ended are dropped)."""
+        now = self._wall()
+        return {alias: dict(entry) for alias, entry in self._peers_frozen.items()
+                if entry.get("until") is None or float(entry["until"]) > now}
+
+    def _frozen_peers_note(self) -> str:
+        """A line for every turn naming the frozen peers, so work is not handed to them."""
+        peers = self.frozen_peers()
+        if not peers:
+            return ""
+        parts = []
+        for alias, entry in sorted(peers.items()):
+            why = {"quota": "quota ran out", "pause": "paused"}.get(
+                str(entry.get("ref") or ""), "frozen")
+            until = describe_until(entry.get("until"))
+            parts.append(f"{alias} ({why}{', ' + until if until else ''})")
+        return (f"\n\n[Frozen peers take no work until they resume: {'; '.join(parts)}. "
+                "Give their part to another peer; if no one else can do it, tell the admin.]")
 
     # Machine-class envelope kinds recorded as state without waking the adapter (token
     # economy, issue #43). REQUEST/RESPONSE/BLOCKED are never machine-class.
@@ -1590,6 +1743,10 @@ class AgentChannel:
                 await self.check_stalled_handoffs()
             except Exception:                              # noqa: BLE001 - a tick must never die silently
                 logger.exception("hand-off check failed")
+            try:
+                await self._lift_expired_freeze()
+            except Exception:                              # noqa: BLE001 - a tick must never die silently
+                logger.exception("freeze expiry check failed")
 
     # -- durable-plane fallback --------------------------------------------------------
     def _gitbus_root(self) -> Path:
@@ -1845,6 +2002,7 @@ class AgentChannel:
                     event.author_is_bot, (event.text[:120] if event.text else "<no text>"))
 
         envelope, _body = parse_message(event.text or "")
+        self._track_peer_freeze(envelope, event)
         if in_home_channel:
             self.selftest.observe(envelope, event)
             if await self._handle_roster(envelope, event):
@@ -1895,10 +2053,17 @@ class AgentChannel:
             return None
         if pause_reply is not None:
             self.stats.handled += 1
-            return await self.send(pause_reply, reply_to_message_id=event.message_id,
+            sent = await self.send(pause_reply, reply_to_message_id=event.message_id,
                                    chat_id=event.chat_id, thread_id=event.thread_id,
                                    allow_when_frozen=True)
+            if self._announce_resumed:              # /resume ended a quota freeze
+                self._announce_resumed = False
+                await self.send(self._resumed_notice("the admin resumed it"),
+                                allow_when_frozen=True)
+            return sent
 
+        if self._frozen:
+            await self._lift_expired_freeze()
         if self._frozen or self._pause_pending:
             if self._may_start_turns(event):
                 await self._look_up_models(event)
@@ -1906,10 +2071,16 @@ class AgentChannel:
                              if self._may_start_turns(event) else None)
             if command_reply is not None:
                 self.stats.handled += 1
-                return await self.send(command_reply, reply_to_message_id=event.message_id,
+                sent = await self.send(command_reply, reply_to_message_id=event.message_id,
                                        chat_id=event.chat_id, thread_id=event.thread_id,
-                                   allow_when_frozen=True)
+                                       allow_when_frozen=True)
+                if self._announce_resumed:          # a /model switch lifted a quota freeze
+                    self._announce_resumed = False
+                    await self.send(self._resumed_notice("switched to another model"),
+                                    allow_when_frozen=True)
+                return sent
             logger.info("routing decision: respond=False (reason: transport frozen)")
+            await self._tell_frozen(event)
             self.stats.ignored += 1
             return None
 
@@ -2064,6 +2235,7 @@ class AgentChannel:
         text = recap + text
         if not event.author_is_bot and not is_admin_dm:     # peers can't see a DM
             text += self._waiting_note(event.text)
+        text += self._frozen_peers_note()
         if not event.self_task and asks_for_topic(event.text or ""):
             text += f"\n\n{TOPIC_ASKED_NOTE}"
         incoming = IncomingMessage(
@@ -2218,6 +2390,7 @@ class AgentChannel:
         alias = self.config.identity.alias
         if command == "resume":
             was = self._frozen or self._pause_pending
+            self._announce_resumed = self._freeze_ref == "quota"     # peers route around it
             self._pause_pending = False
             self._set_frozen(False, None)
             return f"▶ {alias} resumed." if was else f"▶ {alias} was not paused."

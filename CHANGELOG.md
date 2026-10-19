@@ -16,6 +16,14 @@ All notable changes to this project are documented here. The format follows
   reads as one that was taken; the report is per sender, so a second peer's dropped hand-off
   inside the same window is still answerable (`#27`).
 
+- A bot frozen on quota no longer goes silent and stays frozen for good. The freeze ends by
+  itself at the reset time the provider's error gives (else after `quota_retry_minutes`), and
+  a person who addresses the frozen bot is told why and how to resume. `/status` shows the
+  freeze, `/model@<bot> <name>` lifts a quota freeze to try the other model (instead of
+  promising a turn that never came), and `/resume` tells the peers. Peers keep track of frozen
+  bots, show them in `/status`, and every turn's prompt names them so work goes to a bot that
+  can take it.
+
 ## [0.10.1] - 2026-10-17
 
 A correctness round: the suite is hermetic on hosts that run an agent, and the bugs that each
