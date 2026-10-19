@@ -29,9 +29,9 @@ reports the stall to the coordinator rather than chasing the peer itself, so a s
 not pinged by three bots at once.
 
 Chasing a stalled owner is not the same thing as retrying a delivery. The escalation ladder in
-[PROTOCOL.md](telegram/PROTOCOL.md#escalation-ladder) — re-sending a REQUEST that got no ACK,
-`/ping` at its `ttl`, mirroring to the bus, escalating to the human — belongs to whoever sent
-that REQUEST, whichever role it has: a retry is not a nudge.
+[PROTOCOL.md](telegram/PROTOCOL.md#escalation-ladder) — at `ttl`, re-sending the REQUEST with
+`/ping`, mirroring it to the bus, escalating to the human — belongs to whoever sent that
+REQUEST, whichever role it has: a retry is not a nudge.
 
 ## How an agent gets its role
 

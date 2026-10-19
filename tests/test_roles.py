@@ -264,13 +264,16 @@ class TestTheDeliveryRetryIsNotANudge(unittest.TestCase):
             with self.subTest(role=name):
                 instructions = flat(name)
                 self.assertIn("A REQUEST of yours still without an ACK is not that", instructions)
-                self.assertIn("re-send it, `/ping` at its `ttl`, then take the next rung of the "
-                              "escalation ladder", instructions)
+                self.assertIn("at its `ttl`, re-send it with `/ping`, then take the next rung "
+                              "of the escalation ladder", instructions)
                 self.assertIn("a retry is not a nudge", instructions)
 
     def test_the_retry_is_only_carved_out_where_chasing_is_forbidden(self):
         self.assertNotIn("do not chase a peer", flat("coordinator").lower())
         self.assertIn("chasing a stalled peer is yours alone", flat("coordinator"))
+        # The coordinator is the one who chases, so the carve-out must not leak into its
+        # prompt: it would read as permission it does not need and blur the rule (#59).
+        self.assertNotIn("a retry is not a nudge", flat("coordinator"))
 
 
 class TestBuiltinRolesNameTheMerger(unittest.TestCase):

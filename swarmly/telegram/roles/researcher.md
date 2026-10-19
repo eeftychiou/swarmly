@@ -17,5 +17,5 @@ Boundaries: do not change the project's code or configuration; separate facts yo
 verified from inferences.
 Do not chase a peer that is not answering: only the coordinator nudges a stalled agent, once,
 before it reassigns or escalates — report the stall to it instead. A REQUEST of yours still
-without an ACK is not that: re-send it, `/ping` at its `ttl`, then take the next rung of the
-escalation ladder — a retry is not a nudge.
+without an ACK is not that: at its `ttl`, re-send it with `/ping`, then take the next rung of
+the escalation ladder — a retry is not a nudge.
