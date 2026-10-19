@@ -40,6 +40,22 @@ class TestQuotaFreeze(unittest.TestCase):
         self.assertIn("its provider's quota ran out", notice)
         self.assertIn("/resume@HermesBot", notice)
 
+    def test_a_stated_reset_time_freezes_on_the_first_failure(self):
+        # Live run: Codex took a hand-off weeks before its quota reset and only posted ❌;
+        # the peers learned nothing until two more turns had failed.
+        channel = make_channel(make_config(adapter={"type": "codex"}))
+        channel._wall = lambda: NOW
+        run(channel._note_adapter_failure("You've hit your usage limit. Please retry in 2h."))
+        self.assertTrue(channel._frozen)
+        self.assertEqual(channel._freeze_until, NOW + 7200)
+        self.assertIn("intent=FROZEN ref=quota", channel._test_sender.last)
+
+    def test_without_a_reset_time_it_takes_the_threshold(self):
+        channel = make_channel(make_config(adapter={"type": "codex"}))
+        channel._wall = lambda: NOW
+        run(channel._note_adapter_failure("429 Too Many Requests"))
+        self.assertFalse(channel._frozen)
+
     def test_without_a_reset_time_it_is_retried_after_the_interval(self):
         channel = frozen_channel(detail="429 Too Many Requests")
         self.assertEqual(channel._freeze_until, NOW + 60 * 60)

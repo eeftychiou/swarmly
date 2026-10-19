@@ -1531,9 +1531,13 @@ class AgentChannel:
         self._quota_failures += 1
         threshold = max(1, int(self.config.limits.quota_freeze_threshold))
         logger.warning("quota-signature adapter failure %d/%d", self._quota_failures, threshold)
-        if self._quota_failures >= threshold:
-            now = self._wall()
-            until = quota_resets_at(detail, now) or now + self._quota_retry_seconds()
+        now = self._wall()
+        resets = quota_resets_at(detail, now)
+        # An error that says when the quota comes back is not a blip: freeze at once, so the
+        # FROZEN status reaches the peers and the coordinator hands the work elsewhere (live
+        # run: Codex took a hand-off weeks before its quota reset and only posted a ❌).
+        if resets is not None or self._quota_failures >= threshold:
+            until = resets or now + self._quota_retry_seconds()
             self._set_frozen(True, "quota", until)
             self.stats.last_error = "auto-frozen: adapter quota exhausted"
             await self.send(self._frozen_notice(), allow_when_frozen=True)
@@ -2882,7 +2886,8 @@ class AgentChannel:
             # turn), so this is a pause, not a failure: ⏳, which peers read as busy.
             await self.send(f"⏳ {reply.error}; it continues where it stopped in its next turn."
                             if resume else f"❌ {reply.error}",
-                            chat_id=event.chat_id, thread_id=event.thread_id)
+                            chat_id=event.chat_id, thread_id=event.thread_id,
+                            reply_to_message_id=event.message_id)
             if resume and not self._busy_waiting_by.get((event.chat_id, event.thread_id)):
                 self._run_own_task(CONTINUE_NOTE, event.chat_id, event.thread_id,
                                    self.topics.name(event.chat_id, event.thread_id))
