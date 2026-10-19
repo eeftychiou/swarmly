@@ -47,8 +47,12 @@ def reply_state_path_for(raw_path: str, base_dir: Optional[str] = None) -> Path:
 
 
 class ReplyStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, reply_chars: Optional[int] = None):
         self.path = Path(path)
+        #: Issue #31: the reply budget a ticket's answer is held to. A ticket has no topic,
+        #: so this is the channel's ``limits.reply_chars`` (500 unless changed); a project's
+        #: per-topic override reaches the turn rules, not this sender.
+        self.reply_chars = reply_chars if reply_chars and reply_chars > 0 else 500
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             try:
@@ -194,8 +198,12 @@ class ReplyStore:
                 tag = f"@{row['recipient']}" if row['recipient'] else ""
                 if tag and not body.lower().startswith(tag.lower() + ":"):
                     body = f"{tag}: {body}"
-                if len(body) >= 500:
-                    raise ValueError("Telegram reply must be under 500 characters including recipient")
+                if len(body) >= self.reply_chars:
+                    # The budget is "under N": N itself is already over it, as it always was
+                    # for the default 500 (issue #31 keeps that boundary, only the number moves).
+                    raise ValueError(
+                        f"Telegram reply must be under {self.reply_chars} characters including "
+                        f"recipient (got {len(body)})")
             if row['state'] in ('ready', 'claimed', 'sending', 'sent', 'skipped'):
                 if row['text'] == body and (state != 'skipped' or row['detail'] == detail):
                     return dict(row)  # idempotent submission, never a second send

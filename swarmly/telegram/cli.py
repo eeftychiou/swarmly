@@ -95,7 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
     reply = sub.add_parser("reply", help="submit a queued task's explicit Telegram answer")
     reply.add_argument("ticket", help="reply ticket ID from the inbound prompt")
     response = reply.add_mutually_exclusive_group(required=True)
-    response.add_argument("--text", help="answer or blocker; under 500 characters")
+    response.add_argument("--text", help="answer or blocker; within limits.reply_chars "
+                                        "(under 500 characters unless configured)")
     response.add_argument("--skip", help="reason no reply is needed (pure ACK/status only)")
     reply.add_argument("--wait", type=float, default=0, help="wait up to this many seconds (maximum 60) for Telegram acceptance")
     status = sub.add_parser("reply-status", help="inspect a reply ticket without posting")
@@ -597,7 +598,7 @@ async def _post(config: AgentConfig, args) -> int:
 
 def _reply(config, args) -> int:
     from swarmly.telegram.replies import ReplyStore, reply_state_path
-    store = ReplyStore(reply_state_path(config))
+    store = ReplyStore(reply_state_path(config), reply_chars=config.limits.reply_chars)
     if args.command == "reply":
         store.submit(args.ticket, text=args.text, skip_reason=args.skip)
         deadline = time.monotonic() + max(0, min(args.wait, 60))

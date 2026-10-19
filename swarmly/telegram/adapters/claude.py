@@ -156,6 +156,7 @@ class ClaudeAdapter(SubprocessAdapter):
             project=project_line(message),
             role=self.role_text,
             card=turn_card(message),
+            reply_chars=getattr(message, "reply_chars", None),
         )
 
     def system_rules(self, message: IncomingMessage) -> Optional[str]:
@@ -166,7 +167,8 @@ class ClaudeAdapter(SubprocessAdapter):
             return None
         return channel_rules(getattr(message, "mentions", None),
                              getattr(message, "maintainer_username", None),
-                             role=self.role_text)
+                             role=self.role_text,
+                             reply_chars=getattr(message, "reply_chars", None))
 
     def rules_inline(self, rules: str) -> bool:
         """Whether this turn also needs the rules in the message (a fresh session never does)."""

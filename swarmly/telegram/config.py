@@ -170,7 +170,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
             "folder", "gdrive", "swarm", "swarm_agent", "allow_unsigned", "senders",
             "mirror_handoffs"),
     "fallback": ("gitbus_root", "gitbus_ref", "gitbus_poll_minutes"),
-    "projects": ("repo", "cwd", "topics", "worktrees"),
+    "projects": ("repo", "cwd", "topics", "worktrees", "reply_chars"),
     "github": ("login", "token_env", "poll_minutes", "mark_read", "tracking_label"),
 }
 
@@ -582,6 +582,10 @@ class ChannelLimits:
     work_in_topics: bool = True                         # General is for setup; work moves to a topic
     handoff_nudge_minutes: float = 10.0                 # a hand-off with no word from its bot: remind it, then the admin; 0 = off
     max_reply_parts: int = 4                            # a long reply is split into at most this many messages
+    #: Issue #31: the channel's reply budget, in characters (the swarm's 500-char convention).
+    #: A project may override it per topic (``projects.<key>.reply_chars``); everything else
+    #: -- General, unbound topics, the reply tickets -- uses this.
+    reply_chars: int = 500
     typing_indicator: bool = True                       # show "typing…" in the chat while a turn runs
     ack_reaction: bool = True                           # 👀 on a person's message when a turn starts
     max_attachment_mb: float = 20.0                     # incoming files larger than this are not downloaded
@@ -619,11 +623,16 @@ class ChannelLimits:
             raise ConfigError("limits.max_messages_per_minute must be a whole number, 0 for "
                               f"max_group_messages_per_minute (got {rate!r}).")
         for key in ("busy_queue_max", "max_reply_parts", "max_parallel_turns",
-                    "max_group_messages_per_minute"):
+                    "reply_chars", "max_group_messages_per_minute"):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ConfigError(f"limits.{key} must be a whole number of at least 1 "
                                   f"(got {value!r}).")
+        # Issue #31: a reply budget above one Telegram message cannot be delivered as one
+        # message, so it is refused rather than promised to the agent and then split.
+        if self.reply_chars > self.max_message_chars:
+            raise ConfigError(f"limits.reply_chars must be at most max_message_chars "
+                              f"({self.max_message_chars}); got {self.reply_chars}")
         # #29 review: a reply is split into at most MAX_REPLY_PARTS parts, and the receiver
         # refuses a part header above that. Clamping here keeps the two ends agreeing: a larger
         # configured value loses the tail to the existing truncation instead of having every
@@ -741,6 +750,9 @@ class ProjectSettings:
     cwd: str
     topics: List[Tuple[Optional[int], int]]   # (chat_id or None for home group, thread_id)
     worktrees: bool = False
+    #: Issue #31: this project's topics get this reply budget instead of ``limits.reply_chars``.
+    #: None (the default) keeps the global one, so a config without it behaves as before.
+    reply_chars: Optional[int] = None
 
 
 @dataclass
@@ -1020,6 +1032,14 @@ class AgentConfig:
                 cwd_raw = pval.get("cwd")
                 cwd = str(cwd_raw).strip() if cwd_raw is not None else ""
                 worktrees = _parse_bool(f"projects.{pkey}.worktrees", pval.get("worktrees", False))
+                reply_chars = None
+                if pval.get("reply_chars") is not None and pval.get("reply_chars") != "":
+                    reply_chars = _parse_int(f"projects.{pkey}.reply_chars",
+                                             pval.get("reply_chars"), 0, positive=True)
+                    if reply_chars > limits.max_message_chars:
+                        raise ConfigError(
+                            f"projects.{pkey}.reply_chars must be at most max_message_chars "
+                            f"({limits.max_message_chars}); got {reply_chars}")
                 raw_topics = pval.get("topics")
                 parsed_topics: List[Tuple[Optional[int], Any]] = []
                 if isinstance(raw_topics, list):
@@ -1052,6 +1072,7 @@ class AgentConfig:
                     cwd=cwd,
                     topics=parsed_topics,  # type: ignore[arg-type]
                     worktrees=bool(worktrees),
+                    reply_chars=reply_chars,
                 )
 
         github_raw = data.get("github")

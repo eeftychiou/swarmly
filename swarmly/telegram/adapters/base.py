@@ -80,6 +80,9 @@ class IncomingMessage:
     fresh_text: Optional[str] = None
     project: Optional[str] = None                  # the bound project key; None = unbound
     project_repo: Optional[str] = None             # the project's github repo (owner/name)
+    #: Issue #31: the reply budget for this turn, set by the project bound to its topic; None
+    #: means the configured default (``limits.reply_chars``, 500 unless changed).
+    reply_chars: Optional[int] = None
     # Issue #29: the channel joined the ``↪ (k/n)`` parts of a split reply before this turn, so
     # ``text`` is the whole message the sender wrote -- one message, one answer.
     reassembled: bool = False
@@ -229,6 +232,10 @@ def is_silent_reply(text: str) -> bool:
     return len(core) < 200 and bool(re.search(r"\bstay(?:ing)? silent\b", core, re.I))
 
 
+#: Issue #31: the channel's reply budget when nothing says otherwise. ``limits.reply_chars``
+#: overrides it, and ``projects.<key>.reply_chars`` overrides that for one project's topics.
+DEFAULT_REPLY_CHARS = 500
+
 _LEAD_RULES = [
     "- The transport selected this message for you. Preserve its original addressing; a message addressed to several peers also addresses you.",
     "- An addressed question, review request, routing test, or action MUST get an answer or an explicit blocker. A transport ACK only means received, never completed.",
@@ -236,13 +243,19 @@ _LEAD_RULES = [
 ]
 _TAIL_RULES = [
     "- BOTS IGNORE UNMENTIONED MESSAGES: Other bots will strictly ignore any message unless their exact @username is mentioned.",
-    "- Keep the response strictly under 500 characters.",
+    "- Keep the response strictly under {limit} characters.",
     "- For deep research, tables, or proposals, post on GitHub and refer to it here.",
     "- NO PING-PONG / NO ACK LOOPS: Stay silent ONLY for a pure acknowledgment, status confirmation or sign-off with NO question or requested action. Mixed status plus a request still requires a reply; these silence rules never cancel an action obligation.",
     "- An answer to a question you asked, a confirmation, or a peer's description of itself needs no reply unless it asks you something or hands you work.",
     f"- To stay silent, output exactly {NO_REPLY} and nothing else. Never post why you are not replying.",
     "- To take work into its own topic (separate research, a side task), reply with a first line NEW_TOPIC: <short title> and the brief below it; mention a peer in the brief to hand it over. In a topic you opened, start your final reply with REPORT_BACK: <summary> to send the summary back where the work was asked for.",
 ]
+
+
+def _tail_rules(reply_chars: Optional[int] = None) -> List[str]:
+    """The standing rules, with the reply budget this turn is held to (#31)."""
+    limit = reply_chars if reply_chars and reply_chars > 0 else DEFAULT_REPLY_CHARS
+    return [rule.format(limit=limit) if "{limit}" in rule else rule for rule in _TAIL_RULES]
 
 
 def format_channel_prompt(
@@ -256,6 +269,7 @@ def format_channel_prompt(
     project: str = "",
     role: str = "",
     card: str = "",
+    reply_chars: Optional[int] = None,
 ) -> str:
     """Frame an inbound chat message with operational rules to suppress intermediate thinking and ping-pong chatter.
 
@@ -273,7 +287,7 @@ def format_channel_prompt(
         *_LEAD_RULES,
         f"- Address the recipient clearly at the very start of your reply (e.g. '{recipient_tag}: ...').",
         *_roster_lines(mentions, maintainer),
-        *_TAIL_RULES,
+        *_tail_rules(reply_chars),
     ]
     if discussion:
         lines.append(f"- {discussion}")
@@ -291,7 +305,8 @@ def format_channel_prompt(
 
 
 def channel_rules(mentions: Optional[Dict[str, str]] = None,
-                  maintainer: Optional[str] = None, role: str = "") -> str:
+                  maintainer: Optional[str] = None, role: str = "",
+                  reply_chars: Optional[int] = None) -> str:
     """The channel's standing rules, for a system prompt: the same text on every turn, so a
     resumed session never accumulates copies of them and the prompt cache keeps them."""
     return "\n".join([
@@ -303,7 +318,7 @@ def channel_rules(mentions: Optional[Dict[str, str]] = None,
         "- Address the recipient clearly at the very start of your reply, with the @handle "
         "from the message's first line (e.g. '@name: ...').",
         *_roster_lines(mentions, maintainer),
-        *_TAIL_RULES,
+        *_tail_rules(reply_chars),
         "- When a message names a discussion, use its context_id for swarm posts about it.",
         *(["", role.strip()] if role else []),
     ])
@@ -403,10 +418,11 @@ def turn_card(message: Any) -> str:
     role = plain(getattr(message, "role_brief", None) or "", limit=160)
     where = ("this topic" if getattr(message, "context_id", None)
              else "General (setup only; real work goes to a topic)")
+    limit = getattr(message, "reply_chars", None) or DEFAULT_REPLY_CHARS
     parts = [f"reply here, in {where}",
              "hand work to a bot with a line that starts with its @username and the task "
              "(the transport also records it on the bus)",
-             "under 500 characters", f"{NO_REPLY} to stay silent"]
+             f"under {limit} characters", f"{NO_REPLY} to stay silent"]
     if role:
         parts.insert(0, f"your role: {role}; stay within it")
     return f"turn rules: {' · '.join(parts)}"

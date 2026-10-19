@@ -47,6 +47,8 @@ adapter:
 #     cwd: /home/user/your-project
 #     topics: [12, 15]
 #     worktrees: true               # optional: create isolated git worktrees per topic
+#     reply_chars: 1500             # optional: this project's topics get a longer reply budget
+#                                   # (default: limits.reply_chars, 500)
 
 # Optional: GitHub identity and notifications backstop (required when projects configured)
 # github:
@@ -59,6 +61,7 @@ adapter:
 
 limits:
   max_message_chars: 4096          # Telegram's hard limit for text messages
+  reply_chars: 500                 # the reply budget the turn rules and the sender hold agents to
   min_seconds_between_messages: 3.0     # at least 3s between sends (per topic at N>1)
   max_messages_per_minute: 18          # max 18 msg/min (per topic at N>1)
   max_group_messages_per_minute: 1     # alias

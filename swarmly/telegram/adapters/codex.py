@@ -269,7 +269,8 @@ class CodexAdapter(SubprocessAdapter):
             return None
         return channel_rules(getattr(message, "mentions", None),
                              getattr(message, "maintainer_username", None),
-                             role=self.role_text)
+                             role=self.role_text,
+                             reply_chars=getattr(message, "reply_chars", None))
 
     def add_system_rules(self, argv: List[str], rules: str) -> List[str]:
         # A JSON string is a TOML basic string, and it keeps the value on one line.
@@ -364,6 +365,7 @@ class CodexAdapter(SubprocessAdapter):
             project=project_line(message),
             role=self.role_text,
             card=turn_card(message),
+            reply_chars=getattr(message, "reply_chars", None),
         )
 
 
@@ -515,6 +517,7 @@ class CodexThreadAdapter(AgentAdapter):
             project=project_line(message),
             role=self.role_text,
             card=turn_card(message),
+            reply_chars=getattr(message, "reply_chars", None),
         )
         if message.response_instructions:
             prompt = message.response_instructions + "\n\n" + prompt

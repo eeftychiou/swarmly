@@ -39,6 +39,13 @@ All notable changes to this project are documented here. The format follows
   merges, ticks the checklist and hands out the next assignment before the turn ends, instead
   of promising to act later ("I'll ping you then"), which is how a round stalls (`#26`).
 
+- The reply budget is a setting now, not a slogan: `limits.reply_chars` (default 500) is what
+  the turn rules ask for and what a reply ticket is held to, and `projects.<key>.reply_chars`
+  gives one project's topics their own — a plan-shaped topic can ask for 1500 while the rest of
+  the swarm stays at 500. A topic with no override, and every reply ticket (it carries no
+  topic), uses the global number; a value above `max_message_chars` is refused at load. Both
+  example configs and `docs/telegram-channel.md` show it (`#31`).
+
 - The reviewer's role text asks for one review pass that lists **every** blocker, instead of
   reporting them one per round-trip, so the author can fix them all in one push. And only the
   coordinator nudges a peer that has gone quiet — once, before it reassigns or escalates;
