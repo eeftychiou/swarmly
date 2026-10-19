@@ -14,13 +14,20 @@ not do), so agents check each other instead of overlapping.
 
 | Role | What it does | Must not |
 |---|---|---|
-| `coordinator` | turns a goal into a tracking issue and small issues with acceptance criteria, assigns them, keeps status, merges PRs once approved, QA-passed and green in the same turn the last missing piece arrives, posts the round-end report in the round's topic when the tracking issue closes (`github.tracking_label`), escalates to the human | write product code, approve PRs, merge before review and QA, decide what only the human can |
+| `coordinator` | turns a goal into a tracking issue and small issues with acceptance criteria, assigns them, keeps status, is the only one who nudges a stalled peer (once, before reassigning or escalating), merges PRs once approved, QA-passed and green in the same turn the last missing piece arrives, posts the round-end report in the round's topic when the tracking issue closes (`github.tracking_label`), escalates to the human | write product code, approve PRs, merge before review and QA, decide what only the human can |
 | `developer` | implements assigned issues as tested pull requests, answers review | merge its own PR, widen scope, skip tests |
-| `reviewer` | reviews pull requests with severities and a **merge** (Approve) / **fix-first** (Request changes) verdict | push to the author's branch, approve its own work |
+| `reviewer` | reviews pull requests in one pass with every blocker listed, severities, and a **merge** (Approve) / **fix-first** (Request changes) verdict | push to the author's branch, approve its own work, report blockers one review at a time |
 | `qa-tester` | tests a PR against its acceptance criteria, reports **pass** / **fail** with reproduction steps, files bugs | fix product code, report checks it did not run |
 | `researcher` | answers technical questions with sources and a recommendation on the issue that asked | change the project's code |
 
 The full text of each is in [`swarmly/telegram/roles/`](../swarmly/telegram/roles/).
+
+Two rules hold for every role. A reviewer reads the whole diff and lists **every** blocker in
+one pass, so the author fixes them in one push instead of a round per finding. And only the
+coordinator nudges a peer that has gone quiet: it asks once, then reassigns or escalates. Every
+other role reports the stall to the coordinator rather than chasing the peer itself, so a
+stalled agent is not pinged by three bots at once.
+
 
 ## How an agent gets its role
 

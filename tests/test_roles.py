@@ -212,6 +212,49 @@ class TestTheCoordinatorActsInTheTurnThatUnblocksIt(unittest.TestCase):
                 self.assertNotIn("the turn you act in", load_role(name).instructions)
 
 
+def flat(role: str) -> str:
+    """A role's instructions, whitespace-flattened and without Markdown emphasis: the text
+    wraps, the rule is what the test is about."""
+    return " ".join(load_role(role).instructions.replace("*", "").split())
+
+
+class TestTheReviewerListsEveryBlockerInOnePass(unittest.TestCase):
+    """Issue #33: a review that reports one blocker per round-trip costs the round a push per
+    finding, so the reviewer role asks for every blocker in a single pass."""
+
+    def test_the_role_asks_for_one_pass_with_every_blocker(self):
+        instructions = flat("reviewer")
+        self.assertIn("One pass, every blocker", instructions)
+        self.assertIn("report every blocker that pass found", instructions)
+        self.assertIn("never the first one now and the rest after the next push", instructions)
+        self.assertIn("Should-fix items and nits go in the same pass", instructions)
+
+    def test_no_other_role_reviews_one_blocker_at_a_time(self):
+        for name in ("coordinator", "developer", "qa-tester", "researcher"):
+            with self.subTest(role=name):
+                self.assertNotIn("One pass, every blocker", load_role(name).instructions)
+
+
+class TestOnlyTheCoordinatorNudges(unittest.TestCase):
+    """Issue #33: one role chases a stalled peer, once, so three bots do not ping it."""
+
+    NUDGE_RULE = ("only the coordinator nudges a stalled agent, once, before it reassigns or "
+                  "escalates")
+
+    def test_the_coordinator_is_the_one_who_asks_once(self):
+        instructions = flat("coordinator")
+        self.assertIn("you ask its owner once", instructions)
+        self.assertIn("chasing a stalled peer is yours alone", instructions)
+        self.assertIn("Nobody else nudges", instructions)
+
+    def test_every_other_role_reports_the_stall_instead(self):
+        for name in ("developer", "reviewer", "qa-tester", "researcher"):
+            with self.subTest(role=name):
+                instructions = flat(name)
+                self.assertIn(self.NUDGE_RULE, instructions)
+                self.assertIn("report the stall to it instead", instructions)
+
+
 class TestBuiltinRolesNameTheMerger(unittest.TestCase):
     def test_the_coordinator_merges_and_nobody_else_does(self):
         self.assertIn("You merge", load_role("coordinator").instructions)
