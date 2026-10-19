@@ -388,6 +388,14 @@ class AgentChannel:
             if isinstance(pair, list) and len(pair) == 2 and all(
                     isinstance(v, int) and not isinstance(v, bool) for v in pair):
                 self._tg_admitted.append((pair[0], pair[1]))
+        # (message id, author) of the same messages: a mirror whose topic token this bot cannot
+        # resolve (no shared secret) is still recognised by its sender and message id (round 2
+        # export: every hand-off was answered twice, once from Telegram and once from the bus).
+        self._tg_admitted_by: deque = deque(maxlen=500)
+        for pair in load_state(self._admitted_path, "handled Telegram messages").get("by", []):
+            if isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], int) \
+                    and not isinstance(pair[0], bool) and isinstance(pair[1], str):
+                self._tg_admitted_by.append((pair[0], pair[1]))
         self._mirror_tasks: Set[asyncio.Task] = set()
         # Hand-offs this bot made that the receiving bot has not answered yet:
         # (chat, thread, peer alias) -> {"at", "message_id", "nudged"}.
@@ -453,6 +461,17 @@ class AgentChannel:
         self._pause_where: Tuple[Optional[int], Optional[int]] = (None, None)
         self._queue_full_noticed = float("-inf")
         self._ref_topics: Dict[str, Tuple[int, int]] = {}     # "#12" -> the topic about it
+        # Kept across restarts (round 2 export: two restarts emptied it, and #34 and #37 each
+        # got a new topic though one was already about them). "#12" -> wall-clock last seen.
+        self._ref_seen: Dict[str, float] = {}
+        self._refs_path = _state_file(config, "topic-refs")
+        now = time.time()
+        for ref, item in load_state(self._refs_path, "issue topics").get("refs", {}).items():
+            if isinstance(ref, str) and isinstance(item, list) and len(item) == 3 \
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                            for v in item) and now - item[2] < REF_TOPIC_SECONDS:
+                self._ref_topics[ref] = (int(item[0]), int(item[1]))
+                self._ref_seen[ref] = float(item[2])
         self._topics_reported: Set[Tuple[int, Optional[int]]] = set()   # sent REPORT_BACK
         self._report_asked: Set[Tuple[int, Optional[int]]] = set()      # REPORT_NOTE sent
         self._self_tasks: Set[asyncio.Task] = set()
@@ -1898,7 +1917,11 @@ class AgentChannel:
         logger.info("routing decision: respond=%s (reason: %s)", decision, reason)
         if decision and event.message_id is not None:
             self._tg_admitted.append((int(event.chat_id), int(event.message_id)))
-            save_state(self._admitted_path, {"ids": [list(p) for p in self._tg_admitted]},
+            if event.author_username:
+                self._tg_admitted_by.append((int(event.message_id),
+                                             str(event.author_username).lstrip("@").lower()))
+            save_state(self._admitted_path, {"ids": [list(p) for p in self._tg_admitted],
+                                             "by": [list(p) for p in self._tg_admitted_by]},
                        "handled Telegram messages")
         if not decision:
             self.stats.ignored += 1
@@ -2758,7 +2781,10 @@ class AgentChannel:
             known = self._topic_for_refs(f"{event.text or ''}\n{body}")
             if known is not None:
                 return await self._post_in_known_topic(event, body, known)
-            if not event.author_is_bot or hands_off:
+            if (not event.author_is_bot or hands_off) and not _is_bus_echo(event):
+                # A bus echo is a step in work that is already going on somewhere: a fresh
+                # topic for the answer to it starts that work over without its context
+                # (round 2 export: three topics opened this way).
                 # A person's request is a new work item: it gets its own topic, and so does a
                 # hand-off (the export of a live test showed short hand-offs staying in
                 # General). Otherwise, between bots a topic is opened on purpose (NEW_TOPIC),
@@ -2872,15 +2898,51 @@ class AgentChannel:
 
     def _learn_topic_refs(self, chat_id: int, thread_id: int, text: str) -> None:
         """Remember which topic first talked about each issue or PR (any bot's topic: every
-        transport sees the group), so later work on it goes there, not to a new topic."""
+        transport sees the group), so later work on it goes there, not to a new topic.
+        An entry not seen for REF_TOPIC_SECONDS is let go: the item has moved on."""
+        now = time.time()
+        changed = False
+        topic = (int(chat_id), int(thread_id))
         for ref in issue_refs(text):
-            self._ref_topics.setdefault(ref, (chat_id, thread_id))
+            known = self._ref_topics.get(ref)
+            if known is None or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS:
+                self._ref_topics[ref] = topic
+                changed = True
+            elif known != topic:
+                continue
+            elif now - self._ref_seen.get(ref, now) >= 3600:
+                changed = True                  # on disk at most hourly per item
+            self._ref_seen[ref] = now
+        if changed:
+            self._save_ref_topics()
 
     def _topic_for_refs(self, text: str) -> Optional[Tuple[int, int]]:
+        now = time.time()
         for ref in issue_refs(text):
-            if ref in self._ref_topics:
+            if ref in self._ref_topics \
+                    and now - self._ref_seen.get(ref, now) < REF_TOPIC_SECONDS:
                 return self._ref_topics[ref]
         return None
+
+    def topic_for_text(self, text: str) -> Optional[Tuple[int, int]]:
+        """The topic already about an issue or PR *text* names, if any (poll.py: a bus reply
+        is posted there rather than in General)."""
+        return self._topic_for_refs(text)
+
+    def _forget_topic_refs(self, chat_id: Optional[int], thread_id: Optional[int]) -> None:
+        """A topic was closed or deleted: work on its items no longer goes there."""
+        gone = [ref for ref, topic in self._ref_topics.items()
+                if topic == (chat_id, thread_id)]
+        for ref in gone:
+            del self._ref_topics[ref]
+            self._ref_seen.pop(ref, None)
+        if gone:
+            self._save_ref_topics()
+
+    def _save_ref_topics(self) -> None:
+        save_state(self._refs_path, {"refs": {
+            ref: [chat, thread, self._ref_seen.get(ref, time.time())]
+            for ref, (chat, thread) in self._ref_topics.items()}}, "issue topics")
 
     async def _post_in_known_topic(self, event: ChannelEvent, body: str,
                                    topic: Tuple[int, int]) -> Any:
@@ -2911,10 +2973,21 @@ class AgentChannel:
         ``moved``: the brief is this agent's reply to work started in General, posted in the
         new topic instead; it already is the work, so nothing more is run."""
         home = self.config.identity.home_channel_id
+        if not moved:
+            # A topic already about the same issue or PR takes the work (round 2 export:
+            # "PR #37 re-review" was opened while a topic about #37 existed).
+            known = self._topic_for_refs(f"{title}\n{brief}")
+            if known is not None:
+                return await self._continue_in_topic(event, brief, known)
         now = self._clock()
         self._topics_opened = [t for t in self._topics_opened if now - t < 3600]
         reason = ""
         thread_id: Optional[int] = None
+        refs = issue_refs(f"{title}\n{event.text or ''}\n{brief}" if moved else title)
+        if moved and refs and refs[0] not in title:
+            # Named after the item, not the first words of the message (round 2 export:
+            # "Copy — QA ready for 34").
+            title = f"{refs[0]} {title}"
         name = topic_name(self.config.identity.alias, title)
         if len(self._topics_opened) >= MAX_TOPICS_PER_HOUR:
             reason = f"{MAX_TOPICS_PER_HOUR} topics opened in the last hour already"
@@ -2967,6 +3040,26 @@ class AgentChannel:
             # Not addressed to a peer: the brief is this agent's own task, in the new topic.
             # A peer named further down (to confirm scope, say) still sees the brief.
             self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", home, thread_id, name)
+        return sent
+
+    async def _continue_in_topic(self, event: ChannelEvent, brief: str,
+                                 topic: Tuple[int, int]) -> Any:
+        """NEW_TOPIC for an item a topic is already about: the brief goes there instead."""
+        chat_id, thread_id = topic
+        here = (int(event.chat_id), event.thread_id) == (chat_id, thread_id)
+        logger.info("not opening a topic: topic %s is already about the same item", thread_id)
+        sent = await self.send(brief, chat_id=chat_id, thread_id=thread_id)
+        self._log_topic(chat_id, thread_id, self.config.identity.alias, brief,
+                        self.last_first_message_id)
+        self._mirror_handoffs(brief, chat_id, thread_id, self.last_first_message_id,
+                              asker=self._asker(event))
+        if not here:
+            sent = await self.send(
+                f"↪ continued in {topic_link(chat_id, thread_id)}, already about this item",
+                chat_id=event.chat_id, thread_id=event.thread_id)
+        if not hands_over(brief, self._peer_handle()):
+            self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", chat_id, thread_id,
+                               self.topics.name(chat_id, thread_id))
         return sent
 
     def assigned_peers(self, text: str) -> List[str]:
@@ -3158,7 +3251,7 @@ class AgentChannel:
         """The peer bot a reply answers, if a bot asked."""
         return event.author_username if event.author_is_bot else None
 
-    def took_telegram_copy(self, ref: Any) -> bool:
+    def took_telegram_copy(self, ref: Any, sender: Optional[str] = None) -> bool:
         """Whether this bot already ran (or queued) the Telegram message a bus mirror names.
 
         Issue #22: a mirror names a topic token rather than a chat id. An un-resolvable token
@@ -3174,6 +3267,18 @@ class AgentChannel:
         except (KeyError, TypeError, ValueError):
             return False
         token = ref.get("topic")
+        if sender and "chat" not in ref and (
+                not isinstance(token, str) or not token or token.startswith("topic:hmac-")):
+            # No token this bot can resolve (no shared secret): the message the mirror names
+            # was taken here if this bot took that message id from the mirror's sender.
+            # Message ids repeat only across chats, and the same bot posting the same id in
+            # two chats this bot also reads, both within the ledger, is not a real case.
+            target = self.config.peers.get(sender)
+            if target is None:
+                target = next((t for a, t in self.config.peers.items()
+                               if a.lower() == sender.lower()), sender)
+            handle = str(target).lstrip("@").lower()
+            return (message_id, handle) in self._tg_admitted_by
         if isinstance(token, str) and token:
             from swarmly.telegram.redact import resolve_topic_token
             import os
@@ -3644,6 +3749,7 @@ class AgentChannel:
                            "; posting in General" if self.reroute_gone_topics else "")
             self.stats.errors += 1      # not last_error: the reply still lands, no blocker
             self._gone_topics.add((destination, thread_id))
+            self._forget_topic_refs(destination, thread_id)
             if self._turn_slots is not None or not self.reroute_gone_topics:
                 raise
         return await self._post_in_general(payload, entities, plain, destination, thread_id,
@@ -4077,6 +4183,16 @@ ATTACHMENTS_DIRNAME = ".a2a-attachments"
 GROUP_MESSAGES_PER_MINUTE = 18
 #: How long a bot left waiting by a person's multi-bot message expects the hand-off.
 HANDOFF_NOTE_SECONDS = 1800.0
+# How long a topic stays the place for an issue or PR nobody mentions there any more.
+REF_TOPIC_SECONDS = 7 * 24 * 3600.0
+
+
+def _is_bus_echo(event: "ChannelEvent") -> bool:
+    """A peer's answer to bus mail, as poll.py posts it ("[gitbus ← sender] ...")."""
+    return bool(event.author_is_bot) and _BUS_ECHO.match(event.text or "") is not None
+
+
+_BUS_ECHO = re.compile(r"^\s*(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\]\s*)?\[gitbus \u2190 ")
 #: Progress a topic's bot-turn cap resets on (see ``_note_progress``).
 _COMMIT_LINK = re.compile(r"github\.com/[\w.-]+/[\w.-]+/commit/([0-9a-f]{7,40})")
 #: Run by the bot that handed work to a peer that never answered (check_stalled_handoffs).

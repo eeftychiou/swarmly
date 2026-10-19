@@ -1130,8 +1130,17 @@ def _bus_incoming(text: str, sender: str, cfg: Any, token: str) -> IncomingMessa
     )
 
 
+def _took(took: Callable[..., Any], ref: dict, sender: str) -> bool:
+    """``took_telegram_copy`` with the mirror's sender when the channel takes it."""
+    try:
+        return bool(took(ref, sender=sender))
+    except TypeError:                                  # an older or test channel
+        return bool(took(ref))
+
+
 async def _echo_reply(channel: Any, sender: str, reply: Any,
-                      outcome: PollOutcome, thread_id: Optional[int] = None) -> None:
+                      outcome: PollOutcome, thread_id: Optional[int] = None,
+                      about: str = "") -> None:
     """Best-effort Telegram echo of an adapter reply (transport up only).
 
     Never retried and never queued for reconnect (issue #59): a failure just
@@ -1140,13 +1149,27 @@ async def _echo_reply(channel: Any, sender: str, reply: Any,
     if not (reply is not None and getattr(reply, "text", "")) or is_silent_reply(reply.text):
         return
     echo_text = f"[gitbus \u2190 {sender}] {reply.text}"
+    chat_id: Optional[int] = None
+    find = getattr(channel, "topic_for_text", None)
+    if thread_id is None and callable(find):
+        # The mirror names no topic (no shared secret): the topic already about the same
+        # issue or PR, never General (round 2 export: these echoes all landed in General).
+        try:
+            known = find(f"{about}\n{reply.text}")
+        except Exception:                              # noqa: BLE001 - General then
+            known = None
+        if known is not None:
+            chat_id, thread_id = known
     if getattr(channel, "_sender", None) is None:
         if getattr(channel, "bot", None) is not None:
             # The running transport: post like any other reply. (Before, only an injected
             # test sender was used, so a live agent's answer to bus mail was dropped.)
             try:
                 # A mirrored hand-off is answered in the topic it came from.
-                await channel.send(echo_text, thread_id=thread_id)
+                if chat_id is None:
+                    await channel.send(echo_text, thread_id=thread_id)
+                else:
+                    await channel.send(echo_text, chat_id=chat_id, thread_id=thread_id)
                 outcome.replies_posted += 1
             except Exception:                          # noqa: BLE001
                 outcome.telegram_ok = False
@@ -1563,7 +1586,7 @@ async def bus_poll_once(channel: Any, *,
             payload_dict = getattr(message, "payload", None)
             tg_ref = payload_dict.get("telegram") if isinstance(payload_dict, dict) else None
             took = getattr(channel, "took_telegram_copy", None)
-            if isinstance(tg_ref, dict) and callable(took) and took(tg_ref):
+            if isinstance(tg_ref, dict) and callable(took) and _took(took, tg_ref, sender):
                 logger.info("poll: %s mirrors Telegram message %s, already handled here",
                             message_id, tg_ref.get("message_id"))
                 outcome.machine_events.append(message_id)
@@ -1624,7 +1647,7 @@ async def bus_poll_once(channel: Any, *,
             if not is_frozen_now:
                 await _echo_reply(channel, sender, reply, outcome,
                                   thread_id=tg_ref.get("thread") if isinstance(tg_ref, dict)
-                                  else None)
+                                  else None, about=text)
 
         # After the loop, refresh the freeze flag in case RESUME arrived.
         is_frozen_now = bool(getattr(channel, "_frozen", False))
@@ -1715,7 +1738,7 @@ async def bus_poll_once(channel: Any, *,
                     outcome.delivery_verified.append(message_id)
                 elif verified is False:
                     outcome.delivery_unknown.append(message_id)
-                await _echo_reply(channel, sender, reply, outcome)
+                await _echo_reply(channel, sender, reply, outcome, about=text)
             deferred = still_deferred
 
         _save_seen(repo, alias, seen, since=since)

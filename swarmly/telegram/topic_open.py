@@ -66,11 +66,11 @@ def strip_report_marker(body: str) -> str:
     return re.sub(r"(?im)^(\s*)\**REPORT_BACK:\**\s*", r"\1", body or "", count=1)
 
 
-_REF = re.compile(r"(?:(?<![\w/])#|/(?:pull|issues)/)(\d{1,7})\b")
+_REF = re.compile(r"(?:(?<![\w/])#|/(?:pull|issues)/|\bPR ?#?)(\d{1,7})\b")
 
 
 def issue_refs(text: str) -> list:
-    """The issue and PR numbers a message is about ("#12", ".../pull/12"), as "#12"."""
+    """The issue and PR numbers a message is about ("#12", ".../pull/12", "PR 12"), as "#12"."""
     return list(dict.fromkeys(f"#{n}" for n in _REF.findall(text or "")))
 
 

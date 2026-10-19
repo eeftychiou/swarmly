@@ -132,8 +132,10 @@ public_redactions:                       # optional: literal -> replacement
   `topic:<project>:<chat tag>:<thread>`, instead of a chat id; each agent resolves it through
   its own `projects:`. The chat tag is an HMAC of the chat id under the swarm's shared
   secret, so a peer bound to another chat of the same project cannot read the token as its
-  own; **without that secret a project token is not sent at all**, and every peer runs the
-  mirror. A token written without the chat tag (an older mirror) cannot name a chat either,
+  own; **without that secret a project token is not sent at all**. A peer then still skips
+  the mirror when it took a Telegram message with the same id from the mirror's sender (a
+  bot posting the same message id in two chats this peer reads is not a real case), and runs
+  it otherwise. A token written without the chat tag (an older mirror) cannot name a chat either,
   so it is never treated as taken: it is re-run, not trusted to someone else's topic. An unbound topic falls back to an HMAC token from
   `SWARMLY_REDACTION_SECRET`, which peers cannot resolve — they then run the mirrored turn as
   well: **processed twice, never lost**. A token that resolves to more than one of this
@@ -604,10 +606,15 @@ happens.
 default), every turn in the home group's General is told that General is for setup and quick
 questions, and that real work goes to its own topic (`NEW_TOPIC:`, below). The transport also
 enforces it: a reply in General longer than 800 characters (400 when it answers a peer bot)
-goes to the topic already about the same issue or PR (`#12`, `.../pull/12`) when there is
-one. Otherwise a person's request gets a new topic named after it, with the request quoted
-there and a "↪ moved this to topic" link in General; between bots no topic is opened as a
-reaction (they open one on purpose with `NEW_TOPIC:`). Short answers stay in General. A
+goes to the topic already about the same issue or PR (`#12`, `PR 12`, `.../pull/12`) when
+there is one. Otherwise a person's request gets a new topic named after it (leading with the
+issue or PR it names), with the request quoted there and a "↪ moved this to topic" link in
+General; between bots no topic is opened as a reaction (they open one on purpose with
+`NEW_TOPIC:`), and an answer to a `[gitbus ← …]` echo never opens one. Which topic is about
+which issue or PR is kept in `topic-refs-<alias>.json` beside the other state, so it survives
+a restart; an item nobody mentions for a week, or whose topic is closed, is let go. An agent's
+answer to bus mail whose hand-off names no topic is posted in the topic about its issue or PR
+when there is one, else in General. Short answers stay in General. A
 summary sent back with `REPORT_BACK:` has its @mentions defused, and a peer bot's message
 that names this bot only inside a list of three or more bots is not taken as addressing it. Set it to
 `false` to keep everything in General (a group without topics falls back to that by itself).
@@ -616,7 +623,9 @@ that names this bot only inside a list of three or more bots is not taken as add
 topic, for example to research something in a separate context and report back. It replies
 with a first line `NEW_TOPIC: <title>` and the brief below it. The bot opens a topic named
 `<alias>: <title>` in the home group, posts the brief there, and links the topic where the
-work was asked for. A message that asks for a topic in plain words ("open a new topic to
+work was asked for. When a topic is already about an issue or PR the title or brief names,
+no topic is opened: the brief is posted in that topic instead, with a "↪ continued in" link.
+A message that asks for a topic in plain words ("open a new topic to
 research X") reminds the agent of this format. A brief that opens by addressing a peer hands
 the work over; any other brief becomes the agent's own task, run at once in the new topic (a
 peer named further down still sees it). A final reply in that topic that starts with
