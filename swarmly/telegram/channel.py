@@ -55,6 +55,7 @@ from swarmly.telegram.commands import (
 from swarmly.telegram.config import EFFORT_LEVELS, AgentConfig, effort_problem, model_problem
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.projects import ProjectRouter
+from swarmly.telegram.model_list import available_models, cached_models, format_list
 from swarmly.telegram.redact import Redactor
 from swarmly.telegram.topic_open import (GENERAL_PEER_REPLY_CHARS, GENERAL_REPLY_CHARS,
                                          MAX_TOPICS_PER_HOUR, REPORT_NOTE, SELF_TASK_NOTE,
@@ -1169,7 +1170,8 @@ class AgentChannel:
             source = ("/model" if key in self._models
                       else "adapter.model" if adapter.model else "the CLI's default")
             return (f"{alias} runs {current or 'its CLI default model'} here ({source}). "
-                    f"The admin can switch it with /model@{self.config.identity.name} <name>.")
+                    f"The admin can switch it with /model@{self.config.identity.name} <name>."
+                    f"{self._model_choices()}")
         if len(args) > 1:
             return f"{alias}: /model takes one model name (or default)."
         if not self.config.is_admin(event.author_id):
@@ -1190,6 +1192,35 @@ class AgentChannel:
         save_state(self._models_path, self._models, "model choices")
         logger.info("/model: %s now runs %s in %s", alias, name, key)
         return f"{alias} runs {name} here from the next turn; the conversation carries on."
+
+    def _model_choices(self) -> str:
+        """The models /model can switch to, as the end of the bare /model answer."""
+        adapter_type = self.config.adapter.type
+        names = cached_models(adapter_type)
+        if names:
+            return f"\n\nModels it can switch to:\n{format_list(names)}"
+        if adapter_type == "reasonix":
+            return ("\n\nIt switches between the providers in its reasonix.toml, e.g. "
+                    "deepseek-flash or deepseek-pro.")
+        return "\n\n(Its CLI did not list its models just now.)"
+
+    async def _look_up_models(self, event: ChannelEvent) -> None:
+        """Before a bare /model for this bot is answered: ask the CLI which models it has
+        (agy models, codex app-server), unless a recent answer is kept."""
+        parsed = parse_command(event.text or "")
+        if not parsed or parsed[0] != "model" or command_args(event.text or ""):
+            return
+        target = parsed[1]
+        if target and target.lstrip("@").lower() \
+                != self.config.identity.name.lstrip("@").lower():
+            return
+        if not self.config.adapter.model_switchable:
+            return
+        try:
+            env = self.adapter.environment()
+        except Exception:                              # noqa: BLE001 - the CLI's own env
+            env = None
+        await available_models(self.config.adapter.type, env=env)
 
     def _direct_chat(self, event: ChannelEvent) -> bool:
         """The admin's private chat with this bot, where a bare command can only mean this bot.
@@ -1846,6 +1877,8 @@ class AgentChannel:
                                    allow_when_frozen=True)
 
         if self._frozen or self._pause_pending:
+            if self._may_start_turns(event):
+                await self._look_up_models(event)
             command_reply = (self._handle_command(event)
                              if self._may_start_turns(event) else None)
             if command_reply is not None:
@@ -1886,6 +1919,7 @@ class AgentChannel:
                                    allow_when_frozen=True)
 
         # §6: /ping /status /diag are transport-level liveness — answered without a runtime turn.
+        await self._look_up_models(event)
         command_reply = self._handle_command(event)
         if command_reply is not None:
             self.stats.handled += 1
