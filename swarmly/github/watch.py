@@ -456,15 +456,21 @@ class GitHubWatcher:
         self._router: Optional[ProjectRouter] = None
 
     def _is_coordinator(self) -> bool:
-        """Only the coordinator posts the round report; a developer's watcher stays quiet."""
-        if self.channel is not None and hasattr(self.channel, "is_coordinator"):
-            try:
-                res = self.channel.is_coordinator()
-                if isinstance(res, bool):
-                    return res
-            except Exception:
-                pass
-        return (self.config.identity.role or "").strip().lower() == "coordinator"
+        """Only the coordinator posts the round report or handles notifications (#83).
+
+        The answer comes from the bus lease, through the channel's one gate, and from nowhere
+        else: falling back to the configured role is how a returning coordinator keeps polling
+        beside the acting one while both read the same shared GitHub login. No authority is a
+        peer, and a peer stays quiet.
+        """
+        if self.channel is None or not hasattr(self.channel, "is_coordinator"):
+            return False
+        try:
+            return bool(self.channel.is_coordinator())
+        except Exception:                              # noqa: BLE001 - no answer is not authority
+            logger.warning("github: the coordinator gate could not answer; staying quiet",
+                           exc_info=True)
+            return False
 
     async def _deliver(self, project: Optional[ProjectSettings], incoming: IncomingMessage,
                        chat_id: int, thread_id: Optional[int],

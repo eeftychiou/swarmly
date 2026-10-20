@@ -258,8 +258,19 @@ class LeaseStore:
         reader = getattr(transport, "read_at_ref", None)
         ranker = getattr(transport, "arrival_rank", None)
 
+        # B4 (#93): only the claims at the highest term can win. A lease never goes back a term
+        # and a holder's renewals stay at its term, so on a bus with hundreds of claims the fold
+        # reads the handful at the top rather than one file (plus two git calls for the rank) per
+        # claim ever written. The caches above stay: this trims what they are asked about.
+        named = [(_CLAIM.match(name), name) for name in names
+                 if name.endswith(".json") and "/" not in name and _CLAIM.match(name) is not None]
+        if not named:
+            return []
+        top_term = max(int(match.group("term")) for match, _name in named)
+        top_names = [name for match, name in named if int(match.group("term")) == top_term]
+
         claims_list: List[LeaseClaim] = []
-        for name in names:
+        for name in top_names:
             if not name.endswith(".json") or "/" in name:
                 continue
             match = _CLAIM.match(name)

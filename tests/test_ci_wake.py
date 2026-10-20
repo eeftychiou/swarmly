@@ -87,6 +87,9 @@ def fake_channel() -> tuple:
     channel.adapter = adapter
     channel.send = AsyncMock()
     channel.has_recent_ref.return_value = False
+    # #83: the coordinator gate is the bus lease, asked through the channel. These tests are
+    # about CI wakes, not the round report, so the lease says "peer" here.
+    channel.is_coordinator.return_value = False
     return channel, adapter
 
 

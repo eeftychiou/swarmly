@@ -570,3 +570,63 @@ class TestSuccessionOnExpiry(unittest.TestCase):
             c3 = reader.claims()
             self.assertEqual(len(c3), 1)
             self.assertEqual(calls["list_at_ref"], 2)
+
+
+class TestFoldCostAndPolling(unittest.TestCase):
+    """#93 B4 and the single-holder rule: cheap folds, and one poller.
+
+    Old terms can never win -- a lease does not go back a term -- so the fold must not read them,
+    and a bot whose lease says no must not poll GitHub.
+    """
+
+    def test_only_the_top_term_is_read(self):
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / ".agents" / "leases"
+            folder.mkdir(parents=True)
+            # 30 old claims, and the current term's one.
+            for index in range(30):
+                (folder / f"{index + 1:06d}-claude-{index:08d}.json").write_text(json.dumps(
+                    {"term": index + 1, "alias": "Claude", "expires_at": 1.0}), encoding="utf-8")
+            (folder / "000031-antigravity-aaaaaaa1.json").write_text(json.dumps(
+                {"term": 31, "alias": "Antigravity", "expires_at": 9999.0}), encoding="utf-8")
+            reads = []
+
+            class Counting(_Bus):
+                def read_at_ref(self, relpath):
+                    reads.append(relpath)
+                    return super().read_at_ref(relpath)
+
+            state = ls.LeaseStore("Claude", transport=Counting(tmp), root=Path(tmp),
+                                  clock=lambda: 1000.0).state(now=1000.0)
+            self.assertEqual((state.term, state.holder), (31, "Antigravity"))
+            self.assertEqual(len(reads), 1, f"read {len(reads)} claims; only the top term matters")
+
+    def test_a_bot_without_the_lease_does_not_poll_github(self):
+        from swarmly.github.watch import GitHubWatcher
+        from tests.test_github_watch import make_test_config
+        from unittest.mock import AsyncMock, MagicMock
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        channel = MagicMock()
+        channel.is_coordinator.return_value = False          # the lease says: peer
+        channel.send = AsyncMock()
+        client = MagicMock()
+        client.notifications.return_value = []
+        watcher = GitHubWatcher(make_test_config(tmp.name), client=client,
+                                state_path=Path(tmp.name) / "s.json", channel=channel)
+        self.assertFalse(watcher._is_coordinator())
+        client.notifications.assert_not_called()
+
+    def test_no_channel_means_no_authority(self):
+        from unittest.mock import MagicMock
+        from swarmly.github.watch import GitHubWatcher
+        from tests.test_github_watch import make_test_config
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        watcher = GitHubWatcher(make_test_config(tmp.name, role="coordinator"), client=MagicMock(),
+                                state_path=Path(tmp.name) / "s.json", channel=None)
+        # A configured coordinator with no lease to ask is a peer, not a poller: the fallback to
+        # the configured role is how a stale coordinator keeps polling beside the acting one.
+        self.assertFalse(watcher._is_coordinator())
