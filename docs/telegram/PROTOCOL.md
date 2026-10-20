@@ -395,7 +395,14 @@ alias does. The other claim is reported in `conflicts` as `holder`.
 **Writing is not holding.** After a write, the store re-reads and compares the fold's holder with
 the writer: a bot that wrote a claim it did not win gets `RoundFenced`, so a stale coordinator (a
 configured role that outlived its term) cannot become a second writer of a round another bot holds,
-and the refusal is visible in its reply. Until #83 lands the lease, the term only ever comes from the bus, which is why a bot
+and the refusal is visible in its reply.
+
+**A first claim needs authority.** The write that *creates* a round cannot be fenced against a
+holder, because there is none yet. It carries an authority: the alias the swarm names as its
+coordinator (`source=membership` today; #83's lease becomes the source, not the rule). A bot that
+is configured as coordinator but is not the one the swarm names gets `RoundUnauthorised`, and so
+does a bot that knows of no coordinator at all — the claim is never made on a guess. Nothing is
+written in that case, so an unauthorised bot cannot take a round simply by writing first. Until #83 lands the lease, the term only ever comes from the bus, which is why a bot
 whose bus checkout is broken cannot write round state at all.
 
 **All segments unreadable is `unreadable`,** not an empty round: no item, no owner and no verdict

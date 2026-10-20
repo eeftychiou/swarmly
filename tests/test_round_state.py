@@ -155,7 +155,8 @@ class TestStore(unittest.TestCase):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.store = rs.RoundStore(None, root=self.root, alias="Claude")
+        self.store = rs.RoundStore(None, root=self.root, alias="Claude",
+                                   authority=rs.Authority(alias="Claude"))
 
     def test_writes_are_append_only(self):
         first = self.store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
@@ -313,7 +314,7 @@ class TestUnchanged(unittest.TestCase):
 
     def test_the_same_state_twice_writes_one_segment(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             update = {"round": "repo#86", "writer": "Claude", "items": {"86": {"owner": "A"}}}
             first = store.append(rs.RoundUpdate(**update))
             again = store.append(rs.RoundUpdate(**update))
@@ -322,7 +323,7 @@ class TestUnchanged(unittest.TestCase):
 
     def test_a_changed_field_is_written(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                         items={"86": {"owner": "A"}}))
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
@@ -370,7 +371,7 @@ class TestBusReadSemantics(unittest.TestCase):
 
     def test_an_unreadable_ref_falls_back_to_the_checkout_and_says_so(self):
         with TemporaryDirectory() as tmp:
-            local = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            local = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             local.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                         items={"86": {"owner": "DeepSeek"}}))
             store = rs.RoundStore(_RefTransport(readable=False), root=Path(tmp))
@@ -382,7 +383,7 @@ class TestBusReadSemantics(unittest.TestCase):
 
     def test_a_segment_the_ref_does_not_have_yet_is_local_not_bus_state(self):
         with TemporaryDirectory() as tmp:
-            local = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            local = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             local.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                         items={"86": {"owner": "DeepSeek"}}))
             store = rs.RoundStore(_RefTransport(), root=Path(tmp))
@@ -412,7 +413,7 @@ class TestWriteFencing(unittest.TestCase):
 
     def test_two_concurrent_disjoint_patches_both_survive(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                         items={"86": {"owner": "DeepSeek"}}))
             base = store.load("repo#86").seq
@@ -429,7 +430,7 @@ class TestWriteFencing(unittest.TestCase):
 
     def test_two_concurrent_writes_to_one_field_are_reported_not_silently_resolved(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude"))
             base = store.load("repo#86").seq
             for writer, owner in (("Claude", "DeepSeek"), ("Antigravity", "Reasonix")):
@@ -451,7 +452,7 @@ class TestWriteFencing(unittest.TestCase):
 
     def test_a_second_bot_cannot_write_a_held_round_at_the_same_term(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                         items={"86": {"owner": "DeepSeek"}}), holder="Claude")
             with self.assertRaises(rs.RoundFenced):
@@ -462,9 +463,9 @@ class TestWriteFencing(unittest.TestCase):
 
     def test_a_later_term_may_take_the_round_over(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Antigravity")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Antigravity", authority=rs.Authority(alias="Antigravity"))
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude", term=1),
-                         holder="Claude")
+                         holder="Claude", authority=rs.Authority(alias="Claude"))
             store.append(rs.RoundUpdate(round="repo#86", writer="Antigravity", term=2),
                          holder="Antigravity")
             state = store.load("repo#86")
@@ -508,7 +509,7 @@ class TestDamagedSegments(unittest.TestCase):
             folder.mkdir(parents=True)
             (folder / "000000-000001-claude-a.json").write_text("{not json", encoding="utf-8")
             (folder / "000000-000002-claude-b.json").write_text("[]", encoding="utf-8")
-            store = rs.RoundStore(None, root=Path(tmp))
+            store = rs.RoundStore(None, root=Path(tmp), authority=rs.Authority(alias="Claude"))
             state = store.load("repo#86")
             self.assertEqual(state.status, "unreadable")
             self.assertIn("could not be read", state.reason)
@@ -516,7 +517,7 @@ class TestDamagedSegments(unittest.TestCase):
 
     def test_one_damaged_segment_among_good_ones_only_marks_the_state_stale(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                         items={"86": {"owner": "DeepSeek"}}))
             folder = store.directory("repo#86")
@@ -604,7 +605,7 @@ class TestLocalAndRefUnion(unittest.TestCase):
                            "items": {"86": {"owner": "DeepSeek"}}})
         files = {".agents/rounds/repo#86/000000-000001-claude-a.json": good}
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(_RefTransport(files), root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(_RefTransport(files), root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             folder = store.directory("repo#86")
             folder.mkdir(parents=True)
             (folder / "000000-000002-claude-b.json").write_text(
@@ -619,10 +620,10 @@ class TestLocalAndRefUnion(unittest.TestCase):
 
     def test_a_write_is_refused_against_a_checkout_only_state(self):
         with TemporaryDirectory() as tmp:
-            local = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            local = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             local.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                         items={"86": {"owner": "DeepSeek"}}))
-            store = rs.RoundStore(_RefTransport(readable=False), root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(_RefTransport(readable=False), root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             with self.assertRaises(rs.RoundStateError):
                 store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                             items={"86": {"pr": 89}}),
@@ -634,7 +635,7 @@ class TestClaimRace(unittest.TestCase):
 
     def test_two_simultaneous_first_writes_leave_one_deterministic_holder(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             folder = store.directory("repo#86")
             folder.mkdir(parents=True)
             for writer in ("Claude", "Antigravity"):
@@ -651,7 +652,7 @@ class TestClaimRace(unittest.TestCase):
 
     def test_a_no_op_from_another_bot_returns_instead_of_raising(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                         items={"86": {"owner": "DeepSeek"}}), holder="Claude")
             # Same content from another bot: nothing to write, and no fence error.
@@ -671,7 +672,7 @@ class TestConflictRecovery(unittest.TestCase):
 
     def test_a_conflict_is_settled_by_a_later_write(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude"), holder="Claude")
             base = store.load("repo#86").seq
             for writer, owner in (("Claude", "DeepSeek"), ("Claude2", "Reasonix")):
@@ -693,7 +694,7 @@ class TestConflictRecovery(unittest.TestCase):
 
     def test_a_claim_race_is_settled_by_the_holders_next_write(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Antigravity")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Antigravity", authority=rs.Authority(alias="Antigravity"))
             folder = store.directory("repo#86")
             folder.mkdir(parents=True)
             for writer in ("Claude", "Antigravity"):
@@ -719,13 +720,13 @@ class TestClaimIsNotOwnership(unittest.TestCase):
 
     def test_a_second_claimant_is_fenced_at_write_time(self):
         with TemporaryDirectory() as tmp:
-            winner = rs.RoundStore(None, root=Path(tmp), alias="Antigravity")
+            winner = rs.RoundStore(None, root=Path(tmp), alias="Antigravity", authority=rs.Authority(alias="Antigravity"))
             winner.append(rs.RoundUpdate(round="repo#86", writer="Antigravity",
                                          items={"86": {"owner": "DeepSeek"}}),
                           holder="Antigravity")
             # A stale, configured coordinator tries the same round: it loses the fold, so its
             # write is refused instead of silently becoming a second writer.
-            stale = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            stale = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             with self.assertRaises(rs.RoundFenced):
                 stale.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                             items={"86": {"owner": "Claude"}}),
@@ -734,7 +735,7 @@ class TestClaimIsNotOwnership(unittest.TestCase):
 
     def test_a_lost_claim_is_fenced_even_in_the_same_window(self):
         with TemporaryDirectory() as tmp:
-            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude", authority=rs.Authority(alias="Claude"))
             folder = store.directory("repo#86")
             folder.mkdir(parents=True)
             # Another bot's claim is already on the bus but not yet folded by this writer.
@@ -759,3 +760,90 @@ class TestRoundListingRefresh(unittest.TestCase):
             store = rs.RoundStore(transport, root=Path(tmp))
             self.assertIn("repo#86", store.rounds())
             self.assertEqual(len(calls), 1)
+
+
+class TestFirstClaimAuthority(unittest.TestCase):
+    """Codex review 4: a stale coordinator must not make the first claim on an absent round.
+
+    The write that creates a round cannot be fenced against a holder, because there is none.
+    It needs an authority: the alias the swarm names as its coordinator.
+    """
+
+    def test_a_first_claim_without_an_authority_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")   # no authority
+            with self.assertRaises(rs.RoundUnauthorised):
+                store.append(rs.RoundUpdate(round="repo#86", writer="Claude"))
+            self.assertFalse(list(Path(tmp).rglob("*.json")))
+
+    def test_a_stale_coordinator_cannot_claim_a_round_the_swarm_gives_someone_else(self):
+        with TemporaryDirectory() as tmp:
+            # The swarm says Claudebot is the coordinator; this bot is configured as one too,
+            # but it is stale. It must not create the round.
+            store = rs.RoundStore(None, root=Path(tmp), alias="Antigravity",
+                                  authority=rs.Authority(alias="Claudebot", source="membership"))
+            with self.assertRaises(rs.RoundUnauthorised):
+                store.append(rs.RoundUpdate(round="repo#86", writer="Antigravity"),
+                             holder="Antigravity")
+            self.assertEqual(store.load("repo#86").status, "absent")
+            self.assertFalse(list(Path(tmp).rglob("*.json")))
+
+    def test_the_named_coordinator_can_make_the_first_claim(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claudebot",
+                                  authority=rs.Authority(alias="Claudebot"))
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claudebot"),
+                         holder="Claudebot")
+            state = store.load("repo#86")
+            self.assertEqual(state.status, "ok")
+            self.assertEqual(state.holder, "Claudebot")
+
+    def test_an_existing_round_needs_no_authority_to_append_to(self):
+        with TemporaryDirectory() as tmp:
+            first = rs.RoundStore(None, root=Path(tmp), alias="Claudebot",
+                                  authority=rs.Authority(alias="Claudebot"))
+            first.append(rs.RoundUpdate(round="repo#86", writer="Claudebot"), holder="Claudebot")
+            # No authority at all, but the round exists and this bot holds it.
+            second = rs.RoundStore(None, root=Path(tmp), alias="Claudebot")
+            second.append(rs.RoundUpdate(round="repo#86", writer="Claudebot",
+                                         items={"86": {"pr": 89}}), holder="Claudebot")
+            self.assertEqual(second.load("repo#86").item("86")["pr"], 89)
+
+
+class TestChannelAuthority(unittest.TestCase):
+    """The channel passes the alias the swarm names, and says so when it is refused."""
+
+    def channel(self, role, coordinator):
+        from tests.test_telegram_channel import event, make_channel, make_config
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        git(root, "init", "-q", "-b", "main")
+        (root / "README").write_text("bus\n", encoding="utf-8")
+        git(root, "add", "README")
+        git(root, "commit", "-q", "-m", "bus")
+        config = make_config(agent={"role": role},
+                             fallback={"gitbus_root": str(root), "gitbus_ref": "main"})
+        channel = make_channel(config)
+        channel.membership.state.coordinator = coordinator
+        return channel, root, event
+
+    def test_a_stale_coordinator_writes_nothing_and_says_why(self):
+        channel, root, event = self.channel("coordinator", "Claudebot")
+        body = channel.apply_round_block(
+            'x\nROUND_STATE {"version": 1, "round": 88, "items": {"86": {"owner": "DeepSeek"}}}',
+            event("hi", username="ClaudeBot"))
+        self.assertNotIn("ROUND_STATE", body)
+        self.assertIn("round state:", body)
+        self.assertIn("Claudebot", body)
+        self.assertFalse(list(root.rglob("*.json")))
+
+    def test_the_named_coordinator_writes_the_round(self):
+        channel, root, event = self.channel("coordinator", "Hermes")
+        body = channel.apply_round_block(
+            'x\nROUND_STATE {"version": 1, "round": 88, "items": {"86": {"owner": "DeepSeek"}}}',
+            event("hi", username="ClaudeBot"))
+        # The write lands; a push with no remote may still note that it is not on the bus yet,
+        # but nothing may say the bot was not allowed to claim the round.
+        self.assertNotIn("may not make the first claim", body)
+        self.assertTrue(list((root / ".agents" / "rounds").rglob("*.json")))

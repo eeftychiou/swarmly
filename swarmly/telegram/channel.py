@@ -2264,6 +2264,26 @@ class AgentChannel:
         repo = str(data.get("repo") or "") or self._round_repo(event)
         return f"{repo}#{number}" if repo else number
 
+    def round_authority(self) -> Any:
+        """The alias the swarm names as its coordinator, and where that came from.
+
+        Membership is the only place that answers today; #83's lease becomes the source and
+        keeps this shape. An empty alias is "nobody knows", which the store refuses.
+        """
+        from swarmly.telegram.rounds import Authority
+        alias = ""
+        try:
+            alias = str(getattr(self.membership.state, "coordinator", "") or "").strip()
+        except Exception:                                  # noqa: BLE001 - never fatal
+            alias = ""
+        if alias:
+            return Authority(alias=alias, source="membership")
+        # Nothing announced yet (a fresh group): the configured coordinator is the only
+        # witness there is, and the store will only accept it for a first claim.
+        if str(self.config.identity.role or "").strip().lower() == "coordinator":
+            return Authority(alias=self.config.identity.alias, source="configured role")
+        return Authority(alias="", source="membership")
+
     def _is_round_coordinator(self) -> bool:
         """Whether this bot is the coordinator -- the only bot that writes the round state.
 
@@ -2308,8 +2328,11 @@ class AgentChannel:
                                            at=utc_now(time.time))
             update.round = key                       # the bus key, not whatever was typed
             # The holder is this bot's alias, set here and not from the block: the store's
-            # fence refuses a round another bot holds at the same term (PR #89, blocker 4).
-            store.append(update, holder=self.config.identity.alias)
+            # fence refuses a round another bot holds at the same term (PR #89, blocker 4),
+            # and its authority check refuses a first claim by a bot the swarm does not name
+            # as coordinator (PR #89 review 4).
+            store.append(update, holder=self.config.identity.alias,
+                         authority=self.round_authority())
         except RoundPushError as exc:
             # Written, not yet on the bus: the file stays, and the transport carries it on
             # the next push. Say so instead of pretending the round is durable.
