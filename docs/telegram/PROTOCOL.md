@@ -338,17 +338,23 @@ ROUND_STATE {"version":1,"round":88,"repo":"owner/project","term":3,"items":{"86
 ```
 
 It is taken out of the adapter's **raw** text, before `limits.reply_chars` clamps or the reply is
-split, so it is never counted against the channel budget and never posted. It is capped at 1200
-characters; a block over the cap, unclosed, or not a JSON object is dropped whole and the last
-good state stands (the round then reads as stale). Only the coordinator writes it — a block from
-any other bot is dropped.
+split, so it is never counted against the channel budget and never posted. **Exactly one block per
+reply**: every block is stripped from the text in every case, and a reply carrying two has its
+state refused (the last good state stands). It is capped at `limits.round_state_chars` (default
+8000 — a six-item round with heads and verdicts is about 2000); a block over the cap, unclosed,
+or not a JSON object is dropped whole. Only the coordinator writes it — a block from any other bot
+is dropped.
+
+A refusal is **visible**: the posted reply ends with `⚠️ round state: <reason>`, because a silent
+one reads exactly like success to the next turn and to any successor.
 
 **Segment fields.** `version` (reader refuses a newer one), `round`, `repo`, `writer`, `term`,
 `seq`, `at`, `items`, `order`, `blockers`, `timers`, `note`, `head`. Unknown fields are ignored
 forward-compatibly; a wrong type, a bad `version` or a missing `round` refuses the whole segment.
 
 Item patches carry `issue`, `pr`, `owner`, `head`, `ci`, `waits_on`, `state`, and one `review`
-and one `qa` verdict. **A verdict is bound to a head**: `{"verdict":"merge","sha":"<40 hex>",
+and one `qa` verdict. `state` is what closes an item: `merged`, `closed` or `done` removes it from
+the open set, so a round can actually end. **A verdict is bound to a head**: `{"verdict":"merge","sha":"<40 hex>",
 "by":"Codex","at":"<iso>"}`. A short SHA may be written when the block also carries `head`, and
 is expanded against it; a prefix that does not identify that head is refused. Reading a verdict
 for a different head returns nothing — a new head clears the verdict instead of carrying an
@@ -374,9 +380,17 @@ concurrent writes to the *same* field keep a deterministic winner **and** are re
 
 **Fencing and fail-closed.** `holder` is set by the transport to the writing bot. Once a round has
 a holder at a term, another bot is refused (`RoundFenced`) at that term or below; only a higher
-term may take the round over. If the bus cannot be read, the write is refused outright: a term and
-a seq that cannot be verified are not written. Until #83 lands the lease, the term only ever comes
-from the bus, which is why a bot whose bus checkout is broken cannot write round state at all.
+term may take the round over. If the bus cannot be read, or the state is only on this checkout,
+the write is refused outright: a term and a seq that cannot be verified are not written.
+
+A **claim race** (two bots writing a round that has no segments yet) is decided by the fold, not by
+whoever pushes last: the highest term wins, and among simultaneous claims at that term the lowest
+alias does. The other claim is reported in `conflicts` as `holder`, and the losing bot's next write
+is fenced. Until #83 lands the lease, the term only ever comes from the bus, which is why a bot
+whose bus checkout is broken cannot write round state at all.
+
+**All segments unreadable is `unreadable`,** not an empty round: no item, no owner and no verdict
+is claimed from a state nothing could be read from.
 
 **Missing is not empty.** A round with no segments is `absent`; a bus that cannot be read is
 `unreadable`. Neither is "no open items", and neither may produce a round report. `/round[@bot]

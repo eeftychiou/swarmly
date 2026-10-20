@@ -42,10 +42,11 @@ logger = logging.getLogger("swarmly.telegram.rounds")
 #: The schema version of one segment. A reader refuses what it does not know.
 VERSION = 1
 
-#: A segment's payload is carried in the coordinator's reply; this is the hard cap on it
-#: (issue #86 review B1). Over the cap the state is not applied and the previous one is
-#: reported stale, rather than silently truncated.
-MAX_BLOCK_CHARS = 1200
+#: The default ceiling on a segment's payload, which travels inside the coordinator's reply.
+#: It is a setting (``limits.round_state_chars``) because the right number is how big a real
+#: round is: a six-item round with heads and verdicts is ~2,000 characters, and a cap below
+#: that refuses exactly the rounds this exists for (PR #89 review, B3).
+MAX_BLOCK_CHARS = 8000
 
 #: ``ROUND_STATE {...}`` on its own line, the block a coordinator reply carries.
 BLOCK_MARKER = "ROUND_STATE"
@@ -269,7 +270,7 @@ def _item_patch(key: str, patch: Dict[str, Any], *, head: Optional[str]) -> Dict
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise RoundStateError(f"item {key!r}: '{name}' must be a positive number")
             clean[name] = value
-    for name in ("owner", "waits_on", "ci", "note"):
+    for name in ("owner", "waits_on", "ci", "note", "state"):
         if name in patch:
             value = patch[name]
             if not isinstance(value, str):
@@ -292,7 +293,8 @@ def _item_patch(key: str, patch: Dict[str, Any], *, head: Optional[str]) -> Dict
 # ------------------------------------------------------------------------------------
 
 
-def extract_block(text: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+def extract_block(text: str, *, max_chars: int = MAX_BLOCK_CHARS
+                  ) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
     """Split a coordinator reply into ``(text, payload, reason)``.
 
     The block is removed from the text in every case -- an unusable block is never posted
@@ -302,22 +304,30 @@ def extract_block(text: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[st
     """
     if not text or BLOCK_MARKER not in text:
         return text, None, None
-    start = None
-    for match in re.finditer(r"(?m)^[ \t]*" + BLOCK_MARKER + r"[ \t]*", text):
-        start = match.start()
-        break
-    if start is None:
+    rest = text
+    blocks: List[str] = []
+    reason: Optional[str] = None
+    while True:
+        found = _next_block(rest, max_chars=max_chars)
+        if found is None:
+            break
+        before, raw, after, why = found
+        blocks.append(raw if raw is not None else "")
+        if why and reason is None:
+            reason = why
+        # Join the text around the removed block without leaving blank lines behind.
+        rest = (before.rstrip() + "\n" + after.lstrip("\n")) if before.strip() \
+            else after.lstrip("\n")
+    if not blocks:
         return text, None, None
-    brace = text.find("{", start)
-    if brace == -1:
-        return text[:start].strip(), None, "the block carried no object"
-    end = _matching_brace(text, brace)
-    if end == -1:
-        return text[:start].strip(), None, "the block's object was not closed"
-    raw = text[brace:end + 1]
-    stripped = (text[:start] + "\n" + text[end + 1:]).strip()
-    if len(raw) > MAX_BLOCK_CHARS:
-        return stripped, None, f"state too large ({len(raw)} > {MAX_BLOCK_CHARS} chars)"
+    # Every block is removed, always: one must never reach the channel as JSON.
+    stripped = rest.strip()
+    if len(blocks) > 1:
+        return stripped, None, (f"{len(blocks)} state blocks in one reply; "
+                                "exactly one is allowed")
+    if reason:
+        return stripped, None, reason
+    raw = blocks[0]
     try:
         payload = json.loads(raw)
     except ValueError as exc:
@@ -325,6 +335,31 @@ def extract_block(text: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[st
     if not isinstance(payload, dict):
         return stripped, None, "the block is not a JSON object"
     return stripped, payload, None
+
+
+def _next_block(text: str, *, max_chars: int = MAX_BLOCK_CHARS
+                ) -> Optional[Tuple[str, Optional[str], str, Optional[str]]]:
+    """``(before, raw, after, reason)`` for the next block in *text*, or None.
+
+    A block is stripped even when it cannot be used, so the caller never has to decide
+    between posting JSON and losing text.
+    """
+    match = re.search(r"(?m)^[ \t]*" + BLOCK_MARKER + r"[ \t]*", text)
+    if match is None:
+        return None
+    start = match.start()
+    brace = text.find("{", start)
+    if brace == -1:
+        return text[:start], None, text[match.end():], "the block carried no object"
+    end = _matching_brace(text, brace)
+    if end == -1:
+        return text[:start], None, "", "the block's object was not closed"
+    raw = text[brace:end + 1]
+    after = text[end + 1:]
+    if len(raw) > max_chars:
+        return text[:start], None, after, (
+            f"state too large ({len(raw)} > {max_chars} chars)")
+    return text[:start], raw, after, None
 
 
 def _matching_brace(text: str, start: int) -> int:
@@ -458,6 +493,7 @@ def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
                        status="absent")
     # (item, field) -> (term, base_seq, writer, value): who last set it, and from where.
     seen: Dict[Tuple[str, str], Tuple[int, int, str, Any]] = {}
+    holders: Dict[int, set] = {}
     for update in ordered:
         state.status = "ok"
         state.segments += 1
@@ -490,7 +526,16 @@ def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
         if update.note:
             state.note = update.note
         if update.holder:
-            state.holder = update.holder
+            holders.setdefault(update.term, set()).add(update.holder)
+    if holders:
+        # The claim is resolved by the fold, not by who pushed last: the highest term wins, and
+        # among simultaneous claims at that term the lowest alias does. Two claims at one term
+        # are a conflict and said so -- otherwise two bots both believe they hold the round.
+        top = max(holders)
+        names = sorted(name for name in holders[top] if name)
+        state.holder = names[0] if names else ""
+        if len(names) > 1:
+            state.conflicts.append("holder")
     if state.status == "ok":
         for key in state.items:
             if key not in state.order:
@@ -571,7 +616,11 @@ class RoundStore:
                     raise RoundStateError(f"segment {name} could not be read at the bus ref")
                 at_ref.append((name, text))
             if at_ref:
-                return at_ref, "ref", 0
+                at_ref_names = {name for name, _text in at_ref}
+                extra = [(name, text) for name, text in local if name not in at_ref_names]
+                # A segment whose push failed must not disappear from its own writer's view:
+                # it is unioned in and counted as pending, so the next seq cannot reuse it.
+                return at_ref + extra, "ref", len(extra)
             if local:
                 # The ref is readable and holds nothing yet: these are this turn's own
                 # segments, whose push is still in flight. Labelled `local`, never `ref`.
@@ -588,6 +637,9 @@ class RoundStore:
                 continue
             try:
                 data = json.loads(text)
+                if not isinstance(data, dict):
+                    raise RoundStateError(
+                        f"a segment must be a JSON object, got {type(data).__name__}")
                 update = RoundUpdate.from_dict(
                     data, writer=str(data.get("writer") or ""),
                     seq=int(data.get("seq") or 0), term=int(data.get("term") or 0),
@@ -621,6 +673,11 @@ class RoundStore:
         except RoundStateError as exc:
             return RoundState(round=str(round_key), status="unreadable", reason=str(exc))
         updates = self._parse(round_key, raw)
+        readable = [update for update in updates if not update.note.startswith(_DAMAGED_PREFIX)]
+        if updates and not readable:
+            # Every segment was unreadable: an empty round is not the same fact (PR #89, B2).
+            return RoundState(round=str(round_key), status="unreadable", source=source,
+                              reason=f"all {len(updates)} segment(s) could not be read")
         state = fold(updates, round_key=str(round_key))
         state.source = source
         state.pending = pending
@@ -628,7 +685,7 @@ class RoundStore:
         damaged = [update for update in updates if update.note.startswith(_DAMAGED_PREFIX)]
         if damaged:
             notes.append(damaged[-1].note[len(_DAMAGED_PREFIX):])
-        if state.source == "local" and state.status == "ok":
+        if pending and state.status == "ok":
             notes.append(f"{pending} segment(s) are on this checkout only, not on the bus ref")
         if state.conflicts:
             notes.append("two writers set the same field from the same base: "
@@ -637,11 +694,18 @@ class RoundStore:
         return state
 
     def rounds(self) -> List[str]:
-        """Every round key with a directory on the bus."""
+        """Every round key this bot can see: on the bus ref, or in its own checkout."""
+        names = set()
         base = self.root / self.relpath
-        if not base.is_dir():
-            return []
-        return sorted(path.name for path in base.iterdir() if path.is_dir())
+        if base.is_dir():
+            names.update(path.name for path in base.iterdir() if path.is_dir())
+        transport = self.transport
+        if (transport is not None and getattr(transport, "ref", None)
+                and hasattr(transport, "list_at_ref")):
+            listed = transport.list_at_ref(self.relpath)
+            if listed:
+                names.update(entry.split("/", 1)[0] for entry in listed if "/" in entry)
+        return sorted(names)
 
     # -- writing ---------------------------------------------------------------------
     def next_seq(self, round_key: str) -> int:
@@ -667,6 +731,12 @@ class RoundStore:
                 f"the state of {update.round} on the bus could not be read "
                 f"({current.reason}); refusing to write a term or a seq that cannot be "
                 "verified")
+        has_ref = bool(getattr(self.transport, "ref", None))
+        if has_ref and current.status == "ok" and current.source != "ref":
+            raise RoundStateError(
+                f"the state of {update.round} is on this checkout only, not on the bus "
+                f"({current.stale or 'not pushed'}); refusing to write against a state "
+                "the bus does not have")
         trusted = current.term if current.status == "ok" else 0
         if update.term and update.term < trusted:
             raise RoundStaleTerm(
@@ -675,16 +745,17 @@ class RoundStore:
         if not update.term:
             update.term = trusted
         update.holder = holder or update.holder or self.alias
+        if current.status == "ok" and _unchanged(update, current):
+            # Nothing new: a turn that emits the same state again must not add a commit to
+            # the bus's history (issue #86 review B7). Checked before the fence, so a no-op
+            # from another bot returns the existing segment instead of raising.
+            existing = sorted(self.directory(update.round).glob("*.json"))
+            return str(existing[-1]) if existing else str(self.directory(update.round))
         if (current.status == "ok" and current.holder and update.term <= current.term
                 and current.holder.strip().lower() != update.holder.strip().lower()):
             raise RoundFenced(
                 f"round {update.round} is held by {current.holder} at term {current.term}; "
                 f"{update.holder} cannot write it at term {update.term}")
-        if current.status == "ok" and _unchanged(update, current):
-            # Nothing new: a turn that emits the same state again must not add a commit to
-            # the bus's history (issue #86 review B7). Return the segment that already says it.
-            existing = sorted(self.directory(update.round).glob("*.json"))
-            return str(existing[-1]) if existing else str(self.directory(update.round))
         update.base_seq = current.seq
         if update.seq <= 0:
             update.seq = current.seq + 1

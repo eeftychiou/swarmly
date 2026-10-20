@@ -656,6 +656,11 @@ class ChannelLimits:
     work_in_topics: bool = True                         # General is for setup; work moves to a topic
     handoff_nudge_minutes: float = 10.0                 # a hand-off with no word from its bot: remind it, then the admin; 0 = off
     max_reply_parts: int = 4                            # a long reply is split into at most this many messages
+    #: Issue #86: how large a coordinator's ``ROUND_STATE`` block may be, in characters. It
+    #: is carried inside a reply but is not part of the reply budget, and it is stripped
+    #: before posting. A six-item round with heads and verdicts is ~2,000 characters, so the
+    #: ceiling is generous by design: too small a value silently refuses a real round.
+    round_state_chars: int = 8000
     #: Issue #31: the channel's reply budget, in characters (the swarm's 500-char convention).
     #: A project may override it per topic (``projects.<key>.reply_chars``); everything else
     #: -- General, unbound topics, the reply tickets -- uses this.
@@ -709,7 +714,7 @@ class ChannelLimits:
             raise ConfigError("limits.max_messages_per_minute must be a whole number, 0 for "
                               f"max_group_messages_per_minute (got {rate!r}).")
         for key in ("busy_queue_max", "max_reply_parts", "max_parallel_turns",
-                    "reply_chars", "max_group_messages_per_minute"):
+                    "reply_chars", "max_group_messages_per_minute", "round_state_chars"):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ConfigError(f"limits.{key} must be a whole number of at least 1 "

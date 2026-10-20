@@ -452,9 +452,11 @@ class TestWriteFencing(unittest.TestCase):
     def test_a_second_bot_cannot_write_a_held_round_at_the_same_term(self):
         with TemporaryDirectory() as tmp:
             store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
-            store.append(rs.RoundUpdate(round="repo#86", writer="Claude"), holder="Claude")
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                        items={"86": {"owner": "DeepSeek"}}), holder="Claude")
             with self.assertRaises(rs.RoundFenced):
-                store.append(rs.RoundUpdate(round="repo#86", writer="Antigravity"),
+                store.append(rs.RoundUpdate(round="repo#86", writer="Antigravity",
+                                            items={"86": {"owner": "Reasonix"}}),
                              holder="Antigravity")
             self.assertEqual(store.load("repo#86").holder, "Claude")
 
@@ -473,3 +475,188 @@ class TestWriteFencing(unittest.TestCase):
         update = rs.RoundUpdate.from_dict({"round": 86, "term": 7, "seq": 9})
         self.assertEqual(update.term, 0)
         self.assertEqual(update.seq, 0)
+
+
+class TestItemState(unittest.TestCase):
+    """Reasonix B1 / Codex B1 / QA: a merged item must leave open_keys()."""
+
+    def test_state_survives_the_parse_and_the_fold(self):
+        update = rs.RoundUpdate.from_dict(
+            {"round": 86, "items": {"86": {"state": "merged", "owner": "DeepSeek"}}})
+        self.assertEqual(update.items["86"]["state"], "merged")
+        state = rs.fold([update], round_key="repo#86")
+        self.assertEqual(state.item("86")["state"], "merged")
+        self.assertEqual(state.open_keys(), [])
+
+    def test_an_open_item_stays_open(self):
+        update = rs.RoundUpdate.from_dict(
+            {"round": 86, "items": {"86": {"state": "open"}, "81": {"state": "merged"}}})
+        state = rs.fold([update], round_key="repo#86")
+        self.assertEqual(state.open_keys(), ["86"])
+
+    def test_a_wrongly_typed_state_is_refused(self):
+        with self.assertRaises(rs.RoundStateError):
+            rs.RoundUpdate.from_dict({"round": 86, "items": {"86": {"state": 3}}})
+
+
+class TestDamagedSegments(unittest.TestCase):
+    """Reasonix B2 / Codex B2 / QA: a round with no readable segment is not `ok`."""
+
+    def test_all_damaged_segments_are_unreadable(self):
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / ".agents" / "rounds" / "repo#86"
+            folder.mkdir(parents=True)
+            (folder / "000000-000001-claude-a.json").write_text("{not json", encoding="utf-8")
+            (folder / "000000-000002-claude-b.json").write_text("[]", encoding="utf-8")
+            store = rs.RoundStore(None, root=Path(tmp))
+            state = store.load("repo#86")
+            self.assertEqual(state.status, "unreadable")
+            self.assertIn("could not be read", state.reason)
+            self.assertFalse(state.usable)
+
+    def test_one_damaged_segment_among_good_ones_only_marks_the_state_stale(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                        items={"86": {"owner": "DeepSeek"}}))
+            folder = store.directory("repo#86")
+            (folder / "000000-000002-claude-b.json").write_text("{", encoding="utf-8")
+            state = store.load("repo#86")
+            self.assertEqual(state.status, "ok")
+            self.assertTrue(state.stale)                 # the loss is visible
+            self.assertFalse(state.usable)
+
+
+class TestBlockBudget(unittest.TestCase):
+    """Reasonix B3 / Codex B3: a real six-item round must fit."""
+
+    def six_item_block(self, verdict=True):
+        items = {}
+        for number in (86, 81, 83, 82, 84, 85):
+            item = {"issue": number, "pr": 90 + number % 5, "owner": "DeepSeek",
+                    "state": "open", "waits_on": "ci",
+                    "head": "a" * 40}
+            if verdict:
+                item["review"] = {"verdict": "merge", "sha": "a" * 40, "by": "Codex",
+                                  "at": "2026-10-20T00:00:00Z"}
+                item["qa"] = {"verdict": "pass", "sha": "a" * 40, "by": "Antigravity",
+                              "at": "2026-10-20T00:00:00Z"}
+            items[str(number)] = item
+        return json.dumps({"version": 1, "round": 88, "repo": "owner/project", "term": 3,
+                           "items": items, "order": ["86", "81", "83", "82", "84", "85"],
+                           "blockers": ["#86 waits on CI"],
+                           "timers": {"wake-1": {"owner": "Claude", "until": "2026-10-21"}}})
+
+    def test_a_realistic_six_item_round_fits_the_default_cap(self):
+        block = self.six_item_block()
+        self.assertGreater(len(block), 1200)          # the old cap refused exactly this
+        self.assertLess(len(block), rs.MAX_BLOCK_CHARS)
+        stripped, payload, reason = rs.extract_block("x\nROUND_STATE " + block)
+        self.assertIsNone(reason, reason)
+        self.assertEqual(len(payload["items"]), 6)
+        self.assertNotIn("ROUND_STATE", stripped)
+
+    def test_the_cap_is_a_setting(self):
+        block = self.six_item_block()
+        _, payload, reason = rs.extract_block("x\nROUND_STATE " + block,
+                                              max_chars=len(block) - 1)
+        self.assertIsNone(payload)
+        self.assertIn("too large", reason)
+
+
+class TestSecondBlock(unittest.TestCase):
+    """Reasonix B4 / Codex B4: no block may reach the channel, ever."""
+
+    def test_two_blocks_are_both_stripped_and_the_state_is_refused(self):
+        text = ('done\nROUND_STATE {"round": 86, "items": {}}\n'
+                'again\nROUND_STATE {"round": 86, "items": {"81": {"owner": "X"}}}')
+        stripped, payload, reason = rs.extract_block(text)
+        self.assertEqual(stripped, "done\nagain")
+        self.assertIsNone(payload)
+        self.assertIn("2", reason)
+
+    def test_a_second_block_never_reaches_the_channel(self):
+        from tests.test_telegram_channel import event as event_of
+        from tests.test_telegram_channel import make_channel, make_config
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git(root, "init", "-q", "-b", "main")
+            (root / "README").write_text("bus\n", encoding="utf-8")
+            git(root, "add", "README")
+            git(root, "commit", "-q", "-m", "bus")
+            config = make_config(agent={"role": "coordinator"},
+                                 fallback={"gitbus_root": str(root), "gitbus_ref": "main"})
+            channel = make_channel(config)
+            body = channel.apply_round_block(
+                'x\nROUND_STATE {"round": 88, "items": {}}\n'
+                'y\nROUND_STATE {"round": 88, "items": {}}',
+                event_of("hi", username="ClaudeBot"))
+            self.assertNotIn("ROUND_STATE", body)
+            self.assertIn("round state:", body)          # the refusal is visible
+            self.assertFalse(list(root.rglob("*.json")))
+
+
+class TestLocalAndRefUnion(unittest.TestCase):
+    """Reasonix S8: a segment whose push failed must not vanish from its writer's view."""
+
+    def test_a_local_segment_the_ref_lacks_is_unioned_and_counted(self):
+        good = json.dumps({"version": 1, "round": "repo#86", "writer": "Claude", "seq": 1,
+                           "items": {"86": {"owner": "DeepSeek"}}})
+        files = {".agents/rounds/repo#86/000000-000001-claude-a.json": good}
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(_RefTransport(files), root=Path(tmp), alias="Claude")
+            folder = store.directory("repo#86")
+            folder.mkdir(parents=True)
+            (folder / "000000-000002-claude-b.json").write_text(
+                json.dumps({"version": 1, "round": "repo#86", "writer": "Claude", "seq": 2,
+                            "base_seq": 1, "items": {"86": {"pr": 89}}}), encoding="utf-8")
+            state = store.load("repo#86")
+            self.assertEqual(state.source, "ref")
+            self.assertEqual(state.pending, 1)
+            self.assertEqual(state.item("86")["pr"], 89)
+            self.assertEqual(state.item("86")["owner"], "DeepSeek")
+            self.assertFalse(state.usable)               # not durable until it is pushed
+
+    def test_a_write_is_refused_against_a_checkout_only_state(self):
+        with TemporaryDirectory() as tmp:
+            local = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            local.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                        items={"86": {"owner": "DeepSeek"}}))
+            store = rs.RoundStore(_RefTransport(readable=False), root=Path(tmp), alias="Claude")
+            with self.assertRaises(rs.RoundStateError):
+                store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                            items={"86": {"pr": 89}}),
+                             holder="Claude")
+
+
+class TestClaimRace(unittest.TestCase):
+    """Codex B6: two coordinators, an absent round, both append term 0."""
+
+    def test_two_simultaneous_first_writes_leave_one_deterministic_holder(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            folder = store.directory("repo#86")
+            folder.mkdir(parents=True)
+            for writer in ("Claude", "Antigravity"):
+                update = rs.RoundUpdate(round="repo#86", writer=writer, holder=writer,
+                                        seq=1, base_seq=0, items={"86": {"owner": writer}})
+                (folder / f"000000-000001-{writer[:4]}.json").write_text(
+                    json.dumps(update.to_dict()), encoding="utf-8")
+            first = store.load("repo#86")
+            second = store.load("repo#86")
+            self.assertEqual(first.holder, second.holder)
+            self.assertEqual(first.holder, "Antigravity")     # lowest alias wins the claim
+            self.assertIn("holder", first.conflicts)
+            self.assertFalse(first.usable)
+
+    def test_a_no_op_from_another_bot_returns_instead_of_raising(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                        items={"86": {"owner": "DeepSeek"}}), holder="Claude")
+            # Same content from another bot: nothing to write, and no fence error.
+            path = store.append(rs.RoundUpdate(round="repo#86", writer="Antigravity",
+                                               items={"86": {"owner": "DeepSeek"}}),
+                                holder="Antigravity")
+            self.assertTrue(path.endswith(".json"))
+            self.assertEqual(len(list(Path(tmp).rglob("*.json"))), 1)

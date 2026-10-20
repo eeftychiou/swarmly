@@ -2238,16 +2238,15 @@ class AgentChannel:
     # -- durable round state (issue #86) ------------------------------------------------
 
     def round_store(self) -> Any:
-        """The store for this bot's round state: the bus it already polls."""
+        """The store for this bot's round state: the bus it already polls.
+
+        A fresh store per call on purpose: a cached one keeps the ref it first fetched, and
+        ``/round`` on a bot that has just started must see what the bus holds now.
+        """
         from swarmly.telegram.rounds import RoundStore
         root = self._gitbus_root()
-        store = RoundStore(self.bus_transport(root), root=root, clock=time.time,
-                           alias=self.config.identity.alias)
-        state = self.__dict__.setdefault("_round_store_cache", {})
-        key = str(root)
-        if key not in state:                     # one per bus root: the ref is fetched once
-            state[key] = store
-        return state[key]
+        return RoundStore(self.bus_transport(root), root=root, clock=time.time,
+                          alias=self.config.identity.alias)
 
     def _round_repo(self, event: Optional[ChannelEvent]) -> str:
         if event is None:
@@ -2289,19 +2288,20 @@ class AgentChannel:
         """
         from swarmly.telegram.rounds import (RoundPushError, RoundStateError, RoundUpdate,
                                              extract_block, utc_now)
-        stripped, payload, reason = extract_block(text or "")
+        stripped, payload, reason = extract_block(
+            text or "", max_chars=self.config.limits.round_state_chars)
         if payload is None and reason is None:
             return text                              # no block: the reply is untouched
         if not self._is_round_coordinator():
             logger.info("rounds: a ROUND_STATE block from a non-coordinator was dropped")
-            return stripped
+            return self._round_note(stripped, "a block from a non-coordinator is dropped")
         if payload is None:
             logger.warning("rounds: block dropped (%s); the last good state stands", reason)
-            return stripped
+            return self._round_note(stripped, f"block dropped: {reason}")
         key = self._round_key(event, payload)
         if key is None:
             logger.warning("rounds: block without a tracking issue number dropped")
-            return stripped
+            return self._round_note(stripped, "block dropped: no tracking issue number")
         store = self.round_store()
         try:
             update = RoundUpdate.from_dict(payload, writer=self.config.identity.alias,
@@ -2314,9 +2314,23 @@ class AgentChannel:
             # Written, not yet on the bus: the file stays, and the transport carries it on
             # the next push. Say so instead of pretending the round is durable.
             logger.warning("rounds: %s was written but not pushed: %s", exc.path, exc)
+            return self._round_note(stripped, "state written but not yet on the bus")
         except RoundStateError as exc:
             logger.warning("rounds: block for %s refused: %s", key, exc)
+            return self._round_note(stripped, f"state not saved: {exc}")
         return stripped
+
+    @staticmethod
+    def _round_note(body: str, note: str) -> str:
+        """Say on the channel that the round state did not land (PR #89 review, S9).
+
+        A silent refusal reads exactly like success: the next turn, and any successor, would
+        act on a state the sender believes it wrote.
+        """
+        note = note.strip()
+        if len(note) > 140:
+            note = note[:139] + "\u2026"
+        return f"{body}\n\u26a0\ufe0f round state: {note}" if body else f"\u26a0\ufe0f round state: {note}"
 
     def _round_summary(self, event: Optional[ChannelEvent]) -> str:
         """``/round[@bot] [issue]``: what the round waits on, and how old the state is."""
