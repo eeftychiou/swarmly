@@ -4665,6 +4665,15 @@ class AgentChannel:
                 self._run_own_task(DOWN_REASSIGN_NOTE.format(alias=alias), chat_id, thread_id,
                                    self.topics.name(chat_id, thread_id))
                 continue
+            if self.presence().status(alias, self.presence_clock()) == "busy":
+                # A busy peer is working, not gone (#82): its pulse carries `busy_since`, so the
+                # clock restarts instead of a reminder landing in the middle of a long turn
+                # (round 3: the reminder fired at a busy DeepSeek).
+                if age >= wait:
+                    entry.update(at=now, nudged=False)
+                    logger.info("hand-off to %s in %s: it is busy; the clock restarts",
+                                alias, thread_id or "General")
+                continue
             if not may_nudge:
                 if age >= 2 * wait:
                     self._pending_handoffs.pop(key, None)

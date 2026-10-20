@@ -232,3 +232,26 @@ class TestDownOnTheChannel(unittest.TestCase):
         self.assertEqual(len(tasks), 1)
         self.assertIn("Codex is DOWN", tasks[0])
         self.assertEqual(admin_lines(channel, "has not answered the hand-off"), [])
+
+    def test_a_busy_peer_gets_no_reminder_and_the_clock_restarts(self):
+        # Round 3: the reminder landed on a DeepSeek that was 20 minutes into a turn. A pulse
+        # carrying `busy_since` says "working", so the hand-off clock starts again instead.
+        channel = live_channel(handoff_nudge_minutes=10)
+        channel.bot = object()
+        tasks = []
+        channel._run_own_task = lambda text, chat, thread, name: tasks.append(text)
+        channel._mirror_handoffs("@CodexBot please run the suite", GROUP, 307, 55)
+        key = (int(GROUP), 307, "Codex")
+        channel._test_sender.sent.clear()
+        started = channel._pending_handoffs[key]["at"]
+        mono = {"t": started}                               # the hand-off ladder's clock
+        channel._clock = lambda: mono["t"]
+        hear(channel, pulse_text("Codex", NOW, busy_since=NOW - 1200))
+        channel._test_presence_clock["t"] = NOW + 60        # still pulsing: not DOWN
+        mono["t"] = started + 700.0                         # past the 10 min nudge
+        run(channel.check_stalled_handoffs())
+        self.assertEqual(admin_lines(channel, "reminder: the hand-off above"), [])
+        self.assertEqual(tasks, [])
+        self.assertIn(key, channel._pending_handoffs)       # still owed, not handed back
+        self.assertEqual(channel._pending_handoffs[key]["at"], started + 700.0)
+        self.assertIn("Codex:busy(", channel.presence_line())

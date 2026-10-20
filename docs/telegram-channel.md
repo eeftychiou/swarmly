@@ -580,7 +580,9 @@ does it when the coordinator is the silent one) and one line when the peer comes
 **advisory**: it says "not heard from", never "somebody else should lead" — the lease (#83) alone
 decides who coordinates, because using DOWN to start a takeover would let a partition elect a
 second coordinator. A hand-off to a DOWN peer gets no reminder: like a frozen peer, the work
-comes straight back with a turn asking what happens to it. `/status` and `/swarm` carry the
+comes straight back with a turn asking what happens to it. A busy peer — one pulsing with
+`busy_since` — gets no reminder either: its hand-off clock restarts instead, so the reminder
+does not land in the middle of a long turn. `/status` and `/swarm` carry the
 liveness line, e.g. `peers=Claudebot:up,DeepSeek:down(12m),Reasonix:busy(25m)`. Either limit at
 `0` turns the rule off and nobody is ever DOWN.
 
