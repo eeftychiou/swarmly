@@ -87,11 +87,10 @@ ALLOWED_ARGV: Tuple[Tuple[str, ...], ...] = (
     ("git", "diff"),
     ("git", "show"),
     ("git", "rev-parse"),
-    ("git", "ls-remote"),
 )
-#: Deliberately absent: ``git fetch``. Its repository argument accepts ``ext::<command>``,
-#: which git runs as a remote helper -- an arbitrary command execution that no shell
-#: metacharacter check can see (PR #92 review, Codex blocker 1).
+#: Deliberately absent: ``git fetch`` and ``git ls-remote``. Both take a repository
+#: argument that accepts ``ext::<command>``, which git runs as a remote helper -- arbitrary
+#: command execution that no shell metacharacter check can see (PR #92 review, B1/Codex 1).
 
 #: Flags that turn a read into a write, as canonical flag names. Matched after
 #: normalization, because gh accepts an attached value: ``-XPOST`` is ``-X POST`` and
@@ -590,6 +589,7 @@ class WakeStore:
         if len(live) >= max_timers:
             raise WakeError(f"{len(live)} timers are already armed (limits.wake_max={max_timers})")
         self.write(timer)
+        self.publish_state(timer)
 
     def cancel(self, timer_id: str) -> bool:
         found = False
@@ -597,6 +597,7 @@ class WakeStore:
             if timer.live and timer.id.lower().startswith(timer_id.lower()):
                 timer.state = "cancelled"
                 self.write(timer)
+                self.publish_state(timer)
                 found = True
         return found
 
@@ -606,11 +607,40 @@ class WakeStore:
                       key=lambda timer: timer.next_at)
 
     def replace(self, timer: WakeTimer) -> None:
+        """Persist a timer, and tell the bus whenever its state is not simply "armed"."""
+        previous = next((row for row in self.load() if row.id == timer.id), None)
         self.write(timer)
+        if (previous is None or previous.state != timer.state) or not timer.live:
+            self.publish_state(timer)
 
     def pending_firings(self) -> List[WakeTimer]:
         """Timers whose turn was written but not started: replayed once after a restart."""
         return [timer for timer in self.load() if timer.in_flight]
+
+    def publish_state(self, timer: WakeTimer) -> None:
+        """Record this timer's *state* on the bus, so a successor knows what it inherits.
+
+        One `<id>-state.json` per timer per alias, overwritten on every transition: a
+        successor reads the newest state for an id and adopts it only if it is still armed.
+        Without this a claim (which carries the pre-firing snapshot) would resurrect a
+        finished timer, once per firing it ever had (PR #92 review, B2).
+        """
+        transport = self.transport
+        if transport is None or not getattr(transport, "ref", None):
+            return
+        directory = self.root / WAKE_RELPATH / self.safe_alias
+        directory.mkdir(parents=True, exist_ok=True)
+        relpath = f"{WAKE_RELPATH}/{self.safe_alias}/{timer.id}-state.json"
+        if not is_bus_document(relpath):
+            raise WakeError(f"refusing to write outside {WAKE_RELPATH}: {relpath!r}")
+        payload = timer.to_dict()
+        payload["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock()))
+        (self.root / relpath).write_text(json.dumps(payload), encoding="utf-8")
+        if hasattr(transport, "commit_and_push"):
+            try:
+                transport.commit_and_push(f"wakes: {timer.id} {timer.state}", paths=[relpath])
+            except Exception as exc:                   # noqa: BLE001 - the local file stands
+                logger.warning("wake: state %s was written but not pushed: %s", relpath, exc)
 
     def adopt(self, *, max_timers: int) -> List[WakeTimer]:
         """Take over armed timers this checkout does not have, from the bus claims.
@@ -629,22 +659,29 @@ class WakeStore:
         if not names:
             return []
         mine = {timer.id for timer in self.load()}
-        taken: List[WakeTimer] = []
+        # Only state records are adopted, and only the newest one per timer: a firing claim
+        # is an audit record of a moment, not the timer's current state.
+        newest: Dict[str, Tuple[str, WakeTimer]] = {}
         for name in names:
-            if not name.endswith(".json") or "/" not in name:
+            base = name.rsplit("/", 1)[-1]
+            if not base.endswith("-state.json"):
                 continue
             owner = name.split("/", 1)[0]
             if owner == self.safe_alias:
                 continue
             try:
                 payload = json.loads(transport.read_at_ref(f"{WAKE_RELPATH}/{name}") or "{}")
-                row = (payload or {}).get("timer")
-                if not isinstance(row, dict):
-                    continue
-                timer = WakeTimer.from_dict(row)
-            except Exception:                          # noqa: BLE001 - one bad claim, skip it
+                timer = WakeTimer.from_dict(payload)
+            except Exception:                          # noqa: BLE001 - one bad record, skip
                 continue
-            if not timer.live or timer.id in mine or timer.alias == self.alias:
+            stamp = str(payload.get("at") or "")
+            current = newest.get(timer.id)
+            if current is None or (stamp, owner) > (current[0], current[1].alias.lower()):
+                newest[timer.id] = (stamp, timer)
+        taken: List[WakeTimer] = []
+        for timer_id in sorted(newest):
+            timer = newest[timer_id][1]
+            if not timer.live or timer_id in mine or timer.alias == self.alias:
                 continue
             if len(taken) + self.live_count >= max_timers:
                 break

@@ -462,9 +462,9 @@ exit code:
 **The check is a read-only command, matched argv-to-argv.** `check` is untrusted model output
 running outside a turn, so it may only start with one of the read-only prefixes in
 `swarmly.telegram.wake.ALLOWED_ARGV` (`gh pr checks|view|list|status|diff`, `gh run view|list`,
-`gh api` with GET only, `gh issue view`, `gh search`, `git status|log|diff|show|rev-parse|ls-remote` —
-`git fetch` is deliberately not allowed: its repository argument accepts `ext::<command>`, which
-git runs as a remote helper).
+`gh api` with GET only, `gh issue view`, `gh search`, `git status|log|diff|show|rev-parse` —
+`git fetch` and `git ls-remote` are deliberately not allowed: both take a repository argument that
+accepts `ext::<command>`, which git runs as a remote helper).
 It is parsed with `shlex` and run without a shell, so shell metacharacters are refused, as are
 `-X`/`--method`/`-f`/`--input` and anything not on `PATH`. A refused line is stripped from the
 reply and the refusal is posted in its place.
@@ -483,7 +483,9 @@ cannot be pushed, does not fire: a broken bus is not "I am the only one".
 **A ready firing is written down before its turn starts.** The timer records the turn text and
 moves to `firing`; the transport starts it and then retires the timer. A crash in between replays
 that one turn on the next tick instead of losing it. A successor also adopts an armed timer it
-finds on the bus (`adopt()`), because a timer is a promise to the swarm, not to one bot.
+finds on the bus (`adopt()`), because a timer is a promise to the swarm, not to one bot: each
+transition publishes a state record (`<id>-state.json`), a successor adopts only the **newest**
+record per timer, and never one that has finished, expired or been cancelled.
 `attempts` is persisted and bounded by `limits.wake_max_attempts`.
 
 **Commands.** `/wakes` lists the live timers with their next time, check and attempt count;

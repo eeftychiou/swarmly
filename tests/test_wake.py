@@ -638,9 +638,11 @@ class TestFetchIsGone(unittest.TestCase):
         with self.assertRaises(wk.WakeError):
             wk.validate_check("git fetch ext::curl -I https://example.invalid")
 
-    def test_git_ls_remote_is_still_allowed(self):
-        self.assertEqual(wk.validate_check("git ls-remote origin"),
-                         ("git", "ls-remote", "origin"))
+    def test_git_ls_remote_is_gone_too(self):
+        # It takes a remote argument just like fetch, so `ext::` reaches it as well.
+        for command in ("git ls-remote origin", "git ls-remote ext::sh -c id"):
+            with self.subTest(command=command), self.assertRaises(wk.WakeError):
+                wk.validate_check(command)
 
 
 class TestRefreshBeforeClaim(unittest.TestCase):
@@ -706,7 +708,7 @@ class TestAdoption(unittest.TestCase):
             dead = wk.WakeStore("antigravity", state_dir=Path(tmp),
                                 transport=_BusTransport(tmp), root=Path(tmp),
                                 clock=lambda: 1000.0)
-            dead.claim(self.timer())
+            dead.add(self.timer(), max_timers=10)        # arming publishes the state
             heir = wk.WakeStore("claudebot", state_dir=Path(tmp) / "heir",
                                 transport=_BusTransport(tmp), root=Path(tmp),
                                 clock=lambda: 1000.0)
@@ -723,7 +725,8 @@ class TestAdoption(unittest.TestCase):
                                 clock=lambda: 1000.0)
             finished = self.timer()
             finished.state = "done"
-            dead.claim(finished)
+            dead.write(finished)
+            dead.publish_state(finished)
             heir = wk.WakeStore("claudebot", state_dir=Path(tmp) / "heir",
                                 transport=_BusTransport(tmp), root=Path(tmp),
                                 clock=lambda: 1000.0)
@@ -766,3 +769,56 @@ class TestCrashWindow(unittest.TestCase):
         started.clear()
         self.assertEqual(asyncio.run(channel._wake_tick(now=time.time())), [])
         self.assertEqual(started, [])
+
+
+class TestStateRecords(unittest.TestCase):
+    """B2: a state record per timer, newest wins, terminal states are never adopted."""
+
+    def timer(self, ident="abc12345", alias="antigravity"):
+        return wk.WakeTimer(argv=("gh", "pr", "checks", "75"), then="merge it",
+                            next_at=1000.0, expires_at=2000.0, every_seconds=300.0,
+                            chat_id=-7, alias=alias, id=ident)
+
+    def heir(self, root):
+        return wk.WakeStore("claudebot", state_dir=Path(root) / "heir",
+                            transport=_BusTransport(root), root=Path(root),
+                            clock=lambda: 5000.0)
+
+    def test_a_timer_with_several_firings_is_adopted_once(self):
+        with TemporaryDirectory() as tmp:
+            dead = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            for firing in (1000.0, 1300.0, 1600.0):
+                dead.claim(self.timer())
+                dead.publish_state(self.timer())
+                moved = self.timer()
+                moved.next_at = firing
+                dead.write(moved)
+            self.assertEqual([timer.id for timer in self.heir(tmp).adopt(max_timers=10)],
+                             ["abc12345"])
+
+    def test_a_cancelled_timer_is_not_adopted(self):
+        with TemporaryDirectory() as tmp:
+            dead = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            dead.add(self.timer(), max_timers=10)
+            dead.cancel("abc12345")
+            self.assertEqual(self.heir(tmp).adopt(max_timers=10), [])
+
+    def test_the_newest_state_wins(self):
+        with TemporaryDirectory() as tmp:
+            old = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                               transport=_BusTransport(tmp), root=Path(tmp),
+                               clock=lambda: 1000.0)
+            old.write(self.timer())
+            old.publish_state(self.timer())
+            newer = wk.WakeStore("codex", state_dir=Path(tmp) / "c",
+                                 transport=_BusTransport(tmp), root=Path(tmp),
+                                 clock=lambda: 9000.0)
+            done = self.timer()
+            done.state = "done"
+            newer.write(done)
+            newer.publish_state(done)                    # later stamp, terminal
+            self.assertEqual(self.heir(tmp).adopt(max_timers=10), [])
