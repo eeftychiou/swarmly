@@ -1064,7 +1064,7 @@ ignored, whatever its header says.
    group as an **admin** (or disable its group privacy).
 2. Copy the example config onto that machine; set `name`, `alias`, `bot_token`, the shared
    `home_channel_id` and `admin_user_id`.
-3. Run `check`, then `run`. On start it posts `HELLO intent=ONLINE ref=<alias>`, with a line naming its adapter, role, the model and reasoning effort General runs at (`CLI default` when unset; effort is left out for an adapter without one) and its revision.
+3. Run `check`, then `run`. On start it posts `HELLO intent=ONLINE ref=<alias>`, with a line naming its adapter, role, the model and reasoning effort General really runs at, and its revision. Each comes from `/model` and `/reasoning`, else `adapter.model` and `adapter.effort`, else the CLI's own settings (`swarmly/telegram/cli_defaults.py`: Codex `~/.codex/config.toml`, Reasonix `reasonix.toml` / its global `config.toml`, Claude Code `ANTHROPIC_MODEL` / `CLAUDE_CODE_EFFORT_LEVEL` / `settings.json`), else the model the CLI reported on its last turn (Claude's `modelUsage`). What none of these names reads `not known until its first turn` or `the model default`; effort is left out for an adapter without one.
 4. In the group, the admin sends `/admit @newbot`. Every running bot that saw the newcomer's
    HELLO adds it to its peers and answers with a silent `HELLO intent=WELCOME` mentioning it;
    the newcomer, having seen itself admitted, adds each bot that welcomes it in the next 10
