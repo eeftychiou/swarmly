@@ -1586,3 +1586,46 @@ class TestUnrankedClaimsFailClosed(unittest.TestCase):
             records = store._claim_records("t1", 1060)
             self.assertEqual([claim.alias for claim in records], ["alpha"])
             self.assertEqual(records[0].seen_at, 1000.0)
+
+
+class TestGitBusTimerFires(unittest.TestCase):
+    """Live, round 4: on a git bus a claim's settle window is timed by the store's own memory
+    (the bus ranks a claim; it gives no time). A store built afresh every tick forgot it and
+    said "wait" on every tick, so no WAKE ever fired. The channel keeps one store."""
+
+    def test_a_claimed_timer_fires_once_the_settle_window_passes(self):
+        import asyncio
+        from tests.test_telegram_channel import make_channel, make_config
+
+        class Ranked(_BusTransport):
+            def arrival_rank(self, relpath):
+                return 0 if (self.root / relpath).is_file() else None
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config(agent={"role": "developer"},
+                             fallback={"gitbus_root": tmp.name, "gitbus_ref": "origin/main"},
+                             limits={"wake_tick_seconds": 0, "wake_claim_settle_seconds": 0.2})
+        channel = make_channel(config)
+        bus = Ranked(tmp.name)
+        channel.bus_transport = lambda root: bus
+        channel.lease_fence = lambda now=None: False          # a developer, not the coordinator
+        started = []
+        channel._run_own_task = lambda text, chat_id, thread_id, name: started.append(text)
+        timer = wk.WakeTimer(argv=("git", "status"), then="continue #82", next_at=1.0,
+                             expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
+                             alias=channel.config.identity.alias)
+        channel.wake_store().add(timer, max_timers=10)
+        first = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertIn("settle window", first[0])
+        self.assertEqual(started, [])
+        time.sleep(0.3)
+        second = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(len(started), 1, second)
+        self.assertIn("continue #82", started[0])
+
+    def test_the_channel_keeps_one_store(self):
+        from tests.test_telegram_channel import make_channel, make_config
+        with TemporaryDirectory() as tmp:
+            channel = make_channel(make_config(fallback={"gitbus_root": tmp}))
+            self.assertIs(channel.wake_store(), channel.wake_store())
