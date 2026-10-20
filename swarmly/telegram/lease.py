@@ -342,8 +342,15 @@ class LeaseStore:
             filtered.extend(yields)
             non_yields = [c for c in group if not c.yielded]
             if non_yields:
-                best = max(non_yields, key=lambda c: (c.renews_at, c.nonce))
-                filtered.append(best)
+                latest = max(non_yields, key=lambda c: (c.renews_at, c.nonce))
+                # The *earliest* claim of the group decides the ordering -- a holder that renews
+                # must not look later than the claimant it beat -- while the times come from the
+                # latest renewal, which is what says whether the lease is live (#93 R6).
+                first = min(non_yields, key=lambda c: (c.depth, c.nonce))
+                filtered.append(LeaseClaim(
+                    term=latest.term, alias=latest.alias, expires_at=latest.expires_at,
+                    renews_at=latest.renews_at, rank=latest.rank, depth=first.depth,
+                    nonce=latest.nonce, yielded=False))
 
         if tip_sha:
             self._cached_ref_tip = tip_sha

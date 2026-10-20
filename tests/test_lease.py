@@ -770,6 +770,12 @@ class TestTipAdvancing(unittest.TestCase):
                                                              identity=("t", "t@t")),
                               root=bus, clock=lambda: now, ttl_seconds=60.0, rank=2)
         first.claim(term=1)                     # the first claim, worse role, arrives first
+        # Warm the cache *before* the tip moves: without this the test would pass even with the
+        # old arrival-rank ordering, because nothing stale would ever have been cached (#93).
+        warm = ls.LeaseStore("Zulu", transport=GitTransport(bus, ref="origin/main",
+                                                            identity=("t", "t@t")),
+                             root=bus, clock=lambda: now, ttl_seconds=60.0)
+        self.assertEqual(warm.state(now=now).holder, "Zulu")
         # The branch grows by a few commits, then a better-ranked bot claims the same term.
         for index in range(3):
             (bus / f"noise{index}.txt").write_text("x", encoding="utf-8")
@@ -823,3 +829,37 @@ class TestPeerDoesNotPoll(unittest.TestCase):
         outcome = asyncio.run(watcher.poll_once())
         self.assertEqual(outcome.polled_repos, [])
         client.notifications.assert_not_called()
+
+
+class TestRenewalKeepsTheEarliestDepth(unittest.TestCase):
+    """#93 R6: a holder's renewal must not make it look later than the claimant it beat.
+
+    `claims()` keeps one entry per (term, alias): its times come from the latest renewal, but its
+    ordering key has to stay the group's *earliest* claim. Otherwise A claiming N+1 at depth 100
+    and renewing at 140 loses the term to B, who claimed at 105.
+    """
+
+    def test_a_renewal_does_not_move_the_holder_behind_a_late_claimant(self):
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / ".agents" / "leases"
+            folder.mkdir(parents=True)
+            # A: the original claim (depth 100) and a renewal much later in the branch (depth 140).
+            (folder / "000002-alpha-aaaa0001.json").write_text(json.dumps(
+                {"term": 2, "alias": "Alpha", "expires_at": 5000.0, "renews_at": 1000.0,
+                 "rank": 0, "nonce": "aaaa0001"}), encoding="utf-8")
+            (folder / "000002-alpha-aaaa0002.json").write_text(json.dumps(
+                {"term": 2, "alias": "Alpha", "expires_at": 9000.0, "renews_at": 2000.0,
+                 "rank": 0, "nonce": "aaaa0002"}), encoding="utf-8")
+            # B: a later claimant at depth 105, better ranked.
+            (folder / "000002-zulu-bbbb0001.json").write_text(json.dumps(
+                {"term": 2, "alias": "Zulu", "expires_at": 5000.0, "renews_at": 1500.0,
+                 "rank": 1, "nonce": "bbbb0001"}), encoding="utf-8")
+            depths = {"000002-alpha-aaaa0001.json": 100, "000002-alpha-aaaa0002.json": 140,
+                      "000002-zulu-bbbb0001.json": 105}
+            bus = _Bus(tmp, ranks=depths)
+            state = ls.LeaseStore("Alpha", transport=bus, root=Path(tmp),
+                                  clock=lambda: 2000.0).state(now=2000.0)
+            self.assertEqual(state.holder, "Alpha", "the earlier claim keeps the term")
+            # ... and the times still come from the renewal, so the lease is live.
+            self.assertEqual(state.expires_at, 9000.0)
+            self.assertTrue(state.live(2000.0))
