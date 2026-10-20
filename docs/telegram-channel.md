@@ -562,6 +562,23 @@ above for every bot.) A hand-off to a peer that is frozen (quota or pause) gets 
 and no notice at all: the bot that handed it off is asked straight away to give the work to
 someone else or to wait until the peer resumes.
 
+**Except the coordinator.** A hand-off *to* the coordinator, and a peer's answer to it, is
+waited on by the bot that sent it, which does post the reminder and the notice: nobody else
+would ever follow it up. The coordinator's next post in that discussion answers it.
+
+**A restart loses no message.** A message accepted for a turn (queued or running, a reply not
+yet posted) is kept in `inbox-<alias>.json` beside the transport's state until its turn is
+done; the next start runs whatever is still there (younger than 12 hours). That is
+at-least-once: a crash right after a reply is posted can repeat that one turn. Commands are
+never kept, and the same message arriving twice at once (a replay and Telegram's redelivery)
+runs once.
+
+**The coordinator checks in when nothing wakes it.** A coordinator that holds no WAKE and has
+had no turn for `limits.coordinator_watch_minutes` (default 30) gets one turn in the topic it
+last worked in, asking it to look at the round and act on whatever waits, or to answer
+`NO_REPLY`. The wait doubles after each check (up to 8 hours), any other turn resets it, and
+it stops a day after the last turn. `0` turns it off.
+
 **Busy is not gone.** A message that queues behind a turn running for two minutes or more
 gets one "⏳ <alias> is busy with a turn running since HH:MM UTC" line in its topic (at
 most one per topic per five minutes), so peers and people see a working bot rather than a

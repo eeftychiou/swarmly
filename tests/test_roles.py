@@ -309,7 +309,8 @@ class TestTheAdminDeploys(unittest.TestCase):
             text = line.strip().lstrip("`—").strip()
             if text.startswith("WAKE "):
                 spec = parse_line(text.replace("<n>", "75").strip("`"))
-                self.assertEqual(spec.argv[:3], ("gh", "pr", "checks"))
+                # CI for a PR, or the standing check on the tracking issue while a round runs.
+                self.assertIn(spec.argv[:3], {("gh", "pr", "checks"), ("gh", "issue", "view")})
 
     def test_other_roles_do_not_carry_the_coordinator_rule(self):
         for name in ("developer", "reviewer", "qa-tester", "researcher"):
