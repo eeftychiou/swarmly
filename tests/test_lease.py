@@ -46,7 +46,7 @@ class _Bus:
         self.pushed.append(list(paths or []))
         return True
 
-    def arrival_rank(self, relpath):
+    def commit_depth(self, relpath):
         name = relpath.rsplit("/", 1)[-1]
         return self.ranks.get(name, 0)
 
@@ -69,9 +69,9 @@ class TestClaims(unittest.TestCase):
 
 class TestFold(unittest.TestCase):
 
-    def claim(self, term, alias, *, rank=0, arrival=1, expires=1000.0, nonce=""):
+    def claim(self, term, alias, *, rank=0, depth=1, expires=1000.0, nonce=""):
         return ls.LeaseClaim(term=term, alias=alias, expires_at=expires, rank=rank,
-                             arrival=arrival, nonce=nonce or alias)
+                             depth=depth, nonce=nonce or alias)
 
     def test_the_highest_term_wins(self):
         state = ls.fold_claims([self.claim(1, "Claude"), self.claim(2, "Antigravity")])
@@ -150,7 +150,7 @@ class TestStore(unittest.TestCase):
             with self.assertRaises(ls.LeasePushError):
                 store.claim(term=1)
 
-    def test_a_claim_the_bus_cannot_rank_is_not_counted(self):
+    def test_a_claim_the_bus_cannot_place_is_not_counted(self):
         with TemporaryDirectory() as tmp:
             bus = _Bus(tmp)
             entry = Path(tmp) / ".agents" / "leases"
@@ -158,11 +158,11 @@ class TestStore(unittest.TestCase):
             (entry / "000001-Antigravity-aaaa.json").write_text(json.dumps(
                 {"term": 1, "alias": "Antigravity", "expires_at": 9999.0}), encoding="utf-8")
 
-            class Unranked(_Bus):
-                def arrival_rank(self, relpath):
+            class Unplaced(_Bus):
+                def commit_depth(self, relpath):
                     return None
 
-            store = ls.LeaseStore("Claude", transport=Unranked(tmp), root=Path(tmp),
+            store = ls.LeaseStore("Claude", transport=Unplaced(tmp), root=Path(tmp),
                                   clock=lambda: 1000.0)
             self.assertEqual(store.claims(), [])
 
@@ -175,8 +175,8 @@ class TestStore(unittest.TestCase):
                 (entry / name).write_text(json.dumps(
                     {"term": 1, "alias": alias, "expires_at": 9999.0, "rank": 1}),
                     encoding="utf-8")
-            # Alpha is lower alphabetically but arrived first on the bus: rank 1 vs 0.
-            bus = _Bus(tmp, ranks={"000001-Alpha-aaaa.json": 1, "000001-Zulu-bbbb.json": 0})
+            # Alpha arrived first: its commit is shallower (1 ancestor against Zulu's 2).
+            bus = _Bus(tmp, ranks={"000001-Alpha-aaaa.json": 1, "000001-Zulu-bbbb.json": 2})
             state = ls.LeaseStore("Zulu", transport=bus, root=Path(tmp),
                                   clock=lambda: 1000.0).state()
             self.assertEqual(state.holder, "Alpha")        # earliest arrival, not lowest name
@@ -640,19 +640,19 @@ class TestLateButBetterRankedClaim(unittest.TestCase):
     bot had acted and still win -- two acting coordinators.
     """
 
-    def claim(self, alias, *, rank, arrival, term=2):
+    def claim(self, alias, *, rank, depth, term=2):
         return ls.LeaseClaim(term=term, alias=alias, expires_at=9999.0, renews_at=1000.0,
-                             rank=rank, arrival=arrival, nonce=f"{alias}-{arrival}")
+                             rank=rank, depth=depth, nonce=f"{alias}-{depth}")
 
     def test_the_earlier_claim_beats_a_better_ranked_late_one(self):
-        early = self.claim("Zulu", rank=2, arrival=1)        # arrived first, worse role
-        late = self.claim("Alpha", rank=0, arrival=0)        # arrived later, better role
+        early = self.claim("Zulu", rank=2, depth=1)        # arrived first: shallower commit
+        late = self.claim("Alpha", rank=0, depth=2)        # arrived later: deeper commit
         state = ls.fold_claims([early, late])
         self.assertEqual(state.holder, "Zulu")
 
     def test_a_tie_on_arrival_is_broken_by_rank(self):
-        one = self.claim("Zulu", rank=2, arrival=3)
-        two = self.claim("Alpha", rank=0, arrival=3)
+        one = self.claim("Zulu", rank=2, depth=3)
+        two = self.claim("Alpha", rank=0, depth=3)
         self.assertEqual(ls.fold_claims([one, two]).holder, "Alpha")
 
     def test_the_settle_window_outlasts_a_push(self):
@@ -738,3 +738,60 @@ class TestCoordinatorFence(unittest.TestCase):
         # the fence catches it, and both mean the same thing -- this bot may not write the round.
         self.assertIn("round state:", body)
         self.assertFalse(list((bus / ".agents" / "rounds").rglob("*.json")))
+
+
+class TestTipAdvancing(unittest.TestCase):
+    """#93: a cached claim must not go stale when the branch grows.
+
+    `arrival_rank` is "commits after the adding commit", which every new commit changes; caching
+    it let an old claim look later than it is, so a later, better-ranked claim won. The fold now
+    orders by the adding commit's depth, which no later commit can move, and the cache holds that.
+    """
+
+    def test_a_later_higher_ranked_claim_still_loses_after_the_tip_moves(self):
+        import subprocess
+        from tests.gitenv import git as run_git, git_env
+        from swarmly.transports.git import GitTransport
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        remote = base / "remote.git"
+        run_git(base, "init", "-q", "--bare", "-b", "main", str(remote))
+        bus = base / "bus"
+        run_git(base, "clone", "-q", str(remote), str(bus))
+        (bus / "README").write_text("bus", encoding="utf-8")
+        run_git(bus, "add", "README")
+        run_git(bus, "commit", "-q", "-m", "bus")
+        run_git(bus, "push", "-q", "-u", "origin", "main")
+
+        now = 1000.0
+        first = ls.LeaseStore("Zulu", transport=GitTransport(bus, ref="origin/main",
+                                                             identity=("t", "t@t")),
+                              root=bus, clock=lambda: now, ttl_seconds=60.0, rank=2)
+        first.claim(term=1)                     # the first claim, worse role, arrives first
+        # The branch grows by a few commits, then a better-ranked bot claims the same term.
+        for index in range(3):
+            (bus / f"noise{index}.txt").write_text("x", encoding="utf-8")
+            run_git(bus, "add", f"noise{index}.txt")
+            run_git(bus, "commit", "-q", "-m", f"noise {index}")
+        run_git(bus, "push", "-q")
+        # Alpha's claim lands after the noise: written as a bus fact, since `claim()` refuses a
+        # live holder's term (that guard is a different test).
+        import json as _json
+        entry = bus / ".agents" / "leases"
+        entry.mkdir(parents=True, exist_ok=True)
+        (entry / "000001-alpha-late0001.json").write_text(_json.dumps(
+            {"term": 1, "alias": "Alpha", "expires_at": 9999.0, "renews_at": now, "rank": 0,
+             "nonce": "late0001"}), encoding="utf-8")
+        run_git(bus, "add", ".agents/leases")
+        run_git(bus, "commit", "-q", "-m", "alpha claims later")
+        run_git(bus, "push", "-q")
+
+        reader = ls.LeaseStore("Zulu", transport=GitTransport(bus, ref="origin/main",
+                                                              identity=("t", "t@t")),
+                               root=bus, clock=lambda: now, ttl_seconds=60.0)
+        reader.refresh(force=True)
+        state = reader.state(now=now)
+        self.assertEqual(state.holder, "Zulu",
+                         "the claim the bus saw first must still win after the tip moved")

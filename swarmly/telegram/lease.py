@@ -10,8 +10,8 @@ mutable lease file would have the last-writer-wins race that #92 spent ten heads
 renewal that loses a push race would silently overwrite the holder it never saw.
 
 **Folded, not read.** Every bot folds the claims: the highest term wins, ties are broken by
-succession rank and then alias, and claims are ordered by the bus's own arrival order
-(:meth:`GitTransport.arrival_rank`). A claim the bus can rank but cannot place is skipped, exactly
+succession rank and then alias, and claims are ordered by the depth of the commit that carries
+them (:meth:`GitTransport.commit_depth`), which the branch cannot rewrite as it grows. A claim the bus can rank but cannot place is skipped, exactly
 as a wake claim is — falling back to anything the writer says about itself would hand the ordering
 back to the writer.
 
@@ -62,8 +62,10 @@ class LeaseClaim:
     renews_at: float = 0.0
     #: Succession rank at the time of the claim (lower is earlier in the order).
     rank: int = 0
-    #: Where the claim sits in the bus's history: higher means it arrived earlier.
-    arrival: int = -1
+    #: How many commits reach the one that added this claim. A commit's own depth never moves
+    #: when the branch grows (unlike "commits after it"), so a cached answer stays true -- and a
+    #: *lower* depth means the claim was there first.
+    depth: int = -1
     nonce: str = ""
     #: The holder gave the role up (FROZEN, OFFLINE, superseded by `/role`): the lease is over
     #: at this term, without waiting for it to lapse.
@@ -97,9 +99,10 @@ class LeaseClaim:
 
         Ordering by rank first let a better-ranked claimant write term N+1 *after* another bot
         had already acted and still win the fold -- two acting coordinators, from nothing but
-        arriving late with a nicer role (#93 B3a).
+        arriving late with a nicer role (#93 B3a). Depth is the commit's own, so this order does
+        not move when the branch grows: a lower depth is an earlier claim.
         """
-        return (-self.arrival, self.rank, self.alias.lower(), self.nonce)
+        return (self.depth, self.rank, self.alias.lower(), self.nonce)
 
 
 class LeaseState(NamedTuple):
@@ -261,7 +264,10 @@ class LeaseStore:
             return list(getattr(self, "_cached_claims", []))
 
         reader = getattr(transport, "read_at_ref", None)
-        ranker = getattr(transport, "arrival_rank", None)
+        # The *depth* of the adding commit, not the number of commits after it: depth is a
+        # property of the commit and does not move when the tip advances, so a cached claim keeps
+        # a true ordering (#93, Codex's blocker at lease.py:289).
+        depth_of = getattr(transport, "commit_depth", None)
 
         # B4 (#93): only the claims at the highest term can win. A lease never goes back a term
         # and a holder's renewals stay at its term, so on a bus with hundreds of claims the fold
@@ -289,15 +295,15 @@ class LeaseStore:
                 claims_list.append(cached[1])
                 continue
 
-            arrival = None
-            if ranker is not None:
+            depth = None
+            if depth_of is not None:
                 try:
-                    arrival = ranker(relpath)
-                except Exception:                      # noqa: BLE001 - unranked: not a claim
-                    logger.warning("lease: %s could not be ranked; not counted", name,
-                                   exc_info=True)
+                    depth = depth_of(relpath)
+                except Exception:                      # noqa: BLE001 - unplaced: not a claim
+                    logger.warning("lease: %s could not be placed in the bus history; "
+                                   "not counted", name, exc_info=True)
                     continue
-                if arrival is None:
+                if depth is None:
                     logger.warning("lease: %s has no place in the bus history; not counted", name)
                     continue
 
@@ -317,9 +323,9 @@ class LeaseStore:
 
             claim = LeaseClaim(term=parsed.term, alias=parsed.alias,
                                expires_at=parsed.expires_at, renews_at=parsed.renews_at,
-                               rank=parsed.rank, arrival=int(arrival if arrival is not None else -1),
+                               rank=parsed.rank, depth=int(depth if depth is not None else -1),
                                nonce=match.group("nonce"), yielded=parsed.yielded)
-            _PARSED_CLAIMS_CACHE[cache_key] = (arrival, claim)
+            _PARSED_CLAIMS_CACHE[cache_key] = (depth, claim)
             claims_list.append(claim)
 
         # B5/B4: Prune superseded renewals in-memory without repetitive git subprocess reads.

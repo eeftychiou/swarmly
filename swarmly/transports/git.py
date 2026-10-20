@@ -134,6 +134,28 @@ class GitTransport:
         return sorted(path[len(prefix):] for path in (result.stdout or "").splitlines()
                       if path.startswith(prefix))
 
+    def commit_depth(self, relpath: str) -> Optional[int]:
+        """How many commits reach the one that added *relpath*: its depth in the branch.
+
+        Unlike ``arrival_rank`` -- commits *after* it, which every new commit on the branch
+        changes -- this is a property of the commit itself and never moves. Ordering by it means
+        a cached answer stays true when the tip advances (#93, Codex's blocker at lease.py:289).
+        """
+        if not self.ref:
+            return None
+        added = self._git("log", "-1", "--format=%H", "--diff-filter=A", self.ref, "--",
+                          relpath, timeout=30)
+        commit = (added.stdout or "").strip().splitlines()
+        if added.returncode != 0 or not commit:
+            return None
+        counted = self._git("rev-list", "--count", commit[-1], timeout=30)
+        if counted.returncode != 0:
+            return None
+        try:
+            return int((counted.stdout or "").strip())
+        except ValueError:
+            return None
+
     def arrival_rank(self, relpath: str) -> Optional[int]:
         """How many commits on the bus branch came *after* the one that added *relpath*.
 
