@@ -135,6 +135,10 @@ class WakeError(ValueError):
     """A WAKE line, a timer or a check that is refused."""
 
 
+class WakePushError(WakeError):
+    """The timer state was written here but the bus did not take it."""
+
+
 def parse_duration(text: str) -> float:
     """``90``, ``90s``, ``10m``, ``2h``, ``1d`` -> seconds."""
     value = str(text or "").strip()
@@ -643,9 +647,10 @@ class WakeStore:
         if hasattr(transport, "commit_and_push"):
             try:
                 transport.commit_and_push(f"wakes: {timer.id} {timer.state}", paths=[relpath])
-            except Exception as exc:                   # noqa: BLE001 - the local file stands
+            except Exception as exc:                   # noqa: BLE001 - reported, not swallowed
                 logger.warning("wake: state %s was written but not pushed: %s", relpath, exc)
-                return False
+                raise WakePushError(
+                    f"the timer state is local only: {exc}") from exc
         return True
 
     def adopt(self, *, max_timers: int, allow: Iterable[str] = ()
@@ -746,8 +751,14 @@ class WakeStore:
             return False
         return result is not False
 
-    def _claims(self, timer_id: str, firing: int) -> Optional[List[str]]:
-        """Aliases that have claimed *timer_id*'s *firing*, or ``None`` if unreadable."""
+    def _claim_records(self, timer_id: str, firing: int
+                       ) -> Optional[List[Tuple[float, str]]]:
+        """``(written_at, alias)`` for every claim on this firing, or ``None`` if unreadable.
+
+        The winner is the **earliest write**, ties broken by the lowest alias: the alias alone
+        let a later claimant win by simply being lower, so a bot that pushed second could still
+        fire alongside the bot that pushed first (PR #92 review, Codex/QA repro).
+        """
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
             return []
@@ -759,12 +770,27 @@ class WakeStore:
         if names is None:
             return None
         prefix = f"{timer_id}-{firing}-"
-        claims = []
+        records: List[Tuple[float, str]] = []
         for name in names:
             base = name.rsplit("/", 1)[-1]
-            if base.startswith(prefix) and base.endswith(".json"):
-                claims.append(base[len(prefix):-len(".json")])
-        return sorted(claims)
+            if not (base.startswith(prefix) and base.endswith(".json")):
+                continue
+            alias = base[len(prefix):-len(".json")]
+            stamp = 0.0
+            reader = getattr(transport, "read_at_ref", None)
+            if reader is not None:
+                try:
+                    payload = json.loads(reader(f"{WAKE_RELPATH}/{name}") or "{}")
+                    stamp = float(payload.get("written_at") or 0.0)
+                except Exception:                      # noqa: BLE001 - an unreadable stamp
+                    stamp = 0.0
+            records.append((stamp, alias))
+        return sorted(records)
+
+    def _claims(self, timer_id: str, firing: int) -> Optional[List[str]]:
+        """Aliases that have claimed this firing, first written first."""
+        records = self._claim_records(timer_id, firing)
+        return None if records is None else [alias for _stamp, alias in records]
 
     def _claim_written_at(self, timer: WakeTimer) -> Optional[float]:
         """When this bot's claim for the timer's current firing was written, if it was."""
@@ -810,13 +836,14 @@ class WakeStore:
         firing = self.firing_of(timer)
         if not self.refresh():                # a peer's claim from a minute ago must be visible
             return "lost"                     # a stale ref is a reason not to fire
-        before = self._claims(timer.id, firing)
+        before = self._claim_records(timer.id, firing)
         if before is None:                    # a broken bus is not "I am the only one"
             return "lost"
-        mine = self.safe_alias in (before or [])
+        mine = any(alias == self.safe_alias for _stamp, alias in before)
         if not mine:
-            if before and sorted([*before, self.safe_alias])[0] != self.safe_alias:
-                return "lost"                 # a lower alias holds the firing
+            # Someone claimed it before we did: the earliest claim holds the firing.
+            if before:
+                return "lost"
             if not self._write_claim(timer, firing):
                 return "lost"                 # it did not reach the bus: do not fire on it
             if settle_seconds > 0:
@@ -827,12 +854,12 @@ class WakeStore:
                 return "wait"                 # written, but not visible to peers for long enough
         if not self.refresh():                # the post-read must come from a fresh ref too
             return "lost"
-        after = self._claims(timer.id, firing)
-        if after is None or self.safe_alias not in after:
+        after = self._claim_records(timer.id, firing)
+        if after is None or not any(alias == self.safe_alias for _stamp, alias in after):
             # The post-read must show this bot's own claim: an empty list means the bus did
             # not confirm it, not that this bot won.
             return "lost"
-        return "won" if sorted(after)[0] == self.safe_alias else "lost"
+        return "won" if after[0][1] == self.safe_alias else "lost"
 
     def _write_claim(self, timer: WakeTimer, firing: int) -> bool:
         """Write this bot's claim for one firing (append-only: never rewritten)."""

@@ -933,3 +933,107 @@ class TestSettleWindow(unittest.TestCase):
                                  transport=_BusTransport(tmp), root=Path(tmp),
                                  clock=lambda: 1000.0)
             self.assertTrue(store.claim(self.timer(), settle_seconds=0))
+
+
+class TestOverlappingPushRace(unittest.TestCase):
+    """Codex/QA repro: beta fires before alpha's push lands, then alpha fires too.
+
+    Two things stop it: a claim is not honoured until it has settled (so beta cannot fire on
+    the tick it wrote), and the winner is the earliest claim, not the lowest alias (so alpha
+    pushing later cannot overtake a claim that is already there).
+    """
+
+    def timer(self):
+        return wk.WakeTimer(argv=("git", "status"), then="go", next_at=1060.0,
+                            expires_at=1300.0, every_seconds=60.0, chat_id=1,
+                            alias="beta", id="t1")
+
+    def test_the_repro_does_not_double_fire(self):
+        with TemporaryDirectory() as tmp:
+            class Scripted(_BusTransport):
+                """The bus, seen at the moment each bot asks: beta pushes first, alpha after."""
+
+                def __init__(self, root, alias, script):
+                    super().__init__(root)
+                    self.alias = alias
+                    self.script = list(script)
+                    self.calls = 0
+
+                def list_at_ref(self, relpath):
+                    self.calls += 1
+                    if self.script:
+                        return self.script.pop(0)
+                    return super().list_at_ref(relpath)
+
+            now = {"t": 1000.0}
+            beta = wk.WakeStore("beta", state_dir=Path(tmp),
+                                transport=Scripted(tmp, "beta", [[], ["beta/t1-1060-beta.json"]]),
+                                root=Path(tmp), clock=lambda: now["t"])
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp),
+                                 transport=Scripted(tmp, "alpha",
+                                                    [["beta/t1-1060-beta.json"],
+                                                     ["alpha/t1-1060-alpha.json",
+                                                      "beta/t1-1060-beta.json"]]),
+                                 root=Path(tmp), clock=lambda: now["t"])
+            self.assertFalse(beta.claim(self.timer(), settle_seconds=30),
+                             "beta must not fire on the tick it wrote its claim")
+            now["t"] += 60                       # alpha pushed in the meantime
+            won = [store.claim(self.timer(), settle_seconds=30) for store in (beta, alpha)]
+            self.assertEqual(sum(1 for result in won if result), 1, won)
+
+    def test_a_late_lower_alias_cannot_overtake_the_earlier_claim(self):
+        with TemporaryDirectory() as tmp:
+            now = {"t": 1000.0}
+            first = wk.WakeStore("zulu", state_dir=Path(tmp), transport=_BusTransport(tmp),
+                                 root=Path(tmp), clock=lambda: now["t"])
+            self.assertEqual(first.claim_state(self.timer(), settle_seconds=30), "wait")
+            now["t"] += 60
+            self.assertEqual(first.claim_state(self.timer(), settle_seconds=30), "won")
+            # The lower alias only writes now; the firing is already claimed by an older one.
+            later = wk.WakeStore("alpha", state_dir=Path(tmp), transport=_BusTransport(tmp),
+                                 root=Path(tmp), clock=lambda: now["t"])
+            self.assertEqual(later.claim_state(self.timer(), settle_seconds=30), "lost")
+
+
+class TestPublicationSurfaces(unittest.TestCase):
+    """Codex/QA repro: publish_state() swallowed push failures."""
+
+    def timer(self):
+        return wk.WakeTimer(argv=("git", "status"), then="go", next_at=1000.0,
+                            expires_at=2000.0, every_seconds=0, chat_id=-1,
+                            alias="claude", id="abc12345")
+
+    def test_add_raises_when_the_bus_refuses_the_state(self):
+        with TemporaryDirectory() as tmp:
+            class Refuses(_BusTransport):
+                def commit_and_push(self, message, paths=None):
+                    raise RuntimeError("push rejected")
+
+            store = wk.WakeStore("claude", state_dir=Path(tmp), transport=Refuses(tmp),
+                                 root=Path(tmp), clock=lambda: 1000.0)
+            with self.assertRaises(wk.WakePushError):
+                store.add(self.timer(), max_timers=10)
+            self.assertEqual(store.live_count, 1)       # it is armed here, and said so
+
+    def test_a_refused_state_is_reported_in_the_wake_ack(self):
+        from tests.test_telegram_channel import event, make_channel, make_config
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config(agent={"role": "developer"},
+                             fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
+                             limits={"wake_tick_seconds": 0})
+        channel = make_channel(config)
+        store = wk.WakeStore(channel.config.identity.alias,
+                             state_dir=Path(tmp.name) / "state", transport=None,
+                             root=Path(tmp.name), clock=time.time)
+
+        def refuse(timer, *, max_timers):
+            store.write(timer)
+            raise wk.WakePushError("the bus did not take the state")
+
+        store.add = refuse
+        channel.wake_store = lambda: store
+        body = channel.apply_wake_lines('x\nWAKE in=1m check="git status" then="go"',
+                                        event("hi", username="ClaudeBot"))
+        self.assertIn("armed locally only", body)
+        self.assertIn("the bus did not take the state", body)

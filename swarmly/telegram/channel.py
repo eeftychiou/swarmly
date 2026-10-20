@@ -2356,7 +2356,8 @@ class AgentChannel:
         every refusal is said back into the reply, because a timer the bot believes it armed
         is a promise the rest of the swarm counts on.
         """
-        from swarmly.telegram.wake import WakeError, extract_wakes, make_timer
+        from swarmly.telegram.wake import (WakeError, WakePushError, extract_wakes,
+                                           make_timer)
         body, specs, reasons = extract_wakes(text or "")
         if not specs and not reasons:
             return text
@@ -2375,15 +2376,17 @@ class AgentChannel:
                                topic=self.topics.name(event.chat_id, event.thread_id) or "",
                                now=time.time())
             try:
-                published = store.add(timer, max_timers=max(1, int(limits.wake_max)))
+                store.add(timer, max_timers=max(1, int(limits.wake_max)))
+            except WakePushError as exc:
+                # Armed here, but the bus did not take it: say so, loudly, rather than
+                # promise the swarm a timer only this checkout can see.
+                notes.append(timer.ack(now=time.time()))
+                notes.append(f"⚠️ WAKE armed locally only: {exc}")
+                continue
             except WakeError as exc:
                 notes.append(f"WAKE refused: {exc}")
                 continue
             notes.append(timer.ack(now=time.time()))
-            if not published:
-                # Armed here, but the bus does not have it yet: say so rather than promise
-                # the swarm a timer only this checkout can see.
-                notes.append("WAKE armed locally; the bus copy has not pushed yet")
         if len(specs) > per_reply:
             notes.append(f"WAKE refused: a reply may arm at most {per_reply} timers")
         notes.extend(f"WAKE refused: {reason}" for reason in reasons)
@@ -2502,7 +2505,12 @@ class AgentChannel:
         if not is_admin:
             return "wakes: only the admin cancels a timer; ask them, or let it expire"
         timer_id = args[1].lstrip("#")
-        if self.wake_store().cancel(timer_id):
+        from swarmly.telegram.wake import WakePushError
+        try:
+            cancelled = self.wake_store().cancel(timer_id)
+        except WakePushError as exc:
+            return f"wakes: cancelled {timer_id} locally only ({exc})"
+        if cancelled:
             return f"wakes: cancelled {timer_id}"
         return f"wakes: no live timer {timer_id}"
 

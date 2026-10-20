@@ -914,6 +914,9 @@ The check is parsed token by token and every flag is normalized first, so an att
 carries only read flags (`--jq`, `--paginate`, `--slurp`, `-i`, `-H`). `check=` and `then=` must be
 quoted — an unquoted `then` would silently keep only its first word.
 
+A timer whose state the bus refuses is still armed (the local schedule stands) but the ack says
+`⚠️ WAKE armed locally only: …`, because the swarm cannot adopt a promise the bus does not have.
+
 `/wakes@<bot>` lists the live timers with their next time, check and attempt count;
 `/wakes@<bot> cancel <id>` drops one (admin only); `/status@<bot>` carries `wakes=N`. A frozen
 bot runs no check, and neither does a paused one. The fire claims live on the bus under

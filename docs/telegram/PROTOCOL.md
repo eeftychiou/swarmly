@@ -475,7 +475,8 @@ state dir, so a restart resumes the schedule (times are absolute: `next_at` and 
 append-only claim to `.agents/wakes/<alias>/<timer>-<firing>-<alias>.json` on the bus *before* the
 turn starts (the claim carries the whole timer, so a successor can adopt it) — keyed on the firing's scheduled time, so a stale claim from an earlier firing (or from
 a bot that has since died) never blocks the next one. The claims for that firing are **re-read after
-the push** and the winner is the lowest alias among them, so two bots that both saw none cannot both
+the push** and the winner is the **earliest claim** (ties by lowest alias), not simply the lowest
+alias — a bot that pushes second cannot overtake one that is already there, so two bots that both saw none cannot both
 fire, and the bus ref is fetched before both reads. A claim is not honoured the tick it is
 written: with `limits.wake_claim_settle_seconds` (default 30) the writer waits one window, by
 which time a peer's overlapping claim is visible and every bot folds the same winner, so a claim written a minute ago is
