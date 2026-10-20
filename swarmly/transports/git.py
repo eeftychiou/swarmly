@@ -134,6 +134,25 @@ class GitTransport:
         return sorted(path[len(prefix):] for path in (result.stdout or "").splitlines()
                       if path.startswith(prefix))
 
+    def first_seen_at(self, relpath: str) -> Optional[float]:
+        """When *relpath* first appeared in the bus's history, in epoch seconds.
+
+        A claim is a file added to the bus, so its commit time is a fact about the bus rather
+        than about the bot that wrote it. Callers that need to order competing writes use this
+        and never a timestamp from inside the file (PR #92 review, B4).
+        """
+        if not self.ref:
+            return None
+        result = self._git("log", "-1", "--format=%ct", "--diff-filter=A", self.ref, "--",
+                           relpath, timeout=30)
+        if result.returncode != 0:
+            return None
+        text = (result.stdout or "").strip()
+        try:
+            return float(text.splitlines()[-1]) if text else None
+        except ValueError:
+            return None
+
     def read_at_ref(self, relpath: str) -> Optional[str]:
         """The bytes of one bus document at the ref, or ``None`` when it is not there."""
         if not self.ref:

@@ -474,17 +474,14 @@ state dir, so a restart resumes the schedule (times are absolute: `next_at` and 
 `in=` re-derived) and two parallel turns cannot rewrite each other's schedule. Each firing writes an
 append-only claim to `.agents/wakes/<alias>/<timer>-<firing>-<alias>.json` on the bus *before* the
 turn starts (the claim carries the whole timer, so a successor can adopt it) — keyed on the firing's scheduled time, so a stale claim from an earlier firing (or from
-a bot that has since died) never blocks the next one. The claims for that firing are **re-read after
-the push** and the winner is the **earliest claim** (ties by lowest alias), not simply the lowest
-alias — a bot that pushes second cannot overtake one that is already there, so two bots that both saw none cannot both
-fire, and the bus ref is fetched before both reads. A claim is not honoured the tick it is
-written: with `limits.wake_claim_settle_seconds` (default 30) the writer waits one window **measured
-from when its push was confirmed**, so a claim still in flight cannot be overtaken, and by then a
-peer's overlapping claim is visible and every bot folds the same winner, so a claim written a minute ago is
-visible rather than waiting for the poll. A claim's stamp is the time its **push returned**, not
-the time its file was written — a claim whose push is slow therefore carries a later stamp than a
-bot that fired while it was in flight, and loses. A claim that is on the ref without a confirmed
-stamp (placed, then interrupted) is not a claim at all: nobody counts it, including its writer. A claim whose own write cannot be confirmed, or that
+a bot that has since died) never blocks the next one. The claims for that firing are **re-read
+after the push**, and ordered by **when the bus first saw each one** (`git log
+--diff-filter=A` on the claim path), ties by lowest alias. Nothing inside the file decides it: a
+timestamp a bot writes is advisory, because it is written before its own push, and a slow push
+would then carry an earlier time than the claim it overtook. A claim is not honoured the tick it
+is written: with `limits.wake_claim_settle_seconds` (default 30) the writer waits one window
+**measured from when the bus first had its claim**, so a claim still in flight cannot be overtaken
+and every bot folds the same winner. A claim whose own write cannot be confirmed, or that
 cannot be pushed, or whose fetch failed, does not fire: a stale or broken bus is not "I am the
 only one".
 

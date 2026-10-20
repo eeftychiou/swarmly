@@ -320,12 +320,12 @@ class TestClaims(unittest.TestCase):
             firing = wk.WakeStore.firing_of(self.timer())
             name = f"abc12345-{firing}-claude.json"
             relpath = f".agents/wakes/claude/{name}"
-            # Two pushes: the claim is placed, then stamped with the time its push returned.
-            self.assertEqual(transport.pushed, [[relpath], [relpath]])
+            # One push: the claim goes to the bus as it is, and the bus's history orders it.
+            self.assertEqual(transport.pushed, [[relpath]])
             written = json.loads((Path(tmp) / ".agents" / "wakes" / "claude"
                                   / name).read_text(encoding="utf-8"))
             self.assertEqual(written["check"], "gh pr checks 75")
-            self.assertGreater(written["written_at"], 0)     # stamped after the push
+            self.assertGreater(written["written_at"], 0)     # advisory; the bus history orders
 
     def test_a_second_bot_loses_to_the_lowest_alias(self):
         with TemporaryDirectory() as tmp:
@@ -1265,6 +1265,65 @@ class TestReadyTurnIsNotDropped(unittest.TestCase):
         self.assertEqual(store.live_count, 0)          # and the timer is retired locally
 
 
+class TestBusHistoryOrdersClaims(unittest.TestCase):
+    """B4: the winner is decided by when the bus *saw* a claim, not by a time inside it."""
+
+    def timer(self, alias):
+        return wk.WakeTimer(argv=("git", "status"), then="go", next_at=1060.0,
+                            expires_at=1300.0, every_seconds=60.0, chat_id=1,
+                            alias=alias, id="t1")
+
+    def bus(self, root, seen):
+        class Historic(_BusTransport):
+            def first_seen_at(self, relpath):
+                return seen.get(relpath.rsplit("/", 1)[-1])
+
+        return Historic(root)
+
+    def claim_file(self, root, alias, written_at):
+        folder = Path(root) / ".agents" / "wakes" / alias
+        folder.mkdir(parents=True, exist_ok=True)
+        name = f"t1-1060-{alias}.json"
+        (folder / name).write_text(json.dumps(
+            {"id": "t1", "alias": alias, "firing": 1060, "written_at": written_at,
+             "timer": self.timer(alias).to_dict()}), encoding="utf-8")
+
+    def test_a_claim_that_lies_about_its_stamp_loses_to_the_one_the_bus_saw_first(self):
+        with TemporaryDirectory() as tmp:
+            # alpha says 1000 in its own file but only reached the bus at 1050.
+            self.claim_file(tmp, "alpha", 1000.0)
+            # beta says 1040 and reached the bus at 1040.
+            self.claim_file(tmp, "beta", 1040.0)
+            seen = {"t1-1060-alpha.json": 1050.0, "t1-1060-beta.json": 1040.0}
+            now = {"t": 1100.0}
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
+                                 transport=self.bus(tmp, seen), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            beta = wk.WakeStore("beta", state_dir=Path(tmp) / "b",
+                                transport=self.bus(tmp, seen), root=Path(tmp),
+                                clock=lambda: now["t"])
+            self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=0), "won")
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
+
+    def test_a_slow_confirmation_push_cannot_win_by_its_earlier_write(self):
+        with TemporaryDirectory() as tmp:
+            # The exact residual Codex/Reasonix described: the file says 1000, the bus saw it
+            # at 1050, after beta's 1040 claim had already settled and fired.
+            self.claim_file(tmp, "alpha", 1000.0)
+            self.claim_file(tmp, "beta", 1040.0)
+            seen = {"t1-1060-alpha.json": 1050.0, "t1-1060-beta.json": 1040.0}
+            now = {"t": 1080.0}
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
+                                 transport=self.bus(tmp, seen), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            beta = wk.WakeStore("beta", state_dir=Path(tmp) / "b",
+                                transport=self.bus(tmp, seen), root=Path(tmp),
+                                clock=lambda: now["t"])
+            self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=30), "won")
+            now["t"] += 40
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=30), "lost")
+
+
 class TestPushLandsAfterAPeerFired(unittest.TestCase):
     """B4 exactly as reported: a claim whose push lands *after* another bot fired.
 
@@ -1299,10 +1358,7 @@ class TestPushLandsAfterAPeerFired(unittest.TestCase):
                                       transport=_BusTransport(tmp), root=Path(tmp),
                                       clock=lambda: now["t"])
             now["t"] = 1100.0
-            # A fresh process has no confirmation of its own claim in memory, so it waits one
-            # more window rather than firing on a claim it cannot vouch for.
-            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=30), "wait")
-            now["t"] += 31
+            # Its own claim has been on the bus since 1040 (settled), and beta's is earlier: lost.
             self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=30), "lost")
             # and beta, already fired, does not fire a second time either: its own record says
             # done, so nothing on the claim path can make it fire again.

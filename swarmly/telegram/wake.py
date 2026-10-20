@@ -764,11 +764,13 @@ class WakeStore:
 
     def _claim_records(self, timer_id: str, firing: int
                        ) -> Optional[List[Tuple[float, str]]]:
-        """``(written_at, alias)`` for every claim on this firing, or ``None`` if unreadable.
+        """``(first_seen, alias)`` for every claim on this firing, or ``None`` if unreadable.
 
-        The winner is the **earliest write**, ties broken by the lowest alias: the alias alone
-        let a later claimant win by simply being lower, so a bot that pushed second could still
-        fire alongside the bot that pushed first (PR #92 review, Codex/QA repro).
+        *first_seen* is when the claim first appeared **in the bus's history**, not a time the
+        writer put inside the file: a bot cannot make its claim look older by stamping it, and a
+        slow push cannot carry an earlier claim than the one it overtook. Where the transport
+        cannot say (a folder or an in-memory bus), the file's own stamp is the fallback, and the
+        lowest alias breaks ties.
         """
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
@@ -787,17 +789,25 @@ class WakeStore:
             if not (base.startswith(prefix) and base.endswith(".json")):
                 continue
             alias = base[len(prefix):-len(".json")]
-            stamp = 0.0
-            reader = getattr(transport, "read_at_ref", None)
-            if reader is not None:
+            full = f"{WAKE_RELPATH}/{name}"
+            seen = None
+            first_seen = getattr(transport, "first_seen_at", None)
+            if first_seen is not None:
                 try:
-                    payload = json.loads(reader(f"{WAKE_RELPATH}/{name}") or "{}")
-                    stamp = float(payload.get("written_at") or 0.0)
-                except Exception:                      # noqa: BLE001 - an unreadable stamp
-                    stamp = 0.0
-            if stamp <= 0:                             # placed but never confirmed: not a claim
-                continue
-            records.append((stamp, alias))
+                    seen = first_seen(full)
+                except Exception:                      # noqa: BLE001 - fall back to the stamp
+                    seen = None
+            if seen is None:
+                reader = getattr(transport, "read_at_ref", None)
+                if reader is not None:
+                    try:
+                        payload = json.loads(reader(full) or "{}")
+                        seen = float(payload.get("written_at") or 0.0)
+                    except Exception:                  # noqa: BLE001 - no usable time at all
+                        seen = None
+            if seen is None or seen <= 0:
+                continue                               # the bus cannot place it: not a claim
+            records.append((seen, alias))
         return sorted(records)
 
     def _claims(self, timer_id: str, firing: int) -> Optional[List[str]]:
@@ -854,10 +864,13 @@ class WakeStore:
             if settle_seconds > 0:
                 return "wait"                 # confirmed now; fire once peers can see it
         elif settle_seconds > 0:
-            confirmed = self._confirmed.get(firing)
+            # The window runs from when the *bus* first saw our claim, which a restart keeps
+            # (the local confirmation is only a fallback for a bus that cannot say).
+            seen = next((stamp for stamp, alias in before if alias == self.safe_alias), None)
+            confirmed = seen if seen is not None else self._confirmed.get(firing)
             if confirmed is None:
-                # A restart (or another process): treat the claim as confirmed now, and wait
-                # one more window rather than firing on a claim whose push we cannot vouch for.
+                # A restart (or another process): wait one more window rather than firing on a
+                # claim whose visibility we cannot vouch for.
                 self._confirmed[firing] = self.clock()
                 return "wait"
             if (self.clock() - confirmed) < settle_seconds:
@@ -877,44 +890,32 @@ class WakeStore:
         return "won" if after[0][1] == self.safe_alias else "lost"
 
     def _write_claim(self, timer: WakeTimer, firing: int) -> Optional[float]:
-        """Write this bot's claim, and stamp it once the push has landed.
+        """Write this bot's claim for one firing, and push it once.
 
-        The stamp is what peers order claims by, so it must be the time the claim became
-        visible, not the time the file was created: a claim whose push is slow would otherwise
-        carry an earlier stamp than a bot that fired while it was still in flight, and win
-        afterwards (PR #92 review, B4). A claim without a confirmed stamp is not a claim: peers
-        ignore it until the writer has stamped it.
+        Nothing in the file decides who wins: the bus's history does (see
+        :meth:`_claim_records`). That is the only way to close the last window — a stamp is
+        written before its own push, so a slow push would carry an earlier time than the write
+        it overtook (PR #92 review, B4).
         """
         directory = self.root / WAKE_RELPATH / self.safe_alias
         directory.mkdir(parents=True, exist_ok=True)
         relpath = f"{WAKE_RELPATH}/{self.safe_alias}/{timer.id}-{firing}-{self.safe_alias}.json"
         if not is_bus_document(relpath):
             raise WakeError(f"refusing to write outside {WAKE_RELPATH}: {relpath!r}")
-        def payload(stamp: float) -> str:
-            return json.dumps(
-                {"id": timer.id, "alias": self.safe_alias, "firing": firing,
-                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())),
-                 "written_at": stamp, "check": timer.check, "timer": timer.to_dict()})
-
-        path = self.root / relpath
-        path.write_text(payload(0.0), encoding="utf-8")     # placed, not yet confirmed
+        stamp = self.clock()
+        (self.root / relpath).write_text(json.dumps(
+            {"id": timer.id, "alias": self.safe_alias, "firing": firing,
+             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp)),
+             # Advisory only: claims are ordered by when the bus saw them, not by this.
+             "written_at": stamp, "check": timer.check, "timer": timer.to_dict()}),
+            encoding="utf-8")
         transport = self.transport
         if transport is not None and hasattr(transport, "commit_and_push"):
             try:
-                transport.commit_and_push(f"wakes: {timer.id} firing {firing} placed",
+                transport.commit_and_push(f"wakes: {timer.id} firing {firing}",
                                           paths=[relpath])
             except Exception as exc:                   # noqa: BLE001 - never fire on it
                 logger.warning("wake: claim %s was written but not pushed: %s", relpath, exc)
-                return None
-        stamp = self.clock()                           # the push has returned: it is visible
-        path.write_text(payload(stamp), encoding="utf-8")
-        if transport is not None and hasattr(transport, "commit_and_push"):
-            try:
-                transport.commit_and_push(f"wakes: {timer.id} firing {firing} confirmed",
-                                          paths=[relpath])
-            except Exception as exc:                   # noqa: BLE001 - unconfirmed is not a claim
-                logger.warning("wake: claim %s was confirmed here but not pushed: %s",
-                               relpath, exc)
                 return None
         return stamp
 
