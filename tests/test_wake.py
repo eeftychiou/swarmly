@@ -1263,3 +1263,50 @@ class TestReadyTurnIsNotDropped(unittest.TestCase):
         self.assertIn("merge it", started[0])
         self.assertTrue(any("not on the bus" in line for line in done), done)
         self.assertEqual(store.live_count, 0)          # and the timer is retired locally
+
+
+class TestPushLandsAfterAPeerFired(unittest.TestCase):
+    """B4 exactly as reported: a claim whose push lands *after* another bot fired.
+
+    The stamp is the time the push returned, so the late-landing claim is ordered *after* the
+    claim that already fired -- and loses. Ordering by the pre-push write time is what let it
+    win, and that was the hole.
+    """
+
+    def timer(self, alias):
+        return wk.WakeTimer(argv=("git", "status"), then="go", next_at=1060.0,
+                            expires_at=1300.0, every_seconds=60.0, chat_id=1,
+                            alias=alias, id="t1")
+
+    def claim_file(self, root, alias, stamp):
+        folder = Path(root) / ".agents" / "wakes" / alias
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"t1-1060-{alias}.json").write_text(json.dumps(
+            {"id": "t1", "alias": alias, "firing": 1060, "written_at": stamp,
+             "timer": self.timer(alias).to_dict()}), encoding="utf-8")
+
+    def test_a_claim_landing_after_the_firing_loses_by_its_later_stamp(self):
+        with TemporaryDirectory() as tmp:
+            now = {"t": 1040.0}
+            # beta claimed at 1000, settled, and fired; its claim carries stamp 1000.
+            self.claim_file(tmp, "beta", 1000.0)
+            # alpha wrote at 1000 but its push only landed at 1040, so its stamp is 1040.
+            self.claim_file(tmp, "alpha", 1040.0)
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
+                                 transport=_BusTransport(tmp), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            beta_store = wk.WakeStore("beta", state_dir=Path(tmp) / "b",
+                                      transport=_BusTransport(tmp), root=Path(tmp),
+                                      clock=lambda: now["t"])
+            now["t"] = 1100.0
+            # A fresh process has no confirmation of its own claim in memory, so it waits one
+            # more window rather than firing on a claim it cannot vouch for.
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=30), "wait")
+            now["t"] += 31
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=30), "lost")
+            # and beta, already fired, does not fire a second time either: its own record says
+            # done, so nothing on the claim path can make it fire again.
+            fired = self.timer("beta")
+            fired.state, fired.replays = "done", 1
+            beta_store.write(fired)
+            self.assertFalse(beta_store.due(now=1100.0))
