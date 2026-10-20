@@ -388,3 +388,53 @@ class TestTheBusyWindowAndTheClock(unittest.TestCase):
         hear(channel, pulse_text("Codex", NOW + 3600))
         channel._test_presence_clock["t"] = NOW + 400
         self.assertTrue(channel.presence().is_down("Codex", NOW + 400))
+
+class FakePulseBus:
+    """A pulse ref, without a git repo: publish() records, read() returns the others."""
+
+    def __init__(self, *, push_ok=True, pulses=None):
+        self.push_ok = push_ok
+        self.pulses = dict(pulses or {})
+        self.published = []
+
+    def publish(self, pulse):
+        self.published.append(pulse)
+        if self.push_ok:
+            self.pulses[pulse.alias] = pulse.to_dict()
+        return self.push_ok
+
+    def read(self):
+        return {alias: record for alias, record in self.pulses.items() if alias != "Hermes"}
+
+
+class TestThePulseOnTheBus(unittest.TestCase):
+    """Review B1 on #94: when the bus is on, the pulse is written there, not to Telegram."""
+
+    def channel_with(self, bus):
+        channel = live_channel()
+        channel._pulsebus = bus
+        channel._pulsebus_checked = True
+        return channel
+
+    def test_the_pulse_goes_to_the_ref_and_not_to_telegram(self):
+        bus = FakePulseBus(pulses={"Codex": pr.Pulse(alias="Codex", at=NOW).to_dict()})
+        channel = self.channel_with(bus)
+        said = run(channel._heartbeat_tick())
+        self.assertIn("pulse ref", said)
+        self.assertIn("peers=1", said)                     # Codex was read back from its ref
+        self.assertEqual(channel._test_sender.sent, [])     # nothing on Telegram while the bus is on
+        self.assertEqual([p.alias for p in bus.published], ["Hermes"])
+        self.assertEqual(channel.presence().status("Codex", NOW), "up")
+
+    def test_a_failed_push_falls_back_to_the_telegram_line(self):
+        bus = FakePulseBus(push_ok=False)
+        channel = self.channel_with(bus)
+        said = run(channel._heartbeat_tick())
+        self.assertIn("pulse rev=", said)
+        self.assertIn("STATUS to=* intent=PULSE", channel._test_sender.last)
+
+    def test_a_transport_with_no_config_has_no_bus(self):
+        # A unit test or an ad-hoc run has no checkout to write a ref into: Telegram carries it.
+        channel = live_channel()
+        self.assertIsNone(channel.pulse_bus())
+        self.assertIn("pulse rev=", run(channel._heartbeat_tick()))

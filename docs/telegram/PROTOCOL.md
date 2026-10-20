@@ -563,10 +563,21 @@ A participant conforms to v1.1 if it:
 
 ## Peer liveness: pulse and DOWN (issue #82)
 
-Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2). It is an
-ephemeral `STATUS intent=PULSE` line, **not** a git-bus commit and not a group message: six bots
-at two minutes would be ~180 commits an hour on the bus, forever, each a push race with the real
-bus traffic. The bus carries only a slow pulse plus the existing `HELLO ONLINE` / `BYE OFFLINE`.
+Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2), and it goes
+to the **durable plane** whenever there is one: a parentless commit on this bot's own ref,
+`refs/pulse/<alias>`, force-updated every beat (one blob, `pulse.json`, no parent chain). The ref
+is a mailbox, not a history: the bus branch grows no commits, `main` never learns a pulse
+happened, and the only writer of a bot's ref is that bot, so there is no push race. Peers read
+`refs/pulse/*` on the same interval, so the facts survive a restart -- including a die-off seen
+while this bot was being restarted.
+
+A commit on the bus branch every two minutes would be ~180 commits an hour of history, forever;
+that is why the pulse gets its own ref rather than a lane of the bus branch.
+
+**Telegram is the fallback.** With no bus (a bare transport, no checkout) or when this beat's
+push failed, the pulse goes out as the ephemeral `STATUS intent=PULSE` line instead -- and only
+then. `PULSE` is machine-class traffic (#43): it is recorded as state, wakes no model turn, and
+is swept from General like the other machine notices.
 
 A pulse carries `{alias, at, rev, role, term, busy_since, frozen}`. The pulse is emitted by its
 own task, never the turn lock, so a long turn keeps pulsing and `busy_since` says since when.

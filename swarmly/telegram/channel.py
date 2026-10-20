@@ -62,6 +62,7 @@ from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig
                                      model_problem)
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.presence import Presence, Pulse
+from swarmly.telegram.pulsebus import PulseBus, notes_from
 from swarmly.telegram.projects import ProjectRouter
 from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
 from swarmly.telegram.model_list import available_models, cached_models, format_list
@@ -544,6 +545,8 @@ class AgentChannel:
         # compare against their own), and a test replaces it; the pulse task starts in start().
         self.presence_clock: Callable[[], float] = self._wall
         self._presence: Optional[Presence] = None
+        self._pulsebus: Optional[PulseBus] = None
+        self._pulsebus_checked = False
         self._heartbeat_task: Optional[asyncio.Task] = None
         #: alias -> wall time its current DOWN episode was announced, so one return line closes it.
         self._down_announced: Dict[str, float] = {}
@@ -2064,6 +2067,26 @@ class AgentChannel:
             return float("inf")
         return interval * missed
 
+    def pulse_bus(self) -> Optional[PulseBus]:
+        """The git ref this bot's pulse is written to, or None when the bus is off (#82).
+
+        The pulse goes to the durable plane whenever there is one: a per-bot ref,
+        ``refs/pulse/<alias>``, force-updated every beat. A transport with no config file (a
+        unit test, an ad-hoc run) has no bus to write to, and uses the Telegram line instead.
+        """
+        if not self._pulsebus_checked:
+            self._pulsebus_checked = True
+            try:
+                if self.config.source_path is not None and self.config.bus.enabled:
+                    from swarmly.telegram.poll import transport_state_root
+                    candidate = PulseBus(transport_state_root(self.config),
+                                         self.config.identity.alias)
+                    if candidate.available():
+                        self._pulsebus = candidate
+            except Exception:                      # noqa: BLE001 - no bus, Telegram instead
+                logger.warning("presence: no pulse ref; pulsing on Telegram", exc_info=True)
+        return self._pulsebus
+
     def _presence_state_path(self) -> Optional[Path]:
         """Where the liveness table persists, so a restart does not forget a die-off (#82)."""
         return _state_file(self.config, "presence")
@@ -2244,16 +2267,33 @@ class AgentChannel:
                      frozen=bool(self._frozen))
 
     async def _heartbeat_tick(self, *, now: Optional[float] = None) -> str:
-        """Publish one pulse, then judge the peers. Returns what it said, for a test."""
+        """Publish one pulse, then judge the peers. Returns what it said, for a test.
+
+        The durable plane comes first: the pulse is a parentless commit on this bot's own ref,
+        so it survives a restart and puts nothing on the bus branch. Telegram is the fallback --
+        when there is no bus, or when this beat's push failed -- and the pulse is then the
+        ephemeral `STATUS intent=PULSE` line.
+        """
         moment = self.presence_clock() if now is None else now
         pulse = self.own_pulse(moment)
-        await self.send(
-            format_message(Envelope(type=MessageType.STATUS, to="*", intent="PULSE",
-                                    ref=self._alias_ref(), rev=self._running_revision),
-                           json.dumps(pulse.to_dict(), sort_keys=True, separators=(",", ":"))),
-            silent=True, notice=True, allow_when_frozen=True)
+        bus = self.pulse_bus()
+        on_ref = bool(bus and bus.publish(pulse))
+        table = self.presence()
+        if on_ref:
+            counted = notes_from(bus.read(), table, now=moment,
+                                 skip=[self.config.identity.alias])
+            self._save_presence()
+            said = f"pulse ref rev={pulse.rev or '?'} busy_since={pulse.busy_since} peers={counted}"
+        else:
+            await self.send(
+                format_message(Envelope(type=MessageType.STATUS, to="*", intent="PULSE",
+                                        ref=self._alias_ref(), rev=self._running_revision),
+                               json.dumps(pulse.to_dict(), sort_keys=True,
+                                          separators=(",", ":"))),
+                silent=True, notice=True, allow_when_frozen=True)
+            said = f"pulse rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
         await self.check_peer_liveness(now=moment)
-        return f"pulse rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
+        return said
 
     async def _heartbeat_loop(self) -> None:
         """Publish the pulse on its interval, for as long as this transport runs.
