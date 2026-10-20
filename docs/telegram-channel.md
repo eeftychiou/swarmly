@@ -906,6 +906,7 @@ line. Times are absolute, so a restart resumes the schedule instead of re-arming
 | `wake_tick_seconds` | 15 | how often the transport looks for due timers; `0` disables the loop |
 | `wake_check_seconds` | 120 | a check's own budget; past it the process group is killed |
 | `wake_max_attempts` | 50 | firings of one timer before it gives up with a turn saying so |
+| `wake_claim_settle_seconds` | 30 | how long a claim must be visible before its writer may fire it, so two overlapping pushes cannot both fire |
 | `wake_check_allow` | `["gh", "git"]` | the outer gate on which binary a check may start with |
 
 The check is parsed token by token and every flag is normalized first, so an attached value

@@ -361,7 +361,7 @@ class TestChannelWiring(unittest.TestCase):
             'merging once green\nWAKE in=10m every=5m until=2h check="gh pr checks 75" '
             'then="merge it"',
             event("hi", username="ClaudeBot"))
-        self.assertNotIn("WAKE", body)
+        self.assertNotIn('check="gh pr checks 75"', body)   # the line itself is gone
         self.assertIn("merging once green", body)
         self.assertIn("⏰ wake", body)
         self.assertEqual(channel.wake_store().live_count, 1)
@@ -585,7 +585,7 @@ class TestClaimIsNotFailOpen(unittest.TestCase):
         store = wk.WakeStore(channel.config.identity.alias,
                              state_dir=Path(tmp.name) / "state", transport=None,
                              root=Path(tmp.name), clock=time.time)
-        store.claim = lambda timer: False                  # another bot won the firing
+        store.claim_state = lambda timer, settle_seconds=0: "lost"   # another bot won it
         channel.wake_store = lambda: store
         store.add(wk.WakeTimer(argv=("git", "status"), then="go", next_at=1.0,
                                expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
@@ -895,3 +895,41 @@ class TestRefreshFailure(unittest.TestCase):
             store = wk.WakeStore("claude", state_dir=Path(tmp), transport=FailsLater(tmp),
                                  root=Path(tmp), clock=lambda: 1000.0)
             self.assertFalse(store.claim(self.timer()))
+
+
+class TestSettleWindow(unittest.TestCase):
+    """Codex: two overlapping pushes must not both fire."""
+
+    def timer(self):
+        return wk.WakeTimer(argv=("gh", "pr", "checks", "75"), then="merge", next_at=1000.0,
+                            expires_at=2000.0, every_seconds=300.0, chat_id=-1,
+                            id="abc12345")
+
+    def test_the_first_sighting_writes_the_claim_and_waits(self):
+        with TemporaryDirectory() as tmp:
+            store = wk.WakeStore("claude", state_dir=Path(tmp),
+                                 transport=_BusTransport(tmp), root=Path(tmp),
+                                 clock=lambda: 1000.0)
+            self.assertEqual(store.claim_state(self.timer(), settle_seconds=30), "wait")
+            self.assertFalse(store.claim(self.timer(), settle_seconds=30))
+
+    def test_once_the_window_has_passed_the_lowest_alias_fires(self):
+        with TemporaryDirectory() as tmp:
+            now = {"t": 1000.0}
+            lower = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                 transport=_BusTransport(tmp), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            higher = wk.WakeStore("zulu", state_dir=Path(tmp), transport=_BusTransport(tmp),
+                                  root=Path(tmp), clock=lambda: now["t"])
+            self.assertEqual(lower.claim_state(self.timer(), settle_seconds=30), "wait")
+            self.assertEqual(higher.claim_state(self.timer(), settle_seconds=30), "lost")
+            now["t"] += 60
+            self.assertEqual(higher.claim_state(self.timer(), settle_seconds=30), "lost")
+            self.assertEqual(lower.claim_state(self.timer(), settle_seconds=30), "won")
+
+    def test_without_a_settle_window_a_single_bot_fires_immediately(self):
+        with TemporaryDirectory() as tmp:
+            store = wk.WakeStore("claude", state_dir=Path(tmp),
+                                 transport=_BusTransport(tmp), root=Path(tmp),
+                                 clock=lambda: 1000.0)
+            self.assertTrue(store.claim(self.timer(), settle_seconds=0))

@@ -469,14 +469,16 @@ It is parsed with `shlex` and run without a shell, so shell metacharacters are r
 `-X`/`--method`/`-f`/`--input` and anything not on `PATH`. A refused line is stripped from the
 reply and the refusal is posted in its place.
 
-**A fire is claimed before it happens.** Timers live one file per timer under `wake-<alias>/` in the
+**A fire is claimed before it happens, and the claim must settle.** Timers live one file per timer under `wake-<alias>/` in the
 state dir, so a restart resumes the schedule (times are absolute: `next_at` and `expires_at`, never
 `in=` re-derived) and two parallel turns cannot rewrite each other's schedule. Each firing writes an
 append-only claim to `.agents/wakes/<alias>/<timer>-<firing>-<alias>.json` on the bus *before* the
 turn starts (the claim carries the whole timer, so a successor can adopt it) — keyed on the firing's scheduled time, so a stale claim from an earlier firing (or from
 a bot that has since died) never blocks the next one. The claims for that firing are **re-read after
 the push** and the winner is the lowest alias among them, so two bots that both saw none cannot both
-fire, and the bus ref is fetched before both reads, so a claim written a minute ago is
+fire, and the bus ref is fetched before both reads. A claim is not honoured the tick it is
+written: with `limits.wake_claim_settle_seconds` (default 30) the writer waits one window, by
+which time a peer's overlapping claim is visible and every bot folds the same winner, so a claim written a minute ago is
 visible rather than waiting for the poll. A claim whose own write cannot be confirmed, or that
 cannot be pushed, or whose fetch failed, does not fire: a stale or broken bus is not "I am the
 only one".

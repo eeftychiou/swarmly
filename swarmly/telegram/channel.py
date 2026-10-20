@@ -2375,11 +2375,15 @@ class AgentChannel:
                                topic=self.topics.name(event.chat_id, event.thread_id) or "",
                                now=time.time())
             try:
-                store.add(timer, max_timers=max(1, int(limits.wake_max)))
+                published = store.add(timer, max_timers=max(1, int(limits.wake_max)))
             except WakeError as exc:
                 notes.append(f"WAKE refused: {exc}")
                 continue
             notes.append(timer.ack(now=time.time()))
+            if not published:
+                # Armed here, but the bus does not have it yet: say so rather than promise
+                # the swarm a timer only this checkout can see.
+                notes.append("WAKE armed locally; the bus copy has not pushed yet")
         if len(specs) > per_reply:
             notes.append(f"WAKE refused: a reply may arm at most {per_reply} timers")
         notes.extend(f"WAKE refused: {reason}" for reason in reasons)
@@ -2431,9 +2435,13 @@ class AgentChannel:
             pending.state, pending.pending = "done", ""
             store.replace(pending)
             done.append(f"{pending.id}: replayed after a restart")
+        settle = float(self.config.limits.wake_claim_settle_seconds)
         for timer in store.due(moment):
-            if not await asyncio.to_thread(store.claim, timer):
-                done.append(f"{timer.id}: another bot claimed this firing")
+            claim = await asyncio.to_thread(store.claim_state, timer, settle_seconds=settle)
+            if claim != "won":
+                done.append(f"{timer.id}: "
+                            + ("claim written, firing after the settle window"
+                               if claim == "wait" else "another bot claimed this firing"))
                 continue
             code, tail = await run_check_async(
                 timer.argv, cwd=self._workdir_for(timer.chat_id, timer.thread_id),
@@ -2443,8 +2451,11 @@ class AgentChannel:
             timer.last_exit, timer.last_tail = code, tail
             done.append(f"{timer.id}: {action.kind}")
             if action.kind == "fire":
-                # Write the turn down before starting it, then retire the timer.
+                # Write the turn down before starting it, and count the launch *before* it
+                # starts: a crash after the launch must not replay the turn, so the record
+                # already says this firing was launched.
                 timer.pending = self._wake_prompt(action)
+                timer.replays += 1
                 store.replace(timer)
                 self._run_own_task(timer.pending, timer.chat_id, timer.thread_id,
                                    timer.topic or None)

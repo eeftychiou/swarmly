@@ -672,6 +672,10 @@ class ChannelLimits:
     #: How many firings one timer may have before it gives up with a turn that says so. 0
     #: leaves the bound to `until` alone.
     wake_max_attempts: int = 50
+    #: How long a claim must be visible on the bus before its writer may fire it. Two pushes
+    #: that overlap can otherwise each read "no claims" and both fire; waiting one settle
+    #: window makes the second read see both claims, and the lowest alias wins for everyone.
+    wake_claim_settle_seconds: float = 30.0
     #: The argv prefixes a WAKE check may start with. `gh` and `git` are allowed only through
     #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate.
     wake_check_allow: List[str] = field(default_factory=lambda: ["gh", "git"])
@@ -708,7 +712,7 @@ class ChannelLimits:
             raise ConfigError(
                 f"limits.multi_mention must be one of {list(MULTI_MENTIONS)} "
                 f"(got {self.multi_mention!r}).")
-        for key in ("wake_check_seconds", "wake_tick_seconds"):
+        for key in ("wake_check_seconds", "wake_tick_seconds", "wake_claim_settle_seconds"):
             value = getattr(self, key)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):

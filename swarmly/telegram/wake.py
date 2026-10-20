@@ -588,12 +588,12 @@ class WakeStore:
         tmp.write_text(json.dumps(timer.to_dict(), indent=1, sort_keys=True), encoding="utf-8")
         os.replace(tmp, path)
 
-    def add(self, timer: WakeTimer, *, max_timers: int) -> None:
+    def add(self, timer: WakeTimer, *, max_timers: int) -> bool:
         live = [row for row in self.load() if row.live]
         if len(live) >= max_timers:
             raise WakeError(f"{len(live)} timers are already armed (limits.wake_max={max_timers})")
         self.write(timer)
-        self.publish_state(timer)
+        return self.publish_state(timer)
 
     def cancel(self, timer_id: str) -> bool:
         found = False
@@ -621,7 +621,7 @@ class WakeStore:
         """Timers whose turn was written but not started: replayed once after a restart."""
         return [timer for timer in self.load() if timer.in_flight]
 
-    def publish_state(self, timer: WakeTimer) -> None:
+    def publish_state(self, timer: WakeTimer) -> bool:
         """Record this timer's *state* on the bus, so a successor knows what it inherits.
 
         One `<id>-state.json` per timer per alias, overwritten on every transition: a
@@ -631,7 +631,7 @@ class WakeStore:
         """
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
-            return
+            return True                    # no bus: the checkout is the plane
         directory = self.root / WAKE_RELPATH / self.safe_alias
         directory.mkdir(parents=True, exist_ok=True)
         relpath = f"{WAKE_RELPATH}/{self.safe_alias}/{timer.id}-state.json"
@@ -645,6 +645,8 @@ class WakeStore:
                 transport.commit_and_push(f"wakes: {timer.id} {timer.state}", paths=[relpath])
             except Exception as exc:                   # noqa: BLE001 - the local file stands
                 logger.warning("wake: state %s was written but not pushed: %s", relpath, exc)
+                return False
+        return True
 
     def adopt(self, *, max_timers: int, allow: Iterable[str] = ()
               ) -> List[WakeTimer]:
@@ -764,25 +766,76 @@ class WakeStore:
                 claims.append(base[len(prefix):-len(".json")])
         return sorted(claims)
 
-    def claim(self, timer: WakeTimer) -> bool:
-        """Claim this firing. True only when this bot is the one that may fire it.
+    def _claim_written_at(self, timer: WakeTimer) -> Optional[float]:
+        """When this bot's claim for the timer's current firing was written, if it was."""
+        path = self.root / WAKE_RELPATH / self.safe_alias / (
+            f"{timer.id}-{self.firing_of(timer)}-{self.safe_alias}.json")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return float(data.get("written_at") or 0.0) or path.stat().st_mtime
+        except Exception:                              # noqa: BLE001 - no claim of ours yet
+            return None
 
-        The claim is an append-only file written **before** the turn starts, one per timer
-        per firing, and the winner is the lowest alias among the claims *for that firing*.
-        The claims are re-read after the push, so two bots that both saw none cannot both
-        win; a claim that cannot be read or pushed does not fire (PR #92 review, blocker 3).
+    def claim(self, timer: WakeTimer, *, settle_seconds: float = 0.0) -> bool:
+        """True when this bot may fire now. See :meth:`claim_state` for the why."""
+        return self.claim_state(timer, settle_seconds=settle_seconds) == "won"
+
+    def _claim_written_at(self, timer: WakeTimer) -> Optional[float]:
+        """When this bot's claim for the timer's current firing was written, if it was."""
+        path = self.root / WAKE_RELPATH / self.safe_alias / (
+            f"{timer.id}-{self.firing_of(timer)}-{self.safe_alias}.json")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return float(data.get("written_at") or 0.0) or path.stat().st_mtime
+        except Exception:                              # noqa: BLE001 - no claim of ours yet
+            return None
+
+    def claim(self, timer: WakeTimer, *, settle_seconds: float = 0.0) -> bool:
+        """True when this bot may fire now. See :meth:`claim_state` for the why."""
+        return self.claim_state(timer, settle_seconds=settle_seconds) == "won"
+
+    def claim_state(self, timer: WakeTimer, *, settle_seconds: float = 0.0) -> str:
+        """Claim this firing: ``won`` (fire now), ``wait`` (ours is written, let it settle)
+        or ``lost`` (another bot has it, or the bus could not be read or written).
+
+        The claim is an append-only file, one per timer per firing, and the winner is the
+        lowest alias among the claims *for that firing*. Two pushes can overlap, so a claim
+        is not honoured the moment it is written: with a settle window, the writer fires on a
+        later tick, by which time both claims are visible and every bot folds the same
+        winner. A claim that cannot be read or pushed never fires.
         """
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
-            return True                       # no bus to race on: this transport is alone
+            return "won"                      # no bus to race on: this transport is alone
         firing = self.firing_of(timer)
-        if not self.refresh():            # a peer's claim from a minute ago must be visible
-            return False                  # a stale ref is not "I am the only one"
+        if not self.refresh():                # a peer's claim from a minute ago must be visible
+            return "lost"                     # a stale ref is a reason not to fire
         before = self._claims(timer.id, firing)
-        if before is None:
-            return False                      # a broken bus is not "I am the only one"
-        if before and sorted([*before, self.safe_alias])[0] != self.safe_alias:
-            return False
+        if before is None:                    # a broken bus is not "I am the only one"
+            return "lost"
+        mine = self.safe_alias in (before or [])
+        if not mine:
+            if before and sorted([*before, self.safe_alias])[0] != self.safe_alias:
+                return "lost"                 # a lower alias holds the firing
+            if not self._write_claim(timer, firing):
+                return "lost"                 # it did not reach the bus: do not fire on it
+            if settle_seconds > 0:
+                return "wait"                 # written now; fire once peers can see it
+        elif settle_seconds > 0:
+            written = self._claim_written_at(timer)
+            if written is None or (self.clock() - written) < settle_seconds:
+                return "wait"                 # written, but not visible to peers for long enough
+        if not self.refresh():                # the post-read must come from a fresh ref too
+            return "lost"
+        after = self._claims(timer.id, firing)
+        if after is None or self.safe_alias not in after:
+            # The post-read must show this bot's own claim: an empty list means the bus did
+            # not confirm it, not that this bot won.
+            return "lost"
+        return "won" if sorted(after)[0] == self.safe_alias else "lost"
+
+    def _write_claim(self, timer: WakeTimer, firing: int) -> bool:
+        """Write this bot's claim for one firing (append-only: never rewritten)."""
         directory = self.root / WAKE_RELPATH / self.safe_alias
         directory.mkdir(parents=True, exist_ok=True)
         relpath = f"{WAKE_RELPATH}/{self.safe_alias}/{timer.id}-{firing}-{self.safe_alias}.json"
@@ -791,22 +844,17 @@ class WakeStore:
         (self.root / relpath).write_text(json.dumps(
             {"id": timer.id, "alias": self.safe_alias, "firing": firing,
              "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())),
-             "check": timer.check, "timer": timer.to_dict()}), encoding="utf-8")
-        if hasattr(transport, "commit_and_push"):
+             "written_at": self.clock(), "check": timer.check,
+             "timer": timer.to_dict()}), encoding="utf-8")
+        transport = self.transport
+        if transport is not None and hasattr(transport, "commit_and_push"):
             try:
                 transport.commit_and_push(f"wakes: {timer.id} firing {firing}",
                                           paths=[relpath])
-            except Exception as exc:                   # noqa: BLE001 - do not fire on it
+            except Exception as exc:                   # noqa: BLE001 - never fire on it
                 logger.warning("wake: claim %s was written but not pushed: %s", relpath, exc)
                 return False
-        if not self.refresh():
-            return False
-        after = self._claims(timer.id, firing)
-        if after is None or self.safe_alias not in after:
-            # The post-read must show this bot's own claim: an empty list means the bus did
-            # not confirm it, not that this bot won (PR #92 review, R2).
-            return False
-        return sorted(after)[0] == self.safe_alias
+        return True
 
 
 #: Where the fire claims live on the bus (see ``swarmly.transports.base``).
