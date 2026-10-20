@@ -708,6 +708,15 @@ class ChannelLimits:
             raise ConfigError(
                 f"limits.multi_mention must be one of {list(MULTI_MENTIONS)} "
                 f"(got {self.multi_mention!r}).")
+        for key in ("wake_check_seconds", "wake_tick_seconds"):
+            value = getattr(self, key)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ConfigError(f"limits.{key} must be a number of seconds, 0 or more "
+                                  f"(got {value!r}).")
+        if self.wake_check_seconds <= 0:
+            raise ConfigError("limits.wake_check_seconds must be more than 0 seconds; a check "
+                              f"that may not finish is not a check (got {self.wake_check_seconds!r}).")
         attachment_mb = self.max_attachment_mb
         if (isinstance(attachment_mb, bool) or not isinstance(attachment_mb, (int, float))
                 or not math.isfinite(attachment_mb) or attachment_mb <= 0):

@@ -162,13 +162,14 @@ BUS_DOCUMENT_DIRS = (ROUNDS_RELPATH, WAKES_RELPATH)
 
 
 def is_bus_document(relpath: str) -> bool:
-    """True for a bus *document* (a round-state file); false for anything else.
+    """True for a bus *document* -- round state (#86) or a wake claim (#81) -- else False.
 
     A document is state, not a message: it is not an envelope, it may be nested one
     directory deep (one per round), and it is only ever written whole, under a name that
     is unique to that write. Everything that could escape ``.agents/rounds`` -- an
     absolute path, a ``..``, a drive letter, a control character -- is refused, the same
     way :func:`checked_envelope_name` refuses a path masquerading as a message id.
+    Documents live in one of :data:`BUS_DOCUMENT_DIRS`, one directory deep.
     """
     if not isinstance(relpath, str) or not relpath:
         return False

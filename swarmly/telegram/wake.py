@@ -45,6 +45,7 @@ start would re-arm forever), and ``attempts`` bounds the chain even if a clock m
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -90,8 +91,18 @@ ALLOWED_ARGV: Tuple[Tuple[str, ...], ...] = (
     ("git", "fetch"),
 )
 
-#: ``gh`` flags that turn a read into a write. Refused wherever they appear.
-WRITE_FLAGS = ("-X", "--method", "-f", "--field", "-F", "--input", "--raw-field")
+#: Flags that turn a read into a write, as canonical flag names. Matched after
+#: normalization, because gh accepts an attached value: ``-XPOST`` is ``-X POST`` and
+#: ``--field=body=x`` is ``--field body=x`` (PR #92 review, blocker 1).
+WRITE_FLAGS = ("-X", "--method", "-f", "--field", "-F", "--input", "--raw-field",
+               "-o", "--output")
+
+#: What ``gh api`` may carry besides the path: reads only. Anything else is refused, so a
+#: mutation (``-XPOST``, ``-f body=…``) cannot be composed at all.
+GH_API_FLAGS = ("-q", "--jq", "--paginate", "--slurp", "-i", "--include", "-H", "--header")
+
+#: Canonical flag name of a token: ``--field=x`` -> ``--field``, ``-XPOST`` -> ``-X``.
+_SHORT_FLAGS = tuple(flag for flag in WRITE_FLAGS if len(flag) == 2)
 
 #: Characters that only mean something to a shell. A check needs none of them, and one that
 #: wants ``$`` or a pipe is asking for the thing this allowlist exists to prevent.
@@ -145,11 +156,25 @@ def format_duration(seconds: float) -> str:
     return f"{int(seconds)}s"
 
 
+def flag_name(token: str) -> Optional[str]:
+    """The canonical flag a token starts with: ``--field=x`` -> ``--field``, ``-XPOST`` -> ``-X``.
+
+    ``None`` for a bare ``-``/``--`` and for anything that is not a flag.
+    """
+    if not token.startswith("-") or token in ("-", "--"):
+        return None
+    if token.startswith("--"):
+        return token.split("=", 1)[0]
+    short = token[:2]
+    return short if short in _SHORT_FLAGS else token
+
+
 def validate_check(command: str) -> Tuple[str, ...]:
     """The argv of a check, or :class:`WakeError` saying why it is refused.
 
-    Parsed with :mod:`shlex` and matched against :data:`ALLOWED_ARGV` argv-to-argv: the
-    allowlist is a property of the whole prefix, not of the first word.
+    Parsed with :mod:`shlex` and matched against :data:`ALLOWED_ARGV` argv-to-argv; every
+    token that is a flag is then normalized, so an attached value cannot smuggle a write in
+    (``-XPOST``, ``--field=body=x``, ``--output=/tmp/x``).
     """
     text = str(command or "").strip()
     if not text:
@@ -168,13 +193,16 @@ def validate_check(command: str) -> Tuple[str, ...]:
         allowed = ", ".join(" ".join(prefix) for prefix in ALLOWED_ARGV[:6])
         raise WakeError(f"the check must start with one of: {allowed}, … "
                         f"(got {' '.join(argv)})")
-    for word in argv:
-        if word in WRITE_FLAGS or word.startswith("--method="):
-            raise WakeError(f"the check asks for a write ({word}); a wake check is read-only")
-    if argv[:2] == ("gh", "api"):
-        for index, word in enumerate(argv[:-1]):
-            if word in ("-X", "--method") and argv[index + 1].upper() != "GET":
-                raise WakeError("gh api may only be used with GET")
+    for token in argv:
+        flag = flag_name(token)
+        if flag is None:
+            continue
+        if flag in WRITE_FLAGS:
+            raise WakeError(f"the check asks for a write ({token}); a wake check is read-only")
+        if argv[:2] == ("gh", "api") and flag not in GH_API_FLAGS:
+            raise WakeError(
+                f"gh api may only carry {', '.join(GH_API_FLAGS)} (got {token}); "
+                "a wake check reads, it does not write")
     binary = argv[0]
     if shutil.which(binary) is None:
         raise WakeError(f"{binary} is not on PATH on this host")
@@ -224,9 +252,15 @@ def parse_line(line: str, *, now: Optional[float] = None) -> WakeSpec:
     fields: Dict[str, str] = {}
     for match in _KV.finditer(rest):
         value = match.group(2)
-        if value[:1] in ("'", '"') and value[-1:] == value[:1]:
+        quoted = value[:1] in ("'", '"') and value[-1:] == value[:1]
+        if quoted:
             value = value[1:-1]
-        fields[match.group(1)] = value
+        name = match.group(1)
+        if name in ("check", "then") and not quoted:
+            # `then=merge it if review holds` would parse as "merge" and silently drop the
+            # rest, so the two free-text fields must be quoted (PR #92 review, S1).
+            raise WakeError(f"{name}= must be quoted: {name}=\"…\"")
+        fields[name] = value
     unknown = sorted(set(fields) - {"in", "every", "until", "check", "then"})
     if unknown:
         raise WakeError(f"unknown WAKE field(s): {', '.join(unknown)}")
@@ -499,55 +533,57 @@ class WakeStore:
 
     # -- local ----------------------------------------------------------------------
     @property
+    def directory(self) -> Optional[Path]:
+        """One file per timer, so two parallel turns never rewrite each other's schedule."""
+        return (self.state_dir / f"wake-{self.safe_alias}") if self.state_dir else None
+
+    @property
     def path(self) -> Optional[Path]:
-        return (self.state_dir / f"wake-{self.safe_alias}.json") if self.state_dir else None
+        return self.directory
+
+    def _timer_path(self, timer_id: str) -> Optional[Path]:
+        directory = self.directory
+        return (directory / f"{timer_id}.json") if directory else None
 
     def load(self) -> List[WakeTimer]:
-        path = self.path
-        if path is None or not path.is_file():
-            return []
-        try:
-            import json
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:                              # noqa: BLE001 - a bad file must not stop
-            logger.warning("wake: %s is unreadable; starting from none", path, exc_info=True)
+        directory = self.directory
+        if directory is None or not directory.is_dir():
             return []
         timers: List[WakeTimer] = []
-        for row in (data.get("timers") if isinstance(data, dict) else data) or []:
+        for path in sorted(directory.glob("*.json")):
             try:
-                timers.append(WakeTimer.from_dict(row))
-            except WakeError as exc:
-                logger.warning("wake: a stored timer is not usable: %s", exc)
+                data = json.loads(path.read_text(encoding="utf-8"))
+                timers.append(WakeTimer.from_dict(data))
+            except Exception as exc:                   # noqa: BLE001 - one bad file only
+                logger.warning("wake: %s is not usable (%s); skipping it", path.name, exc)
         return timers
 
     def save(self, timers: Iterable[WakeTimer]) -> None:
-        path = self.path
+        for timer in timers:
+            self.write(timer)
+
+    def write(self, timer: WakeTimer) -> None:
+        path = self._timer_path(timer.id)
         if path is None:
             return
-        import json
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 1, "alias": self.alias,
-                   "timers": [timer.to_dict() for timer in timers]}
-        tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex[:6]}")
-        tmp.write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
+        tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex[:6]}")
+        tmp.write_text(json.dumps(timer.to_dict(), indent=1, sort_keys=True), encoding="utf-8")
         os.replace(tmp, path)
 
     def add(self, timer: WakeTimer, *, max_timers: int) -> None:
-        timers = self.load()
-        live = [row for row in timers if row.live]
+        live = [row for row in self.load() if row.live]
         if len(live) >= max_timers:
             raise WakeError(f"{len(live)} timers are already armed (limits.wake_max={max_timers})")
-        timers.append(timer)
-        self.save(timers)
+        self.write(timer)
 
     def cancel(self, timer_id: str) -> bool:
-        timers = self.load()
         found = False
-        for timer in timers:
+        for timer in self.load():
             if timer.live and timer.id.lower().startswith(timer_id.lower()):
                 timer.state = "cancelled"
+                self.write(timer)
                 found = True
-        self.save(timers)
         return found
 
     def due(self, now: Optional[float] = None) -> List[WakeTimer]:
@@ -556,36 +592,36 @@ class WakeStore:
                       key=lambda timer: timer.next_at)
 
     def replace(self, timer: WakeTimer) -> None:
-        timers = self.load()
-        for index, row in enumerate(timers):
-            if row.id == timer.id:
-                timers[index] = timer
-                break
-        else:
-            timers.append(timer)
-        self.save(timers)
+        self.write(timer)
 
     @property
     def live_count(self) -> int:
         return len([timer for timer in self.load() if timer.live])
 
     # -- bus claims -----------------------------------------------------------------
-    def _claims(self, timer_id: str) -> List[str]:
-        """Aliases that have claimed *timer_id*'s current firing, from the bus.
+    @staticmethod
+    def firing_of(timer: WakeTimer) -> int:
+        """The firing this claim is about: the time the timer is due, agreed by every bot.
 
-        Every bot keeps its claims in its own directory, so the listing is taken one level up:
-        a claim is only meaningful against the other bots' claims.
+        Keyed on the *time*, not on a local attempt counter: two bots holding the same timer
+        would count differently, and a stale claim from an earlier firing must not stop the
+        next one (PR #92 review, blocker 2).
         """
+        return int(timer.next_at)
+
+    def _claims(self, timer_id: str, firing: int) -> Optional[List[str]]:
+        """Aliases that have claimed *timer_id*'s *firing*, or ``None`` if unreadable."""
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
             return []
         try:
-            names = transport.list_at_ref(WAKE_RELPATH) or []
-        except Exception:                              # noqa: BLE001 - a bad bus is not a claim
-            logger.warning("wake: could not list claims; treating this bot as the only one",
-                           exc_info=True)
-            return []
-        prefix = f"{timer_id}-"
+            names = transport.list_at_ref(WAKE_RELPATH)
+        except Exception:                              # noqa: BLE001 - reported, not swallowed
+            logger.warning("wake: the claim list could not be read", exc_info=True)
+            return None
+        if names is None:
+            return None
+        prefix = f"{timer_id}-{firing}-"
         claims = []
         for name in names:
             base = name.rsplit("/", 1)[-1]
@@ -594,35 +630,42 @@ class WakeStore:
         return sorted(claims)
 
     def claim(self, timer: WakeTimer) -> bool:
-        """Claim this firing. True when this bot is the one that may fire it.
+        """Claim this firing. True only when this bot is the one that may fire it.
 
-        The claim is an append-only file written **before** the turn starts, one per firing
-        number, and the winner is the lowest alias among the claims. A crash after the claim
-        leaves the firing un-fired rather than fired twice.
+        The claim is an append-only file written **before** the turn starts, one per timer
+        per firing, and the winner is the lowest alias among the claims *for that firing*.
+        The claims are re-read after the push, so two bots that both saw none cannot both
+        win; a claim that cannot be read or pushed does not fire (PR #92 review, blocker 3).
         """
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
             return True                       # no bus to race on: this transport is alone
-        others = self._claims(timer.id)
-        if others and sorted([*others, self.safe_alias])[0] != self.safe_alias:
+        firing = self.firing_of(timer)
+        before = self._claims(timer.id, firing)
+        if before is None:
+            return False                      # a broken bus is not "I am the only one"
+        if before and sorted([*before, self.safe_alias])[0] != self.safe_alias:
             return False
         directory = self.root / WAKE_RELPATH / self.safe_alias
         directory.mkdir(parents=True, exist_ok=True)
-        relpath = f"{WAKE_RELPATH}/{self.safe_alias}/{timer.id}-{self.safe_alias}.json"
+        relpath = f"{WAKE_RELPATH}/{self.safe_alias}/{timer.id}-{firing}-{self.safe_alias}.json"
         if not is_bus_document(relpath):
             raise WakeError(f"refusing to write outside {WAKE_RELPATH}: {relpath!r}")
-        import json
         (self.root / relpath).write_text(json.dumps(
-            {"id": timer.id, "alias": self.safe_alias, "firing": timer.attempts + 1,
+            {"id": timer.id, "alias": self.safe_alias, "firing": firing,
              "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())),
              "check": timer.check}), encoding="utf-8")
         if hasattr(transport, "commit_and_push"):
             try:
-                transport.commit_and_push(f"wakes: {timer.id} firing {timer.attempts + 1}",
+                transport.commit_and_push(f"wakes: {timer.id} firing {firing}",
                                           paths=[relpath])
-            except Exception as exc:                   # noqa: BLE001 - the claim is local
+            except Exception as exc:                   # noqa: BLE001 - do not fire on it
                 logger.warning("wake: claim %s was written but not pushed: %s", relpath, exc)
-        return True
+                return False
+        after = self._claims(timer.id, firing)
+        if after is None:
+            return False
+        return sorted(after or [self.safe_alias])[0] == self.safe_alias
 
 
 #: Where the fire claims live on the bus (see ``swarmly.transports.base``).

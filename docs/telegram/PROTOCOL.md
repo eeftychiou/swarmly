@@ -467,12 +467,15 @@ It is parsed with `shlex` and run without a shell, so shell metacharacters are r
 `-X`/`--method`/`-f`/`--input` and anything not on `PATH`. A refused line is stripped from the
 reply and the refusal is posted in its place.
 
-**A fire is claimed before it happens.** Timers live in `wake-<alias>.json` in the state dir, so a
-restart resumes the schedule (times are absolute: `next_at` and `expires_at`, never `in=` re-derived).
-Each firing writes an append-only claim to `.agents/wakes/<alias>/<timer>-<alias>.json` on the bus
-*before* the turn starts, and the winner is the lowest alias among the claims — so a takeover or a
-restart can neither fire the same timer twice nor lose the fire. `attempts` is persisted and bounded
-by `limits.wake_max_attempts`.
+**A fire is claimed before it happens.** Timers live one file per timer under `wake-<alias>/` in the
+state dir, so a restart resumes the schedule (times are absolute: `next_at` and `expires_at`, never
+`in=` re-derived) and two parallel turns cannot rewrite each other's schedule. Each firing writes an
+append-only claim to `.agents/wakes/<alias>/<timer>-<firing>-<alias>.json` on the bus *before* the
+turn starts — keyed on the firing's scheduled time, so a stale claim from an earlier firing (or from
+a bot that has since died) never blocks the next one. The claims for that firing are **re-read after
+the push** and the winner is the lowest alias among them, so two bots that both saw none cannot both
+fire. A claim that cannot be read or pushed does not fire: a broken bus is not "I am the only one".
+`attempts` is persisted and bounded by `limits.wake_max_attempts`.
 
 **Commands.** `/wakes` lists the live timers with their next time, check and attempt count;
 `/wakes cancel <id>` drops one (admin only); `/status` carries `wakes=N`. A bot runs no check while

@@ -2401,8 +2401,9 @@ class AgentChannel:
         """One pass over the due timers. Returns what it did, so a test can read it."""
         from swarmly.telegram.wake import decide, run_check_async
         moment = time.time() if now is None else now
-        if self._frozen:
-            return ["frozen: no check runs while this bot is frozen"]
+        if self._frozen or getattr(self, "_pause_pending", False):
+            # The same gate that holds turns: paused is paused, for checks too (#92 S3).
+            return ["paused: no check runs while this bot is paused"]
         store = self.wake_store()
         done: List[str] = []
         for timer in store.due(moment):

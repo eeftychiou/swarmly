@@ -907,9 +907,15 @@ line. Times are absolute, so a restart resumes the schedule instead of re-arming
 | `wake_max_attempts` | 50 | firings of one timer before it gives up with a turn saying so |
 | `wake_check_allow` | `["gh", "git"]` | the outer gate on which binary a check may start with |
 
+The check is parsed token by token and every flag is normalized first, so an attached value
+(`-XPOST`, `--field=body=x`, `--output=/path`) cannot smuggle a write past the allowlist; `gh api`
+carries only read flags (`--jq`, `--paginate`, `--slurp`, `-i`, `-H`). `check=` and `then=` must be
+quoted — an unquoted `then` would silently keep only its first word.
+
 `/wakes@<bot>` lists the live timers with their next time, check and attempt count;
 `/wakes@<bot> cancel <id>` drops one (admin only); `/status@<bot>` carries `wakes=N`. A frozen
-bot runs no check. The fire claims live on the bus under `.agents/wakes/<alias>/`, so an acting
+bot runs no check, and neither does a paused one. The fire claims live on the bus under
+`.agents/wakes/<alias>/`, one per timer per firing, so an acting
 coordinator (#83) can see a timer a dead bot left armed, and two bots cannot fire it twice.
 
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
