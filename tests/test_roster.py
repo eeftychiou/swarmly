@@ -194,6 +194,25 @@ class SwarmBotsAdmitTests(unittest.TestCase):
     def test_the_online_notice_names_the_alias(self):
         self.assertIn("intent=ONLINE ref=Hermes", make_channel().online_notice())
 
+    def test_the_online_notice_names_the_model_and_effort(self):
+        # Admin request: the startup line says what each bot runs, so a costly default
+        # model is visible the moment a bot comes online, without /model and /reasoning.
+        channel = make_channel(make_config(adapter={"type": "codex", "model": "gpt-6-luna",
+                                                    "effort": "medium"}))
+        self.assertIn("model: gpt-6-luna, effort: medium", channel.online_notice())
+        channel = make_channel(make_config(adapter={"type": "claude"}))
+        self.assertIn("model: CLI default, effort: CLI default", channel.online_notice())
+
+    def test_a_runtime_choice_for_general_shows_in_the_online_notice(self):
+        channel = make_channel(make_config(adapter={"type": "claude", "model": "opus"}))
+        channel._models["general"], channel._efforts["general"] = "sonnet", "low"
+        self.assertIn("model: sonnet, effort: low", channel.online_notice())
+
+    def test_an_adapter_without_effort_names_only_the_model(self):
+        notice = make_channel().online_notice()            # the echo adapter
+        self.assertIn("model: CLI default", notice)
+        self.assertNotIn("effort:", notice)
+
 
 class SwarmBotsReviewTests(unittest.TestCase):
     """Review of #153: what may reach a roster, and what keeps it right."""

@@ -1064,7 +1064,7 @@ ignored, whatever its header says.
    group as an **admin** (or disable its group privacy).
 2. Copy the example config onto that machine; set `name`, `alias`, `bot_token`, the shared
    `home_channel_id` and `admin_user_id`.
-3. Run `check`, then `run`. On start it posts `HELLO intent=ONLINE ref=<alias>`.
+3. Run `check`, then `run`. On start it posts `HELLO intent=ONLINE ref=<alias>`, with a line naming its adapter, role, the model and reasoning effort General runs at (`CLI default` when unset; effort is left out for an adapter without one) and its revision.
 4. In the group, the admin sends `/admit @newbot`. Every running bot that saw the newcomer's
    HELLO adds it to its peers and answers with a silent `HELLO intent=WELCOME` mentioning it;
    the newcomer, having seen itself admitted, adds each bot that welcomes it in the next 10
