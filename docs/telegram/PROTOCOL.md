@@ -560,3 +560,30 @@ A participant conforms to v1.1 if it:
 - [ ] announces every escalation rung
 - [ ] carries its round state as a `ROUND_STATE` block that is stripped before posting (§7)
 - [ ] turns a promise to act later into a `WAKE` line in the same turn (§8)
+
+## Peer liveness: pulse and DOWN (issue #82)
+
+Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2). It is an
+ephemeral `STATUS intent=PULSE` line, **not** a git-bus commit and not a group message: six bots
+at two minutes would be ~180 commits an hour on the bus, forever, each a push race with the real
+bus traffic. The bus carries only a slow pulse plus the existing `HELLO ONLINE` / `BYE OFFLINE`.
+
+A pulse carries `{alias, at, rev, role, term, busy_since, frozen}`. The pulse is emitted by its
+own task, never the turn lock, so a long turn keeps pulsing and `busy_since` says since when.
+
+**DOWN** means silent on *both* planes: no pulse and no Telegram traffic for
+`heartbeat_minutes × peer_down_after` (default 6 minutes). Any pulse, `HELLO` or message brings a
+peer back UP, so a bot whose git remote died — or one partitioned away from the bus — is not
+declared dead while it is still talking to us. A peer never heard from is `unknown`, not DOWN, and
+a restart gets one interval of grace before anyone can be judged DOWN.
+
+DOWN is **advisory**. It says "this peer has not been heard from"; it never says "somebody else
+should lead". The lease (#83) decides who coordinates — using DOWN to start a takeover would let
+a partition elect a second coordinator.
+
+What DOWN changes: a hand-off to a DOWN peer is returned to the sender at once (no reminder, no
+wait), the same as FROZEN, and no reminder is ever sent to a DOWN or busy peer. When the
+coordinator, or the acting coordinator when the coordinator is the one down, hears a peer go
+DOWN, it posts one line to the admin — "⚠️ DeepSeek has been silent since 18:30" — deduped once
+per episode. A peer that comes back gets one "back" line and nothing more. `/status` and `/swarm`
+show `peers=Claudebot:up,DeepSeek:down(12m)`; a busy peer shows `busy(3m)`.
