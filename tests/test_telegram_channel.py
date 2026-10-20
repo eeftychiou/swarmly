@@ -25,6 +25,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from tests.aio import run  # noqa: F401  (other test modules import run from here)
 from tests.gitenv import git_env
 from swarmly.telegram.adapters import EchoAdapter, SubprocessAdapter, build_adapter
 from swarmly.telegram.adapters.antigravity import AntigravityAdapter, AntigravityThreadAdapter
@@ -123,10 +124,6 @@ def event(text: str, author_id=202, username="CodexBot", is_bot=True, chat_id=GR
     return ChannelEvent(text=text, chat_id=chat_id, author_id=author_id, author_username=username,
                         author_is_bot=is_bot, replies_to_bot=replies_to_bot, message_id=message_id,
                         thread_id=thread_id, attachments=list(attachments or []), raw=raw)
-
-
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
 
 
 def _token(line: str, name: str) -> int:
