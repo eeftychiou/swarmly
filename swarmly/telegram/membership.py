@@ -310,7 +310,12 @@ class Membership:
 
     def is_coordinator(self) -> bool:
         if self.ch is not None and hasattr(self.ch, "is_coordinator"):
-            return bool(self.ch.is_coordinator())
+            try:
+                res = self.ch.is_coordinator()
+                if isinstance(res, bool):
+                    return res
+            except Exception:
+                pass
         return (self.state.role or "") == "coordinator"
 
     def _role_names(self) -> List[str]:

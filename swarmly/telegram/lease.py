@@ -199,10 +199,20 @@ class LeaseStore:
 
     def _names(self) -> Optional[List[str]]:
         transport = self.transport
+        lister = getattr(transport, "list_at_ref", None)
+        if lister is not None:
+            try:
+                return lister(LEASES_RELPATH)
+            except Exception:                          # noqa: BLE001 - reported, not swallowed
+                logger.warning("lease: the claim list could not be read", exc_info=True)
+                return None
+        folder = self.root / LEASES_RELPATH
+        if not folder.is_dir():
+            return []
         try:
-            return transport.list_at_ref(LEASES_RELPATH) if transport is not None else []
+            return sorted(p.name for p in folder.iterdir() if p.is_file())
         except Exception:                              # noqa: BLE001 - reported, not swallowed
-            logger.warning("lease: the claim list could not be read", exc_info=True)
+            logger.warning("lease: the local claim directory could not be read", exc_info=True)
             return None
 
     def claims(self) -> Optional[List[LeaseClaim]]:
@@ -249,7 +259,8 @@ class LeaseStore:
                                    expires_at=claim.expires_at, renews_at=claim.renews_at,
                                    rank=claim.rank, arrival=int(arrival if arrival is not None
                                                               else -1),
-                                   nonce=match.group("nonce")))
+                                   nonce=match.group("nonce"),
+                                   yielded=claim.yielded))
         return rows
 
     def state(self, *, now: Optional[float] = None) -> LeaseState:

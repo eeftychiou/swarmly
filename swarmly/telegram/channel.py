@@ -2258,7 +2258,9 @@ class AgentChannel:
         limits = getattr(self.config, "limits", None)
         takeover = getattr(limits, "takeover_minutes", 10.0) if limits else 10.0
         ttl = max(float(takeover) * 60.0, 60.0)
-        return LeaseStore(self.config.identity.alias, transport=self.bus_transport(root),
+        has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+        transport = self.bus_transport(root) if has_bus else None
+        return LeaseStore(self.config.identity.alias, transport=transport,
                           root=root, clock=time.time, ttl_seconds=ttl, rank=rank)
 
     def current_coordinator(self, *, now: Optional[float] = None) -> Optional[str]:
@@ -2351,12 +2353,16 @@ class AgentChannel:
         return str(self.config.identity.role or "").strip().lower() == "coordinator" 
 
     def _on_demoted_from_coordinator(self) -> None:
+        if not (self.config.bus.repo or self.config.fallback.gitbus_root):
+            return
         try:
             self.lease_store().yield_lease(reason="superseded by /role")
         except Exception:
             logger.warning("lease: failed to yield on demotion", exc_info=True)
 
     def _on_promoted_to_coordinator(self) -> None:
+        if not (self.config.bus.repo or self.config.fallback.gitbus_root):
+            return
         try:
             store = self.lease_store()
             current = store.state()
