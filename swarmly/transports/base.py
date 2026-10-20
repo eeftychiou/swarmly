@@ -147,3 +147,28 @@ def is_envelope_name(name: str) -> bool:
     """True for an envelope file name; false for temp files, dotfiles and other clutter."""
     base = name.rsplit("/", 1)[-1]
     return base.endswith(".md") and not base.startswith((".", "~"))
+
+
+#: Where the durable round state lives on the bus (issue #86). One directory per round,
+#: one file per write, so two bots never replace each other's file.
+ROUNDS_RELPATH = ".agents/rounds"
+
+
+def is_bus_document(relpath: str) -> bool:
+    """True for a bus *document* (a round-state file); false for anything else.
+
+    A document is state, not a message: it is not an envelope, it may be nested one
+    directory deep (one per round), and it is only ever written whole, under a name that
+    is unique to that write. Everything that could escape ``.agents/rounds`` -- an
+    absolute path, a ``..``, a drive letter, a control character -- is refused, the same
+    way :func:`checked_envelope_name` refuses a path masquerading as a message id.
+    """
+    if not isinstance(relpath, str) or not relpath:
+        return False
+    path = relpath.replace("\\", "/")
+    if not path.startswith(ROUNDS_RELPATH + "/") or not path.endswith(".json"):
+        return False
+    if ":" in path or ".." in path.split("/") or any(ord(char) < 32 for char in path):
+        return False
+    parts = path[len(ROUNDS_RELPATH) + 1:].split("/")
+    return len(parts) == 2 and all(part and not part.startswith(".") for part in parts)

@@ -1392,7 +1392,7 @@ class AgentChannel:
         command, target = parsed
         if command == "effort":
             command = "reasoning"
-        if command not in (*DIAG_COMMANDS, "model", "reasoning"):
+        if command not in (*DIAG_COMMANDS, "model", "reasoning", "round"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1404,6 +1404,8 @@ class AgentChannel:
             return self._model_command(event)
         if command == "reasoning":
             return self._reasoning_command(event)
+        if command == "round":
+            return self._round_summary(event)
         return self._command_reply(command, event)
 
     # ------------------------------------------------------------------------------
@@ -2232,6 +2234,107 @@ class AgentChannel:
                 state_dir=Path(root) / ".agents" / "state",
                 identity=tuple(self.config.identity.git_identity))
         return cache[key]
+
+    # -- durable round state (issue #86) ------------------------------------------------
+
+    def round_store(self) -> Any:
+        """The store for this bot's round state: the bus it already polls."""
+        from swarmly.telegram.rounds import RoundStore
+        root = self._gitbus_root()
+        store = RoundStore(self.bus_transport(root), root=root, clock=time.time,
+                           alias=self.config.identity.alias)
+        state = self.__dict__.setdefault("_round_store_cache", {})
+        key = str(root)
+        if key not in state:                     # one per bus root: the ref is fetched once
+            state[key] = store
+        return state[key]
+
+    def _round_repo(self, event: Optional[ChannelEvent]) -> str:
+        if event is None:
+            return ""
+        project = self.router.project_for(event.chat_id, event.thread_id)
+        return str((project.repo if project else "") or "")
+
+    def _round_key(self, event: Optional[ChannelEvent],
+                   payload: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """``<repo>#<tracking issue>``: the round's identity on the bus."""
+        data = payload or {}
+        number = str(data.get("round") or "").strip().lstrip("#")
+        if not number:
+            return None
+        repo = str(data.get("repo") or "") or self._round_repo(event)
+        return f"{repo}#{number}" if repo else number
+
+    def _is_round_coordinator(self) -> bool:
+        """Whether this bot is the coordinator -- the only bot that writes the round state.
+
+        The role file is the answer when it can be read; the configured role is the fallback,
+        because an unreadable roles directory must not silently turn off the round's state.
+        """
+        if str(self.config.identity.role or "").strip().lower() == "coordinator":
+            return True
+        try:
+            return bool(self.membership.is_coordinator())
+        except Exception:                                  # noqa: BLE001 - never fatal
+            return False
+
+    def apply_round_block(self, text: str, event: ChannelEvent) -> str:
+        """Take the ``ROUND_STATE`` block out of a reply, and put it on the bus.
+
+        Issue #86: the block is the coordinator's own account of the round -- items, owners,
+        verdicts bound to a head, blockers, open timers. It is stripped from the text in
+        every case (a block is never posted into the channel), and only the coordinator
+        writes it. A block that cannot be used keeps the last good state: nothing is
+        rewritten from a truncated or malformed one.
+        """
+        from swarmly.telegram.rounds import (RoundPushError, RoundStateError, RoundUpdate,
+                                             extract_block, utc_now)
+        stripped, payload, reason = extract_block(text or "")
+        if payload is None and reason is None:
+            return text                              # no block: the reply is untouched
+        if not self._is_round_coordinator():
+            logger.info("rounds: a ROUND_STATE block from a non-coordinator was dropped")
+            return stripped
+        if payload is None:
+            logger.warning("rounds: block dropped (%s); the last good state stands", reason)
+            return stripped
+        key = self._round_key(event, payload)
+        if key is None:
+            logger.warning("rounds: block without a tracking issue number dropped")
+            return stripped
+        store = self.round_store()
+        try:
+            update = RoundUpdate.from_dict(payload, writer=self.config.identity.alias,
+                                           at=utc_now(time.time))
+            update.round = key                       # the bus key, not whatever was typed
+            store.append(update)
+        except RoundPushError as exc:
+            # Written, not yet on the bus: the file stays, and the transport carries it on
+            # the next push. Say so instead of pretending the round is durable.
+            logger.warning("rounds: %s was written but not pushed: %s", exc.path, exc)
+        except RoundStateError as exc:
+            logger.warning("rounds: block for %s refused: %s", key, exc)
+        return stripped
+
+    def _round_summary(self, event: Optional[ChannelEvent]) -> str:
+        """``/round[@bot] [issue]``: what the round waits on, and how old the state is."""
+        from swarmly.telegram.rounds import RoundStore
+        store = self.round_store()
+        args = command_args(event.text or "") if event is not None else []
+        repo = self._round_repo(event)
+        wanted = (args[0].lstrip("#") if args else "").strip()
+        if wanted:
+            return store.load(f"{repo}#{wanted}" if repo else wanted).summary()
+        names = store.rounds()
+        prefix = RoundStore.safe_key(f"{repo}#")[:-1] if repo else ""
+        matching = sorted(name for name in names if not prefix or name.startswith(prefix))
+        if not matching:
+            where = f" for {repo}" if repo else ""
+            return (f"round: no round state on the bus{where} -- absent, not empty; "
+                    "nothing is claimed about what is open")
+        states = [store.load(name) for name in matching]
+        newest = max(states, key=lambda state: (state.updated_at, state.seq))
+        return newest.summary()
 
     def _default_bus_pull(self, root: Path) -> None:
         self.bus_transport(root).refresh()
@@ -3387,7 +3490,10 @@ class AgentChannel:
                     self.replies.receipt_unknown(ticket['id'], f"receipt send failed: {exc}")
                 raise
 
-        body = reply.text.strip()
+        # Issue #86: a coordinator's reply carries its round state as one machine block. It
+        # is taken out here -- on the adapter's raw text, before the reply is clamped or
+        # split, so the block is never counted against limits.reply_chars and never posted.
+        body = self.apply_round_block(reply.text or "", event).strip()
         if not body or is_silent_reply(body):
             if body:
                 logger.info("turn for message %s chose to stay silent", event.message_id)

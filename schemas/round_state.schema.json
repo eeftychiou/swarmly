@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RoundStateSegment",
+  "description": "One append-only segment of a round's durable state on the git bus (issue #86). Files live at .agents/rounds/<round>/<term>-<seq>-<writer>-<nonce>.json and are folded by (term, seq, at, writer). Parsed strictly by swarmly.telegram.rounds: an unknown field is ignored, a wrong type or an unknown version refuses the segment.",
+  "type": "object",
+  "required": ["version", "round"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Schema version of this segment. A reader refuses a version it does not know."
+    },
+    "round": {
+      "type": ["string", "integer"],
+      "description": "The tracking issue number."
+    },
+    "repo": {
+      "type": "string",
+      "description": "owner/name of the repository the round runs in (part of the bus directory name)."
+    },
+    "term": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Coordinator term (#83). A segment from a lower term than the bus holds is refused."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotone sequence within a term; ties are broken by writer so every reader folds identically."
+    },
+    "at": {
+      "type": "string",
+      "description": "ISO-8601 UTC write time."
+    },
+    "writer": {
+      "type": "string",
+      "description": "Alias of the bot that wrote the segment. Set by the transport, never by the model's text."
+    },
+    "head": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{7,40}$",
+      "description": "The head the block was written against; short verdict SHAs are expanded against it."
+    },
+    "items": {
+      "type": "object",
+      "description": "Item key (issue number) -> patch. Fields a patch does not mention keep their previous value in the fold.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "issue": {"type": "integer", "minimum": 1},
+          "pr": {"type": "integer", "minimum": 1},
+          "owner": {"type": "string"},
+          "waits_on": {"type": "string"},
+          "ci": {"type": "string"},
+          "note": {"type": "string"},
+          "state": {"type": "string"},
+          "head": {"type": "string", "pattern": "^[0-9a-fA-F]{7,40}$"},
+          "review": {"$ref": "#/$defs/verdict"},
+          "qa": {"$ref": "#/$defs/verdict"}
+        }
+      }
+    },
+    "order": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Merge order for the round's items."
+    },
+    "blockers": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Why the round is not moving, one line each."
+    },
+    "timers": {
+      "type": "object",
+      "description": "Open WAKE timers (#81): timer id -> {owner, wake_id, until, check}.",
+      "additionalProperties": {"type": "object"}
+    },
+    "note": {
+      "type": "string",
+      "description": "One free-form line for people reading the bus."
+    }
+  },
+  "$defs": {
+    "verdict": {
+      "type": ["object", "null"],
+      "description": "A verdict bound to the head it was given on. Reading it for another head yields nothing: a new head clears it.",
+      "required": ["verdict", "sha"],
+      "properties": {
+        "verdict": {"type": "string"},
+        "sha": {"type": "string", "pattern": "^[0-9a-fA-F]{7,40}$"},
+        "by": {"type": "string"},
+        "at": {"type": "string"}
+      }
+    }
+  }
+}

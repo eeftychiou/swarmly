@@ -1,0 +1,645 @@
+"""Durable round state on the bus (issue #86).
+
+A round -- the tracking issue, its items, who owns each one, the verdicts and the open
+WAKE timers -- outlives any one bot's memory: a successor (#83) has to rebuild it from
+the bus and GitHub alone, after the coordinator's process is gone.
+
+Three decisions shape this module.
+
+**Append-only, never one mutable file.** The bus transport retries a push that lost a
+race onto the remote's tip (:mod:`swarmly.transports.git`), so two writers in the same
+window both land and the later bytes win. One shared file would then lose an entire
+update silently -- the reviewer's "one mutable state file loses updates on gitbus". Each
+write here is its own file under ``.agents/rounds/<round>/``, named
+``<term>-<seq>-<writer>-<nonce>.json``, so concurrent writers never overwrite each other
+and a lost push costs one segment, not the state. Reading folds the segments in a
+deterministic order, so every bot that reads the same bus computes the same state.
+
+**Missing is not empty.** A state that cannot be read is ``absent`` or ``unreadable``,
+never "no open items" -- an empty round would otherwise post a round report for work
+that is still running. Callers must look at :attr:`RoundState.status`.
+
+**A verdict is bound to a head.** A review or QA verdict carries the SHA it was given
+on. It is *cleared* -- not carried, not marked stale-and-usable -- the moment the head
+moves: reading a verdict for a different head returns ``None``.
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import logging
+import re
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from swarmly.transports.base import ROUNDS_RELPATH, is_bus_document
+
+logger = logging.getLogger("swarmly.telegram.rounds")
+
+#: The schema version of one segment. A reader refuses what it does not know.
+VERSION = 1
+
+#: A segment's payload is carried in the coordinator's reply; this is the hard cap on it
+#: (issue #86 review B1). Over the cap the state is not applied and the previous one is
+#: reported stale, rather than silently truncated.
+MAX_BLOCK_CHARS = 1200
+
+#: ``ROUND_STATE {...}`` on its own line, the block a coordinator reply carries.
+BLOCK_MARKER = "ROUND_STATE"
+
+#: The kinds of verdict an item carries.
+VERDICT_KINDS = ("review", "qa")
+
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+class RoundStateError(ValueError):
+    """A segment, a block or a round state is not usable."""
+
+
+class RoundStaleTerm(RoundStateError):
+    """A write from an older coordinator term: it must not overwrite a newer one."""
+
+
+class RoundPushError(RoundStateError):
+    """The segment was written but could not be pushed to the bus."""
+
+    def __init__(self, message: str, path: Optional[str] = None):
+        super().__init__(message)
+        self.path = path
+
+
+def utc_now(clock: Optional[Any] = None) -> str:
+    """An ISO-8601 UTC stamp. *clock* is a wall-clock callable (tests inject one)."""
+    moment = clock() if clock is not None else datetime.datetime.now(
+        datetime.timezone.utc).timestamp()
+    return datetime.datetime.fromtimestamp(moment, datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_sha(value: Any, head: Optional[str] = None) -> str:
+    """A full, lower-case commit SHA.
+
+    A 7..40 character hex prefix is expanded to ``head`` when it is a prefix of it, and
+    refused otherwise: an ambiguous or unknown prefix must never be treated as a match,
+    or a verdict on one head would validate another.
+    """
+    if not isinstance(value, str):
+        raise RoundStateError(f"not a sha: {value!r}")
+    text = value.strip().lower()
+    if not _SHA_RE.match(text):
+        raise RoundStateError(f"not a sha: {value!r}")
+    if len(text) == 40:
+        return text
+    if head and head.strip().lower().startswith(text):
+        return head.strip().lower()
+    raise RoundStateError(f"{value!r} is not the head (or is too short to identify it)")
+
+
+# ------------------------------------------------------------------------------------
+# One segment
+# ------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """A verdict by one bot on one head."""
+
+    verdict: str
+    sha: str
+    by: str = ""
+    at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"verdict": self.verdict, "sha": self.sha, "by": self.by, "at": self.at}
+
+    @classmethod
+    def from_dict(cls, data: Any, *, head: Optional[str] = None) -> "Verdict":
+        if not isinstance(data, dict):
+            raise RoundStateError(f"a verdict must be an object, got {type(data).__name__}")
+        verdict = data.get("verdict")
+        if not isinstance(verdict, str) or not verdict.strip():
+            raise RoundStateError("a verdict needs a non-empty 'verdict'")
+        sha = normalize_sha(data.get("sha"), head)
+        by = data.get("by") or ""
+        at = data.get("at") or ""
+        if not isinstance(by, str) or not isinstance(at, str):
+            raise RoundStateError("a verdict's 'by' and 'at' must be strings")
+        return cls(verdict=verdict.strip(), sha=sha, by=by, at=at)
+
+
+@dataclass
+class RoundUpdate:
+    """One append-only segment: the fields this turn learned or changed.
+
+    Every field is optional because a turn usually changes one item, one verdict or one
+    blocker. What a segment does not carry, the fold leaves as it was.
+    """
+
+    round: str
+    writer: str
+    term: int = 0
+    seq: int = 0
+    at: str = ""
+    version: int = VERSION
+    repo: str = ""
+    items: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    order: Optional[List[str]] = None
+    blockers: Optional[List[str]] = None
+    timers: Optional[Dict[str, Dict[str, Any]]] = None
+    note: str = ""
+    #: The head the segment was written against, when the writer knows it. Verdict SHAs in
+    #: this segment are expanded against it.
+    head: str = ""
+
+    # -- validation ------------------------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "version": self.version, "round": self.round, "writer": self.writer,
+            "term": self.term, "seq": self.seq, "at": self.at,
+        }
+        if self.repo:
+            data["repo"] = self.repo
+        if self.items:
+            data["items"] = self.items
+        if self.order is not None:
+            data["order"] = self.order
+        if self.blockers is not None:
+            data["blockers"] = self.blockers
+        if self.timers is not None:
+            data["timers"] = self.timers
+        if self.note:
+            data["note"] = self.note
+        if self.head:
+            data["head"] = self.head
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Any, *, writer: str = "", seq: Optional[int] = None,
+                  term: Optional[int] = None, at: str = "",
+                  head: Optional[str] = None) -> "RoundUpdate":
+        """A strict parse: an unknown *field* is ignored, a wrong *type* is refused.
+
+        ``writer``, ``seq`` and ``term`` default to the transport's own values when the
+        block does not carry them -- the writer must never take them from the model's text.
+        """
+        if not isinstance(data, dict):
+            raise RoundStateError(f"a round state must be an object, got {type(data).__name__}")
+        version = data.get("version", VERSION)
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise RoundStateError(f"bad version: {version!r}")
+        if version > VERSION:
+            raise RoundStateError(f"version {version} is newer than this bot reads ({VERSION})")
+        round_key = data.get("round")
+        if isinstance(round_key, int) and not isinstance(round_key, bool):
+            round_key = str(round_key)
+        if not isinstance(round_key, str) or not round_key.strip():
+            raise RoundStateError("a round state needs 'round' (the tracking issue number)")
+        repo = data.get("repo") or ""
+        if not isinstance(repo, str):
+            raise RoundStateError("'repo' must be a string")
+        items_raw = data.get("items")
+        if items_raw is None:
+            items_raw = {}
+        if not isinstance(items_raw, dict):
+            raise RoundStateError("'items' must be an object keyed by item")
+        items: Dict[str, Dict[str, Any]] = {}
+        for key, patch in items_raw.items():
+            if not isinstance(patch, dict):
+                raise RoundStateError(f"item {key!r} must be an object")
+            items[str(key)] = _item_patch(str(key), patch, head=head)
+        order = data.get("order")
+        if order is not None and not isinstance(order, list):
+            raise RoundStateError("'order' must be a list")
+        blockers = data.get("blockers")
+        if blockers is not None and (not isinstance(blockers, list)
+                                     or not all(isinstance(b, str) for b in blockers)):
+            raise RoundStateError("'blockers' must be a list of strings")
+        timers = data.get("timers")
+        if timers is not None:
+            if not isinstance(timers, dict):
+                raise RoundStateError("'timers' must be an object")
+            for key, timer in timers.items():
+                if not isinstance(timer, dict):
+                    raise RoundStateError(f"timer {key!r} must be an object")
+        note = data.get("note") or ""
+        if not isinstance(note, str):
+            raise RoundStateError("'note' must be a string")
+        return cls(
+            round=round_key.strip(), writer=writer, term=int(term or 0),
+            seq=int(seq or 0), at=at or utc_now(), version=version, repo=repo,
+            items=items, order=[str(x) for x in order] if order is not None else None,
+            blockers=list(blockers) if blockers is not None else None,
+            timers=dict(timers) if timers is not None else None, note=note,
+            head=head or "",
+        )
+
+    def sort_key(self) -> Tuple[int, int, str, str]:
+        """Deterministic order: term, then seq, then time, then writer.
+
+        Two bots that write in the same window can pick the same ``seq``; the writer name
+        makes the winner identical everywhere instead of "whichever arrived last".
+        """
+        return (self.term, self.seq, self.at, self.writer.lower())
+
+
+def _item_patch(key: str, patch: Dict[str, Any], *, head: Optional[str]) -> Dict[str, Any]:
+    """One item's patch, validated. Verdicts are normalized against *head*."""
+    clean: Dict[str, Any] = {}
+    for name in ("issue", "pr"):
+        if name in patch:
+            value = patch[name]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise RoundStateError(f"item {key!r}: '{name}' must be a positive number")
+            clean[name] = value
+    for name in ("owner", "waits_on", "ci", "note"):
+        if name in patch:
+            value = patch[name]
+            if not isinstance(value, str):
+                raise RoundStateError(f"item {key!r}: '{name}' must be a string")
+            clean[name] = value
+    if "head" in patch and patch["head"]:
+        clean["head"] = normalize_sha(patch["head"], head)
+    for kind in VERDICT_KINDS:
+        if kind in patch:
+            value = patch[kind]
+            clean[kind] = None if value is None else Verdict.from_dict(
+                value, head=head).to_dict()
+    # Anything else is ignored on purpose: a colleague's newer block must not be refused
+    # here for a field a newer reader will understand.
+    return clean
+
+
+# ------------------------------------------------------------------------------------
+# The block in a reply
+# ------------------------------------------------------------------------------------
+
+
+def extract_block(text: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """Split a coordinator reply into ``(text, payload, reason)``.
+
+    The block is removed from the text in every case -- an unusable block is never posted
+    into the channel as JSON. ``payload`` is ``None`` when the block is absent, too large,
+    or not a JSON object; ``reason`` then says which, and the caller keeps the previous
+    state and marks it stale.
+    """
+    if not text or BLOCK_MARKER not in text:
+        return text, None, None
+    start = None
+    for match in re.finditer(r"(?m)^[ \t]*" + BLOCK_MARKER + r"[ \t]*", text):
+        start = match.start()
+        break
+    if start is None:
+        return text, None, None
+    brace = text.find("{", start)
+    if brace == -1:
+        return text[:start].strip(), None, "the block carried no object"
+    end = _matching_brace(text, brace)
+    if end == -1:
+        return text[:start].strip(), None, "the block's object was not closed"
+    raw = text[brace:end + 1]
+    stripped = (text[:start] + "\n" + text[end + 1:]).strip()
+    if len(raw) > MAX_BLOCK_CHARS:
+        return stripped, None, f"state too large ({len(raw)} > {MAX_BLOCK_CHARS} chars)"
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        return stripped, None, f"the block is not valid JSON ({exc})"
+    if not isinstance(payload, dict):
+        return stripped, None, "the block is not a JSON object"
+    return stripped, payload, None
+
+
+def _matching_brace(text: str, start: int) -> int:
+    """The index of the ``}`` closing the ``{`` at *start*, or -1.
+
+    String literals and escapes are tracked, so a brace inside a note does not end the
+    object early.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+# ------------------------------------------------------------------------------------
+# The folded state
+# ------------------------------------------------------------------------------------
+
+
+@dataclass
+class RoundState:
+    """What the bus says about one round. Read ``status`` before trusting the rest."""
+
+    round: str
+    #: ``ok``: folded from at least one segment. ``absent``: nothing on the bus yet.
+    #: ``unreadable``: the bus could not be read -- never treat this as an empty round.
+    status: str = "absent"
+    reason: str = ""
+    version: int = VERSION
+    repo: str = ""
+    term: int = 0
+    seq: int = 0
+    writer: str = ""
+    updated_at: str = ""
+    items: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    order: List[str] = field(default_factory=list)
+    blockers: List[str] = field(default_factory=list)
+    timers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    note: str = ""
+    #: How many segments the fold used; 0 for absent.
+    segments: int = 0
+    #: Why this state is not to be trusted, when it is not.
+    stale: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return self.status == "ok" and not self.stale
+
+    def item(self, key: str) -> Dict[str, Any]:
+        return dict(self.items.get(str(key)) or {})
+
+    def verdict(self, key: str, kind: str, head: Optional[str] = None) -> Optional[Verdict]:
+        """The verdict for item *key* of *kind*, or ``None``.
+
+        With *head* given, a verdict on any other head is ``None``: a new head clears the
+        verdict instead of carrying an approval onto code nobody reviewed.
+        """
+        entry = self.item(key).get(kind)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            verdict = Verdict.from_dict(entry, head=head)
+        except RoundStateError:
+            return None
+        if head is not None and verdict.sha.lower() != head.strip().lower():
+            return None
+        return verdict
+
+    def open_keys(self) -> List[str]:
+        """Item keys that are not merged, in the round's order then by key."""
+        merged = set()
+        for key, item in self.items.items():
+            if str(item.get("state") or "").lower() in ("merged", "closed", "done"):
+                merged.add(key)
+        ordered = [key for key in self.order if key in self.items and key not in merged]
+        return ordered + sorted(key for key in self.items if key not in merged
+                                and key not in ordered)
+
+    def summary(self, max_chars: int = 350) -> str:
+        """One short line for ``/round``: what the round waits on, and how old it is."""
+        if self.status != "ok":
+            return (f"round {self.round}: {self.status}"
+                    + (f" ({self.reason})" if self.reason else "")
+                    + " -- the state is not usable; do not act on it")
+        waiting = [key for key, item in self.items.items() if item.get("waits_on")]
+        line = (f"round {self.round} term={self.term} seq={self.seq} "
+                f"items={len(self.items)} open={len(self.open_keys())} "
+                f"updated={self.updated_at} by={self.writer}")
+        if waiting:
+            line += " waiting=" + ",".join(f"#{key}:{self.items[key].get('waits_on')}"
+                                           for key in sorted(waiting))
+        if self.blockers:
+            line += " blockers=" + "; ".join(self.blockers)
+        if self.stale:
+            line += f" STALE ({self.stale})"
+        return line if len(line) <= max_chars else line[:max_chars - 1] + "…"
+
+
+def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
+    """Combine segments into one state, oldest first, deterministically."""
+    ordered = sorted(updates, key=lambda update: update.sort_key())
+    state = RoundState(round=round_key or (ordered[0].round if ordered else ""),
+                       status="absent")
+    for update in ordered:
+        state.status = "ok"
+        state.segments += 1
+        state.version = max(state.version, update.version)
+        state.term = max(state.term, update.term)
+        state.seq = max(state.seq, update.seq)
+        state.writer = update.writer or state.writer
+        state.updated_at = update.at or state.updated_at
+        state.repo = update.repo or state.repo
+        for key, patch in update.items.items():
+            current = dict(state.items.get(key) or {})
+            current.update(patch)
+            state.items[key] = current
+        if update.order is not None:
+            state.order = list(update.order)
+        if update.blockers is not None:
+            state.blockers = list(update.blockers)
+        if update.timers is not None:
+            state.timers.update(update.timers)
+        if update.note:
+            state.note = update.note
+    if state.status == "ok":
+        for key in state.items:
+            if key not in state.order:
+                state.order.append(key)
+    return state
+
+
+# ------------------------------------------------------------------------------------
+# The store
+# ------------------------------------------------------------------------------------
+
+
+class RoundStore:
+    """Reads and appends round segments on a bus transport (gitbus by default)."""
+
+    def __init__(self, transport: Any = None, *, root: Optional[Path] = None,
+                 relpath: str = ROUNDS_RELPATH, clock: Optional[Any] = None,
+                 alias: str = ""):
+        self.transport = transport
+        self.root = Path(root or getattr(transport, "root", None) or ".")
+        self.relpath = relpath
+        self.clock = clock
+        self.alias = alias
+        self._refreshed = False
+
+    # -- paths -----------------------------------------------------------------------
+    @staticmethod
+    def safe_key(round_key: str) -> str:
+        """A directory name for a round key (``owner/repo#88`` -> ``owner_repo#88``)."""
+        text = str(round_key or "").strip()
+        if not text:
+            raise RoundStateError("a round key is required")
+        safe = re.sub(r"[^A-Za-z0-9._#-]+", "_", text).strip(".")
+        if not safe or ".." in safe:
+            raise RoundStateError(f"unusable round key: {round_key!r}")
+        return safe
+
+    def directory(self, round_key: str) -> Path:
+        return self.root / self.relpath / self.safe_key(round_key)
+
+    # -- reading ---------------------------------------------------------------------
+    def _raw_segments(self, round_key: str) -> List[Tuple[str, str]]:
+        directory = f"{self.relpath}/{self.safe_key(round_key)}"
+        transport = self.transport
+        if (not self._refreshed and transport is not None
+                and getattr(transport, "ref", None) and hasattr(transport, "refresh")):
+            # Once per store: a read of the bus ref should not spend a fetch per segment,
+            # and a store is created per turn (issue #86: a successor reads, then writes).
+            self._refreshed = True
+            transport.refresh()
+        if transport is not None and getattr(transport, "ref", None) and hasattr(
+                transport, "list_at_ref"):
+            at_ref = []
+            try:
+                for name in transport.list_at_ref(directory):
+                    text = transport.read_at_ref(f"{directory}/{name}")
+                    if text:
+                        at_ref.append((name, text))
+            except Exception:                            # noqa: BLE001 - fall back, don't fail
+                at_ref = []
+            if at_ref:
+                return at_ref
+            # The ref has nothing yet (a segment written this turn, whose push is still in
+            # flight). The transport's own rule is "prefer the ref, else the checkout".
+        folder = self.directory(round_key)
+        if not folder.is_dir():
+            return []
+        return [(path.name, path.read_text(encoding="utf-8"))
+                for path in sorted(folder.glob("*.json"))]
+
+    def segments(self, round_key: str) -> List[RoundUpdate]:
+        """Every readable segment, oldest first. Raises :class:`RoundStateError`."""
+        try:
+            raw = self._raw_segments(round_key)
+        except RoundStateError:
+            raise
+        except Exception as exc:                            # noqa: BLE001 - reported, not raised raw
+            raise RoundStateError(f"the round's segments could not be read: {exc}") from exc
+        updates: List[RoundUpdate] = []
+        for name, text in raw:
+            if not name.endswith(".json"):
+                continue
+            try:
+                data = json.loads(text)
+                update = RoundUpdate.from_dict(data, writer=str(data.get("writer") or ""),
+                                               seq=int(data.get("seq") or 0),
+                                               term=int(data.get("term") or 0),
+                                               at=str(data.get("at") or ""),
+                                               head=str(data.get("head") or "") or None)
+            except (ValueError, TypeError) as exc:
+                # One unreadable segment must not hide the rest: the round keeps the state
+                # it can still prove, and the loss is visible as `stale` on the fold.
+                logger.warning("rounds: segment %s in %s is not usable: %s",
+                               name, round_key, exc)
+                updates.append(_damaged(name, str(exc)))
+                continue
+            updates.append(update)
+        return updates
+
+    def load(self, round_key: str) -> RoundState:
+        """The round's state, with ``status`` telling absent from unreadable."""
+        try:
+            updates = self.segments(round_key)
+        except RoundStateError as exc:
+            return RoundState(round=str(round_key), status="unreadable", reason=str(exc))
+        state = fold(updates, round_key=str(round_key))
+        damaged = [update for update in updates if update.note.startswith(_DAMAGED_PREFIX)]
+        if damaged and state.status == "ok":
+            state.stale = damaged[-1].note[len(_DAMAGED_PREFIX):]
+        return state
+
+    def rounds(self) -> List[str]:
+        """Every round key with a directory on the bus."""
+        base = self.root / self.relpath
+        if not base.is_dir():
+            return []
+        return sorted(path.name for path in base.iterdir() if path.is_dir())
+
+    # -- writing ---------------------------------------------------------------------
+    def next_seq(self, round_key: str) -> int:
+        return self.load(round_key).seq + 1
+
+    def append(self, update: RoundUpdate) -> str:
+        """Write one segment, then publish it. Returns the segment's bus path.
+
+        Refuses a write from an older term than the bus already holds (issue #86 review
+        B3): a returning coordinator must not overwrite the successor's state.
+        """
+        current = self.load(update.round)
+        if current.status == "ok" and update.term < current.term:
+            raise RoundStaleTerm(
+                f"term {update.term} is behind {current.term} for round {update.round}; "
+                "this bot is not the coordinator of this round any more")
+        if current.status == "ok" and _unchanged(update, current):
+            # Nothing new: a turn that emits the same state again must not add a commit to
+            # the bus's history (issue #86 review B7). Return the segment that already says it.
+            existing = sorted(self.directory(update.round).glob("*.json"))
+            return str(existing[-1]) if existing else str(self.directory(update.round))
+        if update.seq <= 0:
+            update.seq = current.seq + 1
+        if not update.at:
+            update.at = utc_now(self.clock)
+        directory = self.directory(update.round)
+        directory.mkdir(parents=True, exist_ok=True)
+        writer = re.sub(r"[^A-Za-z0-9]+", "", (update.writer or self.alias or "bot"))[:16] \
+            or "bot"
+        name = f"{update.term:06d}-{update.seq:06d}-{writer}-{uuid.uuid4().hex[:8]}.json"
+        path = directory / name
+        relpath = f"{self.relpath}/{directory.name}/{name}"
+        if not is_bus_document(relpath):                    # a guard, not a formality
+            raise RoundStateError(f"refusing to write outside {self.relpath}: {relpath!r}")
+        path.write_text(json.dumps(update.to_dict(), sort_keys=True, indent=1,
+                                   ensure_ascii=False), encoding="utf-8")
+        transport = self.transport
+        if transport is not None and hasattr(transport, "commit_and_push"):
+            try:
+                transport.commit_and_push(
+                    f"rounds: {update.round} term {update.term} seq {update.seq} "
+                    f"by {update.writer or self.alias}", paths=[relpath])
+            except Exception as exc:                        # noqa: BLE001 - the file is safe
+                raise RoundPushError(str(exc), path=str(path)) from exc
+        return str(path)
+
+
+def _unchanged(update: RoundUpdate, state: RoundState) -> bool:
+    """Whether *update* would leave the folded state exactly as it is."""
+    if update.term != state.term:
+        return False
+    for key, patch in update.items.items():
+        current = dict(state.items.get(key) or {})
+        if {**current, **patch} != current:
+            return False
+    if update.order is not None and list(update.order) != list(state.order):
+        return False
+    if update.blockers is not None and list(update.blockers) != list(state.blockers):
+        return False
+    if update.timers is not None and any(state.timers.get(name) != timer
+                                        for name, timer in update.timers.items()):
+        return False
+    if update.note and update.note != state.note:
+        return False
+    return True
+
+
+_DAMAGED_PREFIX = "segment not readable: "
+
+
+def _damaged(name: str, reason: str) -> RoundUpdate:
+    """A segment that could not be parsed, kept so the fold can report it as stale."""
+    return RoundUpdate(round="", writer="", note=_DAMAGED_PREFIX + f"{name}: {reason}")

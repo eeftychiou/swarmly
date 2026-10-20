@@ -319,6 +319,51 @@ existed on no remote branch — the claim, not the intent, is what the protocol 
 nothing. HELLO is answered with the current state pointer, which is also how a restarted agent
 re-syncs.
 
+### Round state on the bus (issue #86)
+
+What a round waits on must outlive the coordinator's process. After every coordinator turn the
+transport writes the round's state to the bus and strips it from the posted reply.
+
+**Placement.** `.agents/rounds/<round>/<term>-<seq>-<writer>-<nonce>.json`, where `<round>` is
+`<owner>_<repo>#<tracking issue>` sanitized to a directory name. Each write is **its own file**:
+the bus retries a push that lost a race onto the remote's tip, so two writers in one window both
+land — a single mutable file would silently lose an update, while a lost push here costs one
+segment. Readers fold the segments in `(term, seq, at, writer)` order, so every bot that reads the
+same bus computes the same state.
+
+**The block.** The coordinator's reply carries one machine block, on its own line:
+
+```
+ROUND_STATE {"version":1,"round":88,"repo":"owner/project","term":3,"items":{"86":{...}}}
+```
+
+It is taken out of the adapter's **raw** text, before `limits.reply_chars` clamps or the reply is
+split, so it is never counted against the channel budget and never posted. It is capped at 1200
+characters; a block over the cap, unclosed, or not a JSON object is dropped whole and the last
+good state stands (the round then reads as stale). Only the coordinator writes it — a block from
+any other bot is dropped.
+
+**Segment fields.** `version` (reader refuses a newer one), `round`, `repo`, `writer`, `term`,
+`seq`, `at`, `items`, `order`, `blockers`, `timers`, `note`, `head`. Unknown fields are ignored
+forward-compatibly; a wrong type, a bad `version` or a missing `round` refuses the whole segment.
+
+Item patches carry `issue`, `pr`, `owner`, `head`, `ci`, `waits_on`, `state`, and one `review`
+and one `qa` verdict. **A verdict is bound to a head**: `{"verdict":"merge","sha":"<40 hex>",
+"by":"Codex","at":"<iso>"}`. A short SHA may be written when the block also carries `head`, and
+is expanded against it; a prefix that does not identify that head is refused. Reading a verdict
+for a different head returns nothing — a new head clears the verdict instead of carrying an
+approval onto code nobody reviewed.
+
+**Authority.** GitHub wins for what exists, merged/closed state, the PR head and CI on that head;
+the file wins for owners' intent, order, blockers, verdicts, timers and term. `coordinator.json`
+(#83) is the authority for `term`; a segment from a lower term than the bus already holds is
+refused, so a returning coordinator cannot overwrite its successor's state.
+
+**Missing is not empty.** A round with no segments is `absent`; a bus that cannot be read is
+`unreadable`. Neither is "no open items", and neither may produce a round report. `/round[@bot]
+[issue]` prints the folded state with its age and writer; it answers with the reason when the
+state is not usable.
+
 ---
 
 ## 8. Loop safety and pacing
@@ -385,3 +430,4 @@ A participant conforms to v1.1 if it:
 - [ ] mirrors every decision with a verifiable `path@commit` pointer
 - [ ] commits under its own identity
 - [ ] announces every escalation rung
+- [ ] carries its round state as a `ROUND_STATE` block that is stripped before posting (§7)
