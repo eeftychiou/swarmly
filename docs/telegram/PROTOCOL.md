@@ -409,6 +409,21 @@ from a ref it has not fetched.
 
 ---
 
+### Coordinator lease and acting coordinator (issue #83)
+
+When the appointed coordinator is offline or fails to renew, another peer takes over to keep the
+round moving.
+
+- **Append-only lease records:** `.agents/leases/<term>-<alias>-<nonce>.json`.
+- **Folded state:** Highest term wins; ties within a term are broken by succession rank then
+  alias, ordered by `arrival_rank` on the bus. Unranked claims fail closed.
+- **Renewal:** The active holder renews its lease every `lease_renew_seconds`.
+- **Takeover:** If a lease expires beyond `takeover_minutes` or is yielded, the first UP,
+  non-frozen successor in succession order (`reviewer` -> `qa-tester` -> `developer`) claims term
+  `N+1`.
+- **Round authority:** Every durable round write carries `Authority(alias, source="lease", term)`.
+  Writes below the folded round term or by non-holders are refused.
+
 ## 8. Loop safety and pacing
 
 Loop safety is **routing, not a turn cap**. The turn cap (`max_agent_turns`) was removed by the

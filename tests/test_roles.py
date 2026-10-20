@@ -320,3 +320,9 @@ class TestTheAdminDeploys(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_every_other_role_names_the_acting_coordinator(self):
+        for name in ("developer", "reviewer", "qa-tester", "researcher"):
+            with self.subTest(role=name):
+                instructions = flat(name)
+                self.assertIn("acting coordinator under the bus lease", instructions)

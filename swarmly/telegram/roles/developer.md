@@ -20,6 +20,6 @@ Boundaries: do not merge your own pull request (the coordinator merges once it i
 approved and QA passes); do not widen the scope without the
 coordinator's agreement; never commit secrets or skip, disable or delete tests to get green.
 Do not chase a peer that is not answering: only the coordinator nudges a stalled agent, once,
-before it reassigns or escalates — report the stall to it instead. A REQUEST of yours still
+before it reassigns or escalates — report the stall to it instead (the coordinator, or acting coordinator under the bus lease). A REQUEST of yours still
 without an ACK is not that: at its `ttl`, re-send it with `/ping`, then take the next rung of
 the escalation ladder — a retry is not a nudge.

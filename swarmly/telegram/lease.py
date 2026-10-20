@@ -220,9 +220,49 @@ class LeaseStore:
         names = self._names()
         if names is None:
             return None
-        rows: List[LeaseClaim] = []
         transport = self.transport
+        reader = getattr(transport, "read_at_ref", None)
+
+        # B5: Prune superseded renewals before ranking to prevent git subprocess storm.
+        by_key = {}
         for name in names:
+            if not name.endswith(".json") or "/" in name:
+                continue
+            match = _CLAIM.match(name)
+            if match is None:
+                continue
+            key = (int(match.group("term")), match.group("alias").lower())
+            by_key.setdefault(key, []).append(name)
+
+        filtered_names = set()
+        for key, group in by_key.items():
+            if len(group) == 1:
+                filtered_names.add(group[0])
+                continue
+            renewals = []
+            for name in group:
+                relpath = f"{LEASES_RELPATH}/{name}"
+                if reader is not None:
+                    txt = reader(relpath)
+                else:
+                    path = self.root / relpath
+                    txt = path.read_text(encoding="utf-8") if path.is_file() else None
+                if not txt:
+                    continue
+                try:
+                    data = json.loads(txt)
+                except Exception:
+                    continue
+                if data.get("yielded"):
+                    filtered_names.add(name)
+                else:
+                    renewals.append((float(data.get("renews_at") or 0.0), name))
+            if renewals:
+                renewals.sort()
+                filtered_names.add(renewals[-1][1])
+
+        rows: List[LeaseClaim] = []
+        for name in sorted(filtered_names):
             if not name.endswith(".json") or "/" in name:
                 continue
             match = _CLAIM.match(name)

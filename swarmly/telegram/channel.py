@@ -2264,12 +2264,26 @@ class AgentChannel:
         return LeaseStore(self.config.identity.alias, transport=transport,
                           root=root, clock=time.time, ttl_seconds=ttl, rank=rank)
 
+    def lease_state(self, *, now: Optional[float] = None) -> Any:
+        """Cached folded lease state to prevent subprocess storms (Reasonix B5)."""
+        moment = self._clock() if now is None else now
+        cached = getattr(self, "_cached_lease_state", None)
+        if cached is not None and (moment - cached[0]) < 5.0:
+            return cached[1]
+        try:
+            store = self.lease_store()
+            state = store.state(now=moment)
+            self._cached_lease_state = (moment, state)
+            return state
+        except Exception:
+            from swarmly.telegram.lease import LeaseState
+            return LeaseState(status="unreadable", term=0, holder="", expires_at=0.0)
+
     def current_coordinator(self, *, now: Optional[float] = None) -> Optional[str]:
         """Who leads the swarm right now, decided by the bus lease."""
         try:
-            store = self.lease_store()
-            moment = time.time() if now is None else now
-            state = store.state(now=moment)
+            moment = self._clock() if now is None else now
+            state = self.lease_state(now=moment)
             if state.live(moment):
                 return state.holder
         except Exception:
@@ -2282,7 +2296,8 @@ class AgentChannel:
         if leader:
             return leader.strip().lower() == self.config.identity.alias.strip().lower()
         try:
-            state = self.lease_store().state(now=now)
+            moment = self._clock() if now is None else now
+            state = self.lease_state(now=moment)
             if state.status == "absent":
                 coord = (getattr(self.membership.state, "coordinator", None) or "").strip()
                 if coord:
