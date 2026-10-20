@@ -441,6 +441,29 @@ class TestTick(unittest.TestCase):
         self.assertIn("merge it", started[0])
         self.assertEqual(channel.wake_store().live_count, 0)
 
+    def test_a_bot_that_is_not_the_coordinator_still_fires_its_own_timer(self):
+        """Live, round 4: the lease fence returned early for every non-coordinator, so the
+        developer's WAKE never fired. The fence is for adopting a dead bot's timers only."""
+        import asyncio
+        channel = self.channel()
+        channel.lease_fence = lambda now=None: False
+        started = []
+        channel._run_own_task = lambda text, chat_id, thread_id, name: started.append(text)
+        store = channel.wake_store()
+        own = wk.WakeTimer(argv=("git", "status"), then="push the next slice", next_at=1.0,
+                           expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
+                           alias=channel.config.identity.alias)
+        adopted = wk.WakeTimer(argv=("git", "status"), then="merge it", next_at=1.0,
+                               expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
+                               alias="SomeoneElse")
+        store.add(own, max_timers=10)
+        store.add(adopted, max_timers=10)
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertIn(f"{own.id}: fire", done)
+        self.assertIn(f"{adopted.id}: adopted, held while this bot is not the coordinator", done)
+        self.assertEqual(len(started), 1)
+        self.assertIn("push the next slice", started[0])
+
     def test_a_frozen_bot_runs_no_check(self):
         import asyncio
         channel = self.channel()
