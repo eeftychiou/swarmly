@@ -2349,9 +2349,7 @@ class AgentChannel:
 
     def _is_round_coordinator(self) -> bool:
         """Whether this bot is the coordinator -- the only bot that writes the round state."""
-        if self.is_coordinator():
-            return True
-        return str(self.config.identity.role or "").strip().lower() == "coordinator" 
+        return self.is_coordinator()
 
     def _on_demoted_from_coordinator(self) -> None:
         if not (self.config.bus.repo or self.config.fallback.gitbus_root):
@@ -2387,8 +2385,10 @@ class AgentChannel:
         if payload is None and reason is None:
             return text                              # no block: the reply is untouched
         if not self._is_round_coordinator():
-            logger.info("rounds: a ROUND_STATE block from a non-coordinator was dropped")
-            return self._round_note(stripped, "a block from a non-coordinator is dropped")
+            leader = self.current_coordinator() or getattr(self.membership.state, "coordinator", None)
+            who = f": the coordinator on the swarm is {leader}" if leader else ""
+            logger.info("rounds: a ROUND_STATE block from a non-coordinator was dropped%s", who)
+            return self._round_note(stripped, f"a block from a non-coordinator is dropped{who}")
         if payload is None:
             logger.warning("rounds: block dropped (%s); the last good state stands", reason)
             return self._round_note(stripped, f"block dropped: {reason}")
