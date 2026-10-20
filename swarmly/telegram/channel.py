@@ -382,6 +382,7 @@ class AgentChannel:
             self.adapter.use_child_registry(_state_file(config, "children"))
         # durable-plane fallback (fallback.gitbus_poll_minutes)
         self._bus_task: Optional[asyncio.Task] = None
+        self._lease_task: Optional[asyncio.Task] = None
         self._lane_poll_task: Optional[asyncio.Task] = None    # one lane poll per doorbell burst
         self._gitbus_busy = False
         self._gitbus_pull = gitbus_pull or self._default_bus_pull
@@ -1150,6 +1151,10 @@ class AgentChannel:
                 result += f" wakes={self.wake_store().live_count}"
             except Exception:                          # noqa: BLE001 - /status must answer
                 result += " wakes=?"
+            try:
+                result += f" {self.lease_store().state().describe()}"
+            except Exception:                          # noqa: BLE001 - /status must answer
+                result += " coordinator=none(unverifiable)"
             result += f" peers={','.join(self.config.peers) or 'none'}"
             if self.config.identity.role:
                 result += f" role={self._role_name()}"
@@ -2245,6 +2250,124 @@ class AgentChannel:
 
     # -- durable round state (issue #86) ------------------------------------------------
 
+    def lease_store(self) -> Any:
+        from swarmly.telegram.lease import LeaseStore, succession_order
+        root = self._gitbus_root()
+        role = str(self.config.identity.role or "").strip().lower()
+        succession = getattr(self.config, "swarm", {}).get("succession") or ()
+        rank = succession_order(role, order=succession)
+        limits = getattr(self.config, "limits", None)
+        takeover = getattr(limits, "takeover_minutes", 10.0) if limits else 10.0
+        ttl = max(float(takeover) * 60.0, 60.0)
+        has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+        transport = self.bus_transport(root) if has_bus else None
+        return LeaseStore(self.config.identity.alias, transport=transport,
+                          root=root, clock=time.time, ttl_seconds=ttl, rank=rank)
+
+    def lease_fence(self, *, now: Optional[float] = None) -> bool:
+        """May this bot still act? Freshly read from the bus, once per side effect.
+
+        A lease can be displaced between the fold that made this bot the acting coordinator and
+        the action it takes next -- a claim that lands while coordinator work is already running.
+        The settle window orders claims, it does not fence work, so every action with a side
+        effect asks this first: no answer, a stale ref, or a different holder all mean "do not
+        act" (#93, Codex's inline blocker).
+        """
+        moment = self._clock() if now is None else now
+        try:
+            store = self.lease_store()
+            if not store.refresh(force=True):
+                logger.warning("lease: no fresh ref for the fence; not acting")
+                return False
+            state = store.state(now=moment)
+        except Exception:                              # noqa: BLE001 - no answer is not authority
+            logger.warning("lease: the fence could not read the lease; not acting", exc_info=True)
+            return False
+        return state.holds(self.config.identity.alias, moment)
+
+    def _forget_lease_cache(self) -> None:
+        """Drop the cached fold: after this bot writes a claim, its own view must not be stale."""
+        self.__dict__["_cached_lease_state"] = None
+
+    def lease_state(self, *, now: Optional[float] = None) -> Any:
+        """Cached folded lease state to prevent subprocess storms (Reasonix B5)."""
+        moment = self._clock() if now is None else now
+        limits = getattr(self.config, "limits", None)
+        window = float(getattr(limits, "lease_cache_seconds", 5.0) or 0.0)
+        cached = getattr(self, "_cached_lease_state", None)
+        if window > 0 and cached is not None and 0 <= (moment - cached[0]) < window:
+            return cached[1]
+        try:
+            store = self.lease_store()
+            state = store.state(now=moment)
+            self._cached_lease_state = (moment, state)
+            return state
+        except Exception:
+            from swarmly.telegram.lease import LeaseState
+            return LeaseState(status="unreadable", term=0, holder="", expires_at=0.0)
+
+    def current_coordinator(self, *, now: Optional[float] = None) -> Optional[str]:
+        """Who leads the swarm right now, decided by the bus lease."""
+        try:
+            moment = self._clock() if now is None else now
+            state = self.lease_state(now=moment)
+            if state.live(moment):
+                return state.holder
+        except Exception:
+            logger.warning("lease: current_coordinator lookup failed", exc_info=True)
+        return None
+
+    def is_coordinator(self, *, now: Optional[float] = None) -> bool:
+        """Whether this bot is currently the coordinator under the bus lease."""
+        leader = self.current_coordinator(now=now)
+        if leader:
+            return leader.strip().lower() == self.config.identity.alias.strip().lower()
+        try:
+            moment = self._clock() if now is None else now
+            state = self.lease_state(now=moment)
+            if state.status == "absent":
+                coord = (getattr(self.membership.state, "coordinator", None) or "").strip()
+                if coord:
+                    return coord.lower() == self.config.identity.alias.strip().lower()
+                return str(self.config.identity.role or "").strip().lower() == "coordinator"
+        except Exception:
+            return False
+        return False
+
+    def round_authority(self, *, now: Optional[float] = None) -> Any:
+        """The alias and term the bus lease names as the coordinator."""
+        from swarmly.telegram.rounds import Authority
+        from swarmly.telegram.lease import LeasePushError
+        try:
+            store = self.lease_store()
+            moment = time.time() if now is None else now
+            state = store.state(now=moment)
+            if state.live(moment):
+                return Authority(alias=state.holder, source="lease", term=state.term)
+            if state.status == "absent":
+                coord = (getattr(self.membership.state, "coordinator", None) or "").strip()
+                if coord and coord.lower() != self.config.identity.alias.strip().lower():
+                    return Authority(alias=coord, source="membership", term=0)
+                if str(self.config.identity.role or "").strip().lower() == "coordinator":
+                    try:
+                        claim = store.claim(term=1, now=moment)
+                        self._forget_lease_cache()
+                        return Authority(alias=claim.alias, source="lease", term=claim.term)
+                    except LeasePushError as exc:
+                        # A claim that never reached the bus is not authority: granting term 1
+                        # here would let a round be written at a term no successor can reason
+                        # about (PR #93 review, B2).
+                        logger.warning("lease: bootstrap claim was not pushed; no authority: %s",
+                                       exc)
+                        return Authority(alias="", source="lease", term=0)
+                    except Exception:
+                        logger.warning("lease: failed to claim term 1 on absent lease; "
+                                       "no authority", exc_info=True)
+                        return Authority(alias="", source="lease", term=0)
+        except Exception:
+            logger.warning("lease: round_authority lookup failed", exc_info=True)
+        return Authority(alias="", source="lease", term=0)
+
     def round_store(self) -> Any:
         """The store for this bot's round state: the bus it already polls.
 
@@ -2254,7 +2377,8 @@ class AgentChannel:
         from swarmly.telegram.rounds import RoundStore
         root = self._gitbus_root()
         return RoundStore(self.bus_transport(root), root=root, clock=time.time,
-                          alias=self.config.identity.alias)
+                          alias=self.config.identity.alias,
+                          authority=self.round_authority())
 
     def _round_repo(self, event: Optional[ChannelEvent]) -> str:
         if event is None:
@@ -2273,17 +2397,26 @@ class AgentChannel:
         return f"{repo}#{number}" if repo else number
 
     def _is_round_coordinator(self) -> bool:
-        """Whether this bot is the coordinator -- the only bot that writes the round state.
+        """Whether this bot is the coordinator -- the only bot that writes the round state."""
+        return self.is_coordinator()
 
-        The role file is the answer when it can be read; the configured role is the fallback,
-        because an unreadable roles directory must not silently turn off the round's state.
-        """
-        if str(self.config.identity.role or "").strip().lower() == "coordinator":
-            return True
+    def _on_demoted_from_coordinator(self) -> None:
+        if not (self.config.bus.repo or self.config.fallback.gitbus_root):
+            return
         try:
-            return bool(self.membership.is_coordinator())
-        except Exception:                                  # noqa: BLE001 - never fatal
-            return False
+            self.lease_store().yield_lease(reason="superseded by /role")
+        except Exception:
+            logger.warning("lease: failed to yield on demotion", exc_info=True)
+
+    def _on_promoted_to_coordinator(self) -> None:
+        if not (self.config.bus.repo or self.config.fallback.gitbus_root):
+            return
+        try:
+            store = self.lease_store()
+            current = store.state()
+            store.claim(term=current.term + 1, promoted=True)
+        except Exception:
+            logger.warning("lease: failed to claim on promotion", exc_info=True)
 
     def apply_round_block(self, text: str, event: ChannelEvent) -> str:
         """Take the ``ROUND_STATE`` block out of a reply, and put it on the bus.
@@ -2301,8 +2434,10 @@ class AgentChannel:
         if payload is None and reason is None:
             return text                              # no block: the reply is untouched
         if not self._is_round_coordinator():
-            logger.info("rounds: a ROUND_STATE block from a non-coordinator was dropped")
-            return self._round_note(stripped, "a block from a non-coordinator is dropped")
+            leader = self.current_coordinator() or getattr(self.membership.state, "coordinator", None)
+            who = f": the coordinator on the swarm is {leader}" if leader else ""
+            logger.info("rounds: a ROUND_STATE block from a non-coordinator was dropped%s", who)
+            return self._round_note(stripped, f"a block from a non-coordinator is dropped{who}")
         if payload is None:
             logger.warning("rounds: block dropped (%s); the last good state stands", reason)
             return self._round_note(stripped, f"block dropped: {reason}")
@@ -2310,6 +2445,10 @@ class AgentChannel:
         if key is None:
             logger.warning("rounds: block without a tracking issue number dropped")
             return self._round_note(stripped, "block dropped: no tracking issue number")
+        if not self.lease_fence():
+            logger.warning("rounds: not the coordinator any more; block not written")
+            return self._round_note(stripped, "state not saved: this bot is not the coordinator "
+                                              "on the bus any more")
         store = self.round_store()
         try:
             update = RoundUpdate.from_dict(payload, writer=self.config.identity.alias,
@@ -2424,6 +2563,9 @@ class AgentChannel:
             return ["paused: no check runs while this bot is paused"]
         store = self.wake_store()
         done: List[str] = []
+        if not self.lease_fence():
+            logger.info("wake: not the coordinator; adopting no timers this tick")
+            return done
         try:                                         # a dead bot's armed timers are promises
             for adopted in await asyncio.to_thread(
                     store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),
@@ -2641,6 +2783,116 @@ class AgentChannel:
             return delivered
         finally:
             self._gitbus_busy = False
+
+    async def check_lease(self, *, now: Optional[float] = None) -> Optional[Any]:
+        """Renew the lease if this bot is the holder, or claim N+1 if expired and next in succession."""
+        if not (self.config.bus.repo or self.config.fallback.gitbus_root):
+            return None
+        if self._frozen or self._pause_pending:
+            return None
+
+        moment = self._clock() if now is None else now
+        store = self.lease_store()
+        try:
+            state = store.state(now=moment)
+        except Exception:
+            logger.warning("lease: check_lease could not read lease state", exc_info=True)
+            return None
+
+        alias = self.config.identity.alias.strip().lower()
+
+        # Case 1: This bot is the live holder -> renew if due
+        if state.live(moment) and state.holder.strip().lower() == alias:
+            renew_interval = getattr(self.config.limits, "lease_renew_seconds", 120.0)
+            last_renew = getattr(state.claim, "renews_at", 0.0) if state.claim else 0.0
+            if (moment - last_renew) >= renew_interval or (state.expires_at - moment) <= (store.ttl_seconds / 2):
+                try:
+                    claim = store.claim(term=state.term, now=moment)
+                    self._forget_lease_cache()
+                    logger.info("lease: %s renewed lease for term %d (expires at %.1f)",
+                                self.config.identity.alias, claim.term, claim.expires_at)
+                    return claim
+                except Exception:
+                    logger.warning("lease: failed to renew lease at term %d", state.term, exc_info=True)
+            return state.claim
+
+        # Case 2: Lease is not live (absent, expired, or yielded)
+        if not state.live(moment):
+            from swarmly.telegram.lease import succession_order
+            role = str(self.config.identity.role or "").strip().lower()
+            succession = getattr(self.config, "swarm", {}).get("succession") or ()
+            my_rank = succession_order(role, order=succession)
+
+            # If lease is absent (swarm bootstrap)
+            if state.status == "absent":
+                coord = (getattr(self.membership.state, "coordinator", None) or "").strip()
+                if (coord and coord.lower() == alias) or (not coord and role == "coordinator"):
+                    try:
+                        claim = store.claim(term=1, now=moment)
+                        self._forget_lease_cache()
+                        logger.info("lease: %s claimed bootstrap term 1", self.config.identity.alias)
+                        return claim
+                    except Exception:
+                        logger.warning("lease: failed to claim bootstrap term 1", exc_info=True)
+                return None
+
+            # If the lease is expired or yielded, claim the next term -- but no liveness
+            # pre-check of the peers: a reviewer that has simply died carries no freeze flag, and
+            # treating every better-ranked peer as alive would stop the qa-tester from ever
+            # taking over the common die-off. Claim, let the claims settle, and act only if the
+            # fold names this bot: a live peer claims N+1 too and wins the fold, a dead one does
+            # not claim at all (#93 B3).
+            next_term = state.term + 1
+            try:
+                mine = store.claim(term=next_term, now=moment)
+            except Exception as exc:
+                logger.warning("lease: %s could not claim term %d: %s", self.config.identity.alias,
+                               next_term, exc)
+                return None
+            settle = float(getattr(self.config.limits, "lease_settle_seconds", 30.0) or 0.0)
+            if settle > 0:
+                await self._sleep(settle)
+            self._forget_lease_cache()
+            if not store.refresh(force=True):
+                logger.warning("lease: ref refresh failed after settle for term %d; refusing to act",
+                               next_term)
+                return None
+            try:
+                fresh = store.state(now=self._clock())
+            except Exception:
+                logger.warning("lease: could not re-read the lease after claiming term %d",
+                               next_term, exc_info=True)
+                return None
+            if not fresh.holds(self.config.identity.alias, self._clock()):
+                logger.info("lease: %s claimed term %d but %s holds it; yielding",
+                            self.config.identity.alias, next_term, fresh.holder or "nobody")
+                return None
+            logger.warning("lease: coordinator lease taken over by %s at term %d (%s)",
+                           self.config.identity.alias, next_term, state.status)
+            await self._announce_takeover(next_term, state.status, mine)
+            return mine
+        return None
+
+    async def _announce_takeover(self, term: int, why: str, claim: Any) -> None:
+        """Tell the admin, once, in the channel: a takeover is theirs to know about (#83)."""
+        try:
+            await self.send(
+                f"🔄 coordinator lease: {self.config.identity.alias} is acting coordinator at term "
+                f"{term} ({'the lease lapsed' if why != 'yielded' else 'the holder yielded'}; "
+                f"expires {time.strftime('%H:%M:%SZ', time.gmtime(claim.expires_at))}).",
+                notice=True)
+        except Exception:                              # noqa: BLE001 - never fatal
+            logger.warning("lease: could not post the takeover notice", exc_info=True)
+
+    async def _lease_tick(self) -> None:
+        """Periodic coordinator lease renewal and succession poll."""
+        interval = min(max(5.0, getattr(self.config.limits, "lease_renew_seconds", 120.0) / 2), 60.0)
+        while True:
+            try:
+                await self.check_lease()
+            except Exception:
+                logger.exception("lease: lease tick failed")
+            await self._sleep(interval)
 
     async def _bus_tick(self) -> None:
         """Periodic durable-bus poll; interval from ``fallback.gitbus_poll_minutes``."""
@@ -5135,6 +5387,8 @@ class AgentChannel:
         if self._bus_task is None and self.config.fallback.gitbus_poll_minutes > 0 \
                 and self.config.bus.enabled:
             self._bus_task = asyncio.create_task(self._bus_tick())
+        if self._lease_task is None and (self.config.bus.repo or self.config.fallback.gitbus_root):
+            self._lease_task = asyncio.create_task(self._lease_tick())
         if self._github_task is None and self.config.github and self.config.github.poll_minutes > 0:
             self._github_task = asyncio.create_task(self._github_tick())
         if self._wake_task is None and self.config.limits.wake_tick_seconds > 0:

@@ -37,6 +37,19 @@ Chasing a stalled owner is not the same thing as retrying a delivery. The escala
 `/ping`, mirroring it to the bus, escalating to the human — belongs to whoever sent that
 REQUEST, whichever role it has: a retry is not a nudge.
 
+## Acting coordinator and succession (issue #83)
+
+The coordinator role can be held by an **acting coordinator** under an append-only bus lease
+(`.agents/leases/<term>-<alias>-<nonce>.json`).
+
+- When the appointed coordinator is offline, frozen, or its lease lapses past `takeover_minutes`,
+  the first eligible successor in succession order (`reviewer` -> `qa-tester` -> `developer`)
+  takes over as acting coordinator at term `N+1`.
+- The acting coordinator inherits coordinator duties: merging approved, QA-passed, green PRs in
+  the same turn, nudging stalled peers, arming WAKE timers, and posting round reports.
+- An acting coordinator does **not** inherit owner or admin powers (`/role`, `/admit`, `/remove`).
+- A demoted or returning coordinator yields the lease and steps down to peer.
+
 ## How an agent gets its role
 
 Roles are not written in any config. An agent started with `swarmly --cli ...` asks the swarm

@@ -455,9 +455,42 @@ class GitHubWatcher:
         self.ci_state = CIWatchState.load(self.ci_state_path)
         self._router: Optional[ProjectRouter] = None
 
+    def _may_poll(self) -> bool:
+        """Whether this watcher may read the shared GitHub login right now.
+
+        `is_coordinator()` answers from a fold the channel caches for a few seconds, which is
+        fine for a display but not for a gate: a bot displaced a moment ago can still look like
+        the coordinator and poll beside its successor. The channel's fence re-reads the lease
+        before every side effect, so the poll asks that instead (#93, Codex's blocker).
+        """
+        if self.channel is None:
+            return True                     # standalone `gh-poll --once`: the only reader
+        fence = getattr(self.channel, "lease_fence", None)
+        if callable(fence):
+            try:
+                return bool(fence())
+            except Exception:                          # noqa: BLE001 - no answer is not authority
+                logger.warning("github: the lease fence could not answer; not polling",
+                               exc_info=True)
+                return False
+        return self._is_coordinator()
+
     def _is_coordinator(self) -> bool:
-        """Only the coordinator posts the round report; a developer's watcher stays quiet."""
-        return (self.config.identity.role or "").strip().lower() == "coordinator"
+        """Only the coordinator posts the round report or handles notifications (#83).
+
+        The answer comes from the bus lease, through the channel's one gate, and from nowhere
+        else: falling back to the configured role is how a returning coordinator keeps polling
+        beside the acting one while both read the same shared GitHub login. No authority is a
+        peer, and a peer stays quiet.
+        """
+        if self.channel is None or not hasattr(self.channel, "is_coordinator"):
+            return False
+        try:
+            return bool(self.channel.is_coordinator())
+        except Exception:                              # noqa: BLE001 - no answer is not authority
+            logger.warning("github: the coordinator gate could not answer; staying quiet",
+                           exc_info=True)
+            return False
 
     async def _deliver(self, project: Optional[ProjectSettings], incoming: IncomingMessage,
                        chat_id: int, thread_id: Optional[int],
@@ -685,6 +718,14 @@ class GitHubWatcher:
             return outcome
         if not self.config.projects:
             logger.debug("no projects configured; github watcher has no repos to poll")
+            return outcome
+
+        if not self._may_poll():
+            # #83: the shared GitHub login is read by exactly one bot -- the one the bus lease
+            # names. A peer that polled too would handle the same notification twice, and would
+            # keep polling after a successor took over. A watcher with no channel is the
+            # standalone `gh-poll --once` path, which is the only reader by construction.
+            logger.info("github: not the coordinator on the bus; skipping this poll")
             return outcome
 
         login = (self.config.github.login or "").strip().lower()

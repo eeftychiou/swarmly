@@ -65,6 +65,10 @@ class RoundStaleTerm(RoundStateError):
     """A write from an older coordinator term: it must not overwrite a newer one."""
 
 
+class RoundUnauthorised(RoundStateError):
+    """This bot may not speak for the round: no authority for it, or it is not the one."""
+
+
 class RoundFenced(RoundStateError):
     """Another bot holds this round at this term: this write is not this bot's to make."""
 
@@ -75,6 +79,21 @@ class RoundPushError(RoundStateError):
     def __init__(self, message: str, path: Optional[str] = None):
         super().__init__(message)
         self.path = path
+
+
+@dataclass(frozen=True)
+class Authority:
+    """Who the swarm says the coordinator is, and where that came from.
+
+    The first claim on a round that does not exist yet is the one write that cannot be fenced
+    against an earlier holder, so it needs an authority: the alias the swarm names as the
+    coordinator, with its term from the lease. An empty alias or expired/absent lease means
+    "nobody knows", and that fails closed.
+    """
+
+    alias: str = ""
+    source: str = "lease"
+    term: int = 0
 
 
 def utc_now(clock: Optional[Any] = None) -> str:
@@ -572,12 +591,13 @@ class RoundStore:
 
     def __init__(self, transport: Any = None, *, root: Optional[Path] = None,
                  relpath: str = ROUNDS_RELPATH, clock: Optional[Any] = None,
-                 alias: str = ""):
+                 alias: str = "", authority: Optional[Authority] = None):
         self.transport = transport
         self.root = Path(root or getattr(transport, "root", None) or ".")
         self.relpath = relpath
         self.clock = clock
         self.alias = alias
+        self.authority = authority
         self._refreshed = False
 
     # -- paths -----------------------------------------------------------------------
@@ -738,7 +758,8 @@ class RoundStore:
     def next_seq(self, round_key: str) -> int:
         return self.load(round_key).seq + 1
 
-    def append(self, update: RoundUpdate, *, holder: str = "") -> str:
+    def append(self, update: RoundUpdate, *, holder: str = "",
+               authority: Optional[Authority] = None) -> str:
         """Write one segment, then publish it. Returns the segment's bus path.
 
         Three rules, one purpose: no bot writes a round it cannot prove it holds.
@@ -751,6 +772,11 @@ class RoundStore:
         * **Fenced by the holder.** Once a round has a holder at a term, another bot cannot
           write it at that term or below (:class:`RoundFenced`). Until #83 supplies a lease,
           ``term`` comes from the bus, never from the model's block.
+        * **A first claim needs an authority.** The write that creates a round cannot be
+          fenced against a holder, because there is none yet: it needs *authority* -- the
+          alias the swarm names as its coordinator. A stale coordinator whose swarm says
+          somebody else is refused (:class:`RoundUnauthorised`), and so is a bot that cannot
+          name one at all.
         """
         current = self.load(update.round)
         if current.status == "unreadable":
@@ -758,26 +784,58 @@ class RoundStore:
                 f"the state of {update.round} on the bus could not be read "
                 f"({current.reason}); refusing to write a term or a seq that cannot be "
                 "verified")
+
+        update.holder = holder or update.holder or self.alias
+        auth = authority
+        if auth is None and (not self.alias or self.alias.strip().lower() == update.holder.strip().lower()):
+            auth = self.authority
+
+        if current.status == "absent":
+            if auth is None or not auth.alias.strip():
+                raise RoundUnauthorised(
+                    f"{update.round} has no state on the bus and no coordinator authority is "
+                    "known; refusing to make its first claim")
+            if auth.alias.strip().lower() != update.holder.strip().lower():
+                raise RoundUnauthorised(
+                    f"the coordinator on the swarm is {auth.alias} "
+                    f"({auth.source}); {update.holder} may not make the first claim on "
+                    f"{update.round}")
+            if auth.term:
+                update.term = auth.term
+
         has_ref = bool(getattr(self.transport, "ref", None))
         if has_ref and current.status == "ok" and current.source != "ref":
             raise RoundStateError(
                 f"the state of {update.round} is on this checkout only, not on the bus "
                 f"({current.stale or 'not pushed'}); refusing to write against a state "
                 "the bus does not have")
+
         trusted = current.term if current.status == "ok" else 0
-        if update.term and update.term < trusted:
+        if auth is not None and auth.term:
+            if auth.term < trusted:
+                raise RoundStaleTerm(
+                    f"term {auth.term} is behind {trusted} for round {update.round}; "
+                    "this bot is not the coordinator of this round any more")
+            update.term = auth.term
+        elif update.term and update.term < trusted:
             raise RoundStaleTerm(
                 f"term {update.term} is behind {trusted} for round {update.round}; "
                 "this bot is not the coordinator of this round any more")
         if not update.term:
             update.term = trusted
-        update.holder = holder or update.holder or self.alias
+
         if current.status == "ok" and _unchanged(update, current):
             # Nothing new: a turn that emits the same state again must not add a commit to
             # the bus's history (issue #86 review B7). Checked before the fence, so a no-op
             # from another bot returns the existing segment instead of raising.
             existing = sorted(self.directory(update.round).glob("*.json"))
             return str(existing[-1]) if existing else str(self.directory(update.round))
+
+        if auth is not None and auth.alias.strip():
+            if auth.alias.strip().lower() != update.holder.strip().lower():
+                raise RoundUnauthorised(
+                    f"the coordinator on the swarm is {auth.alias} "
+                    f"({auth.source}); {update.holder} cannot write round {update.round}")
         if (current.status == "ok" and current.holder and update.term <= current.term
                 and current.holder.strip().lower() != update.holder.strip().lower()):
             raise RoundFenced(
