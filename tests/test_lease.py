@@ -523,3 +523,47 @@ class TestSuccessionOnExpiry(unittest.TestCase):
             # /role is the one path allowed to take a live lease over.
             promoted = usurper.claim(term=2, promoted=True)
             self.assertEqual((promoted.term, promoted.alias), (2, "Antigravity"))
+
+
+    def test_claims_keyed_on_ref_tip_sha(self):
+        with TemporaryDirectory() as tmp:
+            calls = {"rev_parse": 0, "list_at_ref": 0}
+
+            class MockGitTransport(_Bus):
+                def __init__(self, root):
+                    super().__init__(root)
+                    self.tip = "sha11111111"
+
+                def _git(self, *args, **kwargs):
+                    class Proc:
+                        returncode = 0
+                        stdout = self.tip
+                    calls["rev_parse"] += 1
+                    return Proc()
+
+                def list_at_ref(self, relpath):
+                    calls["list_at_ref"] += 1
+                    return super().list_at_ref(relpath)
+
+            bus = MockGitTransport(tmp)
+            claude = ls.LeaseStore("Claude", transport=bus, root=Path(tmp),
+                                   clock=lambda: 1000.0, ttl_seconds=600.0)
+            claude.claim(term=1)
+
+            reader = ls.LeaseStore("Hermes", transport=bus, root=Path(tmp),
+                                   clock=lambda: 1000.0)
+            calls["list_at_ref"] = 0
+            c1 = reader.claims()
+            self.assertEqual(len(c1), 1)
+            self.assertEqual(calls["list_at_ref"], 1)
+
+            # Second call on unchanged tip SHA: returns cached claims without calling list_at_ref
+            c2 = reader.claims()
+            self.assertEqual(len(c2), 1)
+            self.assertEqual(calls["list_at_ref"], 1)
+
+            # When tip moves: list_at_ref is called again
+            bus.tip = "sha22222222"
+            c3 = reader.claims()
+            self.assertEqual(len(c3), 1)
+            self.assertEqual(calls["list_at_ref"], 2)

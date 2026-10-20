@@ -34,7 +34,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from swarmly.transports.base import LEASES_RELPATH, is_bus_document
 
@@ -166,6 +166,9 @@ def succession_order(role: str, *, order: Iterable[str] = ()) -> int:
 DEFAULT_SUCCESSION = ("reviewer", "qa-tester", "developer")
 
 
+_PARSED_CLAIMS_CACHE: Dict[Tuple[str, str], Tuple[Optional[int], LeaseClaim]] = {}
+
+
 class LeaseStore:
     """Reads and appends coordinator lease claims on a bus transport."""
 
@@ -230,60 +233,47 @@ class LeaseStore:
     def claims(self) -> Optional[List[LeaseClaim]]:
         """Every usable claim, or ``None`` when the bus could not be read."""
         self.refresh()
+
+        transport = self.transport
+        # Key the fold on the ref tip SHA: on an unchanged tip return the cached state (Reasonix B4).
+        tip_sha = None
+        if transport is not None and getattr(transport, "ref", None) and hasattr(transport, "_git"):
+            try:
+                proc = transport._git("rev-parse", "--verify", "--quiet", transport.ref)
+                if proc.returncode == 0:
+                    tip_sha = proc.stdout.strip()
+            except Exception:
+                pass
+        if tip_sha and getattr(self, "_cached_ref_tip", None) == tip_sha:
+            return list(getattr(self, "_cached_claims", []))
+
         names = self._names()
         if names is None:
             return None
-        transport = self.transport
-        reader = getattr(transport, "read_at_ref", None)
 
-        # B5: Prune superseded renewals before ranking to prevent git subprocess storm.
-        by_key = {}
+        names_tuple = tuple(names)
+        if getattr(self, "_cached_names", None) == names_tuple:
+            return list(getattr(self, "_cached_claims", []))
+
+        reader = getattr(transport, "read_at_ref", None)
+        ranker = getattr(transport, "arrival_rank", None)
+
+        claims_list: List[LeaseClaim] = []
         for name in names:
             if not name.endswith(".json") or "/" in name:
                 continue
             match = _CLAIM.match(name)
             if match is None:
                 continue
-            key = (int(match.group("term")), match.group("alias").lower())
-            by_key.setdefault(key, []).append(name)
-
-        filtered_names = set()
-        for key, group in by_key.items():
-            if len(group) == 1:
-                filtered_names.add(group[0])
-                continue
-            renewals = []
-            for name in group:
-                relpath = f"{LEASES_RELPATH}/{name}"
-                if reader is not None:
-                    txt = reader(relpath)
-                else:
-                    path = self.root / relpath
-                    txt = path.read_text(encoding="utf-8") if path.is_file() else None
-                if not txt:
-                    continue
-                try:
-                    data = json.loads(txt)
-                except Exception:
-                    continue
-                if data.get("yielded"):
-                    filtered_names.add(name)
-                else:
-                    renewals.append((float(data.get("renews_at") or 0.0), name))
-            if renewals:
-                renewals.sort()
-                filtered_names.add(renewals[-1][1])
-
-        rows: List[LeaseClaim] = []
-        for name in sorted(filtered_names):
-            if not name.endswith(".json") or "/" in name:
-                continue
-            match = _CLAIM.match(name)
-            if match is None:
-                continue
             relpath = f"{LEASES_RELPATH}/{name}"
+            cache_key = (str(self.root), relpath)
+
+            cached = _PARSED_CLAIMS_CACHE.get(cache_key)
+            if cached is not None:
+                claims_list.append(cached[1])
+                continue
+
             arrival = None
-            ranker = getattr(transport, "arrival_rank", None)
             if ranker is not None:
                 try:
                     arrival = ranker(relpath)
@@ -294,8 +284,8 @@ class LeaseStore:
                 if arrival is None:
                     logger.warning("lease: %s has no place in the bus history; not counted", name)
                     continue
+
             text = None
-            reader = getattr(transport, "read_at_ref", None)
             if reader is not None:
                 text = reader(relpath)
             else:
@@ -304,17 +294,40 @@ class LeaseStore:
             if not text:
                 continue
             try:
-                claim = LeaseClaim.from_dict(json.loads(text))
+                parsed = LeaseClaim.from_dict(json.loads(text))
             except (ValueError, TypeError) as exc:
                 logger.warning("lease: %s is not usable: %s", name, exc)
                 continue
-            rows.append(LeaseClaim(term=claim.term, alias=claim.alias,
-                                   expires_at=claim.expires_at, renews_at=claim.renews_at,
-                                   rank=claim.rank, arrival=int(arrival if arrival is not None
-                                                              else -1),
-                                   nonce=match.group("nonce"),
-                                   yielded=claim.yielded))
-        return rows
+
+            claim = LeaseClaim(term=parsed.term, alias=parsed.alias,
+                               expires_at=parsed.expires_at, renews_at=parsed.renews_at,
+                               rank=parsed.rank, arrival=int(arrival if arrival is not None else -1),
+                               nonce=match.group("nonce"), yielded=parsed.yielded)
+            _PARSED_CLAIMS_CACHE[cache_key] = (arrival, claim)
+            claims_list.append(claim)
+
+        # B5/B4: Prune superseded renewals in-memory without repetitive git subprocess reads.
+        by_key: Dict[Tuple[int, str], List[LeaseClaim]] = {}
+        for claim in claims_list:
+            by_key.setdefault((claim.term, claim.alias.lower()), []).append(claim)
+
+        filtered: List[LeaseClaim] = []
+        for group in by_key.values():
+            if len(group) == 1:
+                filtered.append(group[0])
+                continue
+            yields = [c for c in group if c.yielded]
+            filtered.extend(yields)
+            non_yields = [c for c in group if not c.yielded]
+            if non_yields:
+                best = max(non_yields, key=lambda c: (c.renews_at, c.nonce))
+                filtered.append(best)
+
+        if tip_sha:
+            self._cached_ref_tip = tip_sha
+        self._cached_names = names_tuple
+        self._cached_claims = list(filtered)
+        return filtered
 
     def state(self, *, now: Optional[float] = None) -> LeaseState:
         """The folded lease. ``unreadable`` is never ``absent``: one is a broken bus."""
