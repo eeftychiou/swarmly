@@ -57,7 +57,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from swarmly.transports.base import WAKES_RELPATH, is_bus_document
 
@@ -133,6 +133,16 @@ _KV = re.compile(r'([a-z]+)=("[^"]*"|\'[^\']*\'|\S+)')
 
 class WakeError(ValueError):
     """A WAKE line, a timer or a check that is refused."""
+
+
+class Claim(NamedTuple):
+    """One claim on one firing, as the bus places it."""
+
+    #: Sort key, ascending: earlier claims first (a higher arrival rank is a lower key).
+    order: float
+    #: When the claim became visible, when the transport can say (epoch seconds), else None.
+    seen_at: Optional[float]
+    alias: str
 
 
 class WakePushError(WakeError):
@@ -762,15 +772,15 @@ class WakeStore:
             return False
         return result is not False
 
-    def _claim_records(self, timer_id: str, firing: int
-                       ) -> Optional[List[Tuple[float, str]]]:
-        """``(first_seen, alias)`` for every claim on this firing, or ``None`` if unreadable.
+    def _claim_records(self, timer_id: str, firing: int) -> Optional[List[Claim]]:
+        """Every claim on this firing, ordered by when the **bus** got it, or ``None``.
 
-        *first_seen* is when the claim first appeared **in the bus's history**, not a time the
-        writer put inside the file: a bot cannot make its claim look older by stamping it, and a
-        slow push cannot carry an earlier claim than the one it overtook. Where the transport
-        cannot say (a folder or an in-memory bus), the file's own stamp is the fallback, and the
-        lowest alias breaks ties.
+        Order comes from the bus, never from the claim's own contents: a stamp inside the file
+        is written before its own push, and so is a commit time, so either could carry an
+        earlier claim than the one it overtook. The transport's arrival rank (how many commits
+        landed after the one that added the file) is what a writer cannot forge. Where the
+        transport cannot say -- a folder bus, an in-memory one -- the file's own stamp is the
+        fallback, and the lowest alias breaks ties.
         """
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
@@ -783,51 +793,40 @@ class WakeStore:
         if names is None:
             return None
         prefix = f"{timer_id}-{firing}-"
-        records: List[Tuple[float, str]] = []
+        claims: List[Claim] = []
         for name in names:
             base = name.rsplit("/", 1)[-1]
             if not (base.startswith(prefix) and base.endswith(".json")):
                 continue
             alias = base[len(prefix):-len(".json")]
             full = f"{WAKE_RELPATH}/{name}"
-            seen = None
-            first_seen = getattr(transport, "first_seen_at", None)
-            if first_seen is not None:
+            rank = None
+            arrival = getattr(transport, "arrival_rank", None)
+            if arrival is not None:
                 try:
-                    seen = first_seen(full)
+                    rank = arrival(full)
                 except Exception:                      # noqa: BLE001 - fall back to the stamp
-                    seen = None
-            if seen is None:
-                reader = getattr(transport, "read_at_ref", None)
-                if reader is not None:
-                    try:
-                        payload = json.loads(reader(full) or "{}")
-                        seen = float(payload.get("written_at") or 0.0)
-                    except Exception:                  # noqa: BLE001 - no usable time at all
-                        seen = None
-            if seen is None or seen <= 0:
-                continue                               # the bus cannot place it: not a claim
-            records.append((seen, alias))
-        return sorted(records)
+                    rank = None
+            if rank is not None:
+                claims.append(Claim(order=-float(rank), seen_at=None, alias=alias))
+                continue
+            stamp = 0.0
+            reader = getattr(transport, "read_at_ref", None)
+            if reader is not None:
+                try:
+                    payload = json.loads(reader(full) or "{}")
+                    stamp = float(payload.get("written_at") or 0.0)
+                except Exception:                      # noqa: BLE001 - no usable time
+                    stamp = 0.0
+            if stamp <= 0:
+                continue
+            claims.append(Claim(order=stamp, seen_at=stamp, alias=alias))
+        return sorted(claims)
 
     def _claims(self, timer_id: str, firing: int) -> Optional[List[str]]:
         """Aliases that have claimed this firing, first written first."""
         records = self._claim_records(timer_id, firing)
-        return None if records is None else [alias for _stamp, alias in records]
-
-    def claim(self, timer: WakeTimer, *, settle_seconds: float = 0.0) -> bool:
-        """True when this bot may fire now. See :meth:`claim_state` for the why."""
-        return self.claim_state(timer, settle_seconds=settle_seconds) == "won"
-
-    def _claim_written_at(self, timer: WakeTimer) -> Optional[float]:
-        """When this bot's claim for the timer's current firing was written, if it was."""
-        path = self.root / WAKE_RELPATH / self.safe_alias / (
-            f"{timer.id}-{self.firing_of(timer)}-{self.safe_alias}.json")
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return float(data.get("written_at") or 0.0) or path.stat().st_mtime
-        except Exception:                              # noqa: BLE001 - no claim of ours yet
-            return None
+        return None if records is None else [claim.alias for claim in records]
 
     def claim(self, timer: WakeTimer, *, settle_seconds: float = 0.0) -> bool:
         """True when this bot may fire now. See :meth:`claim_state` for the why."""
@@ -852,7 +851,7 @@ class WakeStore:
         before = self._claim_records(timer.id, firing)
         if before is None:                    # a broken bus is not "I am the only one"
             return "lost"
-        mine = any(alias == self.safe_alias for _stamp, alias in before)
+        mine = any(claim.alias == self.safe_alias for claim in before)
         if not mine:
             # Someone claimed it before we did: the earliest claim holds the firing.
             if before:
@@ -866,7 +865,8 @@ class WakeStore:
         elif settle_seconds > 0:
             # The window runs from when the *bus* first saw our claim, which a restart keeps
             # (the local confirmation is only a fallback for a bus that cannot say).
-            seen = next((stamp for stamp, alias in before if alias == self.safe_alias), None)
+            seen = next((claim.seen_at for claim in before
+                         if claim.alias == self.safe_alias), None)
             confirmed = seen if seen is not None else self._confirmed.get(firing)
             if confirmed is None:
                 # A restart (or another process): wait one more window rather than firing on a
@@ -878,16 +878,15 @@ class WakeStore:
         if not self.refresh():                # the post-read must come from a fresh ref too
             return "lost"
         after = self._claim_records(timer.id, firing)
-        if after is None or not any(alias == self.safe_alias for _stamp, alias in after):
+        if after is None or not any(claim.alias == self.safe_alias for claim in after):
             # The post-read must show this bot's own claim: an empty list means the bus did
             # not confirm it, not that this bot won.
             return "lost"
         if len(after) == 1:
-            return "won"                      # only ours is visible: it holds the firing
-        # Several are visible: the earliest write holds it, ties by lowest alias. A claim that
-        # arrives later than that decision finds one already there and loses, whatever its
-        # stamp -- stamps only order claims that are visible at the same moment.
-        return "won" if after[0][1] == self.safe_alias else "lost"
+            return "won"                      # only ours is on the bus: it holds the firing
+        # Several are there: the one the bus got first holds the firing, ties by lowest alias.
+        # A claim that arrives after that decision finds one already there and loses.
+        return "won" if after[0].alias == self.safe_alias else "lost"
 
     def _write_claim(self, timer: WakeTimer, firing: int) -> Optional[float]:
         """Write this bot's claim for one firing, and push it once.

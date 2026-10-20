@@ -134,22 +134,27 @@ class GitTransport:
         return sorted(path[len(prefix):] for path in (result.stdout or "").splitlines()
                       if path.startswith(prefix))
 
-    def first_seen_at(self, relpath: str) -> Optional[float]:
-        """When *relpath* first appeared in the bus's history, in epoch seconds.
+    def arrival_rank(self, relpath: str) -> Optional[int]:
+        """How many commits on the bus branch came *after* the one that added *relpath*.
 
-        A claim is a file added to the bus, so its commit time is a fact about the bus rather
-        than about the bot that wrote it. Callers that need to order competing writes use this
-        and never a timestamp from inside the file (PR #92 review, B4).
+        This is the only ordering a bot cannot forge and a slow push cannot backdate: a commit
+        records its own author's clock, and a commit is created before it is pushed, so both a
+        stamp inside a file and a commit time are earlier than the moment the bus saw it. The
+        **position in the branch** is not: a push that loses the race is replayed onto the tip,
+        which puts it after everything that landed while it was in flight. Higher is earlier.
         """
         if not self.ref:
             return None
-        result = self._git("log", "-1", "--format=%ct", "--diff-filter=A", self.ref, "--",
-                           relpath, timeout=30)
-        if result.returncode != 0:
+        added = self._git("log", "-1", "--format=%H", "--diff-filter=A", self.ref, "--",
+                          relpath, timeout=30)
+        commit = (added.stdout or "").strip().splitlines()
+        if added.returncode != 0 or not commit:
             return None
-        text = (result.stdout or "").strip()
+        after = self._git("rev-list", "--count", f"{commit[-1]}..{self.ref}", timeout=30)
+        if after.returncode != 0:
+            return None
         try:
-            return float(text.splitlines()[-1]) if text else None
+            return int((after.stdout or "").strip())
         except ValueError:
             return None
 

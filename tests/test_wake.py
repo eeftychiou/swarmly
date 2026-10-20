@@ -1273,10 +1273,12 @@ class TestBusHistoryOrdersClaims(unittest.TestCase):
                             expires_at=1300.0, every_seconds=60.0, chat_id=1,
                             alias=alias, id="t1")
 
-    def bus(self, root, seen):
+    def bus(self, root, rank):
+        """A bus that says where each claim sits in its history: higher rank = earlier."""
+
         class Historic(_BusTransport):
-            def first_seen_at(self, relpath):
-                return seen.get(relpath.rsplit("/", 1)[-1])
+            def arrival_rank(self, relpath):
+                return rank.get(relpath.rsplit("/", 1)[-1])
 
         return Historic(root)
 
@@ -1294,7 +1296,8 @@ class TestBusHistoryOrdersClaims(unittest.TestCase):
             self.claim_file(tmp, "alpha", 1000.0)
             # beta says 1040 and reached the bus at 1040.
             self.claim_file(tmp, "beta", 1040.0)
-            seen = {"t1-1060-alpha.json": 1050.0, "t1-1060-beta.json": 1040.0}
+            # beta's claim is one commit further from the tip: the bus got it first.
+            seen = {"t1-1060-alpha.json": 0, "t1-1060-beta.json": 1}
             now = {"t": 1100.0}
             alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
                                  transport=self.bus(tmp, seen), root=Path(tmp),
@@ -1311,7 +1314,7 @@ class TestBusHistoryOrdersClaims(unittest.TestCase):
             # at 1050, after beta's 1040 claim had already settled and fired.
             self.claim_file(tmp, "alpha", 1000.0)
             self.claim_file(tmp, "beta", 1040.0)
-            seen = {"t1-1060-alpha.json": 1050.0, "t1-1060-beta.json": 1040.0}
+            seen = {"t1-1060-alpha.json": 0, "t1-1060-beta.json": 1}
             now = {"t": 1080.0}
             alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
                                  transport=self.bus(tmp, seen), root=Path(tmp),
@@ -1319,9 +1322,10 @@ class TestBusHistoryOrdersClaims(unittest.TestCase):
             beta = wk.WakeStore("beta", state_dir=Path(tmp) / "b",
                                 transport=self.bus(tmp, seen), root=Path(tmp),
                                 clock=lambda: now["t"])
-            self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=30), "won")
+            # beta settled and fired (the window is behind it); alpha's claim lands later.
+            self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=0), "won")
             now["t"] += 40
-            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=30), "lost")
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
 
 
 class TestPushLandsAfterAPeerFired(unittest.TestCase):
@@ -1366,3 +1370,67 @@ class TestPushLandsAfterAPeerFired(unittest.TestCase):
             fired.state, fired.replays = "done", 1
             beta_store.write(fired)
             self.assertFalse(beta_store.due(now=1100.0))
+
+
+class TestDelayedWriterPush(unittest.TestCase):
+    """The case both reviewers asked for: `_write_claim` runs and the push carrying the claim is
+    delayed past the moment a peer fires. No claim file is written by hand here."""
+
+    def timer(self, alias):
+        return wk.WakeTimer(argv=("git", "status"), then="go", next_at=1060.0,
+                            expires_at=1300.0, every_seconds=60.0, chat_id=1,
+                            alias=alias, id="t1")
+
+    def bus(self, root, now, *, delay=0.0, book=None):
+        """A bus that ranks every pushed path, and whose pushes can take extra time."""
+        shared = book if book is not None else {"rank": 0, "paths": {}}
+
+        class Ordered(_BusTransport):
+            def refresh(self):
+                return True
+
+            def commit_and_push(self, message, paths=None):
+                for path in paths or []:
+                    shared["paths"][path] = shared["rank"]
+                    shared["rank"] += 1
+                if delay:
+                    now["t"] += delay          # the push returns only later
+                return True
+
+            def arrival_rank(self, relpath):
+                return shared["paths"].get(relpath)
+
+        return Ordered(root)
+
+    def test_a_claim_whose_push_is_delayed_loses_to_the_one_the_bus_got_first(self):
+        with TemporaryDirectory() as tmp:
+            now = {"t": 1000.0}
+            book = {"rank": 0, "paths": {}}
+            beta = wk.WakeStore("beta", state_dir=Path(tmp) / "b",
+                                transport=self.bus(tmp, now, book=book), root=Path(tmp),
+                                clock=lambda: now["t"])
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
+                                 transport=self.bus(tmp, now, delay=50.0, book=book),
+                                 root=Path(tmp), clock=lambda: now["t"])
+            # beta's writer runs, its push lands, it settles and fires at T+31.
+            self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=30), "wait")
+            now["t"] += 31
+            self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=30), "won")
+            # alpha's writer runs now, but its push takes 50s: the bus gets it after beta's.
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
+            now["t"] += 120
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
+
+    def test_two_writers_are_ordered_by_the_bus_not_by_their_own_stamps(self):
+        with TemporaryDirectory() as tmp:
+            now = {"t": 1000.0}
+            book = {"rank": 0, "paths": {}}
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
+                                 transport=self.bus(tmp, now, book=book), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            beta = wk.WakeStore("beta", state_dir=Path(tmp) / "b",
+                                transport=self.bus(tmp, now, book=book), root=Path(tmp),
+                                clock=lambda: now["t"])
+            # Both write at the same clock value: only arrival order differs.
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "won")
+            self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=0), "lost")

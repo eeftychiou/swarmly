@@ -475,10 +475,11 @@ state dir, so a restart resumes the schedule (times are absolute: `next_at` and 
 append-only claim to `.agents/wakes/<alias>/<timer>-<firing>-<alias>.json` on the bus *before* the
 turn starts (the claim carries the whole timer, so a successor can adopt it) — keyed on the firing's scheduled time, so a stale claim from an earlier firing (or from
 a bot that has since died) never blocks the next one. The claims for that firing are **re-read
-after the push**, and ordered by **when the bus first saw each one** (`git log
---diff-filter=A` on the claim path), ties by lowest alias. Nothing inside the file decides it: a
-timestamp a bot writes is advisory, because it is written before its own push, and a slow push
-would then carry an earlier time than the claim it overtook. A claim is not honoured the tick it
+after the push**, and ordered by **where each claim sits in the bus's history** — how many commits landed after the one
+that added the file (`git rev-list --count <commit>..<ref>`), ties by lowest alias. Nothing inside
+the file decides it: a timestamp a bot writes is advisory, and so is a commit date, because both
+are set before the push; a push that loses the race is replayed onto the tip, which puts its claim
+*after* everything that landed while it was in flight. A claim is not honoured the tick it
 is written: with `limits.wake_claim_settle_seconds` (default 30) the writer waits one window
 **measured from when the bus first had its claim**, so a claim still in flight cannot be overtaken
 and every bot folds the same winner. A claim whose own write cannot be confirmed, or that
