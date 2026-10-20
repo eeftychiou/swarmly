@@ -8,6 +8,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+try:
+    import tomllib  # noqa: F401
+    HAS_TOMLLIB = True
+except ImportError:                                     # Python 3.10
+    HAS_TOMLLIB = False
+
 from swarmly.telegram.adapters.claude import ClaudeAdapter
 from swarmly.telegram.cli_defaults import CliDefault, cli_default, reported_model
 
@@ -32,6 +38,7 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(cli_default("codex", env={}, home=self.home),
                          CliDefault("gpt-6-sol", "xhigh"))
 
+    @unittest.skipUnless(HAS_TOMLLIB, "tables need tomllib; 3.10 reads top-level keys only")
     def test_codex_home_and_the_selected_profile_win(self):
         codex_home = Path(self.tmp.name) / "codex-home"
         self.write(codex_home / "config.toml",
@@ -61,11 +68,8 @@ class CliDefaultsTests(unittest.TestCase):
                "APPDATA": str(self.home / ".config")}
         found = cli_default("reasonix", str(self.work), env=env, home=self.home)
         self.assertEqual(found.model, "deepseek-flash")
-        try:
-            import tomllib  # noqa: F401
-        except ImportError:                                 # 3.10 reads top-level keys only
-            return
-        self.assertEqual(found.effort, "low")
+        if HAS_TOMLLIB:                                     # 3.10 reads top-level keys only
+            self.assertEqual(found.effort, "low")
 
     def test_a_project_reasonix_toml_wins(self):
         self.write(self.home / ".config" / "reasonix" / "config.toml",
