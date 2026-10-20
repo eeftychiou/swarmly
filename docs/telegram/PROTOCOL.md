@@ -481,7 +481,10 @@ fire, and the bus ref is fetched before both reads. A claim is not honoured the 
 written: with `limits.wake_claim_settle_seconds` (default 30) the writer waits one window **measured
 from when its push was confirmed**, so a claim still in flight cannot be overtaken, and by then a
 peer's overlapping claim is visible and every bot folds the same winner, so a claim written a minute ago is
-visible rather than waiting for the poll. A claim whose own write cannot be confirmed, or that
+visible rather than waiting for the poll. A claim's stamp is the time its **push returned**, not
+the time its file was written — a claim whose push is slow therefore carries a later stamp than a
+bot that fired while it was in flight, and loses. A claim that is on the ref without a confirmed
+stamp (placed, then interrupted) is not a claim at all: nobody counts it, including its writer. A claim whose own write cannot be confirmed, or that
 cannot be pushed, or whose fetch failed, does not fire: a stale or broken bus is not "I am the
 only one".
 

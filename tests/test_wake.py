@@ -319,10 +319,13 @@ class TestClaims(unittest.TestCase):
             self.assertTrue(store.claim(self.timer()))
             firing = wk.WakeStore.firing_of(self.timer())
             name = f"abc12345-{firing}-claude.json"
-            self.assertEqual(transport.pushed, [[f".agents/wakes/claude/{name}"]])
+            relpath = f".agents/wakes/claude/{name}"
+            # Two pushes: the claim is placed, then stamped with the time its push returned.
+            self.assertEqual(transport.pushed, [[relpath], [relpath]])
             written = json.loads((Path(tmp) / ".agents" / "wakes" / "claude"
                                   / name).read_text(encoding="utf-8"))
             self.assertEqual(written["check"], "gh pr checks 75")
+            self.assertGreater(written["written_at"], 0)     # stamped after the push
 
     def test_a_second_bot_loses_to_the_lowest_alias(self):
         with TemporaryDirectory() as tmp:
@@ -1154,3 +1157,109 @@ class TestTransitionPublication(unittest.TestCase):
         done = asyncio.run(channel._wake_tick(now=time.time()))
         self.assertEqual(len(started), 1)                 # the turn still runs
         self.assertTrue(any("not on the bus" in line for line in done), done)
+
+
+class TestInFlightClaim(unittest.TestCase):
+    """B4 as QA modelled it: the stamp is the time the *push* returned, not the write."""
+
+    def timer(self, alias="alpha"):
+        return wk.WakeTimer(argv=("git", "status"), then="go", next_at=1060.0,
+                            expires_at=1300.0, every_seconds=60.0, chat_id=1,
+                            alias=alias, id="t1")
+
+    def bus(self, root, now, *, slow=0.0):
+        class Bus(_BusTransport):
+            def refresh(self):
+                return True
+
+            def commit_and_push(self, message, paths=None):
+                if slow:
+                    now["t"] += slow          # the push takes this long to return
+                return True
+
+        return Bus(root)
+
+    def test_a_slow_push_holds_the_firing_and_the_other_bot_loses(self):
+        with TemporaryDirectory() as tmp:
+            now = {"t": 1000.0}
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp),
+                                 transport=self.bus(tmp, now, slow=40.0),
+                                 root=Path(tmp), clock=lambda: now["t"])
+            zulu = wk.WakeStore("zulu", state_dir=Path(tmp), transport=self.bus(tmp, now),
+                                root=Path(tmp), clock=lambda: now["t"])
+            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "wait")
+            # alpha's push took 40s and landed; zulu, starting after it, finds the claim.
+            self.assertEqual(zulu.claim_state(self.timer("zulu"), settle_seconds=30), "lost")
+            now["t"] += 40
+            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "won")
+
+    def test_the_earliest_stamp_wins_when_both_claims_are_visible(self):
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / ".agents" / "wakes"
+            for alias, stamp in (("alpha", 1040.0), ("zulu", 1005.0)):
+                (folder / alias).mkdir(parents=True)
+                timer = self.timer(alias)
+                (folder / alias / f"t1-1060-{alias}.json").write_text(json.dumps(
+                    {"id": "t1", "alias": alias, "firing": 1060, "written_at": stamp,
+                     "timer": timer.to_dict()}), encoding="utf-8")
+            now = {"t": 1100.0}
+            zulu = wk.WakeStore("zulu", state_dir=Path(tmp) / "z",
+                                 transport=self.bus(tmp, now), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
+                                 transport=self.bus(tmp, now), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            # zulu's push returned earlier even though alpha's alias is lower.
+            self.assertEqual(zulu.claim_state(self.timer("zulu"), settle_seconds=0), "won")
+            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=0), "lost")
+
+    def test_a_claim_on_the_ref_without_a_confirmed_stamp_is_not_a_claim(self):
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / ".agents" / "wakes" / "alpha"
+            folder.mkdir(parents=True)
+            (folder / "t1-1060-alpha.json").write_text(json.dumps(
+                {"id": "t1", "alias": "alpha", "firing": 1060, "written_at": 0,
+                 "timer": self.timer().to_dict()}), encoding="utf-8")
+            store = wk.WakeStore("alpha", state_dir=Path(tmp), transport=_BusTransport(tmp),
+                                 root=Path(tmp), clock=lambda: 1000.0)
+            # Placed but never stamped: nobody counts it, including its own writer.
+            self.assertEqual(store._claim_records("t1", 1060), [])
+
+
+class TestReadyTurnIsNotDropped(unittest.TestCase):
+    """B6 as QA modelled it: a failed state publish must not lose the ready turn."""
+
+    def test_a_refused_launch_publication_still_starts_the_turn(self):
+        import asyncio
+        from tests.test_telegram_channel import make_channel, make_config
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config(agent={"role": "developer"},
+                             fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
+                             limits={"wake_tick_seconds": 0})
+        channel = make_channel(config)
+        started = []
+        channel._run_own_task = lambda text, chat_id, thread_id, name: started.append(text)
+        store = wk.WakeStore(channel.config.identity.alias,
+                             state_dir=Path(tmp.name) / "state", transport=None,
+                             root=Path(tmp.name), clock=time.time)
+        channel.wake_store = lambda: store
+        timer = wk.WakeTimer(argv=("git", "status"), then="merge it", next_at=1.0,
+                             expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
+                             alias=channel.config.identity.alias)
+        store.add(timer, max_timers=10)
+        real_replace = store.replace
+
+        def refuse_bus(updated, **kwargs):
+            # The local record is written; only the bus copy of the transition fails.
+            store.write(updated)
+            if updated.state != "armed":
+                raise wk.WakePushError("the bus did not take the transition")
+            return real_replace(updated, **kwargs)
+
+        store.replace = refuse_bus
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(len(started), 1, "the ready turn must still run")
+        self.assertIn("merge it", started[0])
+        self.assertTrue(any("not on the bus" in line for line in done), done)
+        self.assertEqual(store.live_count, 0)          # and the timer is retired locally

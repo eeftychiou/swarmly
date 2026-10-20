@@ -626,7 +626,10 @@ class WakeStore:
         """
         previous = next((row for row in self.load() if row.id == timer.id), None)
         self.write(timer)
-        if (previous is None or previous.state != timer.state) or not timer.live:
+        moved = previous is not None and previous.next_at != timer.next_at
+        if (previous is None or previous.state != timer.state or moved) or not timer.live:
+            # A re-arm moves next_at while staying "armed": without publishing it, a successor
+            # adopts the old schedule and the timer is stranded.
             self.publish_state(timer)
 
     def pending_firings(self) -> List[WakeTimer]:
@@ -792,6 +795,8 @@ class WakeStore:
                     stamp = float(payload.get("written_at") or 0.0)
                 except Exception:                      # noqa: BLE001 - an unreadable stamp
                     stamp = 0.0
+            if stamp <= 0:                             # placed but never confirmed: not a claim
+                continue
             records.append((stamp, alias))
         return sorted(records)
 
@@ -842,9 +847,10 @@ class WakeStore:
             # Someone claimed it before we did: the earliest claim holds the firing.
             if before:
                 return "lost"
-            if not self._write_claim(timer, firing):
+            stamp = self._write_claim(timer, firing)
+            if stamp is None:
                 return "lost"                 # it did not reach the bus: do not fire on it
-            self._confirmed[firing] = self.clock()   # the window starts when the push returns
+            self._confirmed[firing] = stamp   # the window starts when the push returns
             if settle_seconds > 0:
                 return "wait"                 # confirmed now; fire once peers can see it
         elif settle_seconds > 0:
@@ -870,27 +876,47 @@ class WakeStore:
         # stamp -- stamps only order claims that are visible at the same moment.
         return "won" if after[0][1] == self.safe_alias else "lost"
 
-    def _write_claim(self, timer: WakeTimer, firing: int) -> bool:
-        """Write this bot's claim for one firing (append-only: never rewritten)."""
+    def _write_claim(self, timer: WakeTimer, firing: int) -> Optional[float]:
+        """Write this bot's claim, and stamp it once the push has landed.
+
+        The stamp is what peers order claims by, so it must be the time the claim became
+        visible, not the time the file was created: a claim whose push is slow would otherwise
+        carry an earlier stamp than a bot that fired while it was still in flight, and win
+        afterwards (PR #92 review, B4). A claim without a confirmed stamp is not a claim: peers
+        ignore it until the writer has stamped it.
+        """
         directory = self.root / WAKE_RELPATH / self.safe_alias
         directory.mkdir(parents=True, exist_ok=True)
         relpath = f"{WAKE_RELPATH}/{self.safe_alias}/{timer.id}-{firing}-{self.safe_alias}.json"
         if not is_bus_document(relpath):
             raise WakeError(f"refusing to write outside {WAKE_RELPATH}: {relpath!r}")
-        (self.root / relpath).write_text(json.dumps(
-            {"id": timer.id, "alias": self.safe_alias, "firing": firing,
-             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())),
-             "written_at": self.clock(), "check": timer.check,
-             "timer": timer.to_dict()}), encoding="utf-8")
+        def payload(stamp: float) -> str:
+            return json.dumps(
+                {"id": timer.id, "alias": self.safe_alias, "firing": firing,
+                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())),
+                 "written_at": stamp, "check": timer.check, "timer": timer.to_dict()})
+
+        path = self.root / relpath
+        path.write_text(payload(0.0), encoding="utf-8")     # placed, not yet confirmed
         transport = self.transport
         if transport is not None and hasattr(transport, "commit_and_push"):
             try:
-                transport.commit_and_push(f"wakes: {timer.id} firing {firing}",
+                transport.commit_and_push(f"wakes: {timer.id} firing {firing} placed",
                                           paths=[relpath])
             except Exception as exc:                   # noqa: BLE001 - never fire on it
                 logger.warning("wake: claim %s was written but not pushed: %s", relpath, exc)
-                return False
-        return True
+                return None
+        stamp = self.clock()                           # the push has returned: it is visible
+        path.write_text(payload(stamp), encoding="utf-8")
+        if transport is not None and hasattr(transport, "commit_and_push"):
+            try:
+                transport.commit_and_push(f"wakes: {timer.id} firing {firing} confirmed",
+                                          paths=[relpath])
+            except Exception as exc:                   # noqa: BLE001 - unconfirmed is not a claim
+                logger.warning("wake: claim %s was confirmed here but not pushed: %s",
+                               relpath, exc)
+                return None
+        return stamp
 
 
 #: Where the fire claims live on the bus (see ``swarmly.transports.base``).
