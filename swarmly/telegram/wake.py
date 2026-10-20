@@ -551,6 +551,10 @@ class WakeStore:
         self.transport = transport
         self.root = Path(root or getattr(transport, "root", None) or ".")
         self.clock = clock or time.time
+        #: firing -> when this bot's claim for it was *confirmed on the bus*. The settle window
+        #: runs from here, not from when the file was written, so a slow push cannot let a peer
+        #: fire while our claim is still in flight (PR #92 review, Codex/Reasonix).
+        self._confirmed: Dict[int, float] = {}
 
     # -- local ----------------------------------------------------------------------
     @property
@@ -615,7 +619,11 @@ class WakeStore:
                       key=lambda timer: timer.next_at)
 
     def replace(self, timer: WakeTimer) -> None:
-        """Persist a timer, and tell the bus whenever its state is not simply "armed"."""
+        """Persist a timer, and publish its state when it is not simply "armed".
+
+        A failed publication raises :class:`WakePushError`: a transition that never reached the
+        bus leaves a stale `armed` record behind, which a successor would adopt and re-fire.
+        """
         previous = next((row for row in self.load() if row.id == timer.id), None)
         self.write(timer)
         if (previous is None or previous.state != timer.state) or not timer.live:
@@ -792,16 +800,6 @@ class WakeStore:
         records = self._claim_records(timer_id, firing)
         return None if records is None else [alias for _stamp, alias in records]
 
-    def _claim_written_at(self, timer: WakeTimer) -> Optional[float]:
-        """When this bot's claim for the timer's current firing was written, if it was."""
-        path = self.root / WAKE_RELPATH / self.safe_alias / (
-            f"{timer.id}-{self.firing_of(timer)}-{self.safe_alias}.json")
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return float(data.get("written_at") or 0.0) or path.stat().st_mtime
-        except Exception:                              # noqa: BLE001 - no claim of ours yet
-            return None
-
     def claim(self, timer: WakeTimer, *, settle_seconds: float = 0.0) -> bool:
         """True when this bot may fire now. See :meth:`claim_state` for the why."""
         return self.claim_state(timer, settle_seconds=settle_seconds) == "won"
@@ -846,12 +844,18 @@ class WakeStore:
                 return "lost"
             if not self._write_claim(timer, firing):
                 return "lost"                 # it did not reach the bus: do not fire on it
+            self._confirmed[firing] = self.clock()   # the window starts when the push returns
             if settle_seconds > 0:
-                return "wait"                 # written now; fire once peers can see it
+                return "wait"                 # confirmed now; fire once peers can see it
         elif settle_seconds > 0:
-            written = self._claim_written_at(timer)
-            if written is None or (self.clock() - written) < settle_seconds:
-                return "wait"                 # written, but not visible to peers for long enough
+            confirmed = self._confirmed.get(firing)
+            if confirmed is None:
+                # A restart (or another process): treat the claim as confirmed now, and wait
+                # one more window rather than firing on a claim whose push we cannot vouch for.
+                self._confirmed[firing] = self.clock()
+                return "wait"
+            if (self.clock() - confirmed) < settle_seconds:
+                return "wait"                 # not visible to peers for long enough yet
         if not self.refresh():                # the post-read must come from a fresh ref too
             return "lost"
         after = self._claim_records(timer.id, firing)
@@ -859,6 +863,11 @@ class WakeStore:
             # The post-read must show this bot's own claim: an empty list means the bus did
             # not confirm it, not that this bot won.
             return "lost"
+        if len(after) == 1:
+            return "won"                      # only ours is visible: it holds the firing
+        # Several are visible: the earliest write holds it, ties by lowest alias. A claim that
+        # arrives later than that decision finds one already there and loses, whatever its
+        # stamp -- stamps only order claims that are visible at the same moment.
         return "won" if after[0][1] == self.safe_alias else "lost"
 
     def _write_claim(self, timer: WakeTimer, firing: int) -> bool:

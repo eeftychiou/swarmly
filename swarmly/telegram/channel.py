@@ -2404,6 +2404,17 @@ class AgentChannel:
                 logger.exception("wake: a tick failed; the next one carries on")
             await asyncio.sleep(max(1.0, float(self.config.limits.wake_tick_seconds)))
 
+    @staticmethod
+    def _wake_persist(store: Any, timer: Any, done: List[str]) -> None:
+        """Save a timer, and report a state the bus would not take instead of hiding it."""
+        from swarmly.telegram.wake import WakePushError
+        try:
+            store.replace(timer)
+        except WakePushError as exc:
+            # The local record moved on; the bus still shows the old state, so a successor
+            # could adopt a timer this bot has finished. Say so in the tick's own result.
+            done.append(f"{timer.id}: state not on the bus ({exc})")
+
     async def _wake_tick(self, *, now: Optional[float] = None) -> List[str]:
         """One pass over the due timers. Returns what it did, so a test can read it."""
         from swarmly.telegram.wake import decide, run_check_async
@@ -2427,7 +2438,7 @@ class AgentChannel:
             # says so to the bot that receives it.
             if pending.replays:
                 pending.state, pending.pending = "done", ""
-                store.replace(pending)
+                self._wake_persist(store, pending, done)
                 done.append(f"{pending.id}: interrupted turn not replayed again")
                 continue
             replay = ("This firing was interrupted by a restart. If you already acted on it, "
@@ -2436,7 +2447,7 @@ class AgentChannel:
                                pending.topic or None)
             pending.replays += 1
             pending.state, pending.pending = "done", ""
-            store.replace(pending)
+            self._wake_persist(store, pending, done)
             done.append(f"{pending.id}: replayed after a restart")
         settle = float(self.config.limits.wake_claim_settle_seconds)
         for timer in store.due(moment):
@@ -2459,19 +2470,19 @@ class AgentChannel:
                 # already says this firing was launched.
                 timer.pending = self._wake_prompt(action)
                 timer.replays += 1
-                store.replace(timer)
+                self._wake_persist(store, timer, done)
                 self._run_own_task(timer.pending, timer.chat_id, timer.thread_id,
                                    timer.topic or None)
                 timer.state, timer.pending = "done", ""
-                store.replace(timer)
+                self._wake_persist(store, timer, done)
             elif action.kind in ("error", "expire"):
-                store.replace(action.timer)
+                self._wake_persist(store, action.timer, done)
                 self._run_own_task(
                     self._wake_prompt(action, failed=action.kind == "error",
                                       expired=action.kind == "expire"),
                     timer.chat_id, timer.thread_id, timer.topic or None)
             else:
-                store.replace(action.timer)
+                self._wake_persist(store, action.timer, done)
         return done
 
     @staticmethod

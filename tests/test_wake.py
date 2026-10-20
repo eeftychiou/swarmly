@@ -1037,3 +1037,120 @@ class TestPublicationSurfaces(unittest.TestCase):
                                         event("hi", username="ClaudeBot"))
         self.assertIn("armed locally only", body)
         self.assertIn("the bus did not take the state", body)
+
+
+class TestDelayedPush(unittest.TestCase):
+    """Codex: the settle window must start when the *push* returns, not when the file is
+    written, so a claim still in flight cannot be overtaken by a peer firing."""
+
+    def timer(self):
+        return wk.WakeTimer(argv=("git", "status"), then="go", next_at=1060.0,
+                            expires_at=1300.0, every_seconds=60.0, chat_id=1, id="t1")
+
+    def bus(self, root, *, held):
+        """A bus where alpha's claims stay invisible until *held* is cleared."""
+
+        class Bus(_BusTransport):
+            def refresh(self):
+                return True
+
+            def list_at_ref(self, relpath):
+                names = []
+                for owner in ("alpha", "beta"):
+                    if owner == "alpha" and held["alpha"]:
+                        continue                    # still in flight, not on the bus yet
+                    folder = self.root / relpath / owner
+                    if folder.is_dir():
+                        names.extend(f"{owner}/{path.name}" for path in folder.glob("*.json"))
+                return sorted(names)
+
+            def read_at_ref(self, relpath):
+                path = self.root / relpath
+                return path.read_text(encoding="utf-8") if path.is_file() else None
+
+        return Bus(root)
+
+    def test_a_lower_alias_whose_push_is_slow_cannot_double_fire(self):
+        with TemporaryDirectory() as tmp:
+            now = {"t": 1000.0}
+            held = {"alpha": True}
+            beta = wk.WakeStore("beta", state_dir=Path(tmp), transport=self.bus(tmp, held=held),
+                                root=Path(tmp), clock=lambda: now["t"])
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp),
+                                 transport=self.bus(tmp, held=held), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            self.assertEqual(beta.claim_state(self.timer(), settle_seconds=30), "wait")
+            # alpha's push has not landed, so the bus does not confirm its own claim: it must
+            # not fire, and it will not start firing later either.
+            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "lost")
+            now["t"] += 31
+            self.assertEqual(beta.claim_state(self.timer(), settle_seconds=30), "won")
+            # alpha's claim finally lands: it finds beta's claim and loses.
+            held["alpha"] = False
+            now["t"] += 120
+            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "lost")
+
+    def test_the_window_is_measured_from_the_confirmation(self):
+        with TemporaryDirectory() as tmp:
+            now = {"t": 1000.0}
+            store = wk.WakeStore("claude", state_dir=Path(tmp),
+                                 transport=_BusTransport(tmp), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            self.assertEqual(store.claim_state(self.timer(), settle_seconds=30), "wait")
+            now["t"] += 10
+            self.assertEqual(store.claim_state(self.timer(), settle_seconds=30), "wait")
+            now["t"] += 25
+            self.assertEqual(store.claim_state(self.timer(), settle_seconds=30), "won")
+
+
+class TestTransitionPublication(unittest.TestCase):
+    """Codex: replace() must not leave stale armed state on the bus after a failed publish."""
+
+    def timer(self):
+        return wk.WakeTimer(argv=("git", "status"), then="go", next_at=1000.0,
+                            expires_at=2000.0, every_seconds=0, chat_id=-1, id="abc12345")
+
+    def test_a_failed_publish_on_a_transition_raises(self):
+        with TemporaryDirectory() as tmp:
+            class Refuses(_BusTransport):
+                def commit_and_push(self, message, paths=None):
+                    raise RuntimeError("push rejected")
+
+            store = wk.WakeStore("claude", state_dir=Path(tmp), transport=Refuses(tmp),
+                                 root=Path(tmp), clock=lambda: 1000.0)
+            timer = self.timer()
+            store.write(timer)
+            timer.state = "done"
+            with self.assertRaises(wk.WakePushError):
+                store.replace(timer)
+
+    def test_the_tick_reports_a_transition_it_could_not_publish(self):
+        import asyncio
+        from tests.test_telegram_channel import make_channel, make_config
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config(agent={"role": "developer"},
+                             fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
+                             limits={"wake_tick_seconds": 0})
+        channel = make_channel(config)
+        started = []
+        channel._run_own_task = lambda text, chat_id, thread_id, name: started.append(text)
+        store = wk.WakeStore(channel.config.identity.alias,
+                             state_dir=Path(tmp.name) / "state", transport=None,
+                             root=Path(tmp.name), clock=time.time)
+        channel.wake_store = lambda: store
+        timer = wk.WakeTimer(argv=("git", "status"), then="go", next_at=1.0,
+                             expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
+                             alias=channel.config.identity.alias)
+        store.add(timer, max_timers=10)
+        real_replace = store.replace
+
+        def refuse_transitions(updated, **kwargs):
+            if updated.state != "armed":
+                raise wk.WakePushError("the bus did not take the transition")
+            return real_replace(updated, **kwargs)
+
+        store.replace = refuse_transitions
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(len(started), 1)                 # the turn still runs
+        self.assertTrue(any("not on the bus" in line for line in done), done)
