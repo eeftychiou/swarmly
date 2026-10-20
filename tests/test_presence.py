@@ -6,7 +6,10 @@ notice happens once per episode.
 """
 
 import json
+import time
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from swarmly.telegram import presence as pr
 from tests.test_telegram_channel import (ADMIN_ID, GROUP, event, make_channel, make_config,
@@ -255,3 +258,75 @@ class TestDownOnTheChannel(unittest.TestCase):
         self.assertIn(key, channel._pending_handoffs)       # still owed, not handed back
         self.assertEqual(channel._pending_handoffs[key]["at"], started + 700.0)
         self.assertIn("Codex:busy(", channel.presence_line())
+
+class TestAcrossARestart(unittest.TestCase):
+    """Restart grace is not persistence (#82 review): the facts are saved, not just re-guessed."""
+
+    def test_the_facts_survive_a_restart(self):
+        table = pr.Presence(1000.0, down_after=360, grace=120)
+        table.note(pr.Pulse(alias="Codex", at=1000.0, busy_since=900.0, rev="abc1234", term=2))
+        saved = json.loads(json.dumps(table.to_dict(1100.0)))
+        back = pr.Presence.restore(saved, now=1150.0, down_after=360, grace=120)
+        self.assertEqual(back.status("Codex", 1150.0), "busy")
+        self.assertEqual(back.peers["Codex"].busy_since, 900.0)
+        self.assertEqual(back.peers["Codex"].rev, "abc1234")
+        self.assertEqual(back.peers["Codex"].term, 2)
+
+    def test_a_down_verdict_and_its_notice_survive(self):
+        table = pr.Presence(1000.0, down_after=360, grace=120)
+        table.seen("Codex", 1000.0)
+        self.assertTrue(table.mark_notified("Codex", 1400.0))
+        back = pr.Presence.restore(table.to_dict(1400.0), now=1420.0, down_after=360, grace=120)
+        # A stop shorter than one interval missed no pulse: the verdict stands, and so does
+        # the notice it already claimed.
+        self.assertTrue(back.is_down("Codex", 1420.0))
+        self.assertFalse(back.mark_notified("Codex", 1420.0))
+
+    def test_a_long_stop_judges_again_instead_of_declaring_the_swarm_dead(self):
+        table = pr.Presence(1000.0, down_after=360, grace=120)
+        table.seen("Codex", 1000.0)
+        # Four hours later: this bot was not listening, so it cannot call that silence DOWN.
+        back = pr.Presence.restore(table.to_dict(1000.0), now=15_400.0, down_after=360,
+                                   grace=120)
+        self.assertFalse(back.is_down("Codex", 15_400.0))
+        self.assertEqual(back.status("Codex", 15_400.0), "up")
+        self.assertEqual(len(back.peers), 1)                   # the peer is still known
+
+    def test_unusable_state_starts_fresh(self):
+        for data in (None, [], {"peers": 5}, {"peers": {"Codex": "nope"}}, {"saved_at": "x"}):
+            table = pr.Presence.restore(data, now=1000.0, down_after=360, grace=120)
+            self.assertEqual(table.peers, {})
+
+
+class TestPersistenceOnTheChannel(unittest.TestCase):
+
+    def restart(self, path, *, at):
+        channel = live_channel()
+        channel._presence_state_path = lambda: path
+        channel._test_presence_clock["t"] = at
+        return channel
+
+    def test_a_peer_heard_before_a_restart_is_known_after_it(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "presence.json"
+            first = self.restart(path, at=NOW)
+            hear(first, pulse_text("Codex", NOW))
+            self.assertTrue(path.exists())
+            second = self.restart(path, at=NOW + 60)
+            self.assertEqual(second.presence().status("Codex", NOW + 60), "up")
+            self.assertIn("Codex:up", second.presence_line())
+
+    def test_a_down_episode_is_not_announced_twice_after_a_restart(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "presence.json"
+            first = self.restart(path, at=NOW)
+            hear(first, pulse_text("Codex", NOW))
+            first._test_presence_clock["t"] = NOW + 400
+            self.assertEqual(run(first.check_peer_liveness()), ["Codex: down since "
+                                                               + time.strftime(
+                                                                   "%H:%M", time.localtime(NOW))])
+            second = self.restart(path, at=NOW + 420)           # a stop shorter than a pulse
+            second._test_sender.sent.clear()
+            self.assertEqual(run(second.check_peer_liveness()), [])   # still DOWN, already said
+            self.assertEqual(admin_lines(second, "Codex has been silent since"), [])
+            self.assertIn("Codex:down(", second.presence_line())

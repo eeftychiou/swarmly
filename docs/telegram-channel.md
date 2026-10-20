@@ -562,6 +562,22 @@ above for every bot.) A hand-off to a peer that is frozen (quota or pause) gets 
 and no notice at all: the bot that handed it off is asked straight away to give the work to
 someone else or to wait until the peer resumes.
 
+**Except the coordinator.** A hand-off *to* the coordinator, and a peer's answer to it, is
+waited on by the bot that sent it, which does post the reminder and the notice: nobody else
+would ever follow it up. The coordinator's next post in that discussion answers it.
+
+**A restart loses no message.** A message accepted for a turn (queued or running, a reply not
+yet posted) is kept in `inbox-<alias>.json` beside the transport's state until its turn is
+done; the next start runs whatever is still there (younger than 12 hours). That is
+at-least-once: a crash right after a reply is posted can repeat that one turn. Commands are
+never kept, and the same message arriving twice at once (a replay and Telegram's redelivery)
+runs once.
+
+**The coordinator checks in when nothing wakes it.** A coordinator that holds no WAKE and has
+had no turn for `limits.coordinator_watch_minutes` (default 30) gets one turn in the topic it
+last worked in, asking it to look at the round and act on whatever waits, or to answer
+`NO_REPLY`. The wait doubles after each check (up to 8 hours), any other turn resets it, and
+it stops a day after the last turn. `0` turns it off.
 **A bot that dies says nothing, so the swarm listens for its pulse.** Every transport posts
 one heartbeat every `limits.heartbeat_minutes` (default 2) — a `STATUS to=* intent=PULSE` line
 carrying its revision, term, role and, while a turn is running, `busy_since`. It rides the
@@ -575,7 +591,10 @@ A peer silent on **both** planes for `heartbeat_minutes * peer_down_after` (defa
 6 minutes) is **DOWN**. Any message from a peer counts as liveness, whatever plane it is on; a
 peer that has not been heard from at all is `unknown`, not DOWN, and a freshly started transport
 gets one interval of grace before it may judge anybody — otherwise a restart would declare the
-whole swarm dead. The coordinator posts one line to the admin per episode (the acting coordinator
+whole swarm dead. The table is saved beside the transport's other state as
+`presence-<alias>.json` and restored at start, so a die-off seen before a restart is still
+known after it and one admin line stays one line. The coordinator posts one line to the
+admin per episode (the acting coordinator
 does it when the coordinator is the silent one) and one line when the peer comes back. DOWN is
 **advisory**: it says "not heard from", never "somebody else should lead" — the lease (#83) alone
 decides who coordinates, because using DOWN to start a takeover would let a partition elect a
@@ -1088,7 +1107,7 @@ ignored, whatever its header says.
    group as an **admin** (or disable its group privacy).
 2. Copy the example config onto that machine; set `name`, `alias`, `bot_token`, the shared
    `home_channel_id` and `admin_user_id`.
-3. Run `check`, then `run`. On start it posts `HELLO intent=ONLINE ref=<alias>`.
+3. Run `check`, then `run`. On start it posts `HELLO intent=ONLINE ref=<alias>`, with a line naming its adapter, role, the model and reasoning effort General really runs at, and its revision. Each comes from `/model` and `/reasoning`, else `adapter.model` and `adapter.effort`, else the CLI's own settings (`swarmly/telegram/cli_defaults.py`: Codex `~/.codex/config.toml`, Reasonix `reasonix.toml` / its global `config.toml`, Claude Code `ANTHROPIC_MODEL` / `CLAUDE_CODE_EFFORT_LEVEL` / `settings.json`), else the model the CLI reported on its last turn (Claude's `modelUsage`). What none of these names reads `not known until its first turn` or `the model default`; effort is left out for an adapter without one.
 4. In the group, the admin sends `/admit @newbot`. Every running bot that saw the newcomer's
    HELLO adds it to its peers and answers with a silent `HELLO intent=WELCOME` mentioning it;
    the newcomer, having seen itself admitted, adds each bot that welcomes it in the next 10

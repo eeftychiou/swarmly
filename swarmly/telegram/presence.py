@@ -217,3 +217,46 @@ class Presence:
             return False
         peer.down_notified_at = at
         return True
+
+    # -- across a restart --------------------------------------------------------------
+    def to_dict(self, now: float) -> Dict[str, Any]:
+        """What a restart needs to keep this table (#82): the facts, not the judgements.
+
+        `last_seen` is absolute wall clock, so a peer's silence before a restart is still
+        silence after it -- which is the point: a die-off that happened while this bot was
+        being restarted must not be forgotten, and a DOWN already announced must not be
+        announced again.
+        """
+        return {"saved_at": now, "grace_until": self.grace_until,
+                "down_after": self.down_after,
+                "peers": {alias: peer.to_dict() for alias, peer in self.peers.items()}}
+
+    @classmethod
+    def restore(cls, data: Any, *, now: float, down_after: float,
+                grace: Optional[float] = None) -> "Presence":
+        """Rebuild a saved table at *now*, or an empty one if *data* is unusable.
+
+        The saved verdicts are kept only when this bot was **listening**: a restart shorter
+        than one interval misses at most one pulse, so what it saw still stands. After a
+        longer stop the bot cannot know what it did not hear, and the fresh grace period is
+        the honest answer -- it rejudges from now instead of declaring the swarm dead.
+        """
+        table = cls(now, down_after=down_after, grace=grace)
+        if not isinstance(data, dict):
+            return table
+        saved_at = data.get("saved_at")
+        if not isinstance(saved_at, (int, float)) or isinstance(saved_at, bool):
+            return table
+        records = data.get("peers")
+        if isinstance(records, dict):
+            for record in records.values():
+                try:
+                    peer = Peer.from_dict(record)
+                except (ValueError, TypeError):
+                    continue
+                table.peers[peer.alias] = peer
+        blind = max(0.0, now - float(saved_at))
+        saved_grace = data.get("grace_until")
+        if blind <= (table.grace_until - now) and isinstance(saved_grace, (int, float))                 and not isinstance(saved_grace, bool):
+            table.grace_until = float(saved_grace)
+        return table

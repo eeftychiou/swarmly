@@ -575,7 +575,14 @@ own task, never the turn lock, so a long turn keeps pulsing and `busy_since` say
 `heartbeat_minutes × peer_down_after` (default 6 minutes). Any pulse, `HELLO` or message brings a
 peer back UP, so a bot whose git remote died — or one partitioned away from the bus — is not
 declared dead while it is still talking to us. A peer never heard from is `unknown`, not DOWN, and
-a restart gets one interval of grace before anyone can be judged DOWN.
+a freshly started transport gets one interval of grace before anyone can be judged DOWN.
+
+The table survives a restart: each transport saves `presence-<alias>.json` (peer
+`last_seen`/`busy_since`/`term`/`rev`, and any DOWN episode already announced) beside its
+other state and restores it at start, so a die-off seen before a restart is still known
+after it and one admin line is still one line. A stop shorter than one interval missed no
+pulse, so the saved verdicts stand; after a longer stop the bot cannot know what it did not
+hear and rejudges from now under the fresh grace.
 
 DOWN is **advisory**. It says "this peer has not been heard from"; it never says "somebody else
 should lead". The lease (#83) decides who coordinates — using DOWN to start a takeover would let

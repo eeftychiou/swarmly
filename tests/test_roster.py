@@ -7,7 +7,9 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from swarmly.telegram.cli_defaults import CliDefault
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.roster import ADMIT_WINDOW_SECONDS, SYNC_WINDOW_SECONDS, Roster
 from tests.test_telegram_channel import (
@@ -18,6 +20,11 @@ from tests.test_telegram_channel import (
     make_config,
     run,
 )
+
+
+def no_cli_settings():
+    """The host's own CLI settings (~/.codex, ~/.claude) must not reach a test."""
+    return mock.patch("swarmly.telegram.cli_defaults.cli_default", return_value=CliDefault())
 
 
 def hello(alias, username, author_id=303):
@@ -198,6 +205,58 @@ class SwarmBotsAdmitTests(unittest.TestCase):
 
     def test_the_online_notice_names_the_alias(self):
         self.assertIn("intent=ONLINE ref=Hermes", make_channel().online_notice())
+
+    def test_the_online_notice_names_the_model_and_effort(self):
+        # Admin request: the startup line says what each bot runs, so a costly default
+        # model is visible the moment a bot comes online, without /model and /reasoning.
+        channel = make_channel(make_config(adapter={"type": "codex", "model": "gpt-6-luna",
+                                                    "effort": "medium"}))
+        self.assertIn("model: gpt-6-luna, effort: medium", channel.online_notice())
+
+    def test_a_runtime_choice_for_general_shows_in_the_online_notice(self):
+        channel = make_channel(make_config(adapter={"type": "claude", "model": "opus"}))
+        channel._models["general"], channel._efforts["general"] = "sonnet", "low"
+        self.assertIn("model: sonnet, effort: low", channel.online_notice())
+
+    def test_a_runtime_without_a_model_names_neither(self):
+        with no_cli_settings():
+            notice = make_channel().online_notice()        # the echo adapter
+        self.assertNotIn("model:", notice)
+        self.assertNotIn("effort:", notice)
+
+    def test_an_unknown_model_says_so_instead_of_cli_default(self):
+        with no_cli_settings():
+            notice = make_channel(make_config(adapter={"type": "antigravity"})).online_notice()
+        self.assertIn("model: not known until its first turn, effort: the model default", notice)
+        self.assertNotIn("CLI default", notice)
+
+    def test_without_config_the_cli_s_own_settings_are_named(self):
+        # Admin: "CLI default" is not appropriate, the actual model and effort should show.
+        found = CliDefault(model="gpt-6-sol", effort="xhigh")
+        with mock.patch("swarmly.telegram.cli_defaults.cli_default", return_value=found):
+            notice = make_channel(make_config(adapter={"type": "codex"})).online_notice()
+        self.assertIn("model: gpt-6-sol, effort: xhigh", notice)
+
+    def test_the_config_wins_over_the_cli_s_own_settings(self):
+        found = CliDefault(model="gpt-6-sol", effort="xhigh")
+        with mock.patch("swarmly.telegram.cli_defaults.cli_default", return_value=found):
+            notice = make_channel(make_config(adapter={"type": "codex", "model": "gpt-6-luna"})
+                                  ).online_notice()
+        self.assertIn("model: gpt-6-luna, effort: xhigh", notice)
+
+    def test_the_model_the_cli_reported_is_named_and_kept(self):
+        with tempfile.TemporaryDirectory() as tmp, no_cli_settings():
+            config = make_config(adapter={"type": "claude"})
+            config.source_path = Path(tmp) / "agent.local.yaml"
+            make_channel(config)._note_reported_model("claude-opus-5-5")
+            notice = make_channel(config).online_notice()       # a restart reads it back
+        self.assertIn("model: claude-opus-5-5, effort: the model default", notice)
+
+    def test_a_reported_model_that_is_not_a_model_name_is_ignored(self):
+        with no_cli_settings():
+            channel = make_channel(make_config(adapter={"type": "claude"}))
+            channel._note_reported_model("--dangerous flag")
+            self.assertIn("model: not known until its first turn", channel.online_notice())
 
 
 class SwarmBotsReviewTests(unittest.TestCase):

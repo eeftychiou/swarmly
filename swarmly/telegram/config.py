@@ -694,6 +694,10 @@ class ChannelLimits:
     #: The argv prefixes a WAKE check may start with. `gh` and `git` are allowed only through
     #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate.
     wake_check_allow: List[str] = field(default_factory=lambda: ["gh", "git"])
+    #: The coordinator's own watchdog: after this long with no turn while the swarm has been
+    #: active, it gets one turn to check the round and act on whatever waits, or say it is done.
+    #: Doubles after each quiet check, up to 8 hours; any other turn resets it. 0 = off.
+    coordinator_watch_minutes: float = 30.0
     #: Issue #83: how long without a renewal before successors take over the coordinator lease.
     takeover_minutes: float = 10.0
     #: How often the active coordinator renews its lease.
@@ -747,7 +751,7 @@ class ChannelLimits:
                               f"(got {attachment_mb!r}).")
         for key in ("min_seconds_between_messages", "min_seconds_between_agent_turns",
                     "handoff_nudge_minutes", "cleanup_idle_hours",
-                    "ephemeral_notices_minutes"):
+                    "ephemeral_notices_minutes", "coordinator_watch_minutes"):
             value = getattr(self, key)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):

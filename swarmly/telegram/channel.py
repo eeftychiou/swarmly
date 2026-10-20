@@ -27,7 +27,9 @@ import asyncio
 import contextlib
 import html
 import json
+import contextvars
 import logging
+import os
 import re
 import secrets
 import socket
@@ -56,7 +58,8 @@ from swarmly.telegram.commands import (
     where_reply,
 )
 from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig,
-                                     effort_problem, model_problem)
+                                     MODEL_NAME, MODEL_TYPES, effort_problem,
+                                     model_problem)
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.presence import Presence, Pulse
 from swarmly.telegram.projects import ProjectRouter
@@ -78,6 +81,10 @@ from swarmly.telegram.wire import (Envelope, MessageType, addressed, format_mess
                                utf16_length)
 
 logger = logging.getLogger("swarmly.telegram")
+
+#: The inbox entries one handle_event call recorded, marked done when that call returns.
+_INBOX_KEYS: "contextvars.ContextVar[List[Tuple[Any, Any]]]" = contextvars.ContextVar(
+    "swarmly_inbox_keys")
 
 
 class _ReceiptSuperseded(Exception):
@@ -550,6 +557,7 @@ class AgentChannel:
         self._busy_noticed: Dict[Any, float] = {}    # topic -> clock of the last ⏳ busy notice
         self._queue_seq: Dict[Any, int] = {}         # topic -> number of the last queued message
         self._folded: Dict[Any, List[str]] = {}      # topic -> queued messages awaiting one turn
+        self._folded_keys: Dict[Any, List[Tuple[Any, Any]]] = {}   # their inbox entries
         self._stop_generation = 0              # bumped by /stop: queued messages from before it are dropped
         self._stop_topic_generation: Dict[Any, int] = {}   # the same, for /stop in one topic
         self._turn_keys: Dict[Any, Any] = {}               # turn in flight -> its topic
@@ -596,7 +604,24 @@ class AgentChannel:
             else:
                 logger.warning("ignoring effort choice %r for %s in %s", value, key,
                                self._efforts_path)
+        # The model the CLI said it ran on its last turn (Claude's modelUsage), for the online
+        # notice when neither the config nor the CLI's own settings name one.
+        self._reported_model_path = _state_file(config, "cli-model")
+        reported = load_state(self._reported_model_path, "reported model").get("model")
+        self._reported_model: Optional[str] = (
+            reported if isinstance(reported, str) and MODEL_NAME.fullmatch(reported) else None)
         self._outbound_request_seq = 0
+        # Messages accepted for a turn and not yet answered, so a restart replays them (inbox.py).
+        from swarmly.telegram.inbox import Inbox
+        self._inbox = Inbox(_state_file(config, "inbox"))
+        self._inflight: Set[Tuple[Any, Any]] = set()
+        self._shutting_down = False
+        # The coordinator's watchdog (check_coordinator_watch): where and when its last turn
+        # ran, kept across restarts so a coordinator that restarts into silence still checks.
+        self._watch_path = _state_file(config, "coordinator-watch")
+        saved = load_state(self._watch_path, "coordinator watch")
+        self._watch: Dict[str, Any] = saved if isinstance(saved.get("chat_id"), int) else {}
+        self._watch_backoff = 1
 
         self.bot: Any = None
         self.dispatcher: Any = None
@@ -2039,22 +2064,48 @@ class AgentChannel:
             return float("inf")
         return interval * missed
 
+    def _presence_state_path(self) -> Optional[Path]:
+        """Where the liveness table persists, so a restart does not forget a die-off (#82)."""
+        return _state_file(self.config, "presence")
+
+    def _save_presence(self) -> None:
+        """Write the table beside the transport's other state; a failure is not fatal."""
+        path = self._presence_state_path()
+        if path is None or self._presence is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self._presence.to_dict(self.presence_clock())))
+        except Exception:                          # noqa: BLE001 - liveness must not stop
+            logger.warning("presence: cannot save %s", path, exc_info=True)
+
     def presence(self) -> Presence:
         """This bot's liveness table, built on first use.
 
-        Seeded from what membership already recorded (an ONLINE or SEEN at start), so a
-        restart does not report every peer as unknown while the first pulses are in flight.
-        Every timestamp comes from :attr:`presence_clock` -- wall clock here, replaced by a
-        test -- because a pulse is a wall-clock stamp peers compare against their own.
+        Restored from the last run when there is a saved table, so a die-off seen before a
+        restart is still known after it (and a DOWN episode already announced is not announced
+        twice). Failing that, seeded from what membership already recorded (an ONLINE or SEEN
+        at start). Every timestamp comes from :attr:`presence_clock` -- wall clock here,
+        replaced by a test -- because a pulse is a wall-clock stamp peers compare with their own.
         """
         if self._presence is None:
             now = self.presence_clock()
-            table = Presence(now, down_after=self.down_after_seconds(),
-                             grace=self.heartbeat_seconds())
-            for alias, entry in (getattr(self.membership, "presence", None) or {}).items():
-                at = entry.get("at") if isinstance(entry, dict) else None
-                if isinstance(at, (int, float)) and not isinstance(at, bool):
-                    table.seen(str(alias), float(at))
+            saved = self._presence_state_path()
+            table = None
+            if saved is not None and saved.exists():
+                try:
+                    table = Presence.restore(json.loads(saved.read_text()), now=now,
+                                             down_after=self.down_after_seconds(),
+                                             grace=self.heartbeat_seconds())
+                except (OSError, ValueError):
+                    logger.warning("presence: unreadable state at %s; starting fresh", saved)
+            if table is None:
+                table = Presence(now, down_after=self.down_after_seconds(),
+                                 grace=self.heartbeat_seconds())
+                for alias, entry in (getattr(self.membership, "presence", None) or {}).items():
+                    at = entry.get("at") if isinstance(entry, dict) else None
+                    if isinstance(at, (int, float)) and not isinstance(at, bool):
+                        table.seen(str(alias), float(at))
             self._presence = table
         return self._presence
 
@@ -2101,8 +2152,10 @@ class AgentChannel:
                 table.seen(alias, now)
             else:
                 table.note(dataclasses.replace(pulse, alias=alias))
+            self._save_presence()
             return
         table.seen(alias, now)
+        self._save_presence()
 
     def _may_announce_down(self, now: float) -> bool:
         """Whether this bot is the one voice for a DOWN episode (#82).
@@ -2156,6 +2209,7 @@ class AgentChannel:
             if self._may_announce_down(moment):
                 await self.send(f"🟢 {alias} is back (a pulse was heard again).",
                                 silent=True, notice=True, allow_when_frozen=True)
+        self._save_presence()
         return done
 
     def own_pulse(self, now: float) -> Pulse:
@@ -2679,11 +2733,21 @@ class AgentChannel:
     # -- self-wake timers (issue #81) ---------------------------------------------------
 
     def wake_store(self) -> Any:
-        """This bot's timers: a local file keeps the schedule, the bus carries the claims."""
+        """This bot's timers: a local file keeps the schedule, the bus carries the claims.
+
+        One store per bus root, kept for the life of the channel. On a git bus a claim's
+        settle window starts at the confirmation the store keeps in memory (the bus gives an
+        arrival *rank*, not a time), so a store built afresh every tick forgot it each time
+        and answered "wait" forever: no WAKE on a git bus ever fired (live, round 4)."""
         from swarmly.telegram.wake import WakeStore, wake_dir_for
         root = self._gitbus_root()
-        return WakeStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
-                         transport=self.bus_transport(root), root=root, clock=time.time)
+        cached = getattr(self, "_wake_store_cache", None)
+        if cached is not None and cached[0] == root:
+            return cached[1]
+        store = WakeStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
+                          transport=self.bus_transport(root), root=root, clock=time.time)
+        self._wake_store_cache = (root, store)
+        return store
 
     def apply_wake_lines(self, text: str, event: ChannelEvent) -> str:
         """Arm the ``WAKE`` lines in a reply, and strip them from it.
@@ -2731,9 +2795,14 @@ class AgentChannel:
 
     async def _wake_loop(self) -> None:
         """Fire due timers: one check, one action, for as long as this bot runs."""
+        last: List[str] = []
         while True:                                  # cancelled by stop(), like the others
             try:
-                await self._wake_tick()
+                done = await self._wake_tick()
+                if done and done != last:            # what each timer did, once per change:
+                    logger.info("wake: %s", "; ".join(done))   # a stuck timer must show
+                last = done or []
+                self.check_coordinator_watch()
             except asyncio.CancelledError:
                 raise
             except Exception:                          # noqa: BLE001 - the loop must survive
@@ -2760,17 +2829,29 @@ class AgentChannel:
             return ["paused: no check runs while this bot is paused"]
         store = self.wake_store()
         done: List[str] = []
-        if not self.lease_fence():
-            logger.info("wake: not the coordinator; adopting no timers this tick")
-            return done
-        try:                                         # a dead bot's armed timers are promises
-            for adopted in await asyncio.to_thread(
-                    store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),
-                    allow=tuple(self.config.limits.wake_check_allow or ())):
-                done.append(f"{adopted.id}: adopted from the bus")
-        except Exception:                            # noqa: BLE001 - adoption is best effort
-            logger.warning("wake: adoption failed; carrying on", exc_info=True)
+        # The lease fences *adoption*: only the coordinator takes over a dead bot's timers.
+        # A bot's own timers are its own promises and fire whatever its role; fencing them too
+        # meant no developer's or reviewer's WAKE ever fired (live, round 4).
+        coordinator = self.lease_fence()
+        own = self.config.identity.alias
+        if coordinator:
+            try:                                     # a dead bot's armed timers are promises
+                for adopted in await asyncio.to_thread(
+                        store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),
+                        allow=tuple(self.config.limits.wake_check_allow or ())):
+                    done.append(f"{adopted.id}: adopted from the bus")
+            except Exception:                        # noqa: BLE001 - adoption is best effort
+                logger.warning("wake: adoption failed; carrying on", exc_info=True)
+        else:
+            logger.debug("wake: not the coordinator; adopting no timers this tick")
+
+        def mine(timer: Any) -> bool:
+            return coordinator or not timer.alias or timer.alias == own
+
         for pending in store.pending_firings():
+            if not mine(pending):
+                done.append(f"{pending.id}: adopted, held while this bot is not the coordinator")
+                continue
             # A ready turn that was written down but not started (a crash in that window).
             # Replayed at most once: exactly-once across a crash is not available to an agent
             # that cannot commit its side effects, so this is at-least-once, and the replay
@@ -2790,6 +2871,9 @@ class AgentChannel:
             done.append(f"{pending.id}: replayed after a restart")
         settle = float(self.config.limits.wake_claim_settle_seconds)
         for timer in store.due(moment):
+            if not mine(timer):
+                done.append(f"{timer.id}: adopted, held while this bot is not the coordinator")
+                continue
             claim = await asyncio.to_thread(store.claim_state, timer, settle_seconds=settle)
             if claim != "won":
                 done.append(f"{timer.id}: "
@@ -3147,7 +3231,56 @@ class AgentChannel:
         """
         Route one inbound message. Returns the reply text that was posted (or None).
         Pure decision + adapter call + send; safe to unit test with a fake sender.
+
+        A message accepted for a turn is kept in the inbox until this returns, so a restart
+        that cuts a turn (or a queued message, or a reply not yet posted) runs it again.
         """
+        key = (event.chat_id, event.message_id)
+        tracked = event.message_id is not None and not event.self_task
+        if tracked:
+            if key in self._inflight:
+                # The same message twice at once: a restart's replay and Telegram's redelivery.
+                logger.info("message %s is already being handled; ignoring the second copy",
+                            event.message_id)
+                return None
+            self._inflight.add(key)
+        token = _INBOX_KEYS.set([])
+        keep = False
+        try:
+            return await self._route_event(event)
+        except asyncio.CancelledError:
+            keep = self._shutting_down        # a stopping transport: the next start replays it
+            raise
+        finally:
+            recorded = _INBOX_KEYS.get()
+            _INBOX_KEYS.reset(token)
+            if tracked:
+                self._inflight.discard(key)
+            if not keep:
+                for done in recorded:
+                    self._inbox.done(*done)
+
+    def _inbox_record(self, event: ChannelEvent) -> None:
+        """Keep a message accepted for a turn until its handle_event call is done."""
+        if self._inbox.record(event):
+            _INBOX_KEYS.get().append((event.chat_id, event.message_id))
+
+    def replay_interrupted(self) -> int:
+        """Run again what a previous run accepted and never finished. Returns how many."""
+        from swarmly.telegram.inbox import event_from
+        events = self._inbox.interrupted()
+        for data in events:
+            try:
+                event = event_from(data, ChannelEvent)
+            except TypeError:
+                logger.warning("inbox: could not rebuild an interrupted message; skipping it")
+                continue
+            logger.info("inbox: replaying message %s from @%s that a restart interrupted",
+                        event.message_id, event.author_username)
+            self._self_tasks.add(asyncio.create_task(self.handle_event(event)))
+        return len(events)
+
+    async def _route_event(self, event: ChannelEvent) -> Optional[str]:
         in_home_channel = (self.config.identity.home_channel_id is None
                            or event.chat_id == self.config.identity.home_channel_id)
         is_admin_dm = self._is_admin_dm(event, in_home_channel)
@@ -3437,6 +3570,7 @@ class AgentChannel:
                                self.config.identity.alias, event.author_username)
             return None
 
+        self._inbox_record(event)               # until this call is done: a restart replays it
         author_alias = self._alias_for(event)
         author_username = event.author_username
         peer_username = self.config.peer_username_for(author_alias)
@@ -3528,6 +3662,10 @@ class AgentChannel:
                 # them, so a pile-up behind a long turn gets one answer (live run: five
                 # reminders and nudges became five turns once a 15-minute turn ended).
                 self._folded.setdefault(busy_key, []).append(incoming.text or "")
+                # Its inbox entry now belongs to the turn that answers it, not to this call.
+                mine = _INBOX_KEYS.get()
+                self._folded_keys.setdefault(busy_key, []).extend(mine)
+                mine.clear()
                 logger.info("folded a queued message from @%s into the next queued turn",
                             event.author_username)
                 return None
@@ -3712,6 +3850,7 @@ class AgentChannel:
     def _with_folded(self, incoming: IncomingMessage, key: Any) -> IncomingMessage:
         """The queued messages folded into this turn go first, so one answer covers them."""
         folded = self._folded.pop(key, None)
+        _INBOX_KEYS.get([]).extend(self._folded_keys.pop(key, []))
         if not folded:
             return incoming
         lead = ("[Messages that arrived while your last turn ran; answer them together with "
@@ -3930,6 +4069,7 @@ class AgentChannel:
                 logger.info("turn end: message %s ok in %.1fs, %d chars, meta %s",
                             event.message_id, time.monotonic() - started,
                             len(reply.text or ""), reply.meta or {})
+                self._note_reported_model(reply.meta.get("model"))
                 if reply.meta.get("rotated"):
                     # People see that the session changed and that nothing was dropped.
                     await self.send(f"♻️ {self.config.identity.alias} wrote a handover and "
@@ -4063,6 +4203,7 @@ class AgentChannel:
     async def _run_turn(self, event: ChannelEvent, envelope: Envelope,
                         incoming: IncomingMessage, ticket: Optional[Dict[str, Any]]):
         started = self._clock()
+        self._note_turn_for_watch(event)
         try:
             reply = await self._respond(incoming, event)
         except Exception as exc:                          # noqa: BLE001 - a broken adapter must not kill the loop
@@ -4498,14 +4639,27 @@ class AgentChannel:
         agents never did it themselves (live test), and Telegram can drop a message (busy
         queue, cooldown). A receiver that already took the Telegram copy skips the mirror;
         one that missed it gets the work from the bus on its next poll."""
-        peers = self.assigned_peers(body)
+        named = self.assigned_peers(body)
+        peers = named
         if asker:
             # The bot this reply answers is in the conversation already: an answer that opens
             # with its handle is not a hand-off (live test: plain answers were mirrored).
             who = asker.lstrip("@").lower()
             peers = [p for p in peers
                      if p.lower() != who and str(self.config.peers.get(p, "")).lstrip("@").lower() != who]
-        if not peers or self.bot is None:
+        if self.bot is None:
+            return
+        # An answer to the coordinator is not mirrored, but it is still waited on: the round
+        # moves only when the coordinator acts on it, and a lost one (a restart, live round 4)
+        # is otherwise never followed up. Its next post in the topic answers it.
+        leads = {name.strip().lower() for name in
+                 (self.membership.state.coordinator, self.current_coordinator())
+                 if isinstance(name, str) and name.strip()}
+        for peer in named:
+            if peer not in peers and peer.strip().lower() in leads                     and peer.strip().lower() != self.config.identity.alias.strip().lower():
+                self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
+                    "at": self._clock(), "message_id": message_id, "nudged": False}
+        if not peers:
             return
         for peer in peers:
             self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
@@ -4628,6 +4782,56 @@ class AgentChannel:
         elif f"{alias} has not answered the hand-off above" in prose:
             self._pending_handoffs.pop(key, None)
 
+    def _note_turn_for_watch(self, event: ChannelEvent) -> None:
+        """Remember where and when this bot last took a turn, for the coordinator watchdog.
+        A turn that was not the watchdog's own resets its back-off."""
+        watch = event.self_task and (event.text or "").startswith("Coordinator check:")
+        if not watch:
+            self._watch_backoff = 1
+        self._watch = {"chat_id": int(event.chat_id), "thread_id": event.thread_id,
+                       "topic": self.topics.name(event.chat_id, event.thread_id),
+                       "at": time.time(), "backoff": self._watch_backoff}
+        save_state(self._watch_path, self._watch, "coordinator watch")
+
+    def check_coordinator_watch(self, *, now: Optional[float] = None) -> Optional[str]:
+        """Give an idle coordinator one turn to look at the round.
+
+        Live, round 4: a hand-off to the coordinator was lost and nothing else could wake it, so
+        the swarm waited all night. A coordinator that holds no WAKE and has had no turn for
+        ``limits.coordinator_watch_minutes`` gets one, in the topic it last worked in. The wait
+        doubles after each check (up to 8 hours) until another turn resets it, and stops a day
+        after the last turn, so a finished swarm costs a few turns, not one an hour. Returns
+        what it did, for tests."""
+        minutes = float(getattr(self.config.limits, "coordinator_watch_minutes", 0) or 0)
+        if minutes <= 0 or not self._watch or self._frozen or self._busy_waiting                 or any(not turn.done() for turn in self._turns):
+            return None                           # a turn is running or waiting: not idle
+        if not self.is_coordinator():
+            return None
+        try:
+            own = self.config.identity.alias
+            if any(timer.live and (not timer.alias or timer.alias == own)
+                   for timer in self.wake_store().load()):
+                return None                       # it already promised itself a wake-up
+        except Exception:                         # noqa: BLE001 - the watchdog is best effort
+            logger.debug("coordinator watch: could not read the wake timers", exc_info=True)
+        moment = time.time() if now is None else now
+        last = float(self._watch.get("at", 0) or 0)
+        if moment - last > 24 * 3600:
+            return None                           # the swarm is idle: no turn to spend on it
+        backoff = int(self._watch.get("backoff", self._watch_backoff) or 1)
+        wait = min(minutes * backoff, 8 * 60.0)
+        if moment - last < wait * 60:
+            return None
+        self._watch_backoff = min(backoff * 2, 64)
+        self._watch = {**self._watch, "at": moment, "backoff": self._watch_backoff}
+        save_state(self._watch_path, self._watch, "coordinator watch")
+        logger.info("coordinator watch: no turn for %.0f min and no WAKE; checking the round",
+                    (moment - last) / 60)
+        self._run_own_task(WATCH_NOTE.format(minutes=round((moment - last) / 60)),
+                           self._watch["chat_id"], self._watch.get("thread_id"),
+                           self._watch.get("topic"))
+        return "checked"
+
     async def check_stalled_handoffs(self) -> None:
         """A hand-off its bot has not answered after ``limits.handoff_nudge_minutes`` gets one
         reminder that mentions the bot (it wakes it, and the bus copy is re-read); after twice
@@ -4642,10 +4846,16 @@ class AgentChannel:
         # A swarm with no known coordinator (a hand-written setup) keeps the old behaviour.
         coordinator = self.membership.state.coordinator
         may_nudge = coordinator is None or self.membership.is_coordinator()
+        # ...except about a hand-off *to* the coordinator: nobody else would ever follow that
+        # one up (live, round 4: a hand-off to the coordinator was lost in a restart and the
+        # swarm waited all night, because only the coordinator sends reminders).
+        leads = {name.strip().lower() for name in (coordinator, self.current_coordinator())
+                 if isinstance(name, str) and name.strip()}
         for key, entry in list(self._pending_handoffs.items()):
             chat_id, thread_id, alias = key
             handle = str(self.config.peers.get(alias, alias)).lstrip("@")
             age = now - float(entry["at"])
+            nudges = may_nudge or alias.strip().lower() in leads
             if alias in frozen:
                 # A frozen peer cannot answer: no reminder, no "may be stopped" notice; the
                 # work goes back to the bot that handed it over at once (live run: the
@@ -4674,7 +4884,7 @@ class AgentChannel:
                     logger.info("hand-off to %s in %s: it is busy; the clock restarts",
                                 alias, thread_id or "General")
                 continue
-            if not may_nudge:
+            if not nudges:
                 if age >= 2 * wait:
                     self._pending_handoffs.pop(key, None)
                     logger.info("hand-off to %s in %s unanswered after %.0f min; deciding "
@@ -5513,14 +5723,46 @@ class AgentChannel:
                 if self._turn_slots is not None:
                     await self._pace_group()    # the retry is a post too: gap and cap
 
+    def running_model_and_effort(self) -> Tuple[Optional[str], Optional[str]]:
+        """The model and effort a General turn really runs at: /model and /reasoning, then
+        adapter.model and adapter.effort, then the CLI's own settings (cli_defaults.py), then
+        the model the CLI reported on its last turn. None where nothing names it."""
+        from swarmly.telegram.cli_defaults import cli_default
+        adapter = self.config.adapter
+        model, effort = self._model_for(None), self._effort_for(None)
+        if adapter.command:                    # a custom command line: no flag is known
+            return model, effort
+        if not (model and effort):
+            env = {**os.environ, **adapter.extra_env}
+            found = cli_default(adapter.type, adapter.cwd, env=env)
+            model, effort = model or found.model, effort or found.effort
+        return model or self._reported_model, effort
+
+    def _note_reported_model(self, model: Any) -> None:
+        """Keep the model the CLI said it ran, so the next online notice can name it."""
+        if not isinstance(model, str) or not MODEL_NAME.fullmatch(model) \
+                or model == self._reported_model:
+            return
+        self._reported_model = model
+        save_state(self._reported_model_path, {"model": model}, "reported model")
+
     def online_notice(self) -> str:
-        """Startup announcement, carrying the running revision for upgrade visibility."""
+        """Startup announcement, carrying the running revision for upgrade visibility, and the
+        model and reasoning effort General runs at, so the admin sees what each bot will spend
+        without asking every bot for /model and /reasoning."""
+        adapter = self.config.adapter
         role = f", role: {self._role_name()}" if self.config.identity.role else ""
+        running_model, running_effort = self.running_model_and_effort()
+        # A runtime with no model of its own (echo, a custom command) names none.
+        model = ("" if not running_model and (adapter.command or adapter.type not in MODEL_TYPES)
+                 else f", model: {running_model or 'not known until its first turn'}")
+        effort = ("" if adapter.command or effort_problem(adapter.type, "high")
+                  else f", effort: {running_effort or 'the model default'}")
         return format_message(
             Envelope(type=MessageType.HELLO, to="*", intent="ONLINE",
                      ref=self._alias_ref(), rev=self._running_revision),
             f"🟢 {self.config.identity.alias} online "
-            f"(adapter: {self.config.adapter.type}{role}, rev: {self._running_revision})",
+            f"(adapter: {adapter.type}{role}{model}{effort}, rev: {self._running_revision})",
         )
 
     def _role(self) -> Any:
@@ -5613,6 +5855,9 @@ class AgentChannel:
             self._wake_task = asyncio.create_task(self._wake_loop())
         if self._heartbeat_task is None and self.heartbeat_seconds() > 0:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        replayed = self.replay_interrupted()      # what the last run accepted and never finished
+        if replayed:
+            logger.info("inbox: replaying %d message(s) a restart interrupted", replayed)
         try:
             # A webhook left set by another deployment makes getUpdates fail with a conflict.
             # Pending updates are kept: a peer's request sent during a restart must still arrive.
@@ -5638,6 +5883,7 @@ class AgentChannel:
                 bool(getattr(user, "is_bot", False)))
 
     async def stop(self) -> None:
+        self._shutting_down = True                # cancelled turns stay in the inbox
         self._topic_memory.save()
         if self.bot is not None and getattr(self, "_started_wall", None) is not None \
                 and not self.restart_requested:
@@ -5925,6 +6171,13 @@ REASSIGN_NOTE = ("{alias} has not answered your hand-off in this topic for {minu
                  "has not said it is busy, so it may be down. Decide what happens to the work "
                  "now: hand it to another peer whose role fits, or do it yourself, and say so "
                  "here. If it can wait for {alias}, reply exactly NO_REPLY.")
+#: The coordinator's watchdog turn (check_coordinator_watch): nothing woke it for a while.
+WATCH_NOTE = ("Coordinator check: you have had no turn for {minutes} minutes and hold no WAKE. "
+              "Look at the open tracking issue and every item and PR on it (gh issue view, "
+              "gh pr view, gh pr checks). Act now on whatever waits on you: merge what is ready, "
+              "follow up or reassign what has stalled, answer anything handed to you that got "
+              "no answer. Then arm a WAKE for what you are waiting on. If no round is open and "
+              "nothing waits, reply exactly NO_REPLY; the next check then comes later.")
 #: Run when a hand-off went to a peer that is frozen (quota or pause).
 FROZEN_REASSIGN_NOTE = ("{alias} is frozen and cannot answer your hand-off in this topic. "
                         "Decide what happens to the work now: hand it to another peer whose "
