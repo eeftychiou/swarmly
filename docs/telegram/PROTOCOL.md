@@ -357,7 +357,26 @@ approval onto code nobody reviewed.
 **Authority.** GitHub wins for what exists, merged/closed state, the PR head and CI on that head;
 the file wins for owners' intent, order, blockers, verdicts, timers and term. `coordinator.json`
 (#83) is the authority for `term`; a segment from a lower term than the bus already holds is
-refused, so a returning coordinator cannot overwrite its successor's state.
+refused, so a returning coordinator cannot overwrite its successor's state. `term` and `seq` are
+**never** taken from the block — a model cannot give itself a term.
+
+**Reads are labelled.** A state read at the bus ref is `source=ref` and the only kind that is
+actionable. Segments that exist on this checkout but not yet on the ref (a push in flight) are
+`source=local` with `pending=N`; a ref that cannot be read is `unreadable`, never `absent`, and a
+local copy is reported as `local` (with the reason) rather than presented as bus state. A round
+with no segments anywhere is `absent`. Neither `unreadable` nor `local` may become a round
+report, and `usable` is false for both.
+
+**Concurrent writers.** `base_seq` records the `seq` the writer saw. Two segments with the same
+`term` and the same `base_seq` are concurrent. Disjoint fields both survive the fold; two
+concurrent writes to the *same* field keep a deterministic winner **and** are reported in
+`conflicts` (`<item>.<field>`), which marks the state stale. An update is never silently lost.
+
+**Fencing and fail-closed.** `holder` is set by the transport to the writing bot. Once a round has
+a holder at a term, another bot is refused (`RoundFenced`) at that term or below; only a higher
+term may take the round over. If the bus cannot be read, the write is refused outright: a term and
+a seq that cannot be verified are not written. Until #83 lands the lease, the term only ever comes
+from the bus, which is why a bot whose bus checkout is broken cannot write round state at all.
 
 **Missing is not empty.** A round with no segments is `absent`; a bus that cannot be read is
 `unreadable`. Neither is "no open items", and neither may produce a round report. `/round[@bot]

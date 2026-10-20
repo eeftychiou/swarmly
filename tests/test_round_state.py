@@ -261,9 +261,16 @@ class TestChannelWiring(unittest.TestCase):
         from tests.test_telegram_channel import event, make_channel, make_config
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        # A real bus checkout: the store reads a ref (``main``) and pushes, so a write that
+        # cannot be pushed stays visible as local state rather than vanishing.
+        git(root, "init", "-q", "-b", "main")
+        (root / "README").write_text("bus\n", encoding="utf-8")
+        git(root, "add", "README")
+        git(root, "commit", "-q", "-m", "bus")
         config = make_config(agent={"role": role},
-                             fallback={"gitbus_root": tmp.name})
-        return make_channel(config), Path(tmp.name), event
+                             fallback={"gitbus_root": str(root), "gitbus_ref": "main"})
+        return make_channel(config), root, event
 
     def test_a_coordinators_block_is_stripped_and_landed_on_the_bus(self):
         channel, root, event = self.channel("coordinator")
@@ -321,3 +328,148 @@ class TestUnchanged(unittest.TestCase):
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
                                         items={"86": {"owner": "B"}}))
             self.assertEqual(len(list(Path(tmp).rglob("*.json"))), 2)
+
+
+class _RefTransport:
+    """A bus transport whose ref can be read, or cannot -- for the read-semantics tests."""
+
+    def __init__(self, files=None, readable=True):
+        self.ref = "origin/main"
+        self.files = dict(files or {})
+        self.readable = readable
+
+    def refresh(self):
+        pass
+
+    def list_at_ref(self, relpath):
+        if not self.readable:
+            return None
+        prefix = relpath.rstrip("/") + "/"
+        return sorted(path[len(prefix):] for path in self.files if path.startswith(prefix))
+
+    def read_at_ref(self, relpath):
+        return self.files.get(relpath)
+
+
+class TestBusReadSemantics(unittest.TestCase):
+    """Blocker 1: a bus that cannot be read is not an empty round, and local bytes are not
+    presented as bus state."""
+
+    def test_an_unreadable_ref_is_unreadable_not_absent(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(_RefTransport(readable=False), root=Path(tmp))
+            state = store.load("repo#86")
+            self.assertEqual(state.status, "unreadable")
+            self.assertNotEqual(state.status, "absent")
+            self.assertIn("not an empty round", state.reason)
+
+    def test_an_empty_readable_ref_is_absent(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(_RefTransport(), root=Path(tmp))
+            self.assertEqual(store.load("repo#86").status, "absent")
+
+    def test_an_unreadable_ref_falls_back_to_the_checkout_and_says_so(self):
+        with TemporaryDirectory() as tmp:
+            local = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            local.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                        items={"86": {"owner": "DeepSeek"}}))
+            store = rs.RoundStore(_RefTransport(readable=False), root=Path(tmp))
+            state = store.load("repo#86")
+            self.assertEqual(state.status, "ok")
+            self.assertEqual(state.source, "local")
+            self.assertIn("checkout only", state.stale)
+            self.assertFalse(state.usable)
+
+    def test_a_segment_the_ref_does_not_have_yet_is_local_not_bus_state(self):
+        with TemporaryDirectory() as tmp:
+            local = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            local.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                        items={"86": {"owner": "DeepSeek"}}))
+            store = rs.RoundStore(_RefTransport(), root=Path(tmp))
+            state = store.load("repo#86")
+            self.assertEqual(state.source, "local")
+            self.assertEqual(state.pending, 1)
+            self.assertFalse(state.usable)
+
+    def test_a_segment_on_the_ref_is_bus_state(self):
+        payload = json.dumps({"version": 1, "round": "repo#86", "writer": "Claude", "seq": 1,
+                              "items": {"86": {"owner": "DeepSeek"}}})
+        files = {".agents/rounds/repo#86/000000-000001-claude-a.json": payload}
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(_RefTransport(files), root=Path(tmp))
+            state = store.load("repo#86")
+            self.assertEqual(state.source, "ref")
+            self.assertTrue(state.usable)
+            self.assertEqual(state.item("86")["owner"], "DeepSeek")
+
+
+class TestWriteFencing(unittest.TestCase):
+    """Blockers 2-4: concurrent patches, an unverifiable term, and the holder."""
+
+    def write_segment(self, store, name, update):
+        path = store.directory(update.round) / name
+        path.write_text(json.dumps(update.to_dict()), encoding="utf-8")
+
+    def test_two_concurrent_disjoint_patches_both_survive(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                        items={"86": {"owner": "DeepSeek"}}))
+            base = store.load("repo#86").seq
+            for writer, patch in (("Claude", {"pr": 89}), ("Antigravity", {"waits_on": "ci"})):
+                self.write_segment(store, f"000000-{base + 1:06d}-{writer[:4]}.json",
+                                   rs.RoundUpdate(round="repo#86", writer=writer,
+                                                  seq=base + 1, base_seq=base,
+                                                  items={"86": patch}))
+            state = store.load("repo#86")
+            self.assertEqual(state.item("86")["pr"], 89)
+            self.assertEqual(state.item("86")["waits_on"], "ci")
+            self.assertEqual(state.item("86")["owner"], "DeepSeek")
+            self.assertEqual(state.conflicts, [])
+
+    def test_two_concurrent_writes_to_one_field_are_reported_not_silently_resolved(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claude"))
+            base = store.load("repo#86").seq
+            for writer, owner in (("Claude", "DeepSeek"), ("Antigravity", "Reasonix")):
+                self.write_segment(store, f"000000-{base + 1:06d}-{writer[:4]}.json",
+                                   rs.RoundUpdate(round="repo#86", writer=writer,
+                                                  seq=base + 1, base_seq=base,
+                                                  items={"86": {"owner": owner}}))
+            state = store.load("repo#86")
+            self.assertEqual(state.conflicts, ["86.owner"])
+            self.assertIn("same field", state.stale)
+            self.assertFalse(state.usable)
+
+    def test_an_unreadable_bus_refuses_the_write(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(_RefTransport(readable=False), root=Path(tmp))
+            with self.assertRaises(rs.RoundStateError):
+                store.append(rs.RoundUpdate(round="repo#86", writer="Claude"))
+            self.assertFalse(list(Path(tmp).rglob("*.json")))
+
+    def test_a_second_bot_cannot_write_a_held_round_at_the_same_term(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claude"), holder="Claude")
+            with self.assertRaises(rs.RoundFenced):
+                store.append(rs.RoundUpdate(round="repo#86", writer="Antigravity"),
+                             holder="Antigravity")
+            self.assertEqual(store.load("repo#86").holder, "Claude")
+
+    def test_a_later_term_may_take_the_round_over(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Antigravity")
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claude", term=1),
+                         holder="Claude")
+            store.append(rs.RoundUpdate(round="repo#86", writer="Antigravity", term=2),
+                         holder="Antigravity")
+            state = store.load("repo#86")
+            self.assertEqual(state.term, 2)
+            self.assertEqual(state.holder, "Antigravity")
+
+    def test_a_term_from_the_block_is_not_trusted(self):
+        update = rs.RoundUpdate.from_dict({"round": 86, "term": 7, "seq": 9})
+        self.assertEqual(update.term, 0)
+        self.assertEqual(update.seq, 0)

@@ -64,6 +64,10 @@ class RoundStaleTerm(RoundStateError):
     """A write from an older coordinator term: it must not overwrite a newer one."""
 
 
+class RoundFenced(RoundStateError):
+    """Another bot holds this round at this term: this write is not this bot's to make."""
+
+
 class RoundPushError(RoundStateError):
     """The segment was written but could not be pushed to the bus."""
 
@@ -154,6 +158,12 @@ class RoundUpdate:
     #: The head the segment was written against, when the writer knows it. Verdict SHAs in
     #: this segment are expanded against it.
     head: str = ""
+    #: The ``seq`` the writer saw when it built this segment -- a Lamport base. Two segments
+    #: with the same term and the same base are concurrent, and if they set the same field
+    #: the fold reports that instead of picking a winner silently (PR #89 review, blocker 2).
+    base_seq: int = 0
+    #: The bot this segment claims the round for. Set by the store, never by the block.
+    holder: str = ""
 
     # -- validation ------------------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
@@ -175,6 +185,10 @@ class RoundUpdate:
             data["note"] = self.note
         if self.head:
             data["head"] = self.head
+        if self.base_seq:
+            data["base_seq"] = self.base_seq
+        if self.holder:
+            data["holder"] = self.holder
         return data
 
     @classmethod
@@ -370,12 +384,22 @@ class RoundState:
     note: str = ""
     #: How many segments the fold used; 0 for absent.
     segments: int = 0
+    #: Where the segments came from: ``ref`` (the bus, durable) or ``local`` (this checkout
+    #: only -- a push that has not landed yet, or a bus ref that could not be read).
+    source: str = ""
+    #: Segments that are on this checkout but not on the bus ref yet.
+    pending: int = 0
+    #: Fields two concurrent writers set from the same base, as ``item.field``.
+    conflicts: List[str] = field(default_factory=list)
+    #: The bot that holds this round (the coordinator that first wrote it, at ``term``).
+    holder: str = ""
     #: Why this state is not to be trusted, when it is not.
     stale: str = ""
 
     @property
     def usable(self) -> bool:
-        return self.status == "ok" and not self.stale
+        """Whether the state can be acted on: read from the bus, and free of conflicts."""
+        return self.status == "ok" and not self.stale and self.source == "ref"
 
     def item(self, key: str) -> Dict[str, Any]:
         return dict(self.items.get(str(key)) or {})
@@ -432,6 +456,8 @@ def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
     ordered = sorted(updates, key=lambda update: update.sort_key())
     state = RoundState(round=round_key or (ordered[0].round if ordered else ""),
                        status="absent")
+    # (item, field) -> (term, base_seq, writer, value): who last set it, and from where.
+    seen: Dict[Tuple[str, str], Tuple[int, int, str, Any]] = {}
     for update in ordered:
         state.status = "ok"
         state.segments += 1
@@ -443,6 +469,16 @@ def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
         state.repo = update.repo or state.repo
         for key, patch in update.items.items():
             current = dict(state.items.get(key) or {})
+            for name, value in patch.items():
+                prior = seen.get((key, name))
+                if (prior is not None and prior[0] == update.term
+                        and prior[1] == update.base_seq
+                        and prior[2].lower() != (update.writer or "").lower()
+                        and prior[3] != value):
+                    # Two writers, the same base, the same field: neither saw the other. Keep
+                    # the deterministic winner and say so, instead of losing one silently.
+                    state.conflicts.append(f"{key}.{name}")
+                seen[(key, name)] = (update.term, update.base_seq, update.writer or "", value)
             current.update(patch)
             state.items[key] = current
         if update.order is not None:
@@ -453,6 +489,8 @@ def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
             state.timers.update(update.timers)
         if update.note:
             state.note = update.note
+        if update.holder:
+            state.holder = update.holder
     if state.status == "ok":
         for key in state.items:
             if key not in state.order:
@@ -494,54 +532,68 @@ class RoundStore:
         return self.root / self.relpath / self.safe_key(round_key)
 
     # -- reading ---------------------------------------------------------------------
-    def _raw_segments(self, round_key: str) -> List[Tuple[str, str]]:
-        directory = f"{self.relpath}/{self.safe_key(round_key)}"
-        transport = self.transport
-        if (not self._refreshed and transport is not None
-                and getattr(transport, "ref", None) and hasattr(transport, "refresh")):
-            # Once per store: a read of the bus ref should not spend a fetch per segment,
-            # and a store is created per turn (issue #86: a successor reads, then writes).
-            self._refreshed = True
-            transport.refresh()
-        if transport is not None and getattr(transport, "ref", None) and hasattr(
-                transport, "list_at_ref"):
-            at_ref = []
-            try:
-                for name in transport.list_at_ref(directory):
-                    text = transport.read_at_ref(f"{directory}/{name}")
-                    if text:
-                        at_ref.append((name, text))
-            except Exception:                            # noqa: BLE001 - fall back, don't fail
-                at_ref = []
-            if at_ref:
-                return at_ref
-            # The ref has nothing yet (a segment written this turn, whose push is still in
-            # flight). The transport's own rule is "prefer the ref, else the checkout".
+    def _local_segments(self, round_key: str) -> List[Tuple[str, str]]:
         folder = self.directory(round_key)
         if not folder.is_dir():
             return []
         return [(path.name, path.read_text(encoding="utf-8"))
                 for path in sorted(folder.glob("*.json"))]
 
-    def segments(self, round_key: str) -> List[RoundUpdate]:
-        """Every readable segment, oldest first. Raises :class:`RoundStateError`."""
-        try:
-            raw = self._raw_segments(round_key)
-        except RoundStateError:
-            raise
-        except Exception as exc:                            # noqa: BLE001 - reported, not raised raw
-            raise RoundStateError(f"the round's segments could not be read: {exc}") from exc
+    def _raw_segments(self, round_key: str) -> Tuple[List[Tuple[str, str]], str, int]:
+        """``(segments, source, pending)`` for one round.
+
+        *source* is ``ref`` when the segments came from the bus ref (the durable answer), or
+        ``local`` when only this checkout has them -- a push that has not landed, or a ref
+        that could not be read. A ref that cannot be read is never reported as an empty
+        round, and local bytes are never presented as bus state (PR #89 review, blocker 1).
+        """
+        directory = f"{self.relpath}/{self.safe_key(round_key)}"
+        transport = self.transport
+        local = self._local_segments(round_key)
+        if transport is not None and getattr(transport, "ref", None) and hasattr(
+                transport, "list_at_ref"):
+            if not self._refreshed and hasattr(transport, "refresh"):
+                # Once per store: a read of the bus ref should not spend a fetch per
+                # segment, and a store is created per turn.
+                self._refreshed = True
+                transport.refresh()
+            names = transport.list_at_ref(directory)
+            if names is None:
+                if local:
+                    return local, "local", len(local)
+                raise RoundStateError(
+                    f"the bus ref could not be read for {directory}; "
+                    "this is not an empty round")
+            at_ref: List[Tuple[str, str]] = []
+            for name in names:
+                text = transport.read_at_ref(f"{directory}/{name}")
+                if text is None:
+                    raise RoundStateError(f"segment {name} could not be read at the bus ref")
+                at_ref.append((name, text))
+            if at_ref:
+                return at_ref, "ref", 0
+            if local:
+                # The ref is readable and holds nothing yet: these are this turn's own
+                # segments, whose push is still in flight. Labelled `local`, never `ref`.
+                return local, "local", len(local)
+            return [], "ref", 0
+        if local:
+            return local, "local", len(local)
+        return [], "ref", 0
+
+    def _parse(self, round_key: str, raw: List[Tuple[str, str]]) -> List[RoundUpdate]:
         updates: List[RoundUpdate] = []
         for name, text in raw:
             if not name.endswith(".json"):
                 continue
             try:
                 data = json.loads(text)
-                update = RoundUpdate.from_dict(data, writer=str(data.get("writer") or ""),
-                                               seq=int(data.get("seq") or 0),
-                                               term=int(data.get("term") or 0),
-                                               at=str(data.get("at") or ""),
-                                               head=str(data.get("head") or "") or None)
+                update = RoundUpdate.from_dict(
+                    data, writer=str(data.get("writer") or ""),
+                    seq=int(data.get("seq") or 0), term=int(data.get("term") or 0),
+                    at=str(data.get("at") or ""), head=str(data.get("head") or "") or None)
+                update.base_seq = int(data.get("base_seq") or 0)
+                update.holder = str(data.get("holder") or "")
             except (ValueError, TypeError) as exc:
                 # One unreadable segment must not hide the rest: the round keeps the state
                 # it can still prove, and the loss is visible as `stale` on the fold.
@@ -552,16 +604,36 @@ class RoundStore:
             updates.append(update)
         return updates
 
-    def load(self, round_key: str) -> RoundState:
-        """The round's state, with ``status`` telling absent from unreadable."""
+    def segments(self, round_key: str) -> List[RoundUpdate]:
+        """Every readable segment, oldest first. Raises :class:`RoundStateError`."""
         try:
-            updates = self.segments(round_key)
+            raw, _source, _pending = self._raw_segments(round_key)
+        except RoundStateError:
+            raise
+        except Exception as exc:                            # noqa: BLE001 - reported, not raw
+            raise RoundStateError(f"the round's segments could not be read: {exc}") from exc
+        return self._parse(round_key, raw)
+
+    def load(self, round_key: str) -> RoundState:
+        """The round's state, with ``status`` and ``source`` telling absence from a bad read."""
+        try:
+            raw, source, pending = self._raw_segments(round_key)
         except RoundStateError as exc:
             return RoundState(round=str(round_key), status="unreadable", reason=str(exc))
+        updates = self._parse(round_key, raw)
         state = fold(updates, round_key=str(round_key))
+        state.source = source
+        state.pending = pending
+        notes: List[str] = []
         damaged = [update for update in updates if update.note.startswith(_DAMAGED_PREFIX)]
-        if damaged and state.status == "ok":
-            state.stale = damaged[-1].note[len(_DAMAGED_PREFIX):]
+        if damaged:
+            notes.append(damaged[-1].note[len(_DAMAGED_PREFIX):])
+        if state.source == "local" and state.status == "ok":
+            notes.append(f"{pending} segment(s) are on this checkout only, not on the bus ref")
+        if state.conflicts:
+            notes.append("two writers set the same field from the same base: "
+                         + ", ".join(sorted(state.conflicts)))
+        state.stale = "; ".join(notes)
         return state
 
     def rounds(self) -> List[str]:
@@ -575,30 +647,52 @@ class RoundStore:
     def next_seq(self, round_key: str) -> int:
         return self.load(round_key).seq + 1
 
-    def append(self, update: RoundUpdate) -> str:
+    def append(self, update: RoundUpdate, *, holder: str = "") -> str:
         """Write one segment, then publish it. Returns the segment's bus path.
 
-        Refuses a write from an older term than the bus already holds (issue #86 review
-        B3): a returning coordinator must not overwrite the successor's state.
+        Three rules, one purpose: no bot writes a round it cannot prove it holds.
+
+        * **Fail closed.** If the bus cannot be read, the term and the seq this write would
+          take cannot be verified, so the write is refused (PR #89 review, blocker 3).
+        * **No going back a term.** A term lower than the bus already holds is refused
+          (:class:`RoundStaleTerm`): a returning coordinator must not overwrite its
+          successor's state.
+        * **Fenced by the holder.** Once a round has a holder at a term, another bot cannot
+          write it at that term or below (:class:`RoundFenced`). Until #83 supplies a lease,
+          ``term`` comes from the bus, never from the model's block.
         """
         current = self.load(update.round)
-        if current.status == "ok" and update.term < current.term:
+        if current.status == "unreadable":
+            raise RoundStateError(
+                f"the state of {update.round} on the bus could not be read "
+                f"({current.reason}); refusing to write a term or a seq that cannot be "
+                "verified")
+        trusted = current.term if current.status == "ok" else 0
+        if update.term and update.term < trusted:
             raise RoundStaleTerm(
-                f"term {update.term} is behind {current.term} for round {update.round}; "
+                f"term {update.term} is behind {trusted} for round {update.round}; "
                 "this bot is not the coordinator of this round any more")
+        if not update.term:
+            update.term = trusted
+        update.holder = holder or update.holder or self.alias
+        if (current.status == "ok" and current.holder and update.term <= current.term
+                and current.holder.strip().lower() != update.holder.strip().lower()):
+            raise RoundFenced(
+                f"round {update.round} is held by {current.holder} at term {current.term}; "
+                f"{update.holder} cannot write it at term {update.term}")
         if current.status == "ok" and _unchanged(update, current):
             # Nothing new: a turn that emits the same state again must not add a commit to
             # the bus's history (issue #86 review B7). Return the segment that already says it.
             existing = sorted(self.directory(update.round).glob("*.json"))
             return str(existing[-1]) if existing else str(self.directory(update.round))
+        update.base_seq = current.seq
         if update.seq <= 0:
             update.seq = current.seq + 1
         if not update.at:
             update.at = utc_now(self.clock)
         directory = self.directory(update.round)
         directory.mkdir(parents=True, exist_ok=True)
-        writer = re.sub(r"[^A-Za-z0-9]+", "", (update.writer or self.alias or "bot"))[:16] \
-            or "bot"
+        writer = re.sub(r"[^A-Za-z0-9]+", "", (update.writer or self.alias or "bot"))[:16] or "bot"
         name = f"{update.term:06d}-{update.seq:06d}-{writer}-{uuid.uuid4().hex[:8]}.json"
         path = directory / name
         relpath = f"{self.relpath}/{directory.name}/{name}"

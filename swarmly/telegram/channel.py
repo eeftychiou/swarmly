@@ -2307,7 +2307,9 @@ class AgentChannel:
             update = RoundUpdate.from_dict(payload, writer=self.config.identity.alias,
                                            at=utc_now(time.time))
             update.round = key                       # the bus key, not whatever was typed
-            store.append(update)
+            # The holder is this bot's alias, set here and not from the block: the store's
+            # fence refuses a round another bot holds at the same term (PR #89, blocker 4).
+            store.append(update, holder=self.config.identity.alias)
         except RoundPushError as exc:
             # Written, not yet on the bus: the file stays, and the transport carries it on
             # the next push. Say so instead of pretending the round is durable.

@@ -109,19 +109,22 @@ class GitTransport:
             items.append((name, data))
         return items
 
-    def list_at_ref(self, relpath: str) -> List[str]:
+    def list_at_ref(self, relpath: str) -> Optional[List[str]]:
         """File names directly under *relpath* at the bus ref (a round's segments).
 
         Issue #86 review: the round state is a bus *document*, not an envelope, so it has
-        its own read path. Names come back relative to *relpath*; an unreadable ref is an
-        empty list here and the caller decides what that means (absent is not empty).
+        its own read path. ``[]`` means the ref was read and holds nothing there; ``None``
+        means it could not be read at all. The two are never the same answer: a caller that
+        conflates them reports a broken bus as an empty round (PR #89 review, blocker 1).
         """
         if not self.ref:
-            return []
+            return None
         prefix = relpath.rstrip("/") + "/"
         result = self._git("ls-tree", "-r", "--name-only", self.ref, prefix, timeout=30)
         if result.returncode != 0:
-            return []
+            logger.warning("gitbus: could not list %s at %s: %s", relpath, self.ref,
+                           (result.stderr or "").strip()[:200])
+            return None
         return sorted(path[len(prefix):] for path in (result.stdout or "").splitlines()
                       if path.startswith(prefix))
 
