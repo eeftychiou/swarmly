@@ -296,3 +296,35 @@ class TestLeaseSuccession(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(renewed)
             self.assertEqual(renewed.term, 2)
             self.assertEqual(renewed.expires_at, 1670.0)
+
+    def test_a_live_holder_cannot_be_stolen_at_the_same_term(self):
+        with TemporaryDirectory() as tmp:
+            bus = _Bus(tmp)
+            now = 1000.0
+            claude = ls.LeaseStore("Claude", transport=bus, root=Path(tmp),
+                                   clock=lambda: now, ttl_seconds=600.0, rank=1)
+            claude.claim(term=1)
+
+            reviewer = ls.LeaseStore("Codex", transport=bus, root=Path(tmp),
+                                    clock=lambda: now, ttl_seconds=600.0, rank=0)
+            with self.assertRaises(ls.LeaseError):
+                reviewer.claim(term=1)
+
+    async def test_role_promotion_claims_next_term(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = {"t": 1000.0}
+            ch = self.channel(root, "Hermes", "developer", {"Claude": "coordinator"}, clock)
+            # Existing term 1 lease from Claude
+            leases_dir = root / ".agents" / "leases"
+            leases_dir.mkdir(parents=True, exist_ok=True)
+            (leases_dir / "000001-claude-aaaa.json").write_text(json.dumps({
+                "term": 1, "alias": "Claude", "expires_at": 1600.0, "renews_at": 1000.0
+            }), encoding="utf-8")
+
+            # Admin promotes Hermes to coordinator
+            ch._on_promoted_to_coordinator()
+            state = ch.lease_store().state(now=1000.0)
+            self.assertEqual(state.holder, "Hermes")
+            self.assertEqual(state.term, 2)
+            self.assertTrue(state.live(1000.0))

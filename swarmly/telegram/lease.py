@@ -285,6 +285,11 @@ class LeaseStore:
         if wanted < current.term:
             raise LeaseError(f"term {wanted} is behind {current.term}; a lease never goes back")
         stamp = self.clock() if now is None else now
+        if current.live(stamp):
+            if wanted == current.term and current.holder.strip().lower() != self.alias.strip().lower():
+                raise LeaseError(
+                    f"lease at term {current.term} is currently held by {current.holder}; "
+                    f"{self.alias} cannot claim at the same term")
         row = LeaseClaim(term=max(wanted, 1), alias=self.alias,
                          expires_at=stamp + self.ttl_seconds, renews_at=stamp, rank=self.rank,
                          nonce=uuid.uuid4().hex[:8])

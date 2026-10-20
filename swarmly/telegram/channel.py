@@ -2367,7 +2367,7 @@ class AgentChannel:
         try:
             store = self.lease_store()
             current = store.state()
-            store.claim(term=current.term + 1, force=True)
+            store.claim(term=current.term + 1)
         except Exception:
             logger.warning("lease: failed to claim on promotion", exc_info=True)
 
