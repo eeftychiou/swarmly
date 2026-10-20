@@ -118,17 +118,31 @@ class Presence:
     and turning that into "everyone is down" would be a lie with consequences.
     """
 
-    def __init__(self, base: float, *, down_after: float, grace: Optional[float] = None):
+    def __init__(self, base: float, *, down_after: float, grace: Optional[float] = None,
+                 busy_window: Optional[float] = None):
         self.started_at = base
         self.down_after = float(down_after)
         self.grace_until = base + float(self.down_after if grace is None else grace)
+        #: How long a peer's own `busy_since` claim counts as liveness. A peer that says it is
+        #: working is *not* DOWN, because a blocked event loop (a synchronous git or gh call in a
+        #: turn path, a GC pause) stops its pulse without stopping its work; but the claim must
+        #: expire, so a bot that wedged while busy still surfaces as DOWN eventually.
+        four = float("inf") if self.down_after == float("inf") else 4.0 * self.down_after
+        self.busy_window = four if busy_window is None else float(busy_window)
         self.peers: Dict[str, Peer] = {}
 
     # -- facts -----------------------------------------------------------------------
-    def note(self, pulse: Pulse) -> Peer:
-        """Record a heartbeat (or a HELLO, or any message) from *pulse.alias*."""
-        peer = self.peers.get(pulse.alias) or Peer(alias=pulse.alias, last_seen=pulse.at)
-        peer.last_seen = max(peer.last_seen, pulse.at)
+    def note(self, pulse: Pulse, *, seen_at: Optional[float] = None) -> Peer:
+        """Record a heartbeat (or a HELLO, or any message) from *pulse.alias*.
+
+        *seen_at* is when **this** bot saw the line, and it is what `last_seen` records: the
+        sender's own `at` is display only, because a peer whose clock runs fast would otherwise
+        keep itself UP for the length of the skew, and a stamp ahead of us would hide a real
+        die-off. Without it (a unit test, or a writer that has no clock) `at` is used.
+        """
+        observed = pulse.at if seen_at is None else float(seen_at)
+        peer = self.peers.get(pulse.alias) or Peer(alias=pulse.alias, last_seen=observed)
+        peer.last_seen = max(peer.last_seen, observed)
         peer.busy_since = pulse.busy_since
         peer.frozen = pulse.frozen
         peer.term = max(peer.term, pulse.term)
@@ -148,6 +162,19 @@ class Presence:
         peer = self.peers.get(alias)
         return None if peer is None else max(0.0, now - peer.last_seen)
 
+    def is_busy(self, alias: str, now: float) -> bool:
+        """Whether *alias* says it is working, and that claim has not expired (issue #82).
+
+        `busy_since` is liveness, not decoration: a turn can block the event loop (a synchronous
+        git or gh call, a GC pause) without stopping the work, so a busy peer is never DOWN inside
+        :attr:`busy_window`. Past it the claim expires, and a bot that stopped pulsing while busy
+        surfaces as DOWN like any other.
+        """
+        peer = self.peers.get(alias)
+        if peer is None or peer.busy_since is None:
+            return False
+        return max(0.0, now - peer.last_seen) < self.busy_window
+
     def is_down(self, alias: str, now: float) -> bool:
         """Silent for longer than ``down_after``, and past the restart grace period.
 
@@ -157,7 +184,11 @@ class Presence:
         if now < self.grace_until:
             return False
         quiet = self.quiet_for(alias, now)
-        return quiet is not None and quiet >= self.down_after
+        if quiet is None:
+            return False
+        if self.is_busy(alias, now):
+            return False                     # it told us it is working; the claim still holds
+        return quiet >= self.down_after
 
     def status(self, alias: str, now: float) -> str:
         """``up``, ``down``, ``busy`` or ``unknown`` for one peer."""
@@ -172,14 +203,6 @@ class Presence:
 
     def down_peers(self, now: float) -> List[str]:
         return sorted(alias for alias in self.peers if self.is_down(alias, now))
-
-    def recover(self, alias: str, now: float) -> bool:
-        """True when *alias* was DOWN and has just been heard from again."""
-        peer = self.peers.get(alias)
-        if peer is None:
-            return False
-        was_down = self.down_notified_at(alias) is not None
-        return was_down and now - peer.last_seen < 1e-9
 
     # -- what the operator sees --------------------------------------------------------
     def line(self, now: float, *, order: Iterable[str] = ()) -> str:

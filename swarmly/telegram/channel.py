@@ -2106,6 +2106,11 @@ class AgentChannel:
                     at = entry.get("at") if isinstance(entry, dict) else None
                     if isinstance(at, (int, float)) and not isinstance(at, bool):
                         table.seen(str(alias), float(at))
+            # S4: the episode was announced by *this* bot if the saved record says so, so a
+            # restart still closes it with its one "back" line instead of leaving it open.
+            for alias, peer in table.peers.items():
+                if peer.down_notified_at is not None:
+                    self._down_announced.setdefault(alias, peer.down_notified_at)
             self._presence = table
         return self._presence
 
@@ -2151,7 +2156,7 @@ class AgentChannel:
                                alias)
                 table.seen(alias, now)
             else:
-                table.note(dataclasses.replace(pulse, alias=alias))
+                table.note(dataclasses.replace(pulse, alias=alias), seen_at=now)
             self._save_presence()
             return
         table.seen(alias, now)
@@ -2164,7 +2169,14 @@ class AgentChannel:
         went quiet -- otherwise six bots announce the same die-off six times. Advisory: this
         claims no lease, because a DOWN peer must never be able to start a takeover (#83).
         """
-        coordinator = str(self.membership.state.coordinator or "").strip()
+        # S5: under #83 the leader is the lease's holder, not the name in the config: a stale
+        # configured name would otherwise leave nobody as the voice (or two bots announcing).
+        leader = ""
+        try:
+            leader = str(self.current_coordinator() or "").strip()
+        except Exception:                   # noqa: BLE001 - fall back to the configured name
+            logger.warning("presence: no lease-settled coordinator", exc_info=True)
+        coordinator = leader or str(self.membership.state.coordinator or "").strip()
         if not coordinator:
             return True                     # nobody named: no single voice to defer to
         if coordinator.lower() == self.config.identity.alias.strip().lower():
@@ -2206,9 +2218,11 @@ class AgentChannel:
                 continue
             self._down_announced.pop(alias, None)
             done.append(f"{alias}: back")
-            if self._may_announce_down(moment):
-                await self.send(f"🟢 {alias} is back (a pulse was heard again).",
-                                silent=True, notice=True, allow_when_frozen=True)
+            # S4: `_down_announced` is exactly "this bot said it was DOWN", so the voice that
+            # announced the episode is the voice that closes it -- including the coordinator's
+            # own return, which _may_announce_down() cannot see (it is UP again by then).
+            await self.send(f"🟢 {alias} is back (a pulse was heard again).",
+                            silent=True, notice=True, allow_when_frozen=True)
         self._save_presence()
         return done
 
@@ -4879,11 +4893,16 @@ class AgentChannel:
                 # A busy peer is working, not gone (#82): its pulse carries `busy_since`, so the
                 # clock restarts instead of a reminder landing in the middle of a long turn
                 # (round 3: the reminder fired at a busy DeepSeek).
-                if age >= wait:
+                # S3: bounded, so work handed to a perpetually busy peer still escalates --
+                # the exemption lasts one busy window, then the normal ladder takes over.
+                if age >= wait and age < self.presence().busy_window:
                     entry.update(at=now, nudged=False)
                     logger.info("hand-off to %s in %s: it is busy; the clock restarts",
                                 alias, thread_id or "General")
-                continue
+                    continue
+                if age >= wait:
+                    logger.info("hand-off to %s in %s: busy past the window; ladder resumes",
+                                alias, thread_id or "General")
             if not nudges:
                 if age >= 2 * wait:
                     self._pending_handoffs.pop(key, None)

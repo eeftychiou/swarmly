@@ -236,6 +236,38 @@ class TestDownOnTheChannel(unittest.TestCase):
         self.assertIn("Codex is DOWN", tasks[0])
         self.assertEqual(admin_lines(channel, "has not answered the hand-off"), [])
 
+
+    def test_the_coordinator_returning_closes_its_own_episode(self):
+        # S4: on the return branch the peer is UP again, so _may_announce_down() cannot see it;
+        # the voice is "whoever announced the episode", which is this bot.
+        channel = live_channel()
+        channel.membership.state.coordinator = "Hermes"          # this bot leads
+        hear(channel, pulse_text("Codex", NOW))
+        channel._test_presence_clock["t"] = NOW + 400
+        self.assertTrue(any(l.startswith("Codex: down") for l in
+                            run(channel.check_peer_liveness())))
+        hear(channel, pulse_text("Codex", NOW + 401), message_id=2)
+        self.assertEqual(run(channel.check_peer_liveness()), ["Codex: back"])
+        self.assertEqual(len(admin_lines(channel, "is back")), 1)
+
+    def test_a_busy_peer_busy_past_the_window_goes_back_on_the_ladder(self):
+        # S3: the busy exemption is bounded, so a perpetually busy peer still escalates.
+        channel = live_channel(handoff_nudge_minutes=10)
+        channel.bot = object()
+        tasks = []
+        channel._run_own_task = lambda text, chat, thread, name: tasks.append(text)
+        channel._mirror_handoffs("@CodexBot please run the suite", GROUP, 307, 55)
+        key = (int(GROUP), 307, "Codex")
+        started = channel._pending_handoffs[key]["at"]
+        mono = {"t": started}
+        channel._clock = lambda: mono["t"]
+        hear(channel, pulse_text("Codex", NOW, busy_since=NOW - 600))
+        # 30 minutes of a peer that keeps saying it is busy: past 4 x down_after the ladder runs.
+        channel._test_presence_clock["t"] = NOW + 300
+        mono["t"] = started + 1800
+        run(channel.check_stalled_handoffs())
+        self.assertEqual(admin_lines(channel, "reminder: the hand-off above") != [], True)
+
     def test_a_busy_peer_gets_no_reminder_and_the_clock_restarts(self):
         # Round 3: the reminder landed on a DeepSeek that was 20 minutes into a turn. A pulse
         # carrying `busy_since` says "working", so the hand-off clock starts again instead.
@@ -330,3 +362,29 @@ class TestPersistenceOnTheChannel(unittest.TestCase):
             self.assertEqual(run(second.check_peer_liveness()), [])   # still DOWN, already said
             self.assertEqual(admin_lines(second, "Codex has been silent since"), [])
             self.assertIn("Codex:down(", second.presence_line())
+
+class TestTheBusyWindowAndTheClock(unittest.TestCase):
+    """Review B2 and S2 on #94: busy_since is liveness, and last_seen is what *we* saw."""
+
+    def test_a_busy_peer_that_stops_pulsing_is_busy_until_the_window_expires(self):
+        # A blocked event loop (a synchronous git/gh call, a GC pause) stops the pulse without
+        # stopping the work: six minutes of silence must not hand its work to somebody else.
+        table = pr.Presence(1000.0, down_after=360, grace=120)
+        table.note(pr.Pulse(alias="Codex", at=1000.0, busy_since=900.0))
+        self.assertFalse(table.is_down("Codex", 1000.0 + 20 * 60))
+        self.assertEqual(table.status("Codex", 1000.0 + 20 * 60), "busy")
+        # ...but the claim expires, so a bot that wedged while busy still surfaces as DOWN.
+        self.assertTrue(table.is_down("Codex", 1000.0 + 25 * 60))
+        self.assertEqual(table.status("Codex", 1000.0 + 25 * 60), "down")
+
+    def test_a_pulse_stamped_in_the_future_does_not_keep_a_peer_up(self):
+        table = pr.Presence(1000.0, down_after=360, grace=120)
+        table.note(pr.Pulse(alias="Codex", at=1000.0 + 3600), seen_at=1000.0)
+        self.assertEqual(table.peers["Codex"].last_seen, 1000.0)   # the receiver's clock wins
+        self.assertTrue(table.is_down("Codex", 1000.0 + 400))
+
+    def test_a_future_stamp_on_the_channel_is_judged_by_our_clock(self):
+        channel = live_channel()
+        hear(channel, pulse_text("Codex", NOW + 3600))
+        channel._test_presence_clock["t"] = NOW + 400
+        self.assertTrue(channel.presence().is_down("Codex", NOW + 400))
