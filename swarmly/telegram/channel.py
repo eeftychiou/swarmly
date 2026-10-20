@@ -2563,17 +2563,29 @@ class AgentChannel:
             return ["paused: no check runs while this bot is paused"]
         store = self.wake_store()
         done: List[str] = []
-        if not self.lease_fence():
-            logger.info("wake: not the coordinator; adopting no timers this tick")
-            return done
-        try:                                         # a dead bot's armed timers are promises
-            for adopted in await asyncio.to_thread(
-                    store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),
-                    allow=tuple(self.config.limits.wake_check_allow or ())):
-                done.append(f"{adopted.id}: adopted from the bus")
-        except Exception:                            # noqa: BLE001 - adoption is best effort
-            logger.warning("wake: adoption failed; carrying on", exc_info=True)
+        # The lease fences *adoption*: only the coordinator takes over a dead bot's timers.
+        # A bot's own timers are its own promises and fire whatever its role; fencing them too
+        # meant no developer's or reviewer's WAKE ever fired (live, round 4).
+        coordinator = self.lease_fence()
+        own = self.config.identity.alias
+        if coordinator:
+            try:                                     # a dead bot's armed timers are promises
+                for adopted in await asyncio.to_thread(
+                        store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),
+                        allow=tuple(self.config.limits.wake_check_allow or ())):
+                    done.append(f"{adopted.id}: adopted from the bus")
+            except Exception:                        # noqa: BLE001 - adoption is best effort
+                logger.warning("wake: adoption failed; carrying on", exc_info=True)
+        else:
+            logger.debug("wake: not the coordinator; adopting no timers this tick")
+
+        def mine(timer: Any) -> bool:
+            return coordinator or not timer.alias or timer.alias == own
+
         for pending in store.pending_firings():
+            if not mine(pending):
+                done.append(f"{pending.id}: adopted, held while this bot is not the coordinator")
+                continue
             # A ready turn that was written down but not started (a crash in that window).
             # Replayed at most once: exactly-once across a crash is not available to an agent
             # that cannot commit its side effects, so this is at-least-once, and the replay
@@ -2593,6 +2605,9 @@ class AgentChannel:
             done.append(f"{pending.id}: replayed after a restart")
         settle = float(self.config.limits.wake_claim_settle_seconds)
         for timer in store.due(moment):
+            if not mine(timer):
+                done.append(f"{timer.id}: adopted, held while this bot is not the coordinator")
+                continue
             claim = await asyncio.to_thread(store.claim_state, timer, settle_seconds=settle)
             if claim != "won":
                 done.append(f"{timer.id}: "
