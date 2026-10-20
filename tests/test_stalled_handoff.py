@@ -122,3 +122,44 @@ class TestStalledHandoff(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHandoffToTheCoordinator(unittest.TestCase):
+    """Live, round 4: a hand-off *to* the coordinator was lost in a restart, and nobody
+    followed it up, because only the coordinator sends reminders."""
+
+    def test_a_peer_reminds_the_coordinator_of_its_own_hand_off(self):
+        channel = make_channel(make_config(peers={"Claude": "ClaudeBot"}))
+        channel.bot = object()
+        channel._start = channel._clock()
+        channel.membership.state.coordinator = "Claude"
+        channel._mirror_handoffs("@ClaudeBot please merge #94", GROUP, 307, 55)
+        self.assertIn("@ClaudeBot reminder", str(tick(channel, 11)[-1]))
+
+    def test_an_answer_to_the_coordinator_is_waited_on(self):
+        channel = make_channel(make_config(peers={"Claude": "ClaudeBot"}))
+        channel.bot = object()
+        channel._start = channel._clock()
+        channel.membership.state.coordinator = "Claude"
+        channel._mirror_handoffs("@ClaudeBot: pushed 275ca33 on #94", GROUP, 307, 55,
+                                 asker="ClaudeBot")
+        self.assertIn((GROUP, 307, "Claude"), channel._pending_handoffs)
+        self.assertIn("@ClaudeBot reminder", str(tick(channel, 11)[-1]))
+
+    def test_its_next_post_in_the_topic_answers_it(self):
+        channel = make_channel(make_config(peers={"Claude": "ClaudeBot"}))
+        channel.bot = object()
+        channel._start = channel._clock()
+        channel.membership.state.coordinator = "Claude"
+        channel._mirror_handoffs("@ClaudeBot: pushed 275ca33 on #94", GROUP, 307, 55,
+                                 asker="ClaudeBot")
+        run(channel.handle_event(event("[Claude] thanks, reviewing now", username="ClaudeBot",
+                                       author_id=404, thread_id=307, message_id=56)))
+        self.assertEqual(tick(channel, 30), [])
+
+    def test_an_answer_to_another_peer_is_still_not_a_hand_off(self):
+        channel = handed_off()
+        channel.membership.state.coordinator = "Claude"
+        channel._pending_handoffs.clear()
+        channel._mirror_handoffs("@CodexBot: done", GROUP, 307, 58, asker="CodexBot")
+        self.assertEqual(channel._pending_handoffs, {})
