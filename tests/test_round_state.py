@@ -417,7 +417,7 @@ class TestWriteFencing(unittest.TestCase):
                                         items={"86": {"owner": "DeepSeek"}}))
             base = store.load("repo#86").seq
             for writer, patch in (("Claude", {"pr": 89}), ("Antigravity", {"waits_on": "ci"})):
-                self.write_segment(store, f"000000-{base + 1:06d}-{writer[:4]}.json",
+                self.write_segment(store, f"000000-{base + 1:06d}-{writer[-4:]}.json",
                                    rs.RoundUpdate(round="repo#86", writer=writer,
                                                   seq=base + 1, base_seq=base,
                                                   items={"86": patch}))
@@ -433,7 +433,7 @@ class TestWriteFencing(unittest.TestCase):
             store.append(rs.RoundUpdate(round="repo#86", writer="Claude"))
             base = store.load("repo#86").seq
             for writer, owner in (("Claude", "DeepSeek"), ("Antigravity", "Reasonix")):
-                self.write_segment(store, f"000000-{base + 1:06d}-{writer[:4]}.json",
+                self.write_segment(store, f"000000-{base + 1:06d}-{writer}.json",
                                    rs.RoundUpdate(round="repo#86", writer=writer,
                                                   seq=base + 1, base_seq=base,
                                                   items={"86": {"owner": owner}}))
@@ -640,7 +640,7 @@ class TestClaimRace(unittest.TestCase):
             for writer in ("Claude", "Antigravity"):
                 update = rs.RoundUpdate(round="repo#86", writer=writer, holder=writer,
                                         seq=1, base_seq=0, items={"86": {"owner": writer}})
-                (folder / f"000000-000001-{writer[:4]}.json").write_text(
+                (folder / f"000000-000001-{writer}.json").write_text(
                     json.dumps(update.to_dict()), encoding="utf-8")
             first = store.load("repo#86")
             second = store.load("repo#86")
@@ -660,3 +660,102 @@ class TestClaimRace(unittest.TestCase):
                                 holder="Antigravity")
             self.assertTrue(path.endswith(".json"))
             self.assertEqual(len(list(Path(tmp).rglob("*.json"))), 1)
+
+
+class TestConflictRecovery(unittest.TestCase):
+    """Codex blocker 1: a conflict is a report, not a permanent mark on the round."""
+
+    def write_segment(self, store, name, update):
+        path = store.directory(update.round) / name
+        path.write_text(json.dumps(update.to_dict()), encoding="utf-8")
+
+    def test_a_conflict_is_settled_by_a_later_write(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claude"), holder="Claude")
+            base = store.load("repo#86").seq
+            for writer, owner in (("Claude", "DeepSeek"), ("Claude2", "Reasonix")):
+                self.write_segment(store, f"000000-{base + 1:06d}-{writer}.json",
+                                   rs.RoundUpdate(round="repo#86", writer=writer,
+                                                  seq=base + 1, base_seq=base,
+                                                  items={"86": {"owner": owner}}))
+            contested = store.load("repo#86")
+            self.assertIn("86.owner", contested.conflicts)
+            self.assertFalse(contested.usable)
+
+            # The holder writes the field again, having seen both values: settled.
+            store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                        items={"86": {"owner": "DeepSeek"}}), holder="Claude")
+            settled = store.load("repo#86")
+            self.assertEqual(settled.conflicts, [])
+            self.assertTrue(settled.usable)
+            self.assertEqual(settled.item("86")["owner"], "DeepSeek")
+
+    def test_a_claim_race_is_settled_by_the_holders_next_write(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Antigravity")
+            folder = store.directory("repo#86")
+            folder.mkdir(parents=True)
+            for writer in ("Claude", "Antigravity"):
+                update = rs.RoundUpdate(round="repo#86", writer=writer, holder=writer,
+                                        seq=1, base_seq=0, items={"86": {"owner": writer}})
+                (folder / f"000000-000001-{writer}.json").write_text(
+                    json.dumps(update.to_dict()), encoding="utf-8")
+            raced = store.load("repo#86")
+            self.assertIn("holder", raced.conflicts)
+            self.assertEqual(raced.holder, "Antigravity")
+
+            store.append(rs.RoundUpdate(round="repo#86", writer="Antigravity",
+                                        items={"86": {"owner": "Antigravity",
+                                                      "state": "open"}}),
+                         holder="Antigravity")
+            settled = store.load("repo#86")
+            self.assertEqual(settled.conflicts, [])
+            self.assertTrue(settled.usable)
+
+
+class TestClaimIsNotOwnership(unittest.TestCase):
+    """Codex blocker 2: a stale coordinator must not end up writing an absent round."""
+
+    def test_a_second_claimant_is_fenced_at_write_time(self):
+        with TemporaryDirectory() as tmp:
+            winner = rs.RoundStore(None, root=Path(tmp), alias="Antigravity")
+            winner.append(rs.RoundUpdate(round="repo#86", writer="Antigravity",
+                                         items={"86": {"owner": "DeepSeek"}}),
+                          holder="Antigravity")
+            # A stale, configured coordinator tries the same round: it loses the fold, so its
+            # write is refused instead of silently becoming a second writer.
+            stale = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            with self.assertRaises(rs.RoundFenced):
+                stale.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                            items={"86": {"owner": "Claude"}}),
+                             holder="Claude")
+            self.assertEqual(winner.load("repo#86").holder, "Antigravity")
+
+    def test_a_lost_claim_is_fenced_even_in_the_same_window(self):
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(None, root=Path(tmp), alias="Claude")
+            folder = store.directory("repo#86")
+            folder.mkdir(parents=True)
+            # Another bot's claim is already on the bus but not yet folded by this writer.
+            (folder / "000000-000001-Anti.json").write_text(json.dumps({
+                "version": 1, "round": "repo#86", "writer": "Antigravity", "holder":
+                "Antigravity", "seq": 1, "base_seq": 0}), encoding="utf-8")
+            with self.assertRaises(rs.RoundFenced):
+                store.append(rs.RoundUpdate(round="repo#86", writer="Claude",
+                                            items={"86": {"pr": 89}}), holder="Claude")
+
+
+class TestRoundListingRefresh(unittest.TestCase):
+    """Codex should-fix: `/round` must not list a ref from before the fetch."""
+
+    def test_rounds_refreshes_the_bus_first(self):
+        files = {".agents/rounds/repo#86/000000-000001-c-a.json": json.dumps(
+            {"version": 1, "round": "repo#86", "writer": "Claude", "seq": 1})}
+        transport = _RefTransport(files)
+        calls = []
+        transport.refresh = lambda: calls.append(1)
+        with TemporaryDirectory() as tmp:
+            store = rs.RoundStore(transport, root=Path(tmp))
+            self.assertIn("repo#86", store.rounds())
+            self.assertEqual(len(calls), 1)

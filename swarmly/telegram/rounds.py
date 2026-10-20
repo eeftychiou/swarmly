@@ -493,7 +493,15 @@ def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
                        status="absent")
     # (item, field) -> (term, base_seq, writer, value): who last set it, and from where.
     seen: Dict[Tuple[str, str], Tuple[int, int, str, Any]] = {}
+    #: Field -> the base_seq its last conflict was seen at. A later segment (base_seq above
+    #: that) settles the field: conflicts are reports about concurrent writes, not a
+    #: permanent mark on the round (PR #89 review, Codex blocker 1).
+    contested: Dict[str, int] = {}
     holders: Dict[int, set] = {}
+    #: term -> holder -> the base_seq of the segment that first claimed it there.
+    claims: Dict[int, Dict[str, int]] = {}
+    #: term -> the highest base_seq any segment at that term was built on.
+    max_base: Dict[int, int] = {}
     for update in ordered:
         state.status = "ok"
         state.segments += 1
@@ -506,6 +514,7 @@ def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
         for key, patch in update.items.items():
             current = dict(state.items.get(key) or {})
             for name, value in patch.items():
+                field = f"{key}.{name}"
                 prior = seen.get((key, name))
                 if (prior is not None and prior[0] == update.term
                         and prior[1] == update.base_seq
@@ -513,7 +522,10 @@ def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
                         and prior[3] != value):
                     # Two writers, the same base, the same field: neither saw the other. Keep
                     # the deterministic winner and say so, instead of losing one silently.
-                    state.conflicts.append(f"{key}.{name}")
+                    contested[field] = update.base_seq
+                elif field in contested and update.base_seq > contested[field]:
+                    # This writer saw the contested value and wrote over it: settled.
+                    del contested[field]
                 seen[(key, name)] = (update.term, update.base_seq, update.writer or "", value)
             current.update(patch)
             state.items[key] = current
@@ -525,17 +537,24 @@ def fold(updates: Iterable[RoundUpdate], *, round_key: str = "") -> RoundState:
             state.timers.update(update.timers)
         if update.note:
             state.note = update.note
+        max_base[update.term] = max(max_base.get(update.term, 0), update.base_seq)
         if update.holder:
             holders.setdefault(update.term, set()).add(update.holder)
+            claims.setdefault(update.term, {}).setdefault(update.holder, update.base_seq)
     if holders:
         # The claim is resolved by the fold, not by who pushed last: the highest term wins, and
         # among simultaneous claims at that term the lowest alias does. Two claims at one term
-        # are a conflict and said so -- otherwise two bots both believe they hold the round.
+        # are reported -- and settled by the next write from the holder at a later base, so a
+        # claim race does not leave the round permanently unusable.
         top = max(holders)
         names = sorted(name for name in holders[top] if name)
         state.holder = names[0] if names else ""
-        if len(names) > 1:
-            state.conflicts.append("holder")
+        claim_base = max((claims.get(top) or {}).values(), default=0)
+        if len(names) > 1 and max_base.get(top, 0) <= claim_base:
+            # Two claims at one term and nobody has written since: a live conflict. A later
+            # write at that term (base above the claims) settles it.
+            contested["holder"] = claim_base
+    state.conflicts = sorted(contested)
     if state.status == "ok":
         for key in state.items:
             if key not in state.order:
@@ -584,6 +603,14 @@ class RoundStore:
         return [(path.name, path.read_text(encoding="utf-8"))
                 for path in sorted(folder.glob("*.json"))]
 
+    def _refresh_once(self) -> None:
+        """Fetch the bus ref once per store, for whichever read comes first."""
+        transport = self.transport
+        if (not self._refreshed and transport is not None
+                and getattr(transport, "ref", None) and hasattr(transport, "refresh")):
+            self._refreshed = True
+            transport.refresh()
+
     def _raw_segments(self, round_key: str) -> Tuple[List[Tuple[str, str]], str, int]:
         """``(segments, source, pending)`` for one round.
 
@@ -597,11 +624,7 @@ class RoundStore:
         local = self._local_segments(round_key)
         if transport is not None and getattr(transport, "ref", None) and hasattr(
                 transport, "list_at_ref"):
-            if not self._refreshed and hasattr(transport, "refresh"):
-                # Once per store: a read of the bus ref should not spend a fetch per
-                # segment, and a store is created per turn.
-                self._refreshed = True
-                transport.refresh()
+            self._refresh_once()
             names = transport.list_at_ref(directory)
             if names is None:
                 if local:
@@ -627,7 +650,10 @@ class RoundStore:
                 return local, "local", len(local)
             return [], "ref", 0
         if local:
-            return local, "local", len(local)
+            # With no ref configured the checkout *is* the plane this store answers for (a
+            # local bus, a test root), so there is nothing for it to be pending against.
+            has_ref = bool(getattr(transport, "ref", None))
+            return local, ("local" if has_ref else "ref"), (len(local) if has_ref else 0)
         return [], "ref", 0
 
     def _parse(self, round_key: str, raw: List[Tuple[str, str]]) -> List[RoundUpdate]:
@@ -695,6 +721,7 @@ class RoundStore:
 
     def rounds(self) -> List[str]:
         """Every round key this bot can see: on the bus ref, or in its own checkout."""
+        self._refresh_once()          # `/round` must not list a ref from before the fetch
         names = set()
         base = self.root / self.relpath
         if base.is_dir():
@@ -779,6 +806,15 @@ class RoundStore:
                     f"by {update.writer or self.alias}", paths=[relpath])
             except Exception as exc:                        # noqa: BLE001 - the file is safe
                 raise RoundPushError(str(exc), path=str(path)) from exc
+        # Writing is not holding. Whoever the fold names -- highest term, then lowest alias --
+        # owns the round, so a bot that wrote a claim it did not win is fenced here rather
+        # than left believing it writes for the round (PR #89 review, Codex blocker 2).
+        settled = self.load(update.round)
+        if (settled.status == "ok" and settled.holder
+                and settled.holder.strip().lower() != update.holder.strip().lower()):
+            raise RoundFenced(
+                f"round {update.round} is held by {settled.holder}; "
+                f"{update.holder} wrote a claim it does not hold")
         return str(path)
 
 

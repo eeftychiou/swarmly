@@ -378,6 +378,11 @@ report, and `usable` is false for both.
 concurrent writes to the *same* field keep a deterministic winner **and** are reported in
 `conflicts` (`<item>.<field>`), which marks the state stale. An update is never silently lost.
 
+A conflict is a **report, not a mark**: it clears when a later segment writes that field on a
+basis above the contested one (`base_seq` greater than the conflict's), which is what any ordinary
+next write does. The same holds for a two-way claim (`holder`). A round does not stay unusable
+because two bots once wrote at the same moment.
+
 **Fencing and fail-closed.** `holder` is set by the transport to the writing bot. Once a round has
 a holder at a term, another bot is refused (`RoundFenced`) at that term or below; only a higher
 term may take the round over. If the bus cannot be read, or the state is only on this checkout,
@@ -385,8 +390,12 @@ the write is refused outright: a term and a seq that cannot be verified are not 
 
 A **claim race** (two bots writing a round that has no segments yet) is decided by the fold, not by
 whoever pushes last: the highest term wins, and among simultaneous claims at that term the lowest
-alias does. The other claim is reported in `conflicts` as `holder`, and the losing bot's next write
-is fenced. Until #83 lands the lease, the term only ever comes from the bus, which is why a bot
+alias does. The other claim is reported in `conflicts` as `holder`.
+
+**Writing is not holding.** After a write, the store re-reads and compares the fold's holder with
+the writer: a bot that wrote a claim it did not win gets `RoundFenced`, so a stale coordinator (a
+configured role that outlived its term) cannot become a second writer of a round another bot holds,
+and the refusal is visible in its reply. Until #83 lands the lease, the term only ever comes from the bus, which is why a bot
 whose bus checkout is broken cannot write round state at all.
 
 **All segments unreadable is `unreadable`,** not an empty round: no item, no owner and no verdict
@@ -394,8 +403,9 @@ is claimed from a state nothing could be read from.
 
 **Missing is not empty.** A round with no segments is `absent`; a bus that cannot be read is
 `unreadable`. Neither is "no open items", and neither may produce a round report. `/round[@bot]
-[issue]` prints the folded state with its age and writer; it answers with the reason when the
-state is not usable.
+[issue]` fetches the bus ref first, then prints the folded state with its age and writer; it answers
+with the reason when the state is not usable, so a fresh checkout cannot report a round as absent
+from a ref it has not fetched.
 
 ---
 
