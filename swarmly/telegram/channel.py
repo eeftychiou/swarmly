@@ -2264,6 +2264,27 @@ class AgentChannel:
         return LeaseStore(self.config.identity.alias, transport=transport,
                           root=root, clock=time.time, ttl_seconds=ttl, rank=rank)
 
+    def lease_fence(self, *, now: Optional[float] = None) -> bool:
+        """May this bot still act? Freshly read from the bus, once per side effect.
+
+        A lease can be displaced between the fold that made this bot the acting coordinator and
+        the action it takes next -- a claim that lands while coordinator work is already running.
+        The settle window orders claims, it does not fence work, so every action with a side
+        effect asks this first: no answer, a stale ref, or a different holder all mean "do not
+        act" (#93, Codex's inline blocker).
+        """
+        moment = self._clock() if now is None else now
+        try:
+            store = self.lease_store()
+            if not store.refresh(force=True):
+                logger.warning("lease: no fresh ref for the fence; not acting")
+                return False
+            state = store.state(now=moment)
+        except Exception:                              # noqa: BLE001 - no answer is not authority
+            logger.warning("lease: the fence could not read the lease; not acting", exc_info=True)
+            return False
+        return state.holds(self.config.identity.alias, moment)
+
     def _forget_lease_cache(self) -> None:
         """Drop the cached fold: after this bot writes a claim, its own view must not be stale."""
         self.__dict__["_cached_lease_state"] = None
@@ -2424,6 +2445,10 @@ class AgentChannel:
         if key is None:
             logger.warning("rounds: block without a tracking issue number dropped")
             return self._round_note(stripped, "block dropped: no tracking issue number")
+        if not self.lease_fence():
+            logger.warning("rounds: not the coordinator any more; block not written")
+            return self._round_note(stripped, "state not saved: this bot is not the coordinator "
+                                              "on the bus any more")
         store = self.round_store()
         try:
             update = RoundUpdate.from_dict(payload, writer=self.config.identity.alias,
@@ -2538,6 +2563,9 @@ class AgentChannel:
             return ["paused: no check runs while this bot is paused"]
         store = self.wake_store()
         done: List[str] = []
+        if not self.lease_fence():
+            logger.info("wake: not the coordinator; adopting no timers this tick")
+            return done
         try:                                         # a dead bot's armed timers are promises
             for adopted in await asyncio.to_thread(
                     store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),

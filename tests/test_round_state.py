@@ -280,6 +280,7 @@ class TestChannelWiring(unittest.TestCase):
         channel.round_authority = lambda now=None: Authority(
             alias=channel.config.identity.alias if role == "coordinator" else "Claudebot",
             source="lease", term=1)
+        channel.lease_fence = lambda now=None: role == "coordinator"
         return channel, root, event
 
     def test_a_coordinators_block_is_stripped_and_landed_on_the_bus(self):
@@ -885,6 +886,7 @@ class TestChannelAuthority(unittest.TestCase):
         channel.round_authority = lambda now=None: (
             Authority(alias=coordinator, source="lease", term=1) if coordinator == "Hermes"
             else Authority(alias="", source="lease", term=0))
+        channel.lease_fence = lambda now=None: coordinator == "Hermes"
         return channel, root, event
 
     def test_a_stale_coordinator_writes_nothing_and_says_why(self):

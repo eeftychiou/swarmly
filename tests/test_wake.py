@@ -418,6 +418,7 @@ class TestTick(unittest.TestCase):
                              fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
                              limits={"wake_tick_seconds": 0})
         channel = make_channel(config)
+        channel.lease_fence = lambda now=None: True     # the lease is not what these test
         state_dir = Path(tmp.name) / ".agents" / "state"
         channel.wake_store = lambda: wk.WakeStore(
             channel.config.identity.alias, state_dir=state_dir, transport=None,
@@ -590,6 +591,7 @@ class TestClaimIsNotFailOpen(unittest.TestCase):
                              root=Path(tmp.name), clock=time.time)
         store.claim_state = lambda timer, settle_seconds=0: "lost"   # another bot won it
         channel.wake_store = lambda: store
+        channel.lease_fence = lambda now=None: True
         store.add(wk.WakeTimer(argv=("git", "status"), then="go", next_at=1.0,
                                expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
                                alias=channel.config.identity.alias), max_timers=10)
@@ -747,6 +749,7 @@ class TestCrashWindow(unittest.TestCase):
                              fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
                              limits={"wake_tick_seconds": 0})
         channel = make_channel(config)
+        channel.lease_fence = lambda now=None: True     # the lease is not what these test
         state_dir = Path(tmp.name) / "state"
         channel.wake_store = lambda: wk.WakeStore(
             channel.config.identity.alias, state_dir=state_dir, transport=None,
@@ -1036,6 +1039,7 @@ class TestPublicationSurfaces(unittest.TestCase):
 
         store.add = refuse
         channel.wake_store = lambda: store
+        channel.lease_fence = lambda now=None: True
         body = channel.apply_wake_lines('x\nWAKE in=1m check="git status" then="go"',
                                         event("hi", username="ClaudeBot"))
         self.assertIn("armed locally only", body)
@@ -1142,6 +1146,7 @@ class TestTransitionPublication(unittest.TestCase):
                              state_dir=Path(tmp.name) / "state", transport=None,
                              root=Path(tmp.name), clock=time.time)
         channel.wake_store = lambda: store
+        channel.lease_fence = lambda now=None: True
         timer = wk.WakeTimer(argv=("git", "status"), then="go", next_at=1.0,
                              expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
                              alias=channel.config.identity.alias)
@@ -1244,6 +1249,7 @@ class TestReadyTurnIsNotDropped(unittest.TestCase):
                              state_dir=Path(tmp.name) / "state", transport=None,
                              root=Path(tmp.name), clock=time.time)
         channel.wake_store = lambda: store
+        channel.lease_fence = lambda now=None: True
         timer = wk.WakeTimer(argv=("git", "status"), then="merge it", next_at=1.0,
                              expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
                              alias=channel.config.identity.alias)

@@ -660,3 +660,81 @@ class TestLateButBetterRankedClaim(unittest.TestCase):
         # The default has to be longer than a push can take: #92 settled on 30s for the same
         # reason, and 5s equal to the ref-refresh limit was the hole Reasonix named.
         self.assertGreaterEqual(make_config().limits.lease_settle_seconds, 30.0)
+
+
+class TestCoordinatorFence(unittest.TestCase):
+    """#93: a lease displaced mid-turn must fence work that is already under way.
+
+    The settle window orders claims; it does not stop coordinator work. So every action with a
+    side effect re-reads the lease first, and a bot that is no longer the holder does not act --
+    that is what keeps a late claim down to one merge instead of two.
+    """
+
+    def channel(self, *, role="coordinator", alias="Hermes"):
+        from tests.gitenv import git as run_git
+        from tests.test_telegram_channel import make_channel, make_config
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        remote = base / "remote.git"
+        run_git(base, "init", "-q", "--bare", "-b", "main", str(remote))
+        bus = base / "bus"
+        run_git(base, "clone", "-q", str(remote), str(bus))
+        (bus / "README").write_text("bus", encoding="utf-8")
+        run_git(bus, "add", "README")
+        run_git(bus, "commit", "-q", "-m", "bus")
+        run_git(bus, "push", "-q", "-u", "origin", "main")
+        config = make_config(agent={"name": f"{alias.lower()}_bot", "alias": alias, "role": role},
+                             fallback={"gitbus_root": str(bus), "gitbus_ref": "origin/main"},
+                             limits={"lease_cache_seconds": 0})
+        channel = make_channel(config)
+        return channel, bus
+
+    def test_the_holder_is_allowed_to_act(self):
+        channel, _bus = self.channel()
+        now = channel._clock()
+        channel.lease_store().claim(term=1, now=now)
+        self.assertTrue(channel.lease_fence(now=now + 1))
+
+    def test_a_displaced_coordinator_may_not_act(self):
+        channel, bus = self.channel()
+        now = channel._clock()
+        channel.lease_store().claim(term=1, now=now)
+        # A successor takes term 2 while this bot's turn is still running.
+        heir = ls.LeaseStore("Antigravity", transport=channel.lease_store().transport, root=bus,
+                             clock=lambda: now, ttl_seconds=600.0, rank=0)
+        heir.claim(term=2, promoted=True, now=now)
+        self.assertFalse(channel.lease_fence(now=now + 1))
+
+    def test_an_unreadable_lease_is_not_permission(self):
+        from swarmly.telegram.lease import LeaseState
+        channel, _bus = self.channel()
+
+        class Broken:
+            ttl_seconds = 600.0
+
+            def refresh(self, *, force=False):
+                return False
+
+            def state(self, *, now=None):
+                return LeaseState(status="unreadable", term=0, holder="", expires_at=0.0)
+
+        channel.lease_store = lambda: Broken()
+        # No fresh ref means no answer, and no answer is not authority.
+        self.assertFalse(channel.lease_fence())
+
+    def test_a_displaced_coordinator_does_not_write_the_round(self):
+        from tests.test_telegram_channel import event
+        channel, bus = self.channel()
+        now = channel._clock()
+        channel.lease_store().claim(term=1, now=now)
+        heir = ls.LeaseStore("Antigravity", transport=channel.lease_store().transport, root=bus,
+                             clock=lambda: now, ttl_seconds=600.0, rank=0)
+        heir.claim(term=2, promoted=True, now=now)
+        body = channel.apply_round_block(
+            'x\nROUND_STATE {"version": 1, "round": 88, "items": {"86": {"owner": "DeepSeek"}}}',
+            event("hi", username="ClaudeBot"))
+        # Refused before the write, with a reason in the reply: either the coordinator gate or
+        # the fence catches it, and both mean the same thing -- this bot may not write the round.
+        self.assertIn("round state:", body)
+        self.assertFalse(list((bus / ".agents" / "rounds").rglob("*.json")))
