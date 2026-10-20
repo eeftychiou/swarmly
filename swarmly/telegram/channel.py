@@ -2393,7 +2393,7 @@ class AgentChannel:
         try:
             store = self.lease_store()
             current = store.state()
-            store.claim(term=current.term + 1)
+            store.claim(term=current.term + 1, promoted=True)
         except Exception:
             logger.warning("lease: failed to claim on promotion", exc_info=True)
 
@@ -2808,35 +2808,49 @@ class AgentChannel:
                         logger.warning("lease: failed to claim bootstrap term 1", exc_info=True)
                 return None
 
-            # If lease is expired or yielded: check succession
-            if my_rank >= 999:
+            # If the lease is expired or yielded, claim the next term -- but no liveness
+            # pre-check of the peers: a reviewer that has simply died carries no freeze flag, and
+            # treating every better-ranked peer as alive would stop the qa-tester from ever
+            # taking over the common die-off. Claim, let the claims settle, and act only if the
+            # fold names this bot: a live peer claims N+1 too and wins the fold, a dead one does
+            # not claim at all (#93 B3).
+            next_term = state.term + 1
+            try:
+                mine = store.claim(term=next_term, now=moment)
+            except Exception as exc:
+                logger.warning("lease: %s could not claim term %d: %s", self.config.identity.alias,
+                               next_term, exc)
                 return None
-
-            is_first = True
-            frozen_map = self.frozen_peers()
-            for peer_alias, peer_role in self.config.peer_roles.items():
-                p_alias = peer_alias.strip().lower()
-                if p_alias == alias:
-                    continue
-                p_rank = succession_order(str(peer_role).strip().lower(), order=succession)
-                if (p_rank < my_rank) or (p_rank == my_rank and p_alias < alias):
-                    if peer_alias not in frozen_map and p_alias not in {k.lower() for k in frozen_map}:
-                        is_first = False
-                        break
-
-            if is_first:
-                next_term = state.term + 1
-                try:
-                    claim = store.claim(term=next_term, now=moment)
-                    self._forget_lease_cache()
-                    logger.warning("ADMIN: coordinator lease taken over by %s at term %d (%s)",
-                                   self.config.identity.alias, next_term, state.status)
-                    return claim
-                except Exception:
-                    logger.warning("lease: %s failed to take over lease at term %d",
-                                   self.config.identity.alias, next_term, exc_info=True)
-
+            settle = float(getattr(self.config.limits, "lease_settle_seconds", 5.0) or 0.0)
+            if settle > 0:
+                await self._sleep(settle)
+            self._forget_lease_cache()
+            try:
+                fresh = store.state(now=self._clock())
+            except Exception:
+                logger.warning("lease: could not re-read the lease after claiming term %d",
+                               next_term, exc_info=True)
+                return None
+            if not fresh.holds(self.config.identity.alias, self._clock()):
+                logger.info("lease: %s claimed term %d but %s holds it; yielding",
+                            self.config.identity.alias, next_term, fresh.holder or "nobody")
+                return None
+            logger.warning("lease: coordinator lease taken over by %s at term %d (%s)",
+                           self.config.identity.alias, next_term, state.status)
+            await self._announce_takeover(next_term, state.status, mine)
+            return mine
         return None
+
+    async def _announce_takeover(self, term: int, why: str, claim: Any) -> None:
+        """Tell the admin, once, in the channel: a takeover is theirs to know about (#83)."""
+        try:
+            await self.send(
+                f"🔄 coordinator lease: {self.config.identity.alias} is acting coordinator at term "
+                f"{term} ({'the lease lapsed' if why != 'yielded' else 'the holder yielded'}; "
+                f"expires {time.strftime('%H:%M:%SZ', time.gmtime(claim.expires_at))}).",
+                notice=True)
+        except Exception:                              # noqa: BLE001 - never fatal
+            logger.warning("lease: could not post the takeover notice", exc_info=True)
 
     async def _lease_tick(self) -> None:
         """Periodic coordinator lease renewal and succession poll."""

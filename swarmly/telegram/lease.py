@@ -324,7 +324,8 @@ class LeaseStore:
         return fold_claims(rows)
 
     # -- writing ---------------------------------------------------------------------
-    def claim(self, *, term: Optional[int] = None, now: Optional[float] = None) -> LeaseClaim:
+    def claim(self, *, term: Optional[int] = None, now: Optional[float] = None,
+              promoted: bool = False) -> LeaseClaim:
         """Claim (or renew) the role for *term*, and return the claim that was written.
 
         ``term`` defaults to the current term, so a renewal keeps it; a takeover passes the next
@@ -335,8 +336,15 @@ class LeaseStore:
             raise LeaseError(f"the lease could not be read; refusing to claim blind "
                              f"({current.status})")
         wanted = current.term if term is None else int(term)
+        stamp = self.clock() if now is None else now
         if wanted < current.term:
             raise LeaseError(f"term {wanted} is behind {current.term}; a lease never goes back")
+        if wanted > current.term and current.live(stamp) and not promoted:
+            # Anyone could otherwise write N+1 and usurp a coordinator that is alive and renewing:
+            # a higher term needs a lapsed lease, or the admin's explicit promotion (#93 B3).
+            raise LeaseError(
+                f"term {wanted} over a live lease held by {current.holder} (term {current.term}); "
+                "wait for it to lapse or take the role through /role")
         stamp = self.clock() if now is None else now
         if current.live(stamp):
             if wanted == current.term and current.holder.strip().lower() != self.alias.strip().lower():

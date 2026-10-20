@@ -433,3 +433,93 @@ class TestLeaseTickRuns(unittest.TestCase):
         other.claim(term=1)
         self.assertFalse(channel.is_coordinator(now=now))
         self.assertEqual(channel.current_coordinator(now=now), "Antigravity")
+
+
+class TestSuccessionOnExpiry(unittest.TestCase):
+    """#93 B3: a dead higher-ranked peer must not block the next one, and a live holder must not
+    be usurped by anyone willing to write the next term."""
+
+    def channel(self, *, role="qa-tester", alias="Hermes", peers=None, settle=0.0, bus=None):
+        import asyncio
+        from tests.gitenv import git as run_git
+        from tests.test_telegram_channel import make_channel, make_config
+        noted = []
+
+        async def sleeper(seconds):
+            noted.append(seconds)
+            return None
+
+        async def sender(payload, reply_to_message_id=None, **kwargs):
+            noted.append(("sent", payload))
+            return payload
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        if bus is None:
+            remote = base / "remote.git"
+            run_git(base, "init", "-q", "--bare", "-b", "main", str(remote))
+            bus = base / "bus"
+            run_git(base, "clone", "-q", str(remote), str(bus))
+            (bus / "README").write_text("bus", encoding="utf-8")
+            run_git(bus, "add", "README")
+            run_git(bus, "commit", "-q", "-m", "bus")
+            run_git(bus, "push", "-q", "-u", "origin", "main")
+        config = make_config(agent={"name": f"{alias.lower()}_bot", "alias": alias,
+                                    "role": role},
+                             peers=peers or {"Claude": "claude_bot"},
+                             fallback={"gitbus_root": str(bus), "gitbus_ref": "origin/main"},
+                             limits={"lease_cache_seconds": 0, "lease_settle_seconds": settle})
+        channel = make_channel(config, sleeper=sleeper)
+        channel._test_sender_fn = sender
+        return channel, bus, noted
+
+    def test_a_dead_higher_ranked_peer_does_not_block_the_takeover(self):
+        import asyncio
+        channel, bus, _noted = self.channel(
+            role="qa-tester",
+            peers={"Claude": {"username": "claude_bot", "role": "reviewer"}})
+        now = channel._clock()
+        # The reviewer claimed and then died: its lease lapsed without a renew.
+        dead = ls.LeaseStore("Claude", transport=channel.lease_store().transport, root=bus,
+                             clock=lambda: now, ttl_seconds=60.0, rank=0)
+        dead.claim(term=1)
+        later = now + 3600
+        claim = asyncio.run(channel.check_lease(now=later))
+        self.assertIsNotNone(claim, "a dead better-ranked peer must not block the next in line")
+        self.assertEqual(claim.term, 2)
+        self.assertTrue(channel.is_coordinator(now=later))
+
+    def test_two_claimants_leave_exactly_one_acting(self):
+        import asyncio
+        one, bus, _ = self.channel(alias="Hermes", role="reviewer",
+                                   peers={"Antigravity": {"username": "agy_bot",
+                                                          "role": "qa-tester"}})
+        two, _bus, _ = self.channel(alias="Antigravity", role="qa-tester", bus=bus,
+                                    peers={"Hermes": {"username": "hermes_bot",
+                                                      "role": "reviewer"}})
+        now = one._clock()
+        lapsed = ls.LeaseStore("Claude", transport=one.lease_store().transport, root=bus,
+                               clock=lambda: now, ttl_seconds=60.0, rank=0)
+        lapsed.claim(term=1)
+        later = now + 3600
+        first_claim = asyncio.run(one.check_lease(now=later))
+        second_claim = asyncio.run(two.check_lease(now=later))
+        acted = [claim for claim in (first_claim, second_claim) if claim is not None]
+        self.assertEqual(len(acted), 1, "two bots claiming N+1 must not both act")
+        self.assertEqual(one.lease_store().state(now=later).term, 2)
+
+    def test_a_live_lease_cannot_be_taken_by_a_higher_term(self):
+        with TemporaryDirectory() as tmp:
+            now = 1000.0
+            bus = _Bus(tmp)
+            holder = ls.LeaseStore("Claude", transport=bus, root=Path(tmp),
+                                    clock=lambda: now, ttl_seconds=600.0, rank=0)
+            holder.claim(term=1)
+            usurper = ls.LeaseStore("Antigravity", transport=bus, root=Path(tmp),
+                                    clock=lambda: now, ttl_seconds=600.0, rank=1)
+            with self.assertRaises(ls.LeaseError):
+                usurper.claim(term=2)
+            # /role is the one path allowed to take a live lease over.
+            promoted = usurper.claim(term=2, promoted=True)
+            self.assertEqual((promoted.term, promoted.alias), (2, "Antigravity"))
