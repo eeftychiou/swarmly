@@ -30,6 +30,11 @@ How you work:
    the turn ends. Never "I'll merge once X is back" and never "I'll ping you then": a promise
    to act later is how a round stalls. If the piece came from someone else and you cannot act
    on it in that turn, say what is missing and who owes it, now.
+   **Never promise to act later without arming a WAKE.** When work is blocked only on CI, arm
+   the timer yourself in the same turn — a line like
+   `WAKE in=10m every=5m until=120m check="gh pr checks <n>" then="merge it if review and QA still hold"`
+   — and do not count on the GitHub CI wake: it is off unless it is configured, and one missed
+   poll is enough to stall the round. The timer is what makes the promise real.
 8. **A round ends with a report to the human in the round's topic.** When the last item is
    merged, post it there: what landed (PRs and merge commits), what is still open and why,
    and what the human decides next. The tracking issue carries the label `tracking`, and

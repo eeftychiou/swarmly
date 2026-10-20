@@ -556,6 +556,8 @@ class AgentChannel:
         self._ack_task: Optional[asyncio.Task] = None
         #: Issue #64: the timer that deletes this transport's own expired notices in General.
         self._ephemeral_task: Optional[asyncio.Task] = None
+        #: Issue #81: the timer that fires this bot's own WAKE timers, with no model turn.
+        self._wake_task: Optional[asyncio.Task] = None
         from swarmly.telegram.selftest import PeerSelfTest
         self.selftest = PeerSelfTest(self)       # startup check that the bots see each other
         from swarmly.telegram.roster import Roster
@@ -1144,6 +1146,10 @@ class AgentChannel:
             # into it) and additionally surfaced here as their own `busy_dropped=` token. /status is
             # the lighter surface where a loss anomaly is first noticed, so it must not hide it.
             result += f" busy_dropped={self.stats.busy_dropped}"
+            try:                              # issue #81: how many timers this bot holds
+                result += f" wakes={self.wake_store().live_count}"
+            except Exception:                          # noqa: BLE001 - /status must answer
+                result += " wakes=?"
             result += f" peers={','.join(self.config.peers) or 'none'}"
             if self.config.identity.role:
                 result += f" role={self._role_name()}"
@@ -1392,7 +1398,7 @@ class AgentChannel:
         command, target = parsed
         if command == "effort":
             command = "reasoning"
-        if command not in (*DIAG_COMMANDS, "model", "reasoning", "round"):
+        if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1406,6 +1412,8 @@ class AgentChannel:
             return self._reasoning_command(event)
         if command == "round":
             return self._round_summary(event)
+        if command == "wakes":
+            return self._wakes_command(event)
         return self._command_reply(command, event)
 
     # ------------------------------------------------------------------------------
@@ -2331,6 +2339,137 @@ class AgentChannel:
         if len(note) > 140:
             note = note[:139] + "\u2026"
         return f"{body}\n\u26a0\ufe0f round state: {note}" if body else f"\u26a0\ufe0f round state: {note}"
+
+    # -- self-wake timers (issue #81) ---------------------------------------------------
+
+    def wake_store(self) -> Any:
+        """This bot's timers: a local file keeps the schedule, the bus carries the claims."""
+        from swarmly.telegram.wake import WakeStore, wake_dir_for
+        root = self._gitbus_root()
+        return WakeStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
+                         transport=self.bus_transport(root), root=root, clock=time.time)
+
+    def apply_wake_lines(self, text: str, event: ChannelEvent) -> str:
+        """Arm the ``WAKE`` lines in a reply, and strip them from it.
+
+        A line is removed in every case -- a refused one must not be posted as prose -- and
+        every refusal is said back into the reply, because a timer the bot believes it armed
+        is a promise the rest of the swarm counts on.
+        """
+        from swarmly.telegram.wake import WakeError, extract_wakes, make_timer
+        body, specs, reasons = extract_wakes(text or "")
+        if not specs and not reasons:
+            return text
+        limits = self.config.limits
+        store = self.wake_store()
+        allowed = tuple(str(word) for word in (limits.wake_check_allow or ()))
+        per_reply = max(1, int(limits.wake_max_per_reply))
+        notes: List[str] = []
+        for spec in specs[:per_reply]:
+            if allowed and spec.argv[0] not in allowed:
+                notes.append(f"WAKE refused: {spec.argv[0]} is not in "
+                             "limits.wake_check_allow")
+                continue
+            timer = make_timer(spec, alias=self.config.identity.alias, chat_id=event.chat_id,
+                               thread_id=event.thread_id,
+                               topic=self.topics.name(event.chat_id, event.thread_id) or "",
+                               now=time.time())
+            try:
+                store.add(timer, max_timers=max(1, int(limits.wake_max)))
+            except WakeError as exc:
+                notes.append(f"WAKE refused: {exc}")
+                continue
+            notes.append(timer.ack(now=time.time()))
+        if len(specs) > per_reply:
+            notes.append(f"WAKE refused: a reply may arm at most {per_reply} timers")
+        notes.extend(f"WAKE refused: {reason}" for reason in reasons)
+        joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
+        return joined
+
+    async def _wake_loop(self) -> None:
+        """Fire due timers: one check, one action, for as long as this bot runs."""
+        while True:                                  # cancelled by stop(), like the others
+            try:
+                await self._wake_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:                          # noqa: BLE001 - the loop must survive
+                logger.exception("wake: a tick failed; the next one carries on")
+            await asyncio.sleep(max(1.0, float(self.config.limits.wake_tick_seconds)))
+
+    async def _wake_tick(self, *, now: Optional[float] = None) -> List[str]:
+        """One pass over the due timers. Returns what it did, so a test can read it."""
+        from swarmly.telegram.wake import decide, run_check_async
+        moment = time.time() if now is None else now
+        if self._frozen:
+            return ["frozen: no check runs while this bot is frozen"]
+        store = self.wake_store()
+        done: List[str] = []
+        for timer in store.due(moment):
+            if not store.claim(timer):
+                done.append(f"{timer.id}: another bot claimed this firing")
+                continue
+            code, tail = await run_check_async(
+                timer.argv, cwd=self._workdir_for(timer.chat_id, timer.thread_id),
+                timeout=float(self.config.limits.wake_check_seconds))
+            action = decide(timer, code, now=moment,
+                            max_attempts=int(self.config.limits.wake_max_attempts))
+            timer.last_exit, timer.last_tail = code, tail
+            store.replace(action.timer)
+            done.append(f"{timer.id}: {action.kind}")
+            if action.kind in ("fire", "error", "expire"):
+                self._run_own_task(
+                    self._wake_prompt(action, failed=action.kind == "error",
+                                      expired=action.kind == "expire"),
+                    timer.chat_id, timer.thread_id, timer.topic or None)
+        return done
+
+    @staticmethod
+    def _wake_prompt(action: Any, *, failed: bool = False, expired: bool = False) -> str:
+        """The turn a fired timer starts: what to do, and the check's own output."""
+        timer = action.timer
+        if expired:
+            head = (f"WAKE {timer.id} expired: {action.reason}. The wait is over; decide "
+                    "whether to escalate or re-arm, and say which.")
+        elif failed:
+            head = (f"WAKE {timer.id} failed: {action.reason}. The check itself is broken; "
+                    "decide whether to fix, re-arm or escalate.")
+        else:
+            head = f"WAKE {timer.id} is ready: `{timer.check}` exited 0."
+        parts = [head, f"Then: {timer.then}"]
+        if action.reason and not (failed or expired):
+            parts.append(action.reason)
+        if timer.last_tail:
+            parts.append("Last output:\n" + timer.last_tail)
+        parts.append("Act in this turn: do not promise to act later.")
+        return "\n\n".join(parts)
+
+    def _wakes_command(self, event: Optional[ChannelEvent]) -> str:
+        """``/wakes`` lists the timers; ``/wakes cancel <id>`` drops one (admin only)."""
+        args = command_args(event.text or "") if event is not None else []
+        if not args or args[0].lower() != "cancel":
+            return self.wake_summary()
+        if not args[1:]:
+            return "wakes: /wakes cancel <id> needs an id (see /wakes)"
+        is_admin = bool(event is not None and self.config.is_admin(event.author_id))
+        if not is_admin:
+            return "wakes: only the admin cancels a timer; ask them, or let it expire"
+        timer_id = args[1].lstrip("#")
+        if self.wake_store().cancel(timer_id):
+            return f"wakes: cancelled {timer_id}"
+        return f"wakes: no live timer {timer_id}"
+
+    def wake_summary(self) -> str:
+        """``/wakes``: the timers this bot holds, or that it holds none."""
+        from swarmly.telegram.wake import format_duration
+        timers = [timer for timer in self.wake_store().load() if timer.live]
+        if not timers:
+            return "wakes: none armed"
+        rows = []
+        for timer in sorted(timers, key=lambda row: row.next_at)[:10]:
+            wait = format_duration(max(0, int(timer.next_at - time.time())))
+            rows.append(f"{timer.id} in {wait} `{timer.check}` tries={timer.attempts}")
+        return "wakes=" + str(len(timers)) + ": " + "; ".join(rows)
 
     def _round_summary(self, event: Optional[ChannelEvent]) -> str:
         """``/round[@bot] [issue]``: what the round waits on, and how old the state is."""
@@ -3509,7 +3648,8 @@ class AgentChannel:
         # Issue #86: a coordinator's reply carries its round state as one machine block. It
         # is taken out here -- on the adapter's raw text, before the reply is clamped or
         # split, so the block is never counted against limits.reply_chars and never posted.
-        body = self.apply_round_block(reply.text or "", event).strip()
+        body = self.apply_wake_lines(reply.text or "", event)
+        body = self.apply_round_block(body, event).strip()
         if not body or is_silent_reply(body):
             if body:
                 logger.info("turn for message %s chose to stay silent", event.message_id)
@@ -4931,6 +5071,8 @@ class AgentChannel:
             self._bus_task = asyncio.create_task(self._bus_tick())
         if self._github_task is None and self.config.github and self.config.github.poll_minutes > 0:
             self._github_task = asyncio.create_task(self._github_tick())
+        if self._wake_task is None and self.config.limits.wake_tick_seconds > 0:
+            self._wake_task = asyncio.create_task(self._wake_loop())
         try:
             # A webhook left set by another deployment makes getUpdates fail with a conflict.
             # Pending updates are kept: a peer's request sent during a restart must still arrive.
@@ -4978,6 +5120,9 @@ class AgentChannel:
             if self._ephemeral_task is not None:
                 self._ephemeral_task.cancel()
                 self._ephemeral_task = None
+            if self._wake_task is not None:
+                self._wake_task.cancel()
+                self._wake_task = None
             if self._bus_task is not None:
                 self._bus_task.cancel()
                 self._bus_task = None

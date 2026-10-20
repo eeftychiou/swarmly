@@ -438,6 +438,52 @@ written without a token cannot be attributed to a reply, so it is not joined —
 alone and its continuations start no turn. A peer that needs the full text of a long
 handoff should still read it from the durable record (`bus=`).
 
+### Self-wake timers (issue #81)
+
+A bot that must act later arms its own timer. It is a machine line in the reply, stripped before
+posting like the other directives:
+
+```
+WAKE in=10m every=5m until=120m check="gh pr checks 75 --required" then="merge it if review and QA still hold"
+```
+
+`in=` is when the first check runs, `every=` re-arms a check that is not ready yet (optional),
+`until=` is when the wait expires, `check` is the command and `then` is what the bot should do
+when it is ready. The transport runs the check **itself**, with no model turn, and decides on the
+exit code:
+
+| exit | meaning | what happens |
+|---|---|---|
+| 0 | ready | one turn carrying `then` and the last 20 lines of output; the timer is done |
+| the command's documented *pending* code (8 for `gh pr checks`) | not yet | re-arm at `every`, silently, until `until` |
+| anything else, or a timeout | the check itself failed | one turn, with the tail, so the bot decides. Not re-armed |
+| past `until` | the wait expired | one turn saying so, so the bot escalates or re-arms |
+
+**The check is a read-only command, matched argv-to-argv.** `check` is untrusted model output
+running outside a turn, so it may only start with one of the read-only prefixes in
+`swarmly.telegram.wake.ALLOWED_ARGV` (`gh pr checks|view|list|status|diff`, `gh run view|list`,
+`gh api` with GET only, `gh issue view`, `gh search`, `git status|log|diff|show|rev-parse|ls-remote|fetch`).
+It is parsed with `shlex` and run without a shell, so shell metacharacters are refused, as are
+`-X`/`--method`/`-f`/`--input` and anything not on `PATH`. A refused line is stripped from the
+reply and the refusal is posted in its place.
+
+**A fire is claimed before it happens.** Timers live in `wake-<alias>.json` in the state dir, so a
+restart resumes the schedule (times are absolute: `next_at` and `expires_at`, never `in=` re-derived).
+Each firing writes an append-only claim to `.agents/wakes/<alias>/<timer>-<alias>.json` on the bus
+*before* the turn starts, and the winner is the lowest alias among the claims — so a takeover or a
+restart can neither fire the same timer twice nor lose the fire. `attempts` is persisted and bounded
+by `limits.wake_max_attempts`.
+
+**Commands.** `/wakes` lists the live timers with their next time, check and attempt count;
+`/wakes cancel <id>` drops one (admin only); `/status` carries `wakes=N`. A bot runs no check while
+it is frozen.
+
+**No silent promises.** A promise to act later is a WAKE armed in the same turn, not a sentence.
+The coordinator role says so: for a PR blocked only on CI, the coordinator arms the timer itself
+and does not count on an external CI wake.
+
+---
+
 **Messages that arrive mid-turn are queued.** With `busy_behavior: queue` (the default) an
 addressed message that arrives while a turn is running waits, up to `busy_queue_max`, and runs
 in arrival order when the turn ends; a queued peer-bot message still observes
@@ -474,3 +520,4 @@ A participant conforms to v1.1 if it:
 - [ ] commits under its own identity
 - [ ] announces every escalation rung
 - [ ] carries its round state as a `ROUND_STATE` block that is stripped before posting (§7)
+- [ ] turns a promise to act later into a `WAKE` line in the same turn (§8)

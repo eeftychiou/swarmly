@@ -1,0 +1,639 @@
+"""Self-wake timers (issue #81): a bot schedules its own check and acts on its exit code.
+
+Round 3 stalled at the finish line because the only thing that would have ended it was an
+external signal — a GitHub CI wake — and that signal was off. A bot needs its own timer, and
+the timer has to be one the transport can fire without a model turn: nobody can ask a model to
+remember to wake up.
+
+A reply arms one with a machine line, stripped before posting like the other directives::
+
+    WAKE in=10m every=5m until=120m check="gh pr checks 75 --required" then="merge it"
+
+The transport runs ``check`` itself and decides on the **exit code**, which is what makes the
+cost one subprocess instead of one turn per poll:
+
+* **0, ready** — one turn carrying ``then`` and the output tail. The timer is done.
+* **pending** — re-arm at ``every``, silently, until ``expires_at``.
+* **anything else, or a timeout** — one turn saying the check itself failed, with the tail, so
+  the bot decides. It is *not* re-armed: a broken check must not loop.
+* **past ``expires_at``** — one turn saying the wait expired, so the bot escalates or re-arms.
+  A timer never fires silently forever.
+
+Four constraints shape the code, because ``check`` is untrusted model output running beside a
+turn for the first time after it:
+
+**An exact argv prefix, not a first token.** ``gh`` and ``git`` can change the world — a
+``gh pr merge``, an ``api -X POST``, a ``push --force`` — so the allowlist is a list of
+read-only argv prefixes (``ALLOWED_ARGV``), matched argv-to-argv, and the line is parsed with
+:mod:`shlex` rather than a shell. Shell metacharacters are refused outright.
+
+**Exit codes per command.** ``gh pr checks`` exits 0 when green, 8 while pending and 1 when
+failing; mapping every non-zero to "not yet" is how a *failing* check would re-arm forever. Each
+allowed prefix documents the codes it may return (:data:`EXIT_MEANING`), and a code outside that
+map is an error turn.
+
+**A fire is claimed, not assumed.** Two bots can see the same bus-mirrored timer. A firing is
+claimed by writing an append-only record on the bus *before* the turn starts; the claims for one
+firing are folded to exactly one winner (lowest alias), so a restart or a takeover can neither
+fire twice nor lose the fire.
+
+**Absolute times and a stored attempt count.** ``next_at`` and ``expires_at`` are persisted as
+absolute times, so a restart resumes the schedule instead of re-deriving it (``in=10m`` on every
+start would re-arm forever), and ``attempts`` bounds the chain even if a clock misbehaves.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from swarmly.transports.base import WAKES_RELPATH, is_bus_document
+
+logger = logging.getLogger("swarmly.telegram.wake")
+
+#: The marker a reply uses. One per line, stripped from the posted text in every case.
+WAKE_MARKER = "WAKE"
+
+#: One line, bounded: it is carried in a reply and parsed by the transport.
+MAX_LINE_CHARS = 600
+
+#: Read-only argv prefixes a check may start with (issue #81 review, blocker 1). Matched
+#: argv-to-argv, so ``gh pr checks`` cannot be stretched into ``gh pr merge``.
+ALLOWED_ARGV: Tuple[Tuple[str, ...], ...] = (
+    ("gh", "pr", "checks"),
+    ("gh", "pr", "view"),
+    ("gh", "pr", "list"),
+    ("gh", "pr", "status"),
+    ("gh", "pr", "diff"),
+    ("gh", "run", "view"),
+    ("gh", "run", "list"),
+    ("gh", "api"),
+    ("gh", "issue", "view"),
+    ("gh", "search"),
+    ("git", "status"),
+    ("git", "log"),
+    ("git", "diff"),
+    ("git", "show"),
+    ("git", "rev-parse"),
+    ("git", "ls-remote"),
+    ("git", "fetch"),
+)
+
+#: ``gh`` flags that turn a read into a write. Refused wherever they appear.
+WRITE_FLAGS = ("-X", "--method", "-f", "--field", "-F", "--input", "--raw-field")
+
+#: Characters that only mean something to a shell. A check needs none of them, and one that
+#: wants ``$`` or a pipe is asking for the thing this allowlist exists to prevent.
+SHELL_METACHARACTERS = set("|&;<>`$()\n\r\\*?[]{}~!")
+
+#: What each allowed prefix's exit codes mean (issue #81 review, blocker 2). ``gh pr checks``
+#: exits 8 while checks are pending; anything else non-zero is a failure, not a "not yet".
+EXIT_MEANING: Dict[Tuple[str, ...], Dict[int, str]] = {
+    ("gh", "pr", "checks"): {0: "ready", 8: "pending", 1: "error"},
+}
+
+#: Default verdict for an allowed command with no documented map: 0 is ready, else the check
+#: itself failed. Never "pending" by default — silence is not readiness.
+DEFAULT_MEANING: Dict[int, str] = {0: "ready"}
+
+READY, PENDING, ERROR = "ready", "pending", "error"
+
+#: A check's own wall-clock budget. Past it the process group is killed.
+CHECK_TIMEOUT_SECONDS = 120.0
+
+#: The lines of output a wake turn carries.
+TAIL_LINES = 20
+
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smhd]?)$")
+_KV = re.compile(r'([a-z]+)=("[^"]*"|\'[^\']*\'|\S+)')
+
+
+class WakeError(ValueError):
+    """A WAKE line, a timer or a check that is refused."""
+
+
+def parse_duration(text: str) -> float:
+    """``90``, ``90s``, ``10m``, ``2h``, ``1d`` -> seconds."""
+    value = str(text or "").strip()
+    match = _DURATION.match(value)
+    if not match:
+        raise WakeError(f"not a duration: {text!r} (use 30s, 10m, 2h or 1d)")
+    amount = float(match.group(1))
+    unit = match.group(2) or "s"
+    factor = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    seconds = amount * factor
+    if seconds <= 0:
+        raise WakeError(f"a duration must be positive: {text!r}")
+    return seconds
+
+
+def format_duration(seconds: float) -> str:
+    for unit, factor in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= factor and seconds % factor == 0:
+            return f"{int(seconds // factor)}{unit}"
+    return f"{int(seconds)}s"
+
+
+def validate_check(command: str) -> Tuple[str, ...]:
+    """The argv of a check, or :class:`WakeError` saying why it is refused.
+
+    Parsed with :mod:`shlex` and matched against :data:`ALLOWED_ARGV` argv-to-argv: the
+    allowlist is a property of the whole prefix, not of the first word.
+    """
+    text = str(command or "").strip()
+    if not text:
+        raise WakeError("a check needs a command")
+    bad = sorted({char for char in text if char in SHELL_METACHARACTERS})
+    if bad:
+        raise WakeError(f"the check contains shell metacharacters ({''.join(bad)}); "
+                        "it is run without a shell, so it needs none")
+    try:
+        argv = tuple(shlex.split(text, posix=True))
+    except ValueError as exc:
+        raise WakeError(f"the check could not be parsed: {exc}") from None
+    if not argv:
+        raise WakeError("a check needs a command")
+    if not any(argv[:len(prefix)] == prefix for prefix in ALLOWED_ARGV):
+        allowed = ", ".join(" ".join(prefix) for prefix in ALLOWED_ARGV[:6])
+        raise WakeError(f"the check must start with one of: {allowed}, … "
+                        f"(got {' '.join(argv)})")
+    for word in argv:
+        if word in WRITE_FLAGS or word.startswith("--method="):
+            raise WakeError(f"the check asks for a write ({word}); a wake check is read-only")
+    if argv[:2] == ("gh", "api"):
+        for index, word in enumerate(argv[:-1]):
+            if word in ("-X", "--method") and argv[index + 1].upper() != "GET":
+                raise WakeError("gh api may only be used with GET")
+    binary = argv[0]
+    if shutil.which(binary) is None:
+        raise WakeError(f"{binary} is not on PATH on this host")
+    return argv
+
+
+def classify(argv: Iterable[str], returncode: int) -> str:
+    """``ready``, ``pending`` or ``error`` for *argv*'s exit code."""
+    argv = tuple(argv)
+    for prefix, meaning in EXIT_MEANING.items():
+        if argv[:len(prefix)] == prefix:
+            verdict = meaning.get(returncode)
+            if verdict is None:
+                return ERROR if returncode != 0 else READY
+            return verdict
+    return DEFAULT_MEANING.get(returncode, ERROR)
+
+
+# ------------------------------------------------------------------------------------
+# The line in the reply
+# ------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WakeSpec:
+    """One parsed ``WAKE`` line."""
+
+    argv: Tuple[str, ...]
+    then: str
+    in_seconds: float
+    every_seconds: float
+    until_seconds: float
+
+    @property
+    def check(self) -> str:
+        return " ".join(self.argv)
+
+
+def parse_line(line: str, *, now: Optional[float] = None) -> WakeSpec:
+    """One ``WAKE ...`` line -> :class:`WakeSpec`, or :class:`WakeError`."""
+    text = str(line or "").strip()
+    if not text.upper().startswith(WAKE_MARKER):
+        raise WakeError(f"not a {WAKE_MARKER} line")
+    rest = text[len(WAKE_MARKER):].strip()
+    if len(rest) > MAX_LINE_CHARS:
+        raise WakeError(f"a WAKE line must be at most {MAX_LINE_CHARS} characters")
+    fields: Dict[str, str] = {}
+    for match in _KV.finditer(rest):
+        value = match.group(2)
+        if value[:1] in ("'", '"') and value[-1:] == value[:1]:
+            value = value[1:-1]
+        fields[match.group(1)] = value
+    unknown = sorted(set(fields) - {"in", "every", "until", "check", "then"})
+    if unknown:
+        raise WakeError(f"unknown WAKE field(s): {', '.join(unknown)}")
+    for required in ("in", "check"):
+        if not fields.get(required):
+            raise WakeError(f"a WAKE line needs {required}=…")
+    if not fields.get("then"):
+        raise WakeError("a WAKE line needs then=\"…\": what the bot should do when the "
+                        "check says it is ready")
+    argv = validate_check(fields["check"])
+    in_seconds = parse_duration(fields["in"])
+    every_seconds = parse_duration(fields["every"]) if fields.get("every") else 0.0
+    until_seconds = (parse_duration(fields["until"]) if fields.get("until")
+                     else max(in_seconds, every_seconds or in_seconds))
+    if until_seconds < in_seconds:
+        raise WakeError("until= must not be shorter than in=")
+    return WakeSpec(argv=argv, then=fields["then"].strip(), in_seconds=in_seconds,
+                    every_seconds=every_seconds, until_seconds=until_seconds)
+
+
+def extract_wakes(text: str, *, now: Optional[float] = None
+                  ) -> Tuple[str, List[WakeSpec], List[str]]:
+    """``(text, specs, reasons)``: every ``WAKE`` line removed from *text*.
+
+    A line is stripped in every case — a refused one must not be posted as prose — and every
+    refusal comes back in *reasons* so the caller can say why.
+    """
+    if not text or WAKE_MARKER not in text.upper():
+        return text, [], []
+    specs: List[WakeSpec] = []
+    reasons: List[str] = []
+    kept: List[str] = []
+    for line in text.splitlines():
+        if not line.strip().upper().startswith(WAKE_MARKER):
+            kept.append(line)
+            continue
+        try:
+            specs.append(parse_line(line, now=now))
+        except WakeError as exc:
+            reasons.append(str(exc))
+    return "\n".join(kept).strip(), specs, reasons
+
+
+# ------------------------------------------------------------------------------------
+# Timers
+# ------------------------------------------------------------------------------------
+
+
+@dataclass
+class WakeTimer:
+    """A persisted timer. Times are absolute, so a restart resumes the schedule."""
+
+    argv: Tuple[str, ...]
+    then: str
+    next_at: float
+    expires_at: float
+    every_seconds: float
+    chat_id: int
+    alias: str = ""
+    thread_id: Optional[int] = None
+    topic: str = ""
+    id: str = ""
+    created_at: float = 0.0
+    attempts: int = 0
+    fires: int = 0
+    last_exit: Optional[int] = None
+    last_tail: str = ""
+    state: str = "armed"          # armed | done | expired | failed | cancelled
+
+    def __post_init__(self) -> None:
+        self.argv = tuple(self.argv)
+        if not self.id:
+            self.id = uuid.uuid4().hex[:8]
+        if not self.created_at:
+            self.created_at = time.time()
+
+    @property
+    def check(self) -> str:
+        return " ".join(self.argv)
+
+    @property
+    def live(self) -> bool:
+        return self.state == "armed"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id, "alias": self.alias, "argv": list(self.argv), "then": self.then,
+            "next_at": self.next_at, "expires_at": self.expires_at,
+            "every_seconds": self.every_seconds, "chat_id": self.chat_id,
+            "thread_id": self.thread_id, "topic": self.topic, "created_at": self.created_at,
+            "attempts": self.attempts, "fires": self.fires, "last_exit": self.last_exit,
+            "last_tail": self.last_tail, "state": self.state,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "WakeTimer":
+        if not isinstance(data, dict):
+            raise WakeError(f"a timer must be an object, got {type(data).__name__}")
+        argv = data.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+            raise WakeError("a timer needs a non-empty 'argv' list of strings")
+        for name in ("then",):
+            if not isinstance(data.get(name, ""), str):
+                raise WakeError(f"a timer's {name!r} must be a string")
+        for name in ("next_at", "expires_at", "every_seconds"):
+            if not isinstance(data.get(name), (int, float)) or isinstance(
+                    data.get(name), bool):
+                raise WakeError(f"a timer's {name!r} must be a number")
+        if not isinstance(data.get("chat_id"), int) or isinstance(data.get("chat_id"), bool):
+            raise WakeError("a timer needs an integer 'chat_id'")
+        return cls(
+            argv=tuple(argv), then=str(data.get("then") or ""),
+            next_at=float(data["next_at"]), expires_at=float(data["expires_at"]),
+            every_seconds=float(data["every_seconds"]), chat_id=int(data["chat_id"]),
+            alias=str(data.get("alias") or ""),
+            thread_id=(int(data["thread_id"]) if isinstance(data.get("thread_id"), int)
+                       and not isinstance(data.get("thread_id"), bool) else None),
+            topic=str(data.get("topic") or ""), id=str(data.get("id") or ""),
+            created_at=float(data.get("created_at") or 0.0),
+            attempts=int(data.get("attempts") or 0), fires=int(data.get("fires") or 0),
+            last_exit=(int(data["last_exit"]) if isinstance(data.get("last_exit"), int)
+                       and not isinstance(data.get("last_exit"), bool) else None),
+            last_tail=str(data.get("last_tail") or ""),
+            state=str(data.get("state") or "armed"),
+        )
+
+    def ack(self, *, now: float) -> str:
+        """One line for the topic: what will run, when, and in which checkout."""
+        return (f"⏰ wake {self.id}: `{self.check}` at "
+                f"{time.strftime('%H:%M:%SZ', time.gmtime(self.next_at))}"
+                + (f", every {format_duration(self.every_seconds)}" if self.every_seconds else "")
+                + f", until {time.strftime('%H:%M:%SZ', time.gmtime(self.expires_at))}")
+
+
+def make_timer(spec: WakeSpec, *, alias: str, chat_id: int, thread_id: Optional[int],
+               topic: str, now: float) -> WakeTimer:
+    """The timer a parsed line becomes, with absolute times."""
+    return WakeTimer(
+        argv=spec.argv, then=spec.then, alias=alias,
+        next_at=now + spec.in_seconds,
+        expires_at=now + spec.until_seconds,
+        every_seconds=spec.every_seconds, chat_id=chat_id, thread_id=thread_id, topic=topic,
+        created_at=now,
+    )
+
+
+@dataclass
+class WakeAction:
+    """What the transport should do with a fired timer."""
+
+    kind: str                      # fire | rearm | expire | error
+    timer: WakeTimer
+    reason: str = ""
+    tail: str = ""
+
+
+def decide(timer: WakeTimer, returncode: Optional[int], *, now: float,
+           max_attempts: int = 0) -> WakeAction:
+    """The action for a timer that is due, given its check's exit code (or ``None``)."""
+    timer.attempts += 1
+    if max_attempts and timer.attempts >= max_attempts:
+        timer.state = "failed"
+        return WakeAction("expire", timer,
+                          reason=f"gave up after {max_attempts} attempts")
+    if returncode is None:                       # timed out, or could not run at all
+        timer.state = "failed"
+        return WakeAction("error", timer, reason="the check did not finish")
+    verdict = classify(timer.argv, returncode)
+    if verdict == READY:
+        timer.state = "done"
+        timer.fires += 1
+        return WakeAction("fire", timer)
+    if verdict == PENDING and timer.every_seconds:
+        nxt = now + timer.every_seconds
+        if nxt > timer.expires_at:
+            timer.state = "expired"
+            return WakeAction("expire", timer,
+                              reason="the wait expired before the check said ready")
+        timer.next_at = nxt
+        return WakeAction("rearm", timer)
+    if verdict == PENDING:                        # pending, but nothing to re-arm on
+        timer.state = "expired"
+        return WakeAction("expire", timer, reason="still pending, and the timer has no every=")
+    timer.state = "failed"
+    return WakeAction("error", timer, reason=f"the check exited {returncode}")
+
+
+def tail_of(text: str, lines: int = TAIL_LINES) -> str:
+    """The last *lines* lines of a check's output."""
+    rows = [row for row in str(text or "").splitlines() if row.strip()]
+    return "\n".join(rows[-lines:])
+
+
+# ------------------------------------------------------------------------------------
+# Running the check
+# ------------------------------------------------------------------------------------
+
+
+def run_check(argv: Tuple[str, ...], *, cwd: Optional[Path],
+              timeout: float = CHECK_TIMEOUT_SECONDS) -> Tuple[Optional[int], str]:
+    """Run one check in its own process group. ``(returncode, output_tail)``.
+
+    ``None`` as the code means it timed out: the whole process group is killed, so a check
+    that spawned children cannot outlive it (issue #81 review, should-fix 9).
+    """
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GH_PROMPT_DISABLED="1", LC_ALL="C")
+    try:
+        process = subprocess.Popen(
+            list(argv), cwd=str(cwd) if cwd else None, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=(os.name != "nt"),
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+        )
+    except OSError as exc:
+        return None, f"could not run {argv[0]}: {exc}"
+    try:
+        out, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(process)
+        out, _ = process.communicate()
+        return None, tail_of(f"(timed out after {timeout:.0f}s)\n{out or ''}")
+    return process.returncode, tail_of(out or "")
+
+
+def _kill_group(process: "subprocess.Popen[str]") -> None:
+    """Kill the check and everything it started."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                           capture_output=True, text=True, check=False)
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except Exception:                                  # noqa: BLE001 - best effort
+        logger.warning("wake: could not kill %s", process.pid, exc_info=True)
+    try:
+        process.kill()
+    except Exception:                                  # noqa: BLE001
+        pass
+
+
+async def run_check_async(argv: Tuple[str, ...], *, cwd: Optional[Path],
+                          timeout: float = CHECK_TIMEOUT_SECONDS) -> Tuple[Optional[int], str]:
+    """One check, off the event loop."""
+    return await asyncio.to_thread(run_check, argv, cwd=cwd, timeout=timeout)
+
+
+# ------------------------------------------------------------------------------------
+# Storage
+# ------------------------------------------------------------------------------------
+
+
+class WakeStore:
+    """The timers of one bot, persisted locally and claimed on the bus.
+
+    The local file is where a running transport keeps its schedule; the bus carries the
+    **fire claims** (append-only, one file per firing), which is what makes a takeover safe:
+    two bots can see the same timer, and the claims decide who fires it.
+    """
+
+    def __init__(self, alias: str, *, state_dir: Optional[Path] = None,
+                 transport: Any = None, root: Optional[Path] = None,
+                 clock: Any = None):
+        self.alias = alias
+        safe = re.sub(r"[^a-z0-9_-]", "", alias.strip().lower()) or "agent"
+        self.safe_alias = safe
+        self.state_dir = Path(state_dir) if state_dir else None
+        self.transport = transport
+        self.root = Path(root or getattr(transport, "root", None) or ".")
+        self.clock = clock or time.time
+
+    # -- local ----------------------------------------------------------------------
+    @property
+    def path(self) -> Optional[Path]:
+        return (self.state_dir / f"wake-{self.safe_alias}.json") if self.state_dir else None
+
+    def load(self) -> List[WakeTimer]:
+        path = self.path
+        if path is None or not path.is_file():
+            return []
+        try:
+            import json
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:                              # noqa: BLE001 - a bad file must not stop
+            logger.warning("wake: %s is unreadable; starting from none", path, exc_info=True)
+            return []
+        timers: List[WakeTimer] = []
+        for row in (data.get("timers") if isinstance(data, dict) else data) or []:
+            try:
+                timers.append(WakeTimer.from_dict(row))
+            except WakeError as exc:
+                logger.warning("wake: a stored timer is not usable: %s", exc)
+        return timers
+
+    def save(self, timers: Iterable[WakeTimer]) -> None:
+        path = self.path
+        if path is None:
+            return
+        import json
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "alias": self.alias,
+                   "timers": [timer.to_dict() for timer in timers]}
+        tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex[:6]}")
+        tmp.write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+
+    def add(self, timer: WakeTimer, *, max_timers: int) -> None:
+        timers = self.load()
+        live = [row for row in timers if row.live]
+        if len(live) >= max_timers:
+            raise WakeError(f"{len(live)} timers are already armed (limits.wake_max={max_timers})")
+        timers.append(timer)
+        self.save(timers)
+
+    def cancel(self, timer_id: str) -> bool:
+        timers = self.load()
+        found = False
+        for timer in timers:
+            if timer.live and timer.id.lower().startswith(timer_id.lower()):
+                timer.state = "cancelled"
+                found = True
+        self.save(timers)
+        return found
+
+    def due(self, now: Optional[float] = None) -> List[WakeTimer]:
+        moment = now if now is not None else self.clock()
+        return sorted((timer for timer in self.load() if timer.live and timer.next_at <= moment),
+                      key=lambda timer: timer.next_at)
+
+    def replace(self, timer: WakeTimer) -> None:
+        timers = self.load()
+        for index, row in enumerate(timers):
+            if row.id == timer.id:
+                timers[index] = timer
+                break
+        else:
+            timers.append(timer)
+        self.save(timers)
+
+    @property
+    def live_count(self) -> int:
+        return len([timer for timer in self.load() if timer.live])
+
+    # -- bus claims -----------------------------------------------------------------
+    def _claims(self, timer_id: str) -> List[str]:
+        """Aliases that have claimed *timer_id*'s current firing, from the bus.
+
+        Every bot keeps its claims in its own directory, so the listing is taken one level up:
+        a claim is only meaningful against the other bots' claims.
+        """
+        transport = self.transport
+        if transport is None or not getattr(transport, "ref", None):
+            return []
+        try:
+            names = transport.list_at_ref(WAKE_RELPATH) or []
+        except Exception:                              # noqa: BLE001 - a bad bus is not a claim
+            logger.warning("wake: could not list claims; treating this bot as the only one",
+                           exc_info=True)
+            return []
+        prefix = f"{timer_id}-"
+        claims = []
+        for name in names:
+            base = name.rsplit("/", 1)[-1]
+            if base.startswith(prefix) and base.endswith(".json"):
+                claims.append(base[len(prefix):-len(".json")])
+        return sorted(claims)
+
+    def claim(self, timer: WakeTimer) -> bool:
+        """Claim this firing. True when this bot is the one that may fire it.
+
+        The claim is an append-only file written **before** the turn starts, one per firing
+        number, and the winner is the lowest alias among the claims. A crash after the claim
+        leaves the firing un-fired rather than fired twice.
+        """
+        transport = self.transport
+        if transport is None or not getattr(transport, "ref", None):
+            return True                       # no bus to race on: this transport is alone
+        others = self._claims(timer.id)
+        if others and sorted([*others, self.safe_alias])[0] != self.safe_alias:
+            return False
+        directory = self.root / WAKE_RELPATH / self.safe_alias
+        directory.mkdir(parents=True, exist_ok=True)
+        relpath = f"{WAKE_RELPATH}/{self.safe_alias}/{timer.id}-{self.safe_alias}.json"
+        if not is_bus_document(relpath):
+            raise WakeError(f"refusing to write outside {WAKE_RELPATH}: {relpath!r}")
+        import json
+        (self.root / relpath).write_text(json.dumps(
+            {"id": timer.id, "alias": self.safe_alias, "firing": timer.attempts + 1,
+             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())),
+             "check": timer.check}), encoding="utf-8")
+        if hasattr(transport, "commit_and_push"):
+            try:
+                transport.commit_and_push(f"wakes: {timer.id} firing {timer.attempts + 1}",
+                                          paths=[relpath])
+            except Exception as exc:                   # noqa: BLE001 - the claim is local
+                logger.warning("wake: claim %s was written but not pushed: %s", relpath, exc)
+        return True
+
+
+#: Where the fire claims live on the bus (see ``swarmly.transports.base``).
+WAKE_RELPATH = WAKES_RELPATH
+
+
+def wake_dir_for(config: Any) -> Optional[Path]:
+    """The state directory a bot keeps its timers in (beside the gitbus ledger)."""
+    from swarmly.telegram.poll import transport_state_root
+    try:
+        return transport_state_root(config) / ".agents" / "state"
+    except Exception:                                  # noqa: BLE001 - optional
+        return None
+

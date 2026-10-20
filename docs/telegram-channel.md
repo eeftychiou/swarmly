@@ -887,6 +887,31 @@ recorded while running: a per-chat ledger keeps them with their timestamps and p
 past 48 h, and the dry run says how many it can no longer reach. Older General messages stay
 the admin's to delete by hand.
 
+**Self-wake timers (issue #81).** A reply can arm a timer the transport fires without a model
+turn: `WAKE in=10m every=5m until=2h check="gh pr checks 75" then="merge it"`. The line is
+stripped like the other directives and answered with one line in the topic (`⏰ wake <id>: … at
+<first fire>, every 5m, until <expiry>`), so what will run and when is auditable. The check is
+parsed with `shlex`, run without a shell in the checkout the topic uses, and may only start with
+a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|list|status|diff`,
+`gh run view|list`, `gh api` GET only, `gh issue view`, `gh search`, and
+`git status|log|diff|show|rev-parse|ls-remote|fetch`); `-X`/`--method`/`-f`/`--input`, shell
+metacharacters and anything not on `PATH` are refused, and the refusal is posted in place of the
+line. Times are absolute, so a restart resumes the schedule instead of re-arming it. Limits:
+
+| `limits.` | default | what it bounds |
+|---|---|---|
+| `wake_max` | 10 | live timers one bot may hold |
+| `wake_max_per_reply` | 3 | timers one reply may arm (the overflow is refused, not trimmed) |
+| `wake_tick_seconds` | 15 | how often the transport looks for due timers; `0` disables the loop |
+| `wake_check_seconds` | 120 | a check's own budget; past it the process group is killed |
+| `wake_max_attempts` | 50 | firings of one timer before it gives up with a turn saying so |
+| `wake_check_allow` | `["gh", "git"]` | the outer gate on which binary a check may start with |
+
+`/wakes@<bot>` lists the live timers with their next time, check and attempt count;
+`/wakes@<bot> cancel <id>` drops one (admin only); `/status@<bot>` carries `wakes=N`. A frozen
+bot runs no check. The fire claims live on the bus under `.agents/wakes/<alias>/`, so an acting
+coordinator (#83) can see a timer a dead bot left armed, and two bots cannot fire it twice.
+
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt
 failures. Each transport deletes **its own** notices from General once they are older than

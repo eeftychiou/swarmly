@@ -661,6 +661,20 @@ class ChannelLimits:
     #: before posting. A six-item round with heads and verdicts is ~2,000 characters, so the
     #: ceiling is generous by design: too small a value silently refuses a real round.
     round_state_chars: int = 8000
+    #: Issue #81: how many self-wake timers one bot may have armed at once, and how many a
+    #: single reply may arm (a reply that arms ten is refused, not silently trimmed).
+    wake_max: int = 10
+    wake_max_per_reply: int = 3
+    #: How often the transport looks for due timers.
+    wake_tick_seconds: float = 15.0
+    #: A check's own budget; past it the process group is killed and the turn says so.
+    wake_check_seconds: float = 120.0
+    #: How many firings one timer may have before it gives up with a turn that says so. 0
+    #: leaves the bound to `until` alone.
+    wake_max_attempts: int = 50
+    #: The argv prefixes a WAKE check may start with. `gh` and `git` are allowed only through
+    #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate.
+    wake_check_allow: List[str] = field(default_factory=lambda: ["gh", "git"])
     #: Issue #31: the channel's reply budget, in characters (the swarm's 500-char convention).
     #: A project may override it per topic (``projects.<key>.reply_chars``); everything else
     #: -- General, unbound topics, the reply tickets -- uses this.
@@ -714,7 +728,8 @@ class ChannelLimits:
             raise ConfigError("limits.max_messages_per_minute must be a whole number, 0 for "
                               f"max_group_messages_per_minute (got {rate!r}).")
         for key in ("busy_queue_max", "max_reply_parts", "max_parallel_turns",
-                    "reply_chars", "max_group_messages_per_minute", "round_state_chars"):
+                    "reply_chars", "max_group_messages_per_minute", "round_state_chars",
+                    "wake_max", "wake_max_per_reply", "wake_max_attempts"):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ConfigError(f"limits.{key} must be a whole number of at least 1 "
