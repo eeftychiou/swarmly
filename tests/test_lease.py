@@ -328,3 +328,44 @@ class TestLeaseSuccession(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state.holder, "Hermes")
             self.assertEqual(state.term, 2)
             self.assertTrue(state.live(1000.0))
+
+
+class TestNoAuthorityOnAFailedClaim(unittest.TestCase):
+    """#93 B2: a lease claim that never reached the bus is not authority.
+
+    Granting term 1 anyway would write the round at a term no successor can reason about -- the
+    same fail-closed rule #92 applies to a claim the bus cannot place.
+    """
+
+    def channel(self, *, fails):
+        from tests.test_telegram_channel import make_channel, make_config
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config(agent={"role": "coordinator"},
+                             fallback={"gitbus_root": tmp.name, "gitbus_ref": ""})
+        channel = make_channel(config)
+
+        class Store:
+            ttl_seconds = 600.0
+
+            def state(self, *, now=None):
+                return ls.LeaseState(status="absent", term=0, holder="", expires_at=0.0)
+
+            def claim(self, *, term=None, now=None):
+                if fails:
+                    raise ls.LeasePushError("the bus did not take it")
+                return ls.LeaseClaim(term=term or 1, alias=channel.config.identity.alias,
+                                     expires_at=1e9, nonce="abcd")
+
+        channel.lease_store = lambda: Store()
+        return channel
+
+    def test_a_failed_bootstrap_claim_grants_no_authority(self):
+        authority = self.channel(fails=True).round_authority(now=1000.0)
+        self.assertEqual(authority.alias, "")
+        self.assertEqual(authority.term, 0)
+
+    def test_a_successful_bootstrap_claim_grants_its_own_term(self):
+        authority = self.channel(fails=False).round_authority(now=1000.0)
+        self.assertEqual(authority.alias, "Hermes")
+        self.assertEqual(authority.term, 1)

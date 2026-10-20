@@ -272,7 +272,15 @@ class TestChannelWiring(unittest.TestCase):
         git(root, "commit", "-q", "-m", "bus")
         config = make_config(agent={"role": role},
                              fallback={"gitbus_root": str(root), "gitbus_ref": "main"})
-        return make_channel(config), root, event
+        channel = make_channel(config)
+        # #83 moved the authority for a round write to the lease on the bus. These tests are
+        # about the block and its write, not about who holds the lease (that is
+        # tests/test_lease.py and the channel lease tests), so the authority is supplied here.
+        from swarmly.telegram.rounds import Authority
+        channel.round_authority = lambda now=None: Authority(
+            alias=channel.config.identity.alias if role == "coordinator" else "Claudebot",
+            source="lease", term=1)
+        return channel, root, event
 
     def test_a_coordinators_block_is_stripped_and_landed_on_the_bus(self):
         channel, root, event = self.channel("coordinator")
@@ -871,6 +879,12 @@ class TestChannelAuthority(unittest.TestCase):
                              fallback={"gitbus_root": str(root), "gitbus_ref": "main"})
         channel = make_channel(config)
         channel.membership.state.coordinator = coordinator
+        # #83: the authority is the lease, so these two cases stub it directly — one names the
+        # channel's own alias (a write), one names a peer (a refusal).
+        from swarmly.telegram.rounds import Authority
+        channel.round_authority = lambda now=None: (
+            Authority(alias=coordinator, source="lease", term=1) if coordinator == "Hermes"
+            else Authority(alias="", source="lease", term=0))
         return channel, root, event
 
     def test_a_stale_coordinator_writes_nothing_and_says_why(self):

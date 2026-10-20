@@ -2325,11 +2325,17 @@ class AgentChannel:
                     try:
                         claim = store.claim(term=1, now=moment)
                         return Authority(alias=claim.alias, source="lease", term=claim.term)
-                    except LeasePushError:
-                        return Authority(alias=self.config.identity.alias, source="lease", term=1)
+                    except LeasePushError as exc:
+                        # A claim that never reached the bus is not authority: granting term 1
+                        # here would let a round be written at a term no successor can reason
+                        # about (PR #93 review, B2).
+                        logger.warning("lease: bootstrap claim was not pushed; no authority: %s",
+                                       exc)
+                        return Authority(alias="", source="lease", term=0)
                     except Exception:
-                        logger.warning("lease: failed to claim term 1 on absent lease", exc_info=True)
-                        return Authority(alias=self.config.identity.alias, source="role", term=1)
+                        logger.warning("lease: failed to claim term 1 on absent lease; "
+                                       "no authority", exc_info=True)
+                        return Authority(alias="", source="lease", term=0)
         except Exception:
             logger.warning("lease: round_authority lookup failed", exc_info=True)
         return Authority(alias="", source="lease", term=0)
