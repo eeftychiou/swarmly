@@ -28,6 +28,7 @@ import contextlib
 import html
 import json
 import logging
+import os
 import re
 import secrets
 import socket
@@ -56,7 +57,8 @@ from swarmly.telegram.commands import (
     where_reply,
 )
 from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig,
-                                     effort_problem, model_problem)
+                                     MODEL_NAME, MODEL_TYPES, effort_problem,
+                                     model_problem)
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.projects import ProjectRouter
 from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
@@ -588,6 +590,12 @@ class AgentChannel:
             else:
                 logger.warning("ignoring effort choice %r for %s in %s", value, key,
                                self._efforts_path)
+        # The model the CLI said it ran on its last turn (Claude's modelUsage), for the online
+        # notice when neither the config nor the CLI's own settings name one.
+        self._reported_model_path = _state_file(config, "cli-model")
+        reported = load_state(self._reported_model_path, "reported model").get("model")
+        self._reported_model: Optional[str] = (
+            reported if isinstance(reported, str) and MODEL_NAME.fullmatch(reported) else None)
         self._outbound_request_seq = 0
 
         self.bot: Any = None
@@ -3745,6 +3753,7 @@ class AgentChannel:
                 logger.info("turn end: message %s ok in %.1fs, %d chars, meta %s",
                             event.message_id, time.monotonic() - started,
                             len(reply.text or ""), reply.meta or {})
+                self._note_reported_model(reply.meta.get("model"))
                 if reply.meta.get("rotated"):
                     # People see that the session changed and that nothing was dropped.
                     await self.send(f"♻️ {self.config.identity.alias} wrote a handover and "
@@ -5310,15 +5319,41 @@ class AgentChannel:
                 if self._turn_slots is not None:
                     await self._pace_group()    # the retry is a post too: gap and cap
 
+    def running_model_and_effort(self) -> Tuple[Optional[str], Optional[str]]:
+        """The model and effort a General turn really runs at: /model and /reasoning, then
+        adapter.model and adapter.effort, then the CLI's own settings (cli_defaults.py), then
+        the model the CLI reported on its last turn. None where nothing names it."""
+        from swarmly.telegram.cli_defaults import cli_default
+        adapter = self.config.adapter
+        model, effort = self._model_for(None), self._effort_for(None)
+        if adapter.command:                    # a custom command line: no flag is known
+            return model, effort
+        if not (model and effort):
+            env = {**os.environ, **adapter.extra_env}
+            found = cli_default(adapter.type, adapter.cwd, env=env)
+            model, effort = model or found.model, effort or found.effort
+        return model or self._reported_model, effort
+
+    def _note_reported_model(self, model: Any) -> None:
+        """Keep the model the CLI said it ran, so the next online notice can name it."""
+        if not isinstance(model, str) or not MODEL_NAME.fullmatch(model) \
+                or model == self._reported_model:
+            return
+        self._reported_model = model
+        save_state(self._reported_model_path, {"model": model}, "reported model")
+
     def online_notice(self) -> str:
         """Startup announcement, carrying the running revision for upgrade visibility, and the
         model and reasoning effort General runs at, so the admin sees what each bot will spend
         without asking every bot for /model and /reasoning."""
         adapter = self.config.adapter
         role = f", role: {self._role_name()}" if self.config.identity.role else ""
-        model = f", model: {self._model_for(None) or 'CLI default'}"
+        running_model, running_effort = self.running_model_and_effort()
+        # A runtime with no model of its own (echo, a custom command) names none.
+        model = ("" if not running_model and (adapter.command or adapter.type not in MODEL_TYPES)
+                 else f", model: {running_model or 'not known until its first turn'}")
         effort = ("" if adapter.command or effort_problem(adapter.type, "high")
-                  else f", effort: {self._effort_for(None) or 'CLI default'}")
+                  else f", effort: {running_effort or 'the model default'}")
         return format_message(
             Envelope(type=MessageType.HELLO, to="*", intent="ONLINE",
                      ref=self._alias_ref(), rev=self._running_revision),
