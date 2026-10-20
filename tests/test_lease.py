@@ -503,9 +503,12 @@ class TestSuccessionOnExpiry(unittest.TestCase):
                                clock=lambda: now, ttl_seconds=60.0, rank=0)
         lapsed.claim(term=1)
         later = now + 3600
-        first_claim = asyncio.run(one.check_lease(now=later))
-        second_claim = asyncio.run(two.check_lease(now=later))
-        acted = [claim for claim in (first_claim, second_claim) if claim is not None]
+
+        async def run_concurrent():
+            return await asyncio.gather(one.check_lease(now=later), two.check_lease(now=later))
+
+        claims = asyncio.run(run_concurrent())
+        acted = [claim for claim in claims if claim is not None]
         self.assertEqual(len(acted), 1, "two bots claiming N+1 must not both act")
         self.assertEqual(one.lease_store().state(now=later).term, 2)
 

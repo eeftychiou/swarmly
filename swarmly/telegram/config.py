@@ -675,7 +675,7 @@ class ChannelLimits:
     wake_max_attempts: int = 50
     #: How long a takeover claim is left to settle before the claimant re-folds and acts, so two
     #: bots claiming the next term do not both act (#83). 0 acts at once, which only a test wants.
-    lease_settle_seconds: float = 5.0
+    lease_settle_seconds: float = 30.0
     #: How long the folded coordinator lease is cached before the bus is read again (#83). 0
     #: reads on every question, which is what a test wants and what a bus under load does not.
     lease_cache_seconds: float = 5.0

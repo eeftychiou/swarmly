@@ -2821,10 +2821,14 @@ class AgentChannel:
                 logger.warning("lease: %s could not claim term %d: %s", self.config.identity.alias,
                                next_term, exc)
                 return None
-            settle = float(getattr(self.config.limits, "lease_settle_seconds", 5.0) or 0.0)
+            settle = float(getattr(self.config.limits, "lease_settle_seconds", 30.0) or 0.0)
             if settle > 0:
                 await self._sleep(settle)
             self._forget_lease_cache()
+            if not store.refresh(force=True):
+                logger.warning("lease: ref refresh failed after settle for term %d; refusing to act",
+                               next_term)
+                return None
             try:
                 fresh = store.state(now=self._clock())
             except Exception:
