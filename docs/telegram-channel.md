@@ -894,7 +894,8 @@ stripped like the other directives and answered with one line in the topic (`⏰
 parsed with `shlex`, run without a shell in the checkout the topic uses, and may only start with
 a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|list|status|diff`,
 `gh run view|list`, `gh api` GET only, `gh issue view`, `gh search`, and
-`git status|log|diff|show|rev-parse|ls-remote|fetch`); `-X`/`--method`/`-f`/`--input`, shell
+`git status|log|diff|show|rev-parse|ls-remote` — never `git fetch`, whose `ext::` remotes run a
+command); `-X`/`--method`/`-f`/`--input`/`--output`, shell
 metacharacters and anything not on `PATH` are refused, and the refusal is posted in place of the
 line. Times are absolute, so a restart resumes the schedule instead of re-arming it. Limits:
 

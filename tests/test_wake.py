@@ -155,12 +155,17 @@ class TestTimer(unittest.TestCase):
             with self.subTest(data=data), self.assertRaises(wk.WakeError):
                 wk.WakeTimer.from_dict(data)
 
-    def test_ready_fires_once_and_is_done(self):
+    def test_ready_fires_once_and_waits_to_be_marked_done(self):
         timer = self.timer()
         action = wk.decide(timer, 0, now=1000.0)
         self.assertEqual(action.kind, "fire")
-        self.assertEqual(timer.state, "done")
+        # Not "done" yet: the transport writes the turn down first, then retires the timer,
+        # so a crash in between replays it instead of losing it.
+        self.assertEqual(timer.state, "firing")
         self.assertEqual(timer.fires, 1)
+        self.assertFalse(timer.in_flight)          # no turn written yet
+        timer.pending = "the turn"
+        self.assertTrue(timer.in_flight)
 
     def test_pending_rearms_silently(self):
         timer = self.timer()
@@ -514,27 +519,41 @@ class TestClaimIsNotFailOpen(unittest.TestCase):
 
     def test_two_bots_who_both_saw_nothing_leave_one_winner(self):
         with TemporaryDirectory() as tmp:
-            # Both build their claim before either is visible: the second write is what the
-            # re-read catches, so only one of them may fire.
-            seen = {"calls": 0}
-            transport = _BusTransport(tmp)
-
-            class Racing(_BusTransport):
-                """Both pre-reads see nothing (a genuine race); the post-write reads decide."""
+            # A genuine race: each bot's *pre*-read sees nothing, both write, and the shared
+            # post-read (the fold) decides. Exactly one wins, and it is the lowest alias.
+            class Blind(_BusTransport):
+                def __init__(self, root):
+                    super().__init__(root)
+                    self.calls = 0
 
                 def list_at_ref(self, relpath):
-                    seen["calls"] += 1
-                    if seen["calls"] <= 2:
+                    self.calls += 1
+                    if self.calls == 1:            # the pre-read, before either claim exists
                         return []
                     return super().list_at_ref(relpath)
 
-            transport = Racing(tmp)
-            antigravity = wk.WakeStore("antigravity", state_dir=Path(tmp), transport=transport,
-                                       root=Path(tmp), clock=lambda: 1000.0)
-            zulu = wk.WakeStore("zulu", state_dir=Path(tmp), transport=Racing(tmp),
+            antigravity = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                       transport=Blind(tmp), root=Path(tmp),
+                                       clock=lambda: 1000.0)
+            zulu = wk.WakeStore("zulu", state_dir=Path(tmp), transport=Blind(tmp),
                                 root=Path(tmp), clock=lambda: 1000.0)
-            self.assertTrue(antigravity.claim(self.timer()))
-            self.assertFalse(zulu.claim(self.timer()))
+            results = {"antigravity": antigravity.claim(self.timer()),
+                       "zulu": zulu.claim(self.timer())}
+            self.assertEqual(sum(1 for won in results.values() if won), 1, results)
+            self.assertTrue(results["antigravity"], results)
+
+    def test_a_post_read_without_our_own_claim_does_not_fire(self):
+        with TemporaryDirectory() as tmp:
+            class NeverConfirms(_BusTransport):
+                """The bus never shows our claim: unconfirmed is not a win."""
+
+                def list_at_ref(self, relpath):
+                    return []
+
+            store = wk.WakeStore("claude", state_dir=Path(tmp),
+                                 transport=NeverConfirms(tmp), root=Path(tmp),
+                                 clock=lambda: 1000.0)
+            self.assertFalse(store.claim(self.timer()))
 
     def test_an_unreadable_bus_does_not_fire(self):
         with TemporaryDirectory() as tmp:
@@ -608,3 +627,142 @@ class TestStorageIsPerTimer(unittest.TestCase):
                                    expires_at=99, every_seconds=0, chat_id=-1), max_timers=10)
             (Path(tmp) / "wake-claude" / "broken.json").write_text("{", encoding="utf-8")
             self.assertEqual(len(store.load()), 1)
+
+
+class TestFetchIsGone(unittest.TestCase):
+    """Codex blocker 1: `git fetch ext::<cmd>` is arbitrary command execution."""
+
+    def test_git_fetch_is_not_allowed(self):
+        with self.assertRaises(wk.WakeError):
+            wk.validate_check("git fetch origin")
+        with self.assertRaises(wk.WakeError):
+            wk.validate_check("git fetch ext::curl -I https://example.invalid")
+
+    def test_git_ls_remote_is_still_allowed(self):
+        self.assertEqual(wk.validate_check("git ls-remote origin"),
+                         ("git", "ls-remote", "origin"))
+
+
+class TestRefreshBeforeClaim(unittest.TestCase):
+    """R1: a peer's claim from a minute ago must be visible, not wait for the poll."""
+
+    def timer(self, ident="abc12345"):
+        return wk.WakeTimer(argv=("gh", "pr", "checks", "75"), then="merge", next_at=1000.0,
+                            expires_at=2000.0, every_seconds=300.0, chat_id=-1, id=ident)
+
+    def test_a_claim_only_after_refresh_is_honoured(self):
+        with TemporaryDirectory() as tmp:
+            class Lagging(_BusTransport):
+                """The ref is stale until refresh(): a peer's claim is invisible before it."""
+
+                def __init__(self, root):
+                    super().__init__(root)
+                    self.refreshes = 0
+
+                def list_at_ref(self, relpath):
+                    if self.refreshes < 2:          # pre-read and its re-read are stale
+                        return []
+                    return super().list_at_ref(relpath)
+
+                def refresh(self):
+                    self.refreshes += 1
+
+            winner = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                  transport=_BusTransport(tmp), root=Path(tmp),
+                                  clock=lambda: 1000.0)
+            self.assertTrue(winner.claim(self.timer()))
+
+            lagging = Lagging(tmp)
+            store = wk.WakeStore("zulu", state_dir=Path(tmp), transport=lagging,
+                                 root=Path(tmp), clock=lambda: 1000.0)
+            self.assertFalse(store.claim(self.timer()))
+            self.assertGreaterEqual(lagging.refreshes, 1)
+
+
+class TestAdoption(unittest.TestCase):
+    """Codex blocker 3: a successor must be able to take a dead bot's timer over."""
+
+    def timer(self, alias="antigravity"):
+        return wk.WakeTimer(argv=("gh", "pr", "checks", "75"), then="merge it",
+                            next_at=1000.0, expires_at=2000.0, every_seconds=300.0,
+                            chat_id=-7, thread_id=12, topic="Round 4", alias=alias,
+                            id="abc12345")
+
+    def test_a_claim_carries_the_whole_timer(self):
+        with TemporaryDirectory() as tmp:
+            dead = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            self.assertTrue(dead.claim(self.timer()))
+            payload = json.loads(next(
+                (Path(tmp) / ".agents" / "wakes" / "antigravity").glob("*.json")
+            ).read_text(encoding="utf-8"))
+            self.assertEqual(payload["timer"]["then"], "merge it")
+            self.assertEqual(payload["timer"]["topic"], "Round 4")
+            self.assertEqual(payload["timer"]["thread_id"], 12)
+
+    def test_a_successor_adopts_the_armed_timer(self):
+        with TemporaryDirectory() as tmp:
+            dead = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            dead.claim(self.timer())
+            heir = wk.WakeStore("claudebot", state_dir=Path(tmp) / "heir",
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            taken = heir.adopt(max_timers=10)
+            self.assertEqual([timer.id for timer in taken], ["abc12345"])
+            self.assertEqual(taken[0].alias, "claudebot")
+            self.assertEqual(taken[0].then, "merge it")
+            self.assertEqual(heir.live_count, 1)
+
+    def test_a_finished_timer_is_not_adopted(self):
+        with TemporaryDirectory() as tmp:
+            dead = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            finished = self.timer()
+            finished.state = "done"
+            dead.claim(finished)
+            heir = wk.WakeStore("claudebot", state_dir=Path(tmp) / "heir",
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            self.assertEqual(heir.adopt(max_timers=10), [])
+
+
+class TestCrashWindow(unittest.TestCase):
+    """Codex blocker 3b: a ready turn written down is replayed, not lost."""
+
+    def channel(self):
+        from tests.test_telegram_channel import make_channel, make_config
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config(agent={"role": "developer"},
+                             fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
+                             limits={"wake_tick_seconds": 0})
+        channel = make_channel(config)
+        state_dir = Path(tmp.name) / "state"
+        channel.wake_store = lambda: wk.WakeStore(
+            channel.config.identity.alias, state_dir=state_dir, transport=None,
+            root=Path(tmp.name), clock=time.time)
+        return channel
+
+    def test_a_written_but_unstarted_turn_is_replayed_once(self):
+        import asyncio
+        channel = self.channel()
+        started = []
+        channel._run_own_task = lambda text, chat_id, thread_id, name: started.append(text)
+        store = channel.wake_store()
+        timer = wk.WakeTimer(argv=("git", "status"), then="merge it", next_at=1.0,
+                             expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
+                             alias=channel.config.identity.alias, state="firing",
+                             pending="the turn that was about to start")
+        store.add(timer, max_timers=10)
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(done, [f"{timer.id}: replayed after a restart"])
+        self.assertEqual(started, ["the turn that was about to start"])
+        self.assertEqual(store.live_count, 0)
+        # A second tick replays nothing: the turn is not repeated.
+        started.clear()
+        self.assertEqual(asyncio.run(channel._wake_tick(now=time.time())), [])
+        self.assertEqual(started, [])

@@ -88,8 +88,10 @@ ALLOWED_ARGV: Tuple[Tuple[str, ...], ...] = (
     ("git", "show"),
     ("git", "rev-parse"),
     ("git", "ls-remote"),
-    ("git", "fetch"),
 )
+#: Deliberately absent: ``git fetch``. Its repository argument accepts ``ext::<command>``,
+#: which git runs as a remote helper -- an arbitrary command execution that no shell
+#: metacharacter check can see (PR #92 review, Codex blocker 1).
 
 #: Flags that turn a read into a write, as canonical flag names. Matched after
 #: normalization, because gh accepts an attached value: ``-XPOST`` is ``-X POST`` and
@@ -328,7 +330,11 @@ class WakeTimer:
     fires: int = 0
     last_exit: Optional[int] = None
     last_tail: str = ""
-    state: str = "armed"          # armed | done | expired | failed | cancelled
+    #: The turn a ready firing was about to start. Persisted *before* it starts, so a crash
+    #: in that window replays the turn on the next tick instead of losing it.
+    pending: str = ""
+    #: armed | firing (turn written, not yet started) | done | expired | failed | cancelled
+    state: str = "armed"
 
     def __post_init__(self) -> None:
         self.argv = tuple(self.argv)
@@ -343,7 +349,12 @@ class WakeTimer:
 
     @property
     def live(self) -> bool:
-        return self.state == "armed"
+        return self.state in ("armed", "firing")
+
+    @property
+    def in_flight(self) -> bool:
+        """A ready firing whose turn was written down but has not been started yet."""
+        return self.state == "firing" and bool(self.pending)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -352,7 +363,7 @@ class WakeTimer:
             "every_seconds": self.every_seconds, "chat_id": self.chat_id,
             "thread_id": self.thread_id, "topic": self.topic, "created_at": self.created_at,
             "attempts": self.attempts, "fires": self.fires, "last_exit": self.last_exit,
-            "last_tail": self.last_tail, "state": self.state,
+            "last_tail": self.last_tail, "pending": self.pending, "state": self.state,
         }
 
     @classmethod
@@ -384,6 +395,7 @@ class WakeTimer:
             last_exit=(int(data["last_exit"]) if isinstance(data.get("last_exit"), int)
                        and not isinstance(data.get("last_exit"), bool) else None),
             last_tail=str(data.get("last_tail") or ""),
+            pending=str(data.get("pending") or ""),
             state=str(data.get("state") or "armed"),
         )
 
@@ -430,7 +442,9 @@ def decide(timer: WakeTimer, returncode: Optional[int], *, now: float,
         return WakeAction("error", timer, reason="the check did not finish")
     verdict = classify(timer.argv, returncode)
     if verdict == READY:
-        timer.state = "done"
+        # Not "done" yet: the turn text is written to the record first, so a crash between
+        # here and the turn replays it once instead of losing it (PR #92 review, blocker 3).
+        timer.state = "firing"
         timer.fires += 1
         return WakeAction("fire", timer)
     if verdict == PENDING and timer.every_seconds:
@@ -594,6 +608,51 @@ class WakeStore:
     def replace(self, timer: WakeTimer) -> None:
         self.write(timer)
 
+    def pending_firings(self) -> List[WakeTimer]:
+        """Timers whose turn was written but not started: replayed once after a restart."""
+        return [timer for timer in self.load() if timer.in_flight]
+
+    def adopt(self, *, max_timers: int) -> List[WakeTimer]:
+        """Take over armed timers this checkout does not have, from the bus claims.
+
+        A claim carries the whole timer, so a successor can rebuild a dead bot's schedule
+        instead of watching the promise die with it (PR #92 review, blocker 3).
+        """
+        transport = self.transport
+        if transport is None or not getattr(transport, "ref", None):
+            return []
+        self.refresh()
+        try:
+            names = transport.list_at_ref(WAKE_RELPATH)
+        except Exception:                              # noqa: BLE001 - adoption is optional
+            return []
+        if not names:
+            return []
+        mine = {timer.id for timer in self.load()}
+        taken: List[WakeTimer] = []
+        for name in names:
+            if not name.endswith(".json") or "/" not in name:
+                continue
+            owner = name.split("/", 1)[0]
+            if owner == self.safe_alias:
+                continue
+            try:
+                payload = json.loads(transport.read_at_ref(f"{WAKE_RELPATH}/{name}") or "{}")
+                row = (payload or {}).get("timer")
+                if not isinstance(row, dict):
+                    continue
+                timer = WakeTimer.from_dict(row)
+            except Exception:                          # noqa: BLE001 - one bad claim, skip it
+                continue
+            if not timer.live or timer.id in mine or timer.alias == self.alias:
+                continue
+            if len(taken) + self.live_count >= max_timers:
+                break
+            timer.alias = self.alias          # this bot now holds the promise
+            self.write(timer)
+            taken.append(timer)
+        return taken
+
     @property
     def live_count(self) -> int:
         return len([timer for timer in self.load() if timer.live])
@@ -608,6 +667,21 @@ class WakeStore:
         next one (PR #92 review, blocker 2).
         """
         return int(timer.next_at)
+
+    def refresh(self) -> None:
+        """Fetch the bus ref, so a claim written seconds ago by a peer is visible.
+
+        Without this the claim reads whatever the last poll fetched (30 minutes by default)
+        and two bots can both believe they are alone (PR #92 review, R1).
+        """
+        transport = self.transport
+        if transport is None or not getattr(transport, "ref", None):
+            return
+        if hasattr(transport, "refresh"):
+            try:
+                transport.refresh()
+            except Exception:                          # noqa: BLE001 - reported by the read
+                logger.warning("wake: the bus ref could not be refreshed", exc_info=True)
 
     def _claims(self, timer_id: str, firing: int) -> Optional[List[str]]:
         """Aliases that have claimed *timer_id*'s *firing*, or ``None`` if unreadable."""
@@ -641,6 +715,7 @@ class WakeStore:
         if transport is None or not getattr(transport, "ref", None):
             return True                       # no bus to race on: this transport is alone
         firing = self.firing_of(timer)
+        self.refresh()                    # a peer's claim from a minute ago must be visible
         before = self._claims(timer.id, firing)
         if before is None:
             return False                      # a broken bus is not "I am the only one"
@@ -654,7 +729,7 @@ class WakeStore:
         (self.root / relpath).write_text(json.dumps(
             {"id": timer.id, "alias": self.safe_alias, "firing": firing,
              "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())),
-             "check": timer.check}), encoding="utf-8")
+             "check": timer.check, "timer": timer.to_dict()}), encoding="utf-8")
         if hasattr(transport, "commit_and_push"):
             try:
                 transport.commit_and_push(f"wakes: {timer.id} firing {firing}",
@@ -662,10 +737,13 @@ class WakeStore:
             except Exception as exc:                   # noqa: BLE001 - do not fire on it
                 logger.warning("wake: claim %s was written but not pushed: %s", relpath, exc)
                 return False
+        self.refresh()
         after = self._claims(timer.id, firing)
-        if after is None:
+        if after is None or self.safe_alias not in after:
+            # The post-read must show this bot's own claim: an empty list means the bus did
+            # not confirm it, not that this bot won (PR #92 review, R2).
             return False
-        return sorted(after or [self.safe_alias])[0] == self.safe_alias
+        return sorted(after)[0] == self.safe_alias
 
 
 #: Where the fire claims live on the bus (see ``swarmly.transports.base``).

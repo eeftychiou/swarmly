@@ -2406,8 +2406,22 @@ class AgentChannel:
             return ["paused: no check runs while this bot is paused"]
         store = self.wake_store()
         done: List[str] = []
+        try:                                         # a dead bot's armed timers are promises
+            for adopted in await asyncio.to_thread(
+                    store.adopt, max_timers=max(1, int(self.config.limits.wake_max))):
+                done.append(f"{adopted.id}: adopted from the bus")
+        except Exception:                            # noqa: BLE001 - adoption is best effort
+            logger.warning("wake: adoption failed; carrying on", exc_info=True)
+        for pending in store.pending_firings():
+            # A ready turn that was written down but not started (a crash in that window):
+            # replay it once, then retire the timer.
+            self._run_own_task(pending.pending, pending.chat_id, pending.thread_id,
+                               pending.topic or None)
+            pending.state, pending.pending = "done", ""
+            store.replace(pending)
+            done.append(f"{pending.id}: replayed after a restart")
         for timer in store.due(moment):
-            if not store.claim(timer):
+            if not await asyncio.to_thread(store.claim, timer):
                 done.append(f"{timer.id}: another bot claimed this firing")
                 continue
             code, tail = await run_check_async(
@@ -2416,13 +2430,23 @@ class AgentChannel:
             action = decide(timer, code, now=moment,
                             max_attempts=int(self.config.limits.wake_max_attempts))
             timer.last_exit, timer.last_tail = code, tail
-            store.replace(action.timer)
             done.append(f"{timer.id}: {action.kind}")
-            if action.kind in ("fire", "error", "expire"):
+            if action.kind == "fire":
+                # Write the turn down before starting it, then retire the timer.
+                timer.pending = self._wake_prompt(action)
+                store.replace(timer)
+                self._run_own_task(timer.pending, timer.chat_id, timer.thread_id,
+                                   timer.topic or None)
+                timer.state, timer.pending = "done", ""
+                store.replace(timer)
+            elif action.kind in ("error", "expire"):
+                store.replace(action.timer)
                 self._run_own_task(
                     self._wake_prompt(action, failed=action.kind == "error",
                                       expired=action.kind == "expire"),
                     timer.chat_id, timer.thread_id, timer.topic or None)
+            else:
+                store.replace(action.timer)
         return done
 
     @staticmethod
