@@ -2507,11 +2507,21 @@ class AgentChannel:
     # -- self-wake timers (issue #81) ---------------------------------------------------
 
     def wake_store(self) -> Any:
-        """This bot's timers: a local file keeps the schedule, the bus carries the claims."""
+        """This bot's timers: a local file keeps the schedule, the bus carries the claims.
+
+        One store per bus root, kept for the life of the channel. On a git bus a claim's
+        settle window starts at the confirmation the store keeps in memory (the bus gives an
+        arrival *rank*, not a time), so a store built afresh every tick forgot it each time
+        and answered "wait" forever: no WAKE on a git bus ever fired (live, round 4)."""
         from swarmly.telegram.wake import WakeStore, wake_dir_for
         root = self._gitbus_root()
-        return WakeStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
-                         transport=self.bus_transport(root), root=root, clock=time.time)
+        cached = getattr(self, "_wake_store_cache", None)
+        if cached is not None and cached[0] == root:
+            return cached[1]
+        store = WakeStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
+                          transport=self.bus_transport(root), root=root, clock=time.time)
+        self._wake_store_cache = (root, store)
+        return store
 
     def apply_wake_lines(self, text: str, event: ChannelEvent) -> str:
         """Arm the ``WAKE`` lines in a reply, and strip them from it.
@@ -2559,9 +2569,13 @@ class AgentChannel:
 
     async def _wake_loop(self) -> None:
         """Fire due timers: one check, one action, for as long as this bot runs."""
+        last: List[str] = []
         while True:                                  # cancelled by stop(), like the others
             try:
-                await self._wake_tick()
+                done = await self._wake_tick()
+                if done and done != last:            # what each timer did, once per change:
+                    logger.info("wake: %s", "; ".join(done))   # a stuck timer must show
+                last = done or []
                 self.check_coordinator_watch()
             except asyncio.CancelledError:
                 raise
