@@ -180,7 +180,7 @@ def _parse_int(where: str, value: Any, default: int, *, positive: bool = False) 
 #: against :class:`ChannelLimits`.
 KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "": ("agent", "peers", "adapter", "limits", "fallback", "bus", "projects", "github",
-         "public_redactions"),
+         "public_redactions", "swarm"),
     "agent": ("name", "alias", "bot_token", "bot_token_env", "home_channel_id",
               "admin_user_id", "maintainer_username", "allowed_users", "git_name",
               "git_email", "role"),
@@ -194,6 +194,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "fallback": ("gitbus_root", "gitbus_ref", "gitbus_poll_minutes"),
     "projects": ("repo", "cwd", "topics", "worktrees", "reply_chars"),
     "github": ("login", "token_env", "poll_minutes", "mark_read", "tracking_label"),
+    "swarm": ("succession",),
 }
 
 
@@ -212,7 +213,7 @@ def unknown_keys(data: Dict[str, Any]) -> List[str]:
             found.append(f"{where}: unknown key, ignored{hint}")
 
     report("", data, KNOWN_KEYS[""])
-    for section in ("agent", "adapter", "bus", "fallback", "github"):
+    for section in ("agent", "adapter", "bus", "fallback", "github", "swarm"):
         raw = data.get(section)
         if isinstance(raw, dict):
             report(section, raw, KNOWN_KEYS[section])
@@ -679,6 +680,10 @@ class ChannelLimits:
     #: The argv prefixes a WAKE check may start with. `gh` and `git` are allowed only through
     #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate.
     wake_check_allow: List[str] = field(default_factory=lambda: ["gh", "git"])
+    #: Issue #83: how long without a renewal before successors take over the coordinator lease.
+    takeover_minutes: float = 10.0
+    #: How often the active coordinator renews its lease.
+    lease_renew_seconds: float = 120.0
     #: Issue #31: the channel's reply budget, in characters (the swarm's 500-char convention).
     #: A project may override it per topic (``projects.<key>.reply_chars``); everything else
     #: -- General, unbound topics, the reply tickets -- uses this.
@@ -909,6 +914,7 @@ class AgentConfig:
     #: payloads and GitHub-facing text). Empty by default: nothing is redacted until the
     #: operator names what is sensitive on this machine.
     public_redactions: Dict[str, str] = field(default_factory=dict)
+    swarm: Dict[str, Any] = field(default_factory=dict)
     source_path: Optional[Path] = None
     # Whether ``bus.poll_minutes`` was explicitly present in the raw config.
     # Validation must name the key the operator actually wrote — the resolved
@@ -1259,9 +1265,11 @@ class AgentConfig:
                     if not name.lstrip("-").isdigit()]
         for line in unknown:
             logger.warning("config: %s", line)
+        swarm_raw = data.get("swarm") or {}
+        swarm = dict(swarm_raw) if isinstance(swarm_raw, dict) else {}
         return cls(identity=identity, peers=peers, peer_roles=peer_roles, adapter=adapter, limits=limits,
                    fallback=fallback, bus=bus, projects=projects_dict, github=github,
-                   public_redactions=public_redactions, source_path=source_path,
+                   public_redactions=public_redactions, swarm=swarm, source_path=source_path,
                    _bus_poll_minutes_explicit=bool(bus_poll_explicit),
                    unknown_keys=unknown)
 

@@ -1150,6 +1150,10 @@ class AgentChannel:
                 result += f" wakes={self.wake_store().live_count}"
             except Exception:                          # noqa: BLE001 - /status must answer
                 result += " wakes=?"
+            try:
+                result += f" {self.lease_store().state().describe()}"
+            except Exception:                          # noqa: BLE001 - /status must answer
+                result += " coordinator=none(unverifiable)"
             result += f" peers={','.join(self.config.peers) or 'none'}"
             if self.config.identity.role:
                 result += f" role={self._role_name()}"
@@ -2245,6 +2249,73 @@ class AgentChannel:
 
     # -- durable round state (issue #86) ------------------------------------------------
 
+    def lease_store(self) -> Any:
+        from swarmly.telegram.lease import LeaseStore, succession_order
+        root = self._gitbus_root()
+        role = str(self.config.identity.role or "").strip().lower()
+        succession = getattr(self.config, "swarm", {}).get("succession") or ()
+        rank = succession_order(role, order=succession)
+        limits = getattr(self.config, "limits", None)
+        takeover = getattr(limits, "takeover_minutes", 10.0) if limits else 10.0
+        ttl = max(float(takeover) * 60.0, 60.0)
+        return LeaseStore(self.config.identity.alias, transport=self.bus_transport(root),
+                          root=root, clock=time.time, ttl_seconds=ttl, rank=rank)
+
+    def current_coordinator(self, *, now: Optional[float] = None) -> Optional[str]:
+        """Who leads the swarm right now, decided by the bus lease."""
+        try:
+            store = self.lease_store()
+            moment = time.time() if now is None else now
+            state = store.state(now=moment)
+            if state.live(moment):
+                return state.holder
+        except Exception:
+            logger.warning("lease: current_coordinator lookup failed", exc_info=True)
+        return None
+
+    def is_coordinator(self, *, now: Optional[float] = None) -> bool:
+        """Whether this bot is currently the coordinator under the bus lease."""
+        leader = self.current_coordinator(now=now)
+        if leader:
+            return leader.strip().lower() == self.config.identity.alias.strip().lower()
+        try:
+            state = self.lease_store().state(now=now)
+            if state.status == "absent":
+                coord = (getattr(self.membership.state, "coordinator", None) or "").strip()
+                if coord:
+                    return coord.lower() == self.config.identity.alias.strip().lower()
+                return str(self.config.identity.role or "").strip().lower() == "coordinator"
+        except Exception:
+            return False
+        return False
+
+    def round_authority(self, *, now: Optional[float] = None) -> Any:
+        """The alias and term the bus lease names as the coordinator."""
+        from swarmly.telegram.rounds import Authority
+        from swarmly.telegram.lease import LeasePushError
+        try:
+            store = self.lease_store()
+            moment = time.time() if now is None else now
+            state = store.state(now=moment)
+            if state.live(moment):
+                return Authority(alias=state.holder, source="lease", term=state.term)
+            if state.status == "absent":
+                coord = (getattr(self.membership.state, "coordinator", None) or "").strip()
+                if coord and coord.lower() != self.config.identity.alias.strip().lower():
+                    return Authority(alias=coord, source="membership", term=0)
+                if str(self.config.identity.role or "").strip().lower() == "coordinator":
+                    try:
+                        claim = store.claim(term=1, now=moment)
+                        return Authority(alias=claim.alias, source="lease", term=claim.term)
+                    except LeasePushError:
+                        return Authority(alias=self.config.identity.alias, source="lease", term=1)
+                    except Exception:
+                        logger.warning("lease: failed to claim term 1 on absent lease", exc_info=True)
+                        return Authority(alias=self.config.identity.alias, source="role", term=1)
+        except Exception:
+            logger.warning("lease: round_authority lookup failed", exc_info=True)
+        return Authority(alias="", source="lease", term=0)
+
     def round_store(self) -> Any:
         """The store for this bot's round state: the bus it already polls.
 
@@ -2254,7 +2325,8 @@ class AgentChannel:
         from swarmly.telegram.rounds import RoundStore
         root = self._gitbus_root()
         return RoundStore(self.bus_transport(root), root=root, clock=time.time,
-                          alias=self.config.identity.alias)
+                          alias=self.config.identity.alias,
+                          authority=self.round_authority())
 
     def _round_repo(self, event: Optional[ChannelEvent]) -> str:
         if event is None:
@@ -2273,17 +2345,24 @@ class AgentChannel:
         return f"{repo}#{number}" if repo else number
 
     def _is_round_coordinator(self) -> bool:
-        """Whether this bot is the coordinator -- the only bot that writes the round state.
-
-        The role file is the answer when it can be read; the configured role is the fallback,
-        because an unreadable roles directory must not silently turn off the round's state.
-        """
-        if str(self.config.identity.role or "").strip().lower() == "coordinator":
+        """Whether this bot is the coordinator -- the only bot that writes the round state."""
+        if self.is_coordinator():
             return True
+        return str(self.config.identity.role or "").strip().lower() == "coordinator" 
+
+    def _on_demoted_from_coordinator(self) -> None:
         try:
-            return bool(self.membership.is_coordinator())
-        except Exception:                                  # noqa: BLE001 - never fatal
-            return False
+            self.lease_store().yield_lease(reason="superseded by /role")
+        except Exception:
+            logger.warning("lease: failed to yield on demotion", exc_info=True)
+
+    def _on_promoted_to_coordinator(self) -> None:
+        try:
+            store = self.lease_store()
+            current = store.state()
+            store.claim(term=current.term + 1, force=True)
+        except Exception:
+            logger.warning("lease: failed to claim on promotion", exc_info=True)
 
     def apply_round_block(self, text: str, event: ChannelEvent) -> str:
         """Take the ``ROUND_STATE`` block out of a reply, and put it on the bus.

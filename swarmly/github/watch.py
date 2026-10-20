@@ -457,6 +457,8 @@ class GitHubWatcher:
 
     def _is_coordinator(self) -> bool:
         """Only the coordinator posts the round report; a developer's watcher stays quiet."""
+        if self.channel is not None and hasattr(self.channel, "is_coordinator"):
+            return bool(self.channel.is_coordinator())
         return (self.config.identity.role or "").strip().lower() == "coordinator"
 
     async def _deliver(self, project: Optional[ProjectSettings], incoming: IncomingMessage,
