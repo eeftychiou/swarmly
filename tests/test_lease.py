@@ -822,6 +822,7 @@ class TestPeerDoesNotPoll(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         channel = MagicMock()
         channel.is_coordinator.return_value = False
+        channel.lease_fence.return_value = False
         client = MagicMock()
         client.notifications.return_value = []
         watcher = GitHubWatcher(make_test_config(tmp.name, role="coordinator"), client=client,
@@ -829,6 +830,31 @@ class TestPeerDoesNotPoll(unittest.TestCase):
         outcome = asyncio.run(watcher.poll_once())
         self.assertEqual(outcome.polled_repos, [])
         client.notifications.assert_not_called()
+
+    def test_a_displaced_coordinator_does_not_poll_on_a_cached_fold(self):
+        """Codex's blocker: `is_coordinator()` can answer from a fold up to 5s old.
+
+        The poll asks the fence instead, which re-reads the lease, so a bot displaced a moment
+        ago does not read the shared login beside its successor.
+        """
+        import asyncio
+        from unittest.mock import MagicMock
+        from swarmly.github.watch import GitHubWatcher
+        from tests.test_github_watch import make_test_config
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        channel = MagicMock()
+        channel.is_coordinator.return_value = True          # stale: says yes
+        channel.lease_fence.return_value = False            # fresh: says no
+        client = MagicMock()
+        client.notifications.return_value = []
+        watcher = GitHubWatcher(make_test_config(tmp.name, role="coordinator"), client=client,
+                                state_path=Path(tmp.name) / "s.json", channel=channel)
+        outcome = asyncio.run(watcher.poll_once())
+        self.assertEqual(outcome.polled_repos, [])
+        client.notifications.assert_not_called()
+        channel.lease_fence.assert_called()
 
 
 class TestRenewalKeepsTheEarliestDepth(unittest.TestCase):
