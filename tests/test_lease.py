@@ -196,3 +196,103 @@ class TestStore(unittest.TestCase):
             next_term = searcher.claim(term=state.term + 1)
             self.assertEqual(next_term.term, 2)
             self.assertTrue(searcher.state(now=now["t"]).holds("Antigravity", now["t"]))
+
+
+class TestLeaseSuccession(unittest.IsolatedAsyncioTestCase):
+    """Reasonix B1: automatic renewal and takeover on expiry."""
+
+    def channel(self, root: Path, alias: str, role: str, peer_roles: dict, clock_state: dict):
+        from tests.test_telegram_channel import make_channel, make_config
+        config = make_config(
+            agent={"alias": alias, "role": role},
+            bus={"transport": "folder", "folder": str(root), "repo": str(root)},
+            limits={"takeover_minutes": 10.0, "lease_renew_seconds": 60.0},
+        )
+        config.peer_roles = peer_roles
+        return make_channel(config, clock=lambda: clock_state["t"])
+
+    async def test_renewal_moves_the_expiry(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = {"t": 1000.0}
+            ch = self.channel(root, "Claude", "coordinator", {"Codex": "reviewer"}, clock)
+            first = await ch.check_lease(now=1000.0)
+            self.assertIsNotNone(first)
+            self.assertEqual(first.term, 1)
+            self.assertEqual(first.expires_at, 1600.0)
+
+            clock["t"] = 1070.0
+            renewed = await ch.check_lease(now=1070.0)
+            self.assertIsNotNone(renewed)
+            self.assertEqual(renewed.term, 1)
+            self.assertEqual(renewed.expires_at, 1670.0)
+            self.assertEqual(ch.lease_store().state(now=1070.0).expires_at, 1670.0)
+
+    async def test_expiry_makes_exactly_one_successor_claim_n_plus_1(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = {"t": 1000.0}
+            claude = self.channel(root, "Claude", "coordinator",
+                                  {"Codex": "reviewer", "Antigravity": "developer"}, clock)
+            codex = self.channel(root, "Codex", "reviewer",
+                                 {"Claude": "coordinator", "Antigravity": "developer"}, clock)
+            antigravity = self.channel(root, "Antigravity", "developer",
+                                       {"Claude": "coordinator", "Codex": "reviewer"}, clock)
+
+            await claude.check_lease(now=1000.0)
+            self.assertEqual(claude.lease_store().state(now=1000.0).holder, "Claude")
+
+            clock["t"] = 1700.0
+            self.assertFalse(codex.lease_store().state(now=1700.0).live(1700.0))
+
+            codex_claim = await codex.check_lease(now=1700.0)
+            self.assertIsNotNone(codex_claim)
+            self.assertEqual(codex_claim.term, 2)
+            self.assertEqual(codex_claim.alias, "Codex")
+
+            await antigravity.check_lease(now=1700.0)
+            self.assertEqual(antigravity.lease_store().state(now=1700.0).holder, "Codex")
+
+    async def test_a_frozen_successor_is_skipped(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = {"t": 1000.0}
+            claude = self.channel(root, "Claude", "coordinator",
+                                  {"Codex": "reviewer", "Antigravity": "developer"}, clock)
+            antigravity = self.channel(root, "Antigravity", "developer",
+                                       {"Claude": "coordinator", "Codex": "reviewer"}, clock)
+
+            await claude.check_lease(now=1000.0)
+
+            clock["t"] = 1700.0
+            antigravity._peers_frozen["Codex"] = {"until": None, "reason": "test"}
+
+            ag_claim = await antigravity.check_lease(now=1700.0)
+            self.assertIsNotNone(ag_claim)
+            self.assertEqual(ag_claim.term, 2)
+            self.assertEqual(ag_claim.alias, "Antigravity")
+            self.assertEqual(antigravity.lease_store().state(now=1700.0).holder, "Antigravity")
+
+    async def test_the_tick_after_a_clean_takeover_renews_at_n_plus_1(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = {"t": 1000.0}
+            codex = self.channel(root, "Codex", "reviewer",
+                                 {"Claude": "coordinator"}, clock)
+
+            leases_dir = root / ".agents" / "leases"
+            leases_dir.mkdir(parents=True, exist_ok=True)
+            (leases_dir / "000001-claude-aaaa.json").write_text(json.dumps({
+                "term": 1, "alias": "Claude", "expires_at": 500.0, "renews_at": 100.0
+            }), encoding="utf-8")
+
+            takeover = await codex.check_lease(now=1000.0)
+            self.assertIsNotNone(takeover)
+            self.assertEqual(takeover.term, 2)
+            self.assertEqual(takeover.expires_at, 1600.0)
+
+            clock["t"] = 1070.0
+            renewed = await codex.check_lease(now=1070.0)
+            self.assertIsNotNone(renewed)
+            self.assertEqual(renewed.term, 2)
+            self.assertEqual(renewed.expires_at, 1670.0)

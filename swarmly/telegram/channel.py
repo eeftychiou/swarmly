@@ -382,6 +382,7 @@ class AgentChannel:
             self.adapter.use_child_registry(_state_file(config, "children"))
         # durable-plane fallback (fallback.gitbus_poll_minutes)
         self._bus_task: Optional[asyncio.Task] = None
+        self._lease_task: Optional[asyncio.Task] = None
         self._lane_poll_task: Optional[asyncio.Task] = None    # one lane poll per doorbell burst
         self._gitbus_busy = False
         self._gitbus_pull = gitbus_pull or self._default_bus_pull
@@ -2726,6 +2727,95 @@ class AgentChannel:
             return delivered
         finally:
             self._gitbus_busy = False
+
+    async def check_lease(self, *, now: Optional[float] = None) -> Optional[Any]:
+        """Renew the lease if this bot is the holder, or claim N+1 if expired and next in succession."""
+        if not (self.config.bus.repo or self.config.fallback.gitbus_root):
+            return None
+        if self._frozen or self._pause_pending:
+            return None
+
+        moment = self._clock() if now is None else now
+        store = self.lease_store()
+        try:
+            state = store.state(now=moment)
+        except Exception:
+            logger.warning("lease: check_lease could not read lease state", exc_info=True)
+            return None
+
+        alias = self.config.identity.alias.strip().lower()
+
+        # Case 1: This bot is the live holder -> renew if due
+        if state.live(moment) and state.holder.strip().lower() == alias:
+            renew_interval = getattr(self.config.limits, "lease_renew_seconds", 120.0)
+            last_renew = getattr(state.claim, "renews_at", 0.0) if state.claim else 0.0
+            if (moment - last_renew) >= renew_interval or (state.expires_at - moment) <= (store.ttl_seconds / 2):
+                try:
+                    claim = store.claim(term=state.term, now=moment)
+                    logger.info("lease: %s renewed lease for term %d (expires at %.1f)",
+                                self.config.identity.alias, claim.term, claim.expires_at)
+                    return claim
+                except Exception:
+                    logger.warning("lease: failed to renew lease at term %d", state.term, exc_info=True)
+            return state.claim
+
+        # Case 2: Lease is not live (absent, expired, or yielded)
+        if not state.live(moment):
+            from swarmly.telegram.lease import succession_order
+            role = str(self.config.identity.role or "").strip().lower()
+            succession = getattr(self.config, "swarm", {}).get("succession") or ()
+            my_rank = succession_order(role, order=succession)
+
+            # If lease is absent (swarm bootstrap)
+            if state.status == "absent":
+                coord = (getattr(self.membership.state, "coordinator", None) or "").strip()
+                if (coord and coord.lower() == alias) or (not coord and role == "coordinator"):
+                    try:
+                        claim = store.claim(term=1, now=moment)
+                        logger.info("lease: %s claimed bootstrap term 1", self.config.identity.alias)
+                        return claim
+                    except Exception:
+                        logger.warning("lease: failed to claim bootstrap term 1", exc_info=True)
+                return None
+
+            # If lease is expired or yielded: check succession
+            if my_rank >= 999:
+                return None
+
+            is_first = True
+            frozen_map = self.frozen_peers()
+            for peer_alias, peer_role in self.config.peer_roles.items():
+                p_alias = peer_alias.strip().lower()
+                if p_alias == alias:
+                    continue
+                p_rank = succession_order(str(peer_role).strip().lower(), order=succession)
+                if (p_rank < my_rank) or (p_rank == my_rank and p_alias < alias):
+                    if peer_alias not in frozen_map and p_alias not in {k.lower() for k in frozen_map}:
+                        is_first = False
+                        break
+
+            if is_first:
+                next_term = state.term + 1
+                try:
+                    claim = store.claim(term=next_term, now=moment)
+                    logger.warning("ADMIN: coordinator lease taken over by %s at term %d (%s)",
+                                   self.config.identity.alias, next_term, state.status)
+                    return claim
+                except Exception:
+                    logger.warning("lease: %s failed to take over lease at term %d",
+                                   self.config.identity.alias, next_term, exc_info=True)
+
+        return None
+
+    async def _lease_tick(self) -> None:
+        """Periodic coordinator lease renewal and succession poll."""
+        interval = min(max(5.0, getattr(self.config.limits, "lease_renew_seconds", 120.0) / 2), 60.0)
+        while True:
+            try:
+                await self.check_lease()
+            except Exception:
+                logger.exception("lease: lease tick failed")
+            await self._sleep(interval)
 
     async def _bus_tick(self) -> None:
         """Periodic durable-bus poll; interval from ``fallback.gitbus_poll_minutes``."""
@@ -5220,6 +5310,8 @@ class AgentChannel:
         if self._bus_task is None and self.config.fallback.gitbus_poll_minutes > 0 \
                 and self.config.bus.enabled:
             self._bus_task = asyncio.create_task(self._bus_tick())
+        if self._lease_task is None and (self.config.bus.repo or self.config.fallback.gitbus_root):
+            self._lease_task = asyncio.create_task(self._lease_tick())
         if self._github_task is None and self.config.github and self.config.github.poll_minutes > 0:
             self._github_task = asyncio.create_task(self._github_tick())
         if self._wake_task is None and self.config.limits.wake_tick_seconds > 0:
