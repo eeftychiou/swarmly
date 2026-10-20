@@ -1490,3 +1490,70 @@ class TestDelayedWriterPush(unittest.TestCase):
             # Both write at the same clock value: only arrival order differs.
             self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "won")
             self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=0), "lost")
+
+
+class TestUnrankedClaimsFailClosed(unittest.TestCase):
+    """Codex/Reasonix: a bus that can rank claims must not fall back to the sender's stamp.
+
+    If `arrival_rank` exists but cannot place a claim, that claim is not a claim. Demoting it to
+    `written_at` would put the sender-set key back in charge -- exactly the double fire this
+    round was about.
+    """
+
+    def timer(self, alias):
+        return wk.WakeTimer(argv=("git", "status"), then="go", next_at=1060.0,
+                            expires_at=1300.0, every_seconds=60.0, chat_id=1,
+                            alias=alias, id="t1")
+
+    def claim_file(self, root, alias, stamp):
+        folder = Path(root) / ".agents" / "wakes" / alias
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"t1-1060-{alias}.json").write_text(json.dumps(
+            {"id": "t1", "alias": alias, "firing": 1060, "written_at": stamp,
+             "timer": self.timer(alias).to_dict()}), encoding="utf-8")
+
+    def bus(self, root, behaviour):
+        class Ranked(_BusTransport):
+            def refresh(self):
+                return True
+
+            def arrival_rank(self, relpath):
+                if behaviour == "raises":
+                    raise RuntimeError("git failed")
+                return None                          # cannot place it
+
+        return Ranked(root)
+
+    def test_a_claim_the_bus_cannot_rank_is_ignored_not_trusted(self):
+        with TemporaryDirectory() as tmp:
+            # A backdated stamp: under the old fallback this claim would look earliest.
+            self.claim_file(tmp, "alpha", 1.0)
+            self.claim_file(tmp, "beta", 1040.0)
+            now = {"t": 1100.0}
+            store = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
+                                 transport=self.bus(tmp, "none"), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            self.assertEqual(store._claim_records("t1", 1060), [])
+            # ... and it cannot fire on it either.
+            self.assertEqual(store.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
+
+    def test_a_rank_error_also_skips_the_claim(self):
+        with TemporaryDirectory() as tmp:
+            self.claim_file(tmp, "alpha", 1.0)
+            now = {"t": 1100.0}
+            store = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
+                                 transport=self.bus(tmp, "raises"), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            self.assertEqual(store._claim_records("t1", 1060), [])
+            self.assertEqual(store.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
+
+    def test_a_bus_with_no_arrival_order_still_uses_the_stamp(self):
+        with TemporaryDirectory() as tmp:
+            self.claim_file(tmp, "alpha", 1000.0)
+            now = {"t": 1100.0}
+            store = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
+                                 transport=_BusTransport(tmp), root=Path(tmp),
+                                 clock=lambda: now["t"])
+            records = store._claim_records("t1", 1060)
+            self.assertEqual([claim.alias for claim in records], ["alpha"])
+            self.assertEqual(records[0].seen_at, 1000.0)

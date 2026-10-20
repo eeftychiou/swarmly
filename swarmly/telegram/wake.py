@@ -800,14 +800,20 @@ class WakeStore:
                 continue
             alias = base[len(prefix):-len(".json")]
             full = f"{WAKE_RELPATH}/{name}"
-            rank = None
             arrival = getattr(transport, "arrival_rank", None)
             if arrival is not None:
+                # This bus *can* say where a claim sits, so a claim it cannot place is not a
+                # claim: demoting it to the stamp inside the file would put the sender-set key
+                # back in charge, which is the double fire this exists to prevent.
                 try:
                     rank = arrival(full)
-                except Exception:                      # noqa: BLE001 - fall back to the stamp
-                    rank = None
-            if rank is not None:
+                except Exception:                      # noqa: BLE001 - unranked: not a claim
+                    logger.warning("wake: %s could not be ranked; not counted", name,
+                                   exc_info=True)
+                    continue
+                if rank is None:
+                    logger.warning("wake: %s has no place in the bus history; not counted", name)
+                    continue
                 claims.append(Claim(order=-float(rank), seen_at=None, alias=alias))
                 continue
             stamp = 0.0
