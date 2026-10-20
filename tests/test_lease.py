@@ -795,3 +795,31 @@ class TestTipAdvancing(unittest.TestCase):
         state = reader.state(now=now)
         self.assertEqual(state.holder, "Zulu",
                          "the claim the bus saw first must still win after the tip moved")
+
+
+class TestPeerDoesNotPoll(unittest.TestCase):
+    """#93 (Codex): one shared GitHub login, one poller.
+
+    `poll_once()` used to fetch notifications before asking who leads, so a peer handled the same
+    notification the acting coordinator handled. A bot whose channel says "not the coordinator"
+    now polls nothing; the standalone `gh-poll --once` path, which has no channel, still polls,
+    because it is the only reader by construction.
+    """
+
+    def test_a_peer_channel_polls_nothing(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from swarmly.github.watch import GitHubWatcher
+        from tests.test_github_watch import make_test_config
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        channel = MagicMock()
+        channel.is_coordinator.return_value = False
+        client = MagicMock()
+        client.notifications.return_value = []
+        watcher = GitHubWatcher(make_test_config(tmp.name, role="coordinator"), client=client,
+                                state_path=Path(tmp.name) / "s.json", channel=channel)
+        outcome = asyncio.run(watcher.poll_once())
+        self.assertEqual(outcome.polled_repos, [])
+        client.notifications.assert_not_called()

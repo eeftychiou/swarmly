@@ -50,6 +50,9 @@ class FakeGitHub:
     def notifications(self, repo: str = None) -> list:
         return []
 
+    def issues_with_label(self, repo: str, label: str) -> list:
+        return []                     # no tracking issues in these tests
+
     def pr_checks(self, repo: str, number: int):
         self.calls.append((repo, number))
         return self.checks.pop(0) if self.checks else None
@@ -89,7 +92,7 @@ def fake_channel() -> tuple:
     channel.has_recent_ref.return_value = False
     # #83: the coordinator gate is the bus lease, asked through the channel. These tests are
     # about CI wakes, not the round report, so the lease says "peer" here.
-    channel.is_coordinator.return_value = False
+    channel.is_coordinator.return_value = True   # CI wakes are the coordinator's job
     return channel, adapter
 
 

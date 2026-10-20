@@ -700,6 +700,14 @@ class GitHubWatcher:
             logger.debug("no projects configured; github watcher has no repos to poll")
             return outcome
 
+        if self.channel is not None and not self._is_coordinator():
+            # #83: the shared GitHub login is read by exactly one bot -- the one the bus lease
+            # names. A peer that polled too would handle the same notification twice, and would
+            # keep polling after a successor took over. A watcher with no channel is the
+            # standalone `gh-poll --once` path, which is the only reader by construction.
+            logger.info("github: not the coordinator on the bus; skipping this poll")
+            return outcome
+
         login = (self.config.github.login or "").strip().lower()
         router = (
             self.channel.router
