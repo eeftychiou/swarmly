@@ -17,7 +17,8 @@ import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from swarmly.transports.base import is_envelope_name, write_envelope
+from swarmly.transports.base import (ROUNDS_RELPATH, is_bus_document,
+                                     is_envelope_name, write_envelope)
 
 logger = logging.getLogger("swarmly.transports.git")
 
@@ -107,6 +108,32 @@ class GitTransport:
                                   check=True).stdout
             items.append((name, data))
         return items
+
+    def list_at_ref(self, relpath: str) -> Optional[List[str]]:
+        """File names directly under *relpath* at the bus ref (a round's segments).
+
+        Issue #86 review: the round state is a bus *document*, not an envelope, so it has
+        its own read path. ``[]`` means the ref was read and holds nothing there; ``None``
+        means it could not be read at all. The two are never the same answer: a caller that
+        conflates them reports a broken bus as an empty round (PR #89 review, blocker 1).
+        """
+        if not self.ref:
+            return None
+        prefix = relpath.rstrip("/") + "/"
+        result = self._git("ls-tree", "-r", "--name-only", self.ref, prefix, timeout=30)
+        if result.returncode != 0:
+            logger.warning("gitbus: could not list %s at %s: %s", relpath, self.ref,
+                           (result.stderr or "").strip()[:200])
+            return None
+        return sorted(path[len(prefix):] for path in (result.stdout or "").splitlines()
+                      if path.startswith(prefix))
+
+    def read_at_ref(self, relpath: str) -> Optional[str]:
+        """The bytes of one bus document at the ref, or ``None`` when it is not there."""
+        if not self.ref:
+            return None
+        result = self._git("show", f"{self.ref}:{relpath}", timeout=30)
+        return result.stdout if result.returncode == 0 else None
 
     def _list_local(self) -> List[Tuple[str, str]]:
         if not self.inbox_dir.is_dir():
@@ -204,10 +231,14 @@ class GitTransport:
         # files this post staged (commit_and_push lists them), never "whatever HEAD has".
         # It also carries bus files committed here earlier whose own push failed (a
         # checkout that fell behind kept them only locally, and they were never delivered).
+        # Issue #86: round state is a bus document under .agents/rounds, so a lost push
+        # that kept it local is carried forward too -- an envelope-only filter here would
+        # drop a state rewrite silently and leave the bus a sequence behind.
         unpushed = self._git("diff", "--name-only", "--diff-filter=A", f"{tip}...HEAD", "--",
-                             INBOX_RELPATH)
+                             INBOX_RELPATH, ROUNDS_RELPATH)
         earlier = [path for path in unpushed.stdout.splitlines()
-                   if unpushed.returncode == 0 and is_envelope_name(Path(path).name)]
+                   if unpushed.returncode == 0
+                   and (is_envelope_name(Path(path).name) or is_bus_document(path))]
         changed = list(dict.fromkeys([*files, *earlier]))
         if not changed:
             return subprocess.CompletedProcess(

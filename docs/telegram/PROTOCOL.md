@@ -319,6 +319,94 @@ existed on no remote branch — the claim, not the intent, is what the protocol 
 nothing. HELLO is answered with the current state pointer, which is also how a restarted agent
 re-syncs.
 
+### Round state on the bus (issue #86)
+
+What a round waits on must outlive the coordinator's process. After every coordinator turn the
+transport writes the round's state to the bus and strips it from the posted reply.
+
+**Placement.** `.agents/rounds/<round>/<term>-<seq>-<writer>-<nonce>.json`, where `<round>` is
+`<owner>_<repo>#<tracking issue>` sanitized to a directory name. Each write is **its own file**:
+the bus retries a push that lost a race onto the remote's tip, so two writers in one window both
+land — a single mutable file would silently lose an update, while a lost push here costs one
+segment. Readers fold the segments in `(term, seq, at, writer)` order, so every bot that reads the
+same bus computes the same state.
+
+**The block.** The coordinator's reply carries one machine block, on its own line:
+
+```
+ROUND_STATE {"version":1,"round":88,"repo":"owner/project","term":3,"items":{"86":{...}}}
+```
+
+It is taken out of the adapter's **raw** text, before `limits.reply_chars` clamps or the reply is
+split, so it is never counted against the channel budget and never posted. **Exactly one block per
+reply**: every block is stripped from the text in every case, and a reply carrying two has its
+state refused (the last good state stands). It is capped at `limits.round_state_chars` (default
+8000 — a six-item round with heads and verdicts is about 2000); a block over the cap, unclosed,
+or not a JSON object is dropped whole. Only the coordinator writes it — a block from any other bot
+is dropped.
+
+A refusal is **visible**: the posted reply ends with `⚠️ round state: <reason>`, because a silent
+one reads exactly like success to the next turn and to any successor.
+
+**Segment fields.** `version` (reader refuses a newer one), `round`, `repo`, `writer`, `term`,
+`seq`, `at`, `items`, `order`, `blockers`, `timers`, `note`, `head`. Unknown fields are ignored
+forward-compatibly; a wrong type, a bad `version` or a missing `round` refuses the whole segment.
+
+Item patches carry `issue`, `pr`, `owner`, `head`, `ci`, `waits_on`, `state`, and one `review`
+and one `qa` verdict. `state` is what closes an item: `merged`, `closed` or `done` removes it from
+the open set, so a round can actually end. **A verdict is bound to a head**: `{"verdict":"merge","sha":"<40 hex>",
+"by":"Codex","at":"<iso>"}`. A short SHA may be written when the block also carries `head`, and
+is expanded against it; a prefix that does not identify that head is refused. Reading a verdict
+for a different head returns nothing — a new head clears the verdict instead of carrying an
+approval onto code nobody reviewed.
+
+**Authority.** GitHub wins for what exists, merged/closed state, the PR head and CI on that head;
+the file wins for owners' intent, order, blockers, verdicts, timers and term. `coordinator.json`
+(#83) is the authority for `term`; a segment from a lower term than the bus already holds is
+refused, so a returning coordinator cannot overwrite its successor's state. `term` and `seq` are
+**never** taken from the block — a model cannot give itself a term.
+
+**Reads are labelled.** A state read at the bus ref is `source=ref` and the only kind that is
+actionable. Segments that exist on this checkout but not yet on the ref (a push in flight) are
+`source=local` with `pending=N`; a ref that cannot be read is `unreadable`, never `absent`, and a
+local copy is reported as `local` (with the reason) rather than presented as bus state. A round
+with no segments anywhere is `absent`. Neither `unreadable` nor `local` may become a round
+report, and `usable` is false for both.
+
+**Concurrent writers.** `base_seq` records the `seq` the writer saw. Two segments with the same
+`term` and the same `base_seq` are concurrent. Disjoint fields both survive the fold; two
+concurrent writes to the *same* field keep a deterministic winner **and** are reported in
+`conflicts` (`<item>.<field>`), which marks the state stale. An update is never silently lost.
+
+A conflict is a **report, not a mark**: it clears when a later segment writes that field on a
+basis above the contested one (`base_seq` greater than the conflict's), which is what any ordinary
+next write does. The same holds for a two-way claim (`holder`). A round does not stay unusable
+because two bots once wrote at the same moment.
+
+**Fencing and fail-closed.** `holder` is set by the transport to the writing bot. Once a round has
+a holder at a term, another bot is refused (`RoundFenced`) at that term or below; only a higher
+term may take the round over. If the bus cannot be read, or the state is only on this checkout,
+the write is refused outright: a term and a seq that cannot be verified are not written.
+
+A **claim race** (two bots writing a round that has no segments yet) is decided by the fold, not by
+whoever pushes last: the highest term wins, and among simultaneous claims at that term the lowest
+alias does. The other claim is reported in `conflicts` as `holder`.
+
+**Writing is not holding.** After a write, the store re-reads and compares the fold's holder with
+the writer: a bot that wrote a claim it did not win gets `RoundFenced`, so a stale coordinator (a
+configured role that outlived its term) cannot become a second writer of a round another bot holds,
+and the refusal is visible in its reply. Until #83 lands the lease, the term only ever comes from the bus, which is why a bot
+whose bus checkout is broken cannot write round state at all.
+
+**All segments unreadable is `unreadable`,** not an empty round: no item, no owner and no verdict
+is claimed from a state nothing could be read from.
+
+**Missing is not empty.** A round with no segments is `absent`; a bus that cannot be read is
+`unreadable`. Neither is "no open items", and neither may produce a round report. `/round[@bot]
+[issue]` fetches the bus ref first, then prints the folded state with its age and writer; it answers
+with the reason when the state is not usable, so a fresh checkout cannot report a round as absent
+from a ref it has not fetched.
+
 ---
 
 ## 8. Loop safety and pacing
@@ -385,3 +473,4 @@ A participant conforms to v1.1 if it:
 - [ ] mirrors every decision with a verifiable `path@commit` pointer
 - [ ] commits under its own identity
 - [ ] announces every escalation rung
+- [ ] carries its round state as a `ROUND_STATE` block that is stripped before posting (§7)
