@@ -58,6 +58,7 @@ from swarmly.telegram.commands import (
 from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig,
                                      effort_problem, model_problem)
 from swarmly.telegram.poll import bus_poll_once
+from swarmly.telegram.presence import Presence, Pulse
 from swarmly.telegram.projects import ProjectRouter
 from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
 from swarmly.telegram.model_list import available_models, cached_models, format_list
@@ -532,6 +533,13 @@ class AgentChannel:
         # Token economy (issue #43): machine-class traffic recorded as state, not model turns.
         self._machine_log: deque = deque(maxlen=50)
         self._peer_last_seen: Dict[str, Dict[str, Any]] = {}
+        # Issue #82: peer liveness. The clock is wall-clock (a pulse is a timestamp peers
+        # compare against their own), and a test replaces it; the pulse task starts in start().
+        self.presence_clock: Callable[[], float] = self._wall
+        self._presence: Optional[Presence] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        #: alias -> wall time its current DOWN episode was announced, so one return line closes it.
+        self._down_announced: Dict[str, float] = {}
 
         # #9: busy-drop notice state (limits.busy_behavior == "notice")
         self._busy_notice_at = float("-inf")   # clock of the last busy notice; -inf = never
@@ -1155,7 +1163,7 @@ class AgentChannel:
                 result += f" {self.lease_store().state().describe()}"
             except Exception:                          # noqa: BLE001 - /status must answer
                 result += " coordinator=none(unverifiable)"
-            result += f" peers={','.join(self.config.peers) or 'none'}"
+            result += f" {self.presence_line()}"
             if self.config.identity.role:
                 result += f" role={self._role_name()}"
             if self.replies is not None:
@@ -2005,9 +2013,198 @@ class AgentChannel:
         return (f"\n\n[Frozen peers take no work until they resume: {'; '.join(parts)}. "
                 "Give their part to another peer; if no one else can do it, tell the admin.]")
 
+    # -- peer liveness: the pulse, and DOWN (issue #82) -----------------------------------
+
+    def heartbeat_seconds(self) -> float:
+        """``limits.heartbeat_minutes`` in seconds; 0 or less turns the pulse off."""
+        try:
+            minutes = float(getattr(self.config.limits, "heartbeat_minutes", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, minutes * 60.0)
+
+    def down_after_seconds(self) -> float:
+        """Silence, in seconds, after which a peer is DOWN.
+
+        ``heartbeat_minutes * peer_down_after`` -- three missed pulses by default, so six
+        minutes of Telegram silence. Either limit at 0 turns the rule off (nobody is ever
+        DOWN), which is what a swarm that wants no liveness judging configures.
+        """
+        interval = self.heartbeat_seconds()
+        try:
+            missed = float(getattr(self.config.limits, "peer_down_after", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return float("inf")
+        if interval <= 0 or missed <= 0:
+            return float("inf")
+        return interval * missed
+
+    def presence(self) -> Presence:
+        """This bot's liveness table, built on first use.
+
+        Seeded from what membership already recorded (an ONLINE or SEEN at start), so a
+        restart does not report every peer as unknown while the first pulses are in flight.
+        Every timestamp comes from :attr:`presence_clock` -- wall clock here, replaced by a
+        test -- because a pulse is a wall-clock stamp peers compare against their own.
+        """
+        if self._presence is None:
+            now = self.presence_clock()
+            table = Presence(now, down_after=self.down_after_seconds(),
+                             grace=self.heartbeat_seconds())
+            for alias, entry in (getattr(self.membership, "presence", None) or {}).items():
+                at = entry.get("at") if isinstance(entry, dict) else None
+                if isinstance(at, (int, float)) and not isinstance(at, bool):
+                    table.seen(str(alias), float(at))
+            self._presence = table
+        return self._presence
+
+    def presence_line(self, now: Optional[float] = None) -> str:
+        """The ``peers=...`` fragment of ``/status`` and ``/swarm`` (#82).
+
+        Liveness, not just the configured names: a peer that has gone quiet is the thing an
+        operator reads this line for. A peer never heard from shows ``unknown`` -- a bot that
+        has not pulsed yet is not evidence of a die-off.
+        """
+        moment = self.presence_clock() if now is None else now
+        try:
+            table = self.presence()
+            order = [alias for alias in self.config.peers
+                     if alias.lower() != self.config.identity.alias.lower()]
+            order += [alias for alias in table.peers if alias not in order]
+            line = table.line(moment, order=order)
+        except Exception:                          # noqa: BLE001 - /status must answer
+            logger.warning("presence: cannot render the peer line", exc_info=True)
+            return f"peers={','.join(self.config.peers) or 'none'}"
+        if line != "peers=none":
+            return line
+        return f"peers={','.join(self.config.peers) or 'none'}"
+
+    def _note_peer_liveness(self, envelope: Envelope, event: ChannelEvent) -> None:
+        """Any message from a peer is liveness (#82): a pulse is the common case, a message on
+        any other plane is just as good, because DOWN means silent on *both* planes."""
+        alias = self._alias_for(event)
+        if not alias or alias == "admin" \
+                or alias.lower() == self.config.identity.alias.lower():
+            return
+        now = self.presence_clock()
+        table = self.presence()
+        if envelope.type == MessageType.STATUS and (envelope.intent or "").upper() == "PULSE":
+            _envelope, body = parse_message(event.text or "")
+            try:
+                pulse = Pulse.from_dict(json.loads(body)) if body else None
+            except (ValueError, TypeError):
+                pulse = None
+            if pulse is None:
+                # A pulse we cannot parse is still a sign of life; only its detail is lost.
+                logger.warning("presence: unreadable pulse from %s; counting it as liveness",
+                               alias)
+                table.seen(alias, now)
+            else:
+                table.note(dataclasses.replace(pulse, alias=alias))
+            return
+        table.seen(alias, now)
+
+    def _may_announce_down(self, now: float) -> bool:
+        """Whether this bot is the one voice for a DOWN episode (#82).
+
+        The coordinator's, and the acting coordinator's when the coordinator is the one that
+        went quiet -- otherwise six bots announce the same die-off six times. Advisory: this
+        claims no lease, because a DOWN peer must never be able to start a takeover (#83).
+        """
+        coordinator = str(self.membership.state.coordinator or "").strip()
+        if not coordinator:
+            return True                     # nobody named: no single voice to defer to
+        if coordinator.lower() == self.config.identity.alias.strip().lower():
+            return True
+        try:
+            if not self.presence().is_down(coordinator, now):
+                return False                # the coordinator is up, and it will say it
+            return bool(self.lease_state(now=now).holds(self.config.identity.alias, now))
+        except Exception:                   # noqa: BLE001 - no authority, no announcement
+            logger.warning("presence: cannot tell who should announce a DOWN peer",
+                           exc_info=True)
+            return False
+
+    async def check_peer_liveness(self, *, now: Optional[float] = None) -> List[str]:
+        """One pass over peer liveness: a peer gone DOWN is announced once per episode, and a
+        return closes it with one line (#82). Returns what it did, so a test can read it."""
+        moment = self.presence_clock() if now is None else now
+        table = self.presence()
+        done: List[str] = []
+        down = table.down_peers(moment)
+        if down and self._may_announce_down(moment):
+            admin = self.config.identity.maintainer_username
+            lead = f"@{str(admin).lstrip('@')} " if admin else ""
+            for alias in down:
+                self._down_announced[alias] = moment
+                if not table.mark_notified(alias, moment):
+                    continue                # already said, in this episode
+                peer = table.peers.get(alias)
+                since = time.strftime("%H:%M", time.localtime(
+                    peer.last_seen if peer is not None else moment))
+                gone = int((table.quiet_for(alias, moment) or 0.0) // 60)
+                done.append(f"{alias}: down since {since}")
+                await self.send(
+                    f"⚠️ {lead}{alias} has been silent since {since} (no pulse and no message "
+                    f"for {gone} minutes). DOWN is advisory: the lease still decides who "
+                    "coordinates.", silent=True, notice=True, allow_when_frozen=True)
+        for alias in sorted(self._down_announced):
+            if table.is_down(alias, moment):
+                continue
+            self._down_announced.pop(alias, None)
+            done.append(f"{alias}: back")
+            if self._may_announce_down(moment):
+                await self.send(f"🟢 {alias} is back (a pulse was heard again).",
+                                silent=True, notice=True, allow_when_frozen=True)
+        return done
+
+    def own_pulse(self, now: float) -> Pulse:
+        """This bot's heartbeat for *now*: what it is running, and since when.
+
+        ``busy_since`` is the start of the longest-running turn, converted to wall clock: the
+        turn lock records monotonic time, and a peer compares it against its own wall clock.
+        """
+        durations = [self._clock() - start for start in self._busy_since.values()
+                     if isinstance(start, (int, float))]
+        try:
+            term = int(self.lease_state().term or 0)
+        except Exception:                          # noqa: BLE001 - a pulse without a term
+            term = 0
+        return Pulse(alias=self.config.identity.alias, at=now, rev=self._running_revision,
+                     role=self._role_name() if self.config.identity.role else "", term=term,
+                     busy_since=now - max(durations) if durations else None,
+                     frozen=bool(self._frozen))
+
+    async def _heartbeat_tick(self, *, now: Optional[float] = None) -> str:
+        """Publish one pulse, then judge the peers. Returns what it said, for a test."""
+        moment = self.presence_clock() if now is None else now
+        pulse = self.own_pulse(moment)
+        await self.send(
+            format_message(Envelope(type=MessageType.STATUS, to="*", intent="PULSE",
+                                    ref=self._alias_ref(), rev=self._running_revision),
+                           json.dumps(pulse.to_dict(), sort_keys=True, separators=(",", ":"))),
+            silent=True, notice=True, allow_when_frozen=True)
+        await self.check_peer_liveness(now=moment)
+        return f"pulse rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
+
+    async def _heartbeat_loop(self) -> None:
+        """Publish the pulse on its interval, for as long as this transport runs.
+
+        Its own task, never the turn lock: a turn that runs for ten minutes must keep
+        pulsing, and `busy_since` is what tells the swarm the silence is work, not a die-off.
+        """
+        while True:                                  # cancelled by stop(), like the others
+            try:
+                await self._heartbeat_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:                          # noqa: BLE001 - the loop must survive
+                logger.exception("heartbeat: a pulse failed; the next one carries on")
+            await asyncio.sleep(max(1.0, self.heartbeat_seconds()))
+
     # Machine-class envelope kinds recorded as state without waking the adapter (token
     # economy, issue #43). REQUEST/RESPONSE/BLOCKED are never machine-class.
-    _MACHINE_STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED"})
+    _MACHINE_STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED", "PULSE"})
     _MACHINE_NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE"})
 
     def _machine_event_class(self, envelope: Envelope) -> Optional[str]:
@@ -3031,6 +3228,9 @@ class AgentChannel:
 
         envelope, _body = parse_message(event.text or "")
         self._track_peer_freeze(envelope, event)
+        if event.author_is_bot:
+            # #82: a peer that is talking is not down, whatever plane it is talking on.
+            self._note_peer_liveness(envelope, event)
         if in_home_channel:
             self.selftest.observe(envelope, event)
             if await self._handle_roster(envelope, event):
@@ -4456,6 +4656,15 @@ class AgentChannel:
                 self._run_own_task(FROZEN_REASSIGN_NOTE.format(alias=alias),
                                    chat_id, thread_id, self.topics.name(chat_id, thread_id))
                 continue
+            if self.presence().is_down(alias, self.presence_clock()):
+                # Silent on both planes (#82): like a frozen peer it cannot answer, so the
+                # work goes straight back instead of waiting out the reminder ladder.
+                self._pending_handoffs.pop(key, None)
+                logger.info("hand-off to %s in %s: it is DOWN; handing the work back",
+                            alias, thread_id or "General")
+                self._run_own_task(DOWN_REASSIGN_NOTE.format(alias=alias), chat_id, thread_id,
+                                   self.topics.name(chat_id, thread_id))
+                continue
             if not may_nudge:
                 if age >= 2 * wait:
                     self._pending_handoffs.pop(key, None)
@@ -5393,6 +5602,8 @@ class AgentChannel:
             self._github_task = asyncio.create_task(self._github_tick())
         if self._wake_task is None and self.config.limits.wake_tick_seconds > 0:
             self._wake_task = asyncio.create_task(self._wake_loop())
+        if self._heartbeat_task is None and self.heartbeat_seconds() > 0:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             # A webhook left set by another deployment makes getUpdates fail with a conflict.
             # Pending updates are kept: a peer's request sent during a restart must still arrive.
@@ -5443,6 +5654,9 @@ class AgentChannel:
             if self._wake_task is not None:
                 self._wake_task.cancel()
                 self._wake_task = None
+            if self._heartbeat_task is not None:
+                self._heartbeat_task.cancel()
+                self._heartbeat_task = None
             if self._bus_task is not None:
                 self._bus_task.cancel()
                 self._bus_task = None
@@ -5707,6 +5921,12 @@ FROZEN_REASSIGN_NOTE = ("{alias} is frozen and cannot answer your hand-off in th
                         "Decide what happens to the work now: hand it to another peer whose "
                         "role fits, or do it yourself, and say so here. If it can wait until "
                         "{alias} resumes, say that instead.")
+#: Run when a hand-off went to a peer that has gone silent on both planes (#82).
+DOWN_REASSIGN_NOTE = ("{alias} is DOWN: it has not pulsed and has not posted for minutes, so "
+                      "it cannot answer your hand-off in this topic. Decide what happens to "
+                      "the work now: hand it to another peer whose role fits, or do it "
+                      "yourself, and say so here. If it can wait for {alias} to come back, "
+                      "reply exactly NO_REPLY.")
 #: Run after a topic turn hit the time limit in a resumable session.
 CONTINUE_NOTE = ("Your previous turn in this topic hit the time limit and was stopped. Your "
                  "session still holds the work so far: continue the task from where it "

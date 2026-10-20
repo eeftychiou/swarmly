@@ -562,6 +562,28 @@ above for every bot.) A hand-off to a peer that is frozen (quota or pause) gets 
 and no notice at all: the bot that handed it off is asked straight away to give the work to
 someone else or to wait until the peer resumes.
 
+**A bot that dies says nothing, so the swarm listens for its pulse.** Every transport posts
+one heartbeat every `limits.heartbeat_minutes` (default 2) — a `STATUS to=* intent=PULSE` line
+carrying its revision, term, role and, while a turn is running, `busy_since`. It rides the
+ephemeral Telegram line rather than the git bus on purpose: six bots pulsing every two minutes
+is ~180 commits an hour on the bus, forever, each a push race with real bus traffic, so the bus
+keeps only a slow pulse plus ONLINE/BYE. The pulse is its own task, never the turn lock, so a
+turn that runs for half an hour still pulses and shows `busy_since` — a long turn reads as work,
+not as a die-off.
+
+A peer silent on **both** planes for `heartbeat_minutes * peer_down_after` (default 3 misses, so
+6 minutes) is **DOWN**. Any message from a peer counts as liveness, whatever plane it is on; a
+peer that has not been heard from at all is `unknown`, not DOWN, and a freshly started transport
+gets one interval of grace before it may judge anybody — otherwise a restart would declare the
+whole swarm dead. The coordinator posts one line to the admin per episode (the acting coordinator
+does it when the coordinator is the silent one) and one line when the peer comes back. DOWN is
+**advisory**: it says "not heard from", never "somebody else should lead" — the lease (#83) alone
+decides who coordinates, because using DOWN to start a takeover would let a partition elect a
+second coordinator. A hand-off to a DOWN peer gets no reminder: like a frozen peer, the work
+comes straight back with a turn asking what happens to it. `/status` and `/swarm` carry the
+liveness line, e.g. `peers=Claudebot:up,DeepSeek:down(12m),Reasonix:busy(25m)`. Either limit at
+`0` turns the rule off and nobody is ever DOWN.
+
 **Busy is not gone.** A message that queues behind a turn running for two minutes or more
 gets one "⏳ <alias> is busy with a turn running since HH:MM UTC" line in its topic (at
 most one per topic per five minutes), so peers and people see a working bot rather than a
