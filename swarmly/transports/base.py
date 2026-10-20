@@ -157,8 +157,13 @@ ROUNDS_RELPATH = ".agents/rounds"
 #: one per firing, so a takeover or a restart can neither miss a fire nor make it twice.
 WAKES_RELPATH = ".agents/wakes"
 
+#: Where the coordinator lease keeps its claims (issue #83): append-only, one per renewal, at
+#: `.agents/leases/<term>-<alias>-<nonce>.json`. A single mutable file would have the
+#: last-writer-wins race the wake claims were built to avoid.
+LEASES_RELPATH = ".agents/leases"
+
 #: The directories a bus *document* may live in.
-BUS_DOCUMENT_DIRS = (ROUNDS_RELPATH, WAKES_RELPATH)
+BUS_DOCUMENT_DIRS = (ROUNDS_RELPATH, WAKES_RELPATH, LEASES_RELPATH)
 
 
 def is_bus_document(relpath: str) -> bool:
@@ -179,7 +184,11 @@ def is_bus_document(relpath: str) -> bool:
     if ":" in path or ".." in path.split("/") or any(ord(char) < 32 for char in path):
         return False
     for directory in BUS_DOCUMENT_DIRS:
-        if path.startswith(directory + "/"):
-            parts = path[len(directory) + 1:].split("/")
-            return len(parts) == 2 and all(part and not part.startswith(".") for part in parts)
+        if not path.startswith(directory + "/"):
+            continue
+        parts = path[len(directory) + 1:].split("/")
+        # Round state and wake claims live in one directory per round or per bot; a lease
+        # claim is one file directly in `.agents/leases/`.
+        depth = 1 if directory == LEASES_RELPATH else 2
+        return len(parts) == depth and all(part and not part.startswith(".") for part in parts)
     return False
