@@ -22,7 +22,7 @@ import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from swarmly.telegram.presence import Pulse
 
@@ -41,11 +41,16 @@ class PulseBus:
     """Publishes this bot's pulse to ``refs/pulse/<alias>`` and reads everybody else's."""
 
     def __init__(self, root: Path, alias: str, *, remote: str = "origin",
+                 identity: Optional[Tuple[str, str]] = None,
                  timeout: float = GIT_TIMEOUT_SECONDS,
                  runner: Optional[Callable[..., Any]] = None):
         self.root = Path(root)
         self.alias = alias
         self.remote = remote
+        #: The author of the pulse commit. Named on the command line, not taken from the host's
+        #: git config: a fresh checkout (or CI) has none, and the swarm's rule is that a bot's
+        #: work carries the bot's identity.
+        self.identity = identity or (alias, f"{self._safe(alias).lower()}@a2a.local")
         self.timeout = timeout
         self._run = runner or subprocess.run
 
@@ -113,7 +118,9 @@ class PulseBus:
         tree = self._ok("mktree", "-z", stdin=(entry + "\0").encode("utf-8"))
         if not tree:
             return False
-        commit = self._ok("commit-tree", tree.strip(), "-m", f"pulse {self.alias}")
+        name, email = self.identity
+        commit = self._ok("-c", f"user.name={name}", "-c", f"user.email={email}",
+                          "commit-tree", tree.strip(), "-m", f"pulse {self.alias}")
         if not commit:
             return False
         ref = self.ref()

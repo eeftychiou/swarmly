@@ -579,6 +579,12 @@ push failed, the pulse goes out as the ephemeral `STATUS intent=PULSE` line inst
 then. `PULSE` is machine-class traffic (#43): it is recorded as state, wakes no model turn, and
 is swept from General like the other machine notices.
 
+The pulse commit is authored by the bot itself (`DeepSeek <deepseek@a2a.local>`), named on the
+command line rather than read from the host's git config, and it writes a ref of its own --
+never a branch -- so the push guard sees no push to `main`. A role that may not push at all
+(`reviewer`, `researcher`) has no bus half and keeps the Telegram line, which is the
+fallback working as designed.
+
 A pulse carries `{alias, at, rev, role, term, busy_since, frozen}`. The pulse is emitted by its
 own task, never the turn lock, so a long turn keeps pulsing and `busy_since` says since when.
 

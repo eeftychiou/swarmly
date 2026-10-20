@@ -96,6 +96,8 @@ class TestThePulseRef(unittest.TestCase):
         other = self.base / "other"
         subprocess.run(["git", "clone", "--quiet", str(self.base / "origin.git"), str(other)],
                        check=True, env=git_env())
+        # ...with no git identity configured anywhere: CI has none, and a pulse commit must not
+        # depend on the host's config to be authored (it is named on the command line).
         PulseBus(other, "Codex").publish(pulse("Codex", NOW + 30, rev="theirs", busy_since=NOW))
         pulses = self.bus.read()
         self.assertIn("Codex", pulses)
@@ -108,6 +110,12 @@ class TestThePulseRef(unittest.TestCase):
         # Whatever the process's memory was, the ref is what a restart finds.
         fresh = PulseBus(self.work, "Hermes")
         self.assertEqual(fresh.read()["Hermes"]["rev"], "abc")
+
+    def test_the_pulse_commit_is_authored_by_the_bot_without_any_git_config(self):
+        # A fresh checkout -- or CI -- has no user.name: the pulse names its author itself.
+        self.bus.publish(pulse("Hermes", NOW))
+        author = git(self.work, "log", "-1", "--format=%an <%ae>", "refs/pulse/Hermes").stdout
+        self.assertEqual(author.strip(), "Hermes <hermes@a2a.local>")
 
     def test_no_git_checkout_means_no_bus(self):
         plain = self.base / "plain"
