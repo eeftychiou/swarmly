@@ -93,8 +93,13 @@ class LeaseClaim:
                    yielded=bool(data.get("yielded")))
 
     def sort_key(self) -> tuple:
-        """Earlier in the succession order wins: rank, then alias, then arrival, then nonce."""
-        return (self.rank, self.alias.lower(), -self.arrival, self.nonce)
+        """The claim the bus saw first wins. Rank and alias only break a tie.
+
+        Ordering by rank first let a better-ranked claimant write term N+1 *after* another bot
+        had already acted and still win the fold -- two acting coordinators, from nothing but
+        arriving late with a nicer role (#93 B3a).
+        """
+        return (-self.arrival, self.rank, self.alias.lower(), self.nonce)
 
 
 class LeaseState(NamedTuple):

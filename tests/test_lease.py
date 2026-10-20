@@ -630,3 +630,33 @@ class TestFoldCostAndPolling(unittest.TestCase):
         # A configured coordinator with no lease to ask is a peer, not a poller: the fallback to
         # the configured role is how a stale coordinator keeps polling beside the acting one.
         self.assertFalse(watcher._is_coordinator())
+
+
+class TestLateButBetterRankedClaim(unittest.TestCase):
+    """#93 B3a: arriving late with a better role must not win a firing already claimed.
+
+    The fold orders by when the bus saw the claim, and rank only breaks a tie between claims at
+    the same moment. Ordering by rank first let a better-ranked claimant write N+1 after another
+    bot had acted and still win -- two acting coordinators.
+    """
+
+    def claim(self, alias, *, rank, arrival, term=2):
+        return ls.LeaseClaim(term=term, alias=alias, expires_at=9999.0, renews_at=1000.0,
+                             rank=rank, arrival=arrival, nonce=f"{alias}-{arrival}")
+
+    def test_the_earlier_claim_beats_a_better_ranked_late_one(self):
+        early = self.claim("Zulu", rank=2, arrival=1)        # arrived first, worse role
+        late = self.claim("Alpha", rank=0, arrival=0)        # arrived later, better role
+        state = ls.fold_claims([early, late])
+        self.assertEqual(state.holder, "Zulu")
+
+    def test_a_tie_on_arrival_is_broken_by_rank(self):
+        one = self.claim("Zulu", rank=2, arrival=3)
+        two = self.claim("Alpha", rank=0, arrival=3)
+        self.assertEqual(ls.fold_claims([one, two]).holder, "Alpha")
+
+    def test_the_settle_window_outlasts_a_push(self):
+        from tests.test_telegram_channel import make_config
+        # The default has to be longer than a push can take: #92 settled on 30s for the same
+        # reason, and 5s equal to the ref-refresh limit was the hole Reasonix named.
+        self.assertGreaterEqual(make_config().limits.lease_settle_seconds, 30.0)
