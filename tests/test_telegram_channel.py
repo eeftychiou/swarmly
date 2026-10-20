@@ -1566,7 +1566,7 @@ class TestOnlineNoticeRevision(unittest.TestCase):
         self.assertTrue(notice.startswith("[A2A v1.1] HELLO to=* intent=ONLINE ref=Hermes rev="),
                         notice)
         self.assertIn("🟢 Hermes online ", notice)
-        self.assertRegex(notice, r"\(adapter: echo, rev: ([0-9a-f]{7,40}|unknown)\)$")
+        self.assertRegex(notice, r"\(adapter: echo, model: CLI default, rev: ([0-9a-f]{7,40}|unknown)\)$")
 
     def test_local_revision_matches_checkout(self):
         from swarmly.telegram.channel import _local_revision

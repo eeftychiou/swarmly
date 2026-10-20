@@ -5311,13 +5311,19 @@ class AgentChannel:
                     await self._pace_group()    # the retry is a post too: gap and cap
 
     def online_notice(self) -> str:
-        """Startup announcement, carrying the running revision for upgrade visibility."""
+        """Startup announcement, carrying the running revision for upgrade visibility, and the
+        model and reasoning effort General runs at, so the admin sees what each bot will spend
+        without asking every bot for /model and /reasoning."""
+        adapter = self.config.adapter
         role = f", role: {self._role_name()}" if self.config.identity.role else ""
+        model = f", model: {self._model_for(None) or 'CLI default'}"
+        effort = ("" if adapter.command or effort_problem(adapter.type, "high")
+                  else f", effort: {self._effort_for(None) or 'CLI default'}")
         return format_message(
             Envelope(type=MessageType.HELLO, to="*", intent="ONLINE",
                      ref=self._alias_ref(), rev=self._running_revision),
             f"🟢 {self.config.identity.alias} online "
-            f"(adapter: {self.config.adapter.type}{role}, rev: {self._running_revision})",
+            f"(adapter: {adapter.type}{role}{model}{effort}, rev: {self._running_revision})",
         )
 
     def _role(self) -> Any:
