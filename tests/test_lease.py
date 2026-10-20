@@ -369,3 +369,67 @@ class TestNoAuthorityOnAFailedClaim(unittest.TestCase):
         authority = self.channel(fails=False).round_authority(now=1000.0)
         self.assertEqual(authority.alias, "Hermes")
         self.assertEqual(authority.term, 1)
+
+
+class TestLeaseTickRuns(unittest.TestCase):
+    """#93 B1: the lease has to work on a *real* channel, not only on the store.
+
+    `_clock` and `_sleep` are what the tick and the coordinator gate hang off; a missing one made
+    `is_coordinator()` raise inside its try (always False) and killed `_lease_tick` after its first
+    pass. This runs one tick end to end, which is the acceptance the review asked for.
+    """
+
+    def channel(self):
+        import asyncio
+        from tests.gitenv import git as run_git
+        from tests.test_telegram_channel import make_channel, make_config
+        slept = []
+
+        async def sleeper(seconds):
+            slept.append(seconds)
+            raise asyncio.CancelledError          # one pass is all this test needs
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        remote = base / "remote.git"
+        run_git(base, "init", "-q", "--bare", "-b", "main", str(remote))
+        bus = base / "bus"
+        run_git(base, "clone", "-q", str(remote), str(bus))
+        (bus / "README").write_text("bus", encoding="utf-8")
+        run_git(bus, "add", "README")
+        run_git(bus, "commit", "-q", "-m", "bus")
+        run_git(bus, "push", "-q", "-u", "origin", "main")
+        config = make_config(agent={"role": "coordinator"},
+                             fallback={"gitbus_root": str(bus), "gitbus_ref": "origin/main"},
+                             limits={"lease_cache_seconds": 0})
+        channel = make_channel(config, sleeper=sleeper)
+        return channel, bus, slept
+
+    def test_the_tick_renews_or_claims_and_then_sleeps(self):
+        import asyncio
+        channel, root, slept = self.channel()
+        now = channel._clock()
+        claim = asyncio.run(channel.check_lease(now=now))
+        self.assertIsNotNone(claim, "a coordinator with no live lease must claim term 1")
+        self.assertEqual(claim.term, 1)
+        self.assertTrue(channel.is_coordinator(now=now))
+        self.assertEqual(channel.current_coordinator(now=now), "Hermes")
+        # A real renewal: the second tick finds this bot the live holder.
+        renewed = asyncio.run(channel.check_lease(now=now + 1))
+        self.assertIsNotNone(renewed)
+        self.assertEqual(renewed.term, 1)
+        # And the loop itself: one pass, then the sleep that ends it.
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(channel._lease_tick())
+        self.assertEqual(len(slept), 1)
+
+    def test_a_peer_with_a_foreign_lease_is_not_coordinator(self):
+        import asyncio
+        channel, root, _slept = self.channel()
+        now = channel._clock()
+        other = ls.LeaseStore("Antigravity", transport=channel.lease_store().transport,
+                              root=root, clock=lambda: now, ttl_seconds=600.0)
+        other.claim(term=1)
+        self.assertFalse(channel.is_coordinator(now=now))
+        self.assertEqual(channel.current_coordinator(now=now), "Antigravity")

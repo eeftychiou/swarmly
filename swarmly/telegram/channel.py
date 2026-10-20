@@ -2264,11 +2264,17 @@ class AgentChannel:
         return LeaseStore(self.config.identity.alias, transport=transport,
                           root=root, clock=time.time, ttl_seconds=ttl, rank=rank)
 
+    def _forget_lease_cache(self) -> None:
+        """Drop the cached fold: after this bot writes a claim, its own view must not be stale."""
+        self.__dict__["_cached_lease_state"] = None
+
     def lease_state(self, *, now: Optional[float] = None) -> Any:
         """Cached folded lease state to prevent subprocess storms (Reasonix B5)."""
         moment = self._clock() if now is None else now
+        limits = getattr(self.config, "limits", None)
+        window = float(getattr(limits, "lease_cache_seconds", 5.0) or 0.0)
         cached = getattr(self, "_cached_lease_state", None)
-        if cached is not None and (moment - cached[0]) < 5.0:
+        if window > 0 and cached is not None and 0 <= (moment - cached[0]) < window:
             return cached[1]
         try:
             store = self.lease_store()
@@ -2324,6 +2330,7 @@ class AgentChannel:
                 if str(self.config.identity.role or "").strip().lower() == "coordinator":
                     try:
                         claim = store.claim(term=1, now=moment)
+                        self._forget_lease_cache()
                         return Authority(alias=claim.alias, source="lease", term=claim.term)
                     except LeasePushError as exc:
                         # A claim that never reached the bus is not authority: granting term 1
@@ -2773,6 +2780,7 @@ class AgentChannel:
             if (moment - last_renew) >= renew_interval or (state.expires_at - moment) <= (store.ttl_seconds / 2):
                 try:
                     claim = store.claim(term=state.term, now=moment)
+                    self._forget_lease_cache()
                     logger.info("lease: %s renewed lease for term %d (expires at %.1f)",
                                 self.config.identity.alias, claim.term, claim.expires_at)
                     return claim
@@ -2793,6 +2801,7 @@ class AgentChannel:
                 if (coord and coord.lower() == alias) or (not coord and role == "coordinator"):
                     try:
                         claim = store.claim(term=1, now=moment)
+                        self._forget_lease_cache()
                         logger.info("lease: %s claimed bootstrap term 1", self.config.identity.alias)
                         return claim
                     except Exception:
@@ -2819,6 +2828,7 @@ class AgentChannel:
                 next_term = state.term + 1
                 try:
                     claim = store.claim(term=next_term, now=moment)
+                    self._forget_lease_cache()
                     logger.warning("ADMIN: coordinator lease taken over by %s at term %d (%s)",
                                    self.config.identity.alias, next_term, state.status)
                     return claim

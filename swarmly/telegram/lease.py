@@ -180,10 +180,22 @@ class LeaseStore:
         self.clock = clock or time.time
         self.ttl_seconds = float(ttl_seconds)
         self.rank = int(rank)
+        #: When the bus ref was last fetched, so a fold does not pay for a fetch each time.
+        self._fetched_at: float = -1e9
+        self._fetch_interval = 5.0
 
     # -- reading ---------------------------------------------------------------------
-    def refresh(self) -> bool:
-        """Fetch the bus ref, so a claim written a moment ago by a peer is visible."""
+    def refresh(self, *, force: bool = False) -> bool:
+        """Fetch the bus ref, so a claim written a moment ago by a peer is visible.
+
+        Without it a fold reads the ref as of the last poll: this bot's own claim after a push,
+        and a peer's claim from a minute ago, would both be invisible. It is rate-limited because
+        a fork costs a subprocess, and forced after a write so the next read sees our own claim.
+        """
+        now = self.clock()
+        if not force and (now - self._fetched_at) < self._fetch_interval:
+            return True
+        self._fetched_at = now
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
             return True
@@ -217,6 +229,7 @@ class LeaseStore:
 
     def claims(self) -> Optional[List[LeaseClaim]]:
         """Every usable claim, or ``None`` when the bus could not be read."""
+        self.refresh()
         names = self._names()
         if names is None:
             return None
@@ -348,6 +361,7 @@ class LeaseStore:
             except Exception as exc:                   # noqa: BLE001 - reported, not swallowed
                 logger.warning("lease: %s was written but not pushed: %s", relpath, exc)
                 raise LeasePushError(f"the lease claim is local only: {exc}") from exc
+        self.refresh(force=True)      # our own claim has to be visible to the next fold
         return row
 
     def yield_lease(self, *, reason: str = "", now: Optional[float] = None) -> None:
@@ -377,6 +391,7 @@ class LeaseStore:
             except Exception as exc:                   # noqa: BLE001 - reported
                 logger.warning("lease: %s was written but not pushed: %s", relpath, exc)
                 raise LeasePushError(f"the yield is local only: {exc}") from exc
+        self.refresh(force=True)
 
 
 def lease_dir_for(config: Any) -> Optional[Path]:

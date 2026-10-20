@@ -673,6 +673,9 @@ class ChannelLimits:
     #: How many firings one timer may have before it gives up with a turn that says so. 0
     #: leaves the bound to `until` alone.
     wake_max_attempts: int = 50
+    #: How long the folded coordinator lease is cached before the bus is read again (#83). 0
+    #: reads on every question, which is what a test wants and what a bus under load does not.
+    lease_cache_seconds: float = 5.0
     #: How long a claim must be visible on the bus before its writer may fire it. Two pushes
     #: that overlap can otherwise each read "no claims" and both fire; waiting one settle
     #: window makes the second read see both claims, and the lowest alias wins for everyone.
