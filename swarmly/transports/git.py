@@ -58,9 +58,13 @@ class GitTransport:
         return f"git: {self.inbox_dir} ({where})"
 
     # -- reading ---------------------------------------------------------------------
-    def refresh(self) -> None:
-        """Fetch only. The working tree is never touched, so a dirty or diverged checkout
-        cannot block delivery (the reader prefers the fetched ref anyway)."""
+    def refresh(self) -> bool:
+        """Fetch only, and say whether the ref is now trustworthy.
+
+        The working tree is never touched, so a dirty or diverged checkout cannot block
+        delivery. ``False`` means the fetch did not succeed: a caller that arbitrates on the
+        bus (a wake claim) must not treat a stale ref as an empty one.
+        """
         argv = ["git", "-C", str(self.root), "fetch", "--quiet", self.remote]
         prefix = f"{self.remote}/"
         if self.ref and self.ref.startswith(prefix):
@@ -73,7 +77,7 @@ class GitTransport:
                 result = subprocess.run(argv, capture_output=True, text=True, timeout=60,
                                         check=False)
                 if result.returncode == 0:
-                    return
+                    return True
                 # Two agents fetching one checkout at once: one loses the ref lock. A
                 # second try a moment later finds the ref already updated.
                 if attempt == 0 and "cannot lock ref" in (result.stderr or ""):
@@ -81,9 +85,11 @@ class GitTransport:
                     continue
                 logger.warning("gitbus: git fetch exited %s: %s", result.returncode,
                                (result.stderr or "").strip()[:200])
-                return
+                return False
         except Exception:  # noqa: BLE001 - refresh is best-effort
             logger.warning("gitbus: git fetch could not run", exc_info=True)
+            return False
+        return False
 
     def list_messages(self) -> List[Tuple[str, str]]:
         if self.ref:

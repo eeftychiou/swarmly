@@ -478,14 +478,19 @@ a bot that has since died) never blocks the next one. The claims for that firing
 the push** and the winner is the lowest alias among them, so two bots that both saw none cannot both
 fire, and the bus ref is fetched before both reads, so a claim written a minute ago is
 visible rather than waiting for the poll. A claim whose own write cannot be confirmed, or that
-cannot be pushed, does not fire: a broken bus is not "I am the only one".
+cannot be pushed, or whose fetch failed, does not fire: a stale or broken bus is not "I am the
+only one".
 
 **A ready firing is written down before its turn starts.** The timer records the turn text and
 moves to `firing`; the transport starts it and then retires the timer. A crash in between replays
-that one turn on the next tick instead of losing it. A successor also adopts an armed timer it
+that one turn on the next tick instead of losing it, at most once, and the replay tells the bot
+it may already have acted: exactly-once is not available to an agent that cannot commit its side
+effects, and losing the turn is worse than repeating it with a warning. A successor also adopts an armed timer it
 finds on the bus (`adopt()`), because a timer is a promise to the swarm, not to one bot: each
 transition publishes a state record (`<id>-state.json`), a successor adopts only the **newest**
-record per timer, and never one that has finished, expired or been cancelled.
+record per timer, and never one that has finished, expired or been cancelled. An adopted record
+is **untrusted input** — anyone who can push to the bus writes one — so its argv goes through the
+same allowlist and the bot's `limits.wake_check_allow` before it is written or run.
 `attempts` is persisted and bounded by `limits.wake_max_attempts`.
 
 **Commands.** `/wakes` lists the live timers with their next time, check and attempt count;

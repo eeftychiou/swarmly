@@ -763,7 +763,9 @@ class TestCrashWindow(unittest.TestCase):
         store.add(timer, max_timers=10)
         done = asyncio.run(channel._wake_tick(now=time.time()))
         self.assertEqual(done, [f"{timer.id}: replayed after a restart"])
-        self.assertEqual(started, ["the turn that was about to start"])
+        self.assertEqual(len(started), 1)
+        self.assertIn("interrupted by a restart", started[0])   # at-least-once, said plainly
+        self.assertIn("the turn that was about to start", started[0])
         self.assertEqual(store.live_count, 0)
         # A second tick replays nothing: the turn is not repeated.
         started.clear()
@@ -822,3 +824,74 @@ class TestStateRecords(unittest.TestCase):
             newer.write(done)
             newer.publish_state(done)                    # later stamp, terminal
             self.assertEqual(self.heir(tmp).adopt(max_timers=10), [])
+
+
+class TestAdoptionIsUntrusted(unittest.TestCase):
+    """A state record is bus input: anyone who can push can write one, so validate it."""
+
+    def record(self, argv, ident="evil0001"):
+        return wk.WakeTimer(argv=tuple(argv), then="do it", next_at=1000.0,
+                            expires_at=2000.0, every_seconds=0, chat_id=-1,
+                            alias="antigravity", id=ident)
+
+    def publish(self, root, timer):
+        dead = wk.WakeStore(timer.alias, state_dir=Path(root) / "dead",
+                            transport=_BusTransport(root), root=Path(root),
+                            clock=lambda: 1000.0)
+        dead.write(timer)
+        dead.publish_state(timer)
+
+    def heir(self, root):
+        return wk.WakeStore("claudebot", state_dir=Path(root) / "heir",
+                            transport=_BusTransport(root), root=Path(root),
+                            clock=lambda: 5000.0)
+
+    def test_a_forged_record_cannot_smuggle_a_command(self):
+        with TemporaryDirectory() as tmp:
+            self.publish(tmp, self.record(["sh", "-c", "id"]))
+            self.assertEqual(self.heir(tmp).adopt(max_timers=10), [])
+
+    def test_a_write_flag_in_a_record_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            self.publish(tmp, self.record(["gh", "api", "repos/x", "-XPOST"]))
+            self.assertEqual(self.heir(tmp).adopt(max_timers=10), [])
+
+    def test_the_bots_own_allowlist_gates_adoption_too(self):
+        with TemporaryDirectory() as tmp:
+            self.publish(tmp, self.record(["git", "status"]))
+            self.assertEqual(self.heir(tmp).adopt(max_timers=10, allow=("gh",)), [])
+            self.assertEqual(len(self.heir(tmp).adopt(max_timers=10, allow=("git",))), 1)
+
+
+class TestRefreshFailure(unittest.TestCase):
+    """Codex: a failed refresh must not be a claim on a stale ref."""
+
+    def timer(self):
+        return wk.WakeTimer(argv=("gh", "pr", "checks", "75"), then="merge", next_at=1000.0,
+                            expires_at=2000.0, every_seconds=300.0, chat_id=-1,
+                            id="abc12345")
+
+    def test_a_failed_fetch_does_not_fire(self):
+        with TemporaryDirectory() as tmp:
+            class NoFetch(_BusTransport):
+                def refresh(self):
+                    return False
+
+            store = wk.WakeStore("claude", state_dir=Path(tmp), transport=NoFetch(tmp),
+                                 root=Path(tmp), clock=lambda: 1000.0)
+            self.assertFalse(store.claim(self.timer()))
+
+    def test_a_failed_fetch_before_the_post_read_does_not_fire(self):
+        with TemporaryDirectory() as tmp:
+            class FailsLater(_BusTransport):
+                def __init__(self, root):
+                    super().__init__(root)
+                    self.calls = 0
+
+                def refresh(self):
+                    self.calls += 1
+                    return self.calls == 1          # the pre-read fetch works, the post does not
+
+            store = wk.WakeStore("claude", state_dir=Path(tmp), transport=FailsLater(tmp),
+                                 root=Path(tmp), clock=lambda: 1000.0)
+            self.assertFalse(store.claim(self.timer()))

@@ -332,6 +332,8 @@ class WakeTimer:
     #: The turn a ready firing was about to start. Persisted *before* it starts, so a crash
     #: in that window replays the turn on the next tick instead of losing it.
     pending: str = ""
+    #: How many times an interrupted turn has already been replayed.
+    replays: int = 0
     #: armed | firing (turn written, not yet started) | done | expired | failed | cancelled
     state: str = "armed"
 
@@ -362,7 +364,8 @@ class WakeTimer:
             "every_seconds": self.every_seconds, "chat_id": self.chat_id,
             "thread_id": self.thread_id, "topic": self.topic, "created_at": self.created_at,
             "attempts": self.attempts, "fires": self.fires, "last_exit": self.last_exit,
-            "last_tail": self.last_tail, "pending": self.pending, "state": self.state,
+            "last_tail": self.last_tail, "pending": self.pending, "replays": self.replays,
+            "state": self.state,
         }
 
     @classmethod
@@ -395,6 +398,7 @@ class WakeTimer:
                        and not isinstance(data.get("last_exit"), bool) else None),
             last_tail=str(data.get("last_tail") or ""),
             pending=str(data.get("pending") or ""),
+            replays=int(data.get("replays") or 0),
             state=str(data.get("state") or "armed"),
         )
 
@@ -642,12 +646,18 @@ class WakeStore:
             except Exception as exc:                   # noqa: BLE001 - the local file stands
                 logger.warning("wake: state %s was written but not pushed: %s", relpath, exc)
 
-    def adopt(self, *, max_timers: int) -> List[WakeTimer]:
-        """Take over armed timers this checkout does not have, from the bus claims.
+    def adopt(self, *, max_timers: int, allow: Iterable[str] = ()
+              ) -> List[WakeTimer]:
+        """Take over armed timers this checkout does not have, from the bus state records.
 
-        A claim carries the whole timer, so a successor can rebuild a dead bot's schedule
-        instead of watching the promise die with it (PR #92 review, blocker 3).
+        A state record carries the whole timer, so a successor can rebuild a dead bot's
+        schedule instead of watching the promise die with it. Adopted timers are **untrusted
+        input**: anyone who can push to the bus can write one, so the argv is put through the
+        same allowlist a WAKE line goes through, and through ``allow`` (the bot's
+        ``limits.wake_check_allow``) as well, before it is written or run (PR #92 review,
+        ``adopt`` blocker).
         """
+        allowed_binaries = {str(word) for word in allow}
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
             return []
@@ -683,6 +693,16 @@ class WakeStore:
             timer = newest[timer_id][1]
             if not timer.live or timer_id in mine or timer.alias == self.alias:
                 continue
+            try:
+                checked = validate_check(timer.check)
+            except WakeError as exc:
+                logger.warning("wake: adopted timer %s refused: %s", timer_id, exc)
+                continue
+            if allowed_binaries and checked[0] not in allowed_binaries:
+                logger.warning("wake: adopted timer %s refused: %s is not in "
+                               "limits.wake_check_allow", timer_id, checked[0])
+                continue
+            timer.argv = checked
             if len(taken) + self.live_count >= max_timers:
                 break
             timer.alias = self.alias          # this bot now holds the promise
@@ -705,20 +725,24 @@ class WakeStore:
         """
         return int(timer.next_at)
 
-    def refresh(self) -> None:
+    def refresh(self) -> bool:
         """Fetch the bus ref, so a claim written seconds ago by a peer is visible.
 
         Without this the claim reads whatever the last poll fetched (30 minutes by default)
-        and two bots can both believe they are alone (PR #92 review, R1).
+        and two bots can both believe they are alone (PR #92 review, R1). ``False`` means the
+        ref is stale, and a claim must not be arbitrated on it.
         """
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
-            return
-        if hasattr(transport, "refresh"):
-            try:
-                transport.refresh()
-            except Exception:                          # noqa: BLE001 - reported by the read
-                logger.warning("wake: the bus ref could not be refreshed", exc_info=True)
+            return True
+        if not hasattr(transport, "refresh"):
+            return True
+        try:
+            result = transport.refresh()
+        except Exception:                              # noqa: BLE001 - a failed fetch is a no
+            logger.warning("wake: the bus ref could not be refreshed", exc_info=True)
+            return False
+        return result is not False
 
     def _claims(self, timer_id: str, firing: int) -> Optional[List[str]]:
         """Aliases that have claimed *timer_id*'s *firing*, or ``None`` if unreadable."""
@@ -752,7 +776,8 @@ class WakeStore:
         if transport is None or not getattr(transport, "ref", None):
             return True                       # no bus to race on: this transport is alone
         firing = self.firing_of(timer)
-        self.refresh()                    # a peer's claim from a minute ago must be visible
+        if not self.refresh():            # a peer's claim from a minute ago must be visible
+            return False                  # a stale ref is not "I am the only one"
         before = self._claims(timer.id, firing)
         if before is None:
             return False                      # a broken bus is not "I am the only one"
@@ -774,7 +799,8 @@ class WakeStore:
             except Exception as exc:                   # noqa: BLE001 - do not fire on it
                 logger.warning("wake: claim %s was written but not pushed: %s", relpath, exc)
                 return False
-        self.refresh()
+        if not self.refresh():
+            return False
         after = self._claims(timer.id, firing)
         if after is None or self.safe_alias not in after:
             # The post-read must show this bot's own claim: an empty list means the bus did

@@ -2408,15 +2408,26 @@ class AgentChannel:
         done: List[str] = []
         try:                                         # a dead bot's armed timers are promises
             for adopted in await asyncio.to_thread(
-                    store.adopt, max_timers=max(1, int(self.config.limits.wake_max))):
+                    store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),
+                    allow=tuple(self.config.limits.wake_check_allow or ())):
                 done.append(f"{adopted.id}: adopted from the bus")
         except Exception:                            # noqa: BLE001 - adoption is best effort
             logger.warning("wake: adoption failed; carrying on", exc_info=True)
         for pending in store.pending_firings():
-            # A ready turn that was written down but not started (a crash in that window):
-            # replay it once, then retire the timer.
-            self._run_own_task(pending.pending, pending.chat_id, pending.thread_id,
+            # A ready turn that was written down but not started (a crash in that window).
+            # Replayed at most once: exactly-once across a crash is not available to an agent
+            # that cannot commit its side effects, so this is at-least-once, and the replay
+            # says so to the bot that receives it.
+            if pending.replays:
+                pending.state, pending.pending = "done", ""
+                store.replace(pending)
+                done.append(f"{pending.id}: interrupted turn not replayed again")
+                continue
+            replay = ("This firing was interrupted by a restart. If you already acted on it, "
+                      "do nothing; otherwise act now.\n\n" + pending.pending)
+            self._run_own_task(replay, pending.chat_id, pending.thread_id,
                                pending.topic or None)
+            pending.replays += 1
             pending.state, pending.pending = "done", ""
             store.replace(pending)
             done.append(f"{pending.id}: replayed after a restart")
