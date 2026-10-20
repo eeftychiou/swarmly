@@ -1383,7 +1383,7 @@ class TestDelayedWriterPush(unittest.TestCase):
 
     def bus(self, root, now, *, delay=0.0, book=None):
         """A bus that ranks every pushed path, and whose pushes can take extra time."""
-        shared = book if book is not None else {"rank": 0, "paths": {}}
+        shared = book if book is not None else {"pushed": [], "paths": {}}
 
         class Ordered(_BusTransport):
             def refresh(self):
@@ -1391,40 +1391,96 @@ class TestDelayedWriterPush(unittest.TestCase):
 
             def commit_and_push(self, message, paths=None):
                 for path in paths or []:
-                    shared["paths"][path] = shared["rank"]
-                    shared["rank"] += 1
+                    shared["paths"][path] = len(shared["pushed"])
+                    shared["pushed"].append(path)
                 if delay:
                     now["t"] += delay          # the push returns only later
                 return True
 
             def arrival_rank(self, relpath):
-                return shared["paths"].get(relpath)
+                seen = shared["paths"].get(relpath)
+                # How many pushes came after it: higher means it got there earlier.
+                return None if seen is None else len(shared["pushed"]) - 1 - seen
 
         return Ordered(root)
 
     def test_a_claim_whose_push_is_delayed_loses_to_the_one_the_bus_got_first(self):
+        """alpha's `_write_claim` runs first, but its push is held until beta has fired.
+
+        The writer is exercised (the point of the test): alpha's claim only reaches the ref
+        after beta's, so alpha is ordered behind a firing that already happened.
+        """
         with TemporaryDirectory() as tmp:
             now = {"t": 1000.0}
-            book = {"rank": 0, "paths": {}}
-            beta = wk.WakeStore("beta", state_dir=Path(tmp) / "b",
-                                transport=self.bus(tmp, now, book=book), root=Path(tmp),
-                                clock=lambda: now["t"])
-            alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
-                                 transport=self.bus(tmp, now, delay=50.0, book=book),
+            book = {"pushed": [], "paths": {}}
+            held: list = []
+
+            class Ranked(_BusTransport):
+                """A bus that ranks pushed paths, and can hold one bot's push in flight."""
+
+                def __init__(self, root, hold=False):
+                    super().__init__(root)
+                    self.hold = hold
+
+                def refresh(self):
+                    return True
+
+                def commit_and_push(self, message, paths=None):
+                    for path in paths or []:
+                        if self.hold:
+                            held.append(path)               # accepted here, not on the ref
+                        else:
+                            book["paths"][path] = len(book["pushed"])
+                            book["pushed"].append(path)
+                    return True
+
+                def release(self):
+                    for path in held:
+                        book["paths"][path] = len(book["pushed"])
+                        book["pushed"].append(path)
+                    held.clear()
+
+                def list_at_ref(self, relpath):
+                    names = []
+                    for alias in ("alpha", "beta"):
+                        folder = self.root / relpath / alias
+                        if not folder.is_dir():
+                            continue
+                        for path in folder.glob("*.json"):
+                            full = f"{relpath}/{alias}/{path.name}"
+                            if full in book["paths"]:       # only what reached the ref
+                                names.append(f"{alias}/{path.name}")
+                    return sorted(names)
+
+                def arrival_rank(self, relpath):
+                    seen = book["paths"].get(relpath)
+                    return None if seen is None else len(book["pushed"]) - 1 - seen
+
+                def read_at_ref(self, relpath):
+                    path = self.root / relpath
+                    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+            alpha_bus = Ranked(tmp, hold=True)
+            alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a", transport=alpha_bus,
                                  root=Path(tmp), clock=lambda: now["t"])
-            # beta's writer runs, its push lands, it settles and fires at T+31.
+            beta = wk.WakeStore("beta", state_dir=Path(tmp) / "b", transport=Ranked(tmp),
+                                root=Path(tmp), clock=lambda: now["t"])
+
+            # alpha's writer runs first; its push is held, so the ref does not have it yet.
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
+            self.assertEqual(len(held), 1)             # it really was written and pushed
+            # beta claims, settles and fires while alpha's claim is still in flight.
             self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=30), "wait")
             now["t"] += 31
             self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=30), "won")
-            # alpha's writer runs now, but its push takes 50s: the bus gets it after beta's.
-            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
-            now["t"] += 120
+            # alpha's claim finally lands -- behind the one that already fired: it loses.
+            alpha_bus.release()
             self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
 
     def test_two_writers_are_ordered_by_the_bus_not_by_their_own_stamps(self):
         with TemporaryDirectory() as tmp:
             now = {"t": 1000.0}
-            book = {"rank": 0, "paths": {}}
+            book = {"pushed": [], "paths": {}}
             alpha = wk.WakeStore("alpha", state_dir=Path(tmp) / "a",
                                  transport=self.bus(tmp, now, book=book), root=Path(tmp),
                                  clock=lambda: now["t"])
