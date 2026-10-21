@@ -942,6 +942,21 @@ and the topic-name cache — and posts one machine `NOTE intent=TOPIC_GONE ref=<
 peers forget it too, with no model turn on either side. When a round's tracking issue closes,
 the coordinator posts the dry run once in General and asks the admin whether to delete it.
 
+
+**The status snapshot on every heartbeat (issue #124).** Each beat carries one structured
+record of what the bot is doing, taken in code — no adapter call, no model turn, no tokens:
+state (`idle`, `busy`, `paused`, `frozen` or `stuck`, where `stuck` is a turn that has run past
+`adapter.timeout_seconds`), **when that state began** — recorded at the transition, so it
+holds across heartbeats instead of resetting each beat — the discussion it is working in
+(as its `tg-…` token, never a chat id), the turn's elapsed time against its timeout, the queue
+of messages waiting for it, the armed `WAKE` timers with their next fire time, the model and
+effort, `rev:`, uptime, the restart count, and its lease term and expiry when it holds the
+coordinator lease. It rides the pulse — on the bot's own git ref, or the `STATUS intent=PULSE`
+line when there is no bus — so a bot that missed a beat can still be rendered, and a snapshot
+that stopped being renewed shows as **stale** (more than two beats old) rather than as current.
+Nothing in the record is a token, key, chat id or local path.
+
+
 **What a bot has spent — `/usage` (no model turn).** Every model turn appends one row to a
 per-bot ledger (`usage-<alias>.json`, beside the transport's other state): when it started and
 ended, the discussion as its token, the outcome, and the tokens in and out and the cost **when
