@@ -2729,7 +2729,10 @@ class AgentChannel:
         try:
             store = self.lease_store()
             current = store.state()
-            store.claim(term=current.term + 1, promoted=True)
+            row = store.claim(term=current.term + 1, promoted=True)
+            self._forget_lease_cache()
+            logger.info("lease: %s took term %d on the admin's /role",
+                        self.config.identity.alias, row.term)
         except Exception:
             logger.warning("lease: failed to claim on promotion", exc_info=True)
 
@@ -3188,6 +3191,8 @@ class AgentChannel:
             # fold names this bot: a live peer claims N+1 too and wins the fold, a dead one does
             # not claim at all (#93 B3).
             next_term = state.term + 1
+            if self._defer_to_named_coordinator(state.term):
+                return None
             try:
                 mine = store.claim(term=next_term, now=moment)
             except Exception as exc:
@@ -3217,6 +3222,31 @@ class AgentChannel:
             await self._announce_takeover(next_term, state.status, mine)
             return mine
         return None
+
+    def _defer_to_named_coordinator(self, term: int) -> bool:
+        """Whether a lapsed lease is left to the coordinator the admin named, which is up.
+
+        Succession is for a coordinator that is gone. Live: the admin's ``/role`` made the
+        acting coordinator yield, and 27 s later that same bot took the lapsed lease back by
+        succession, ahead of the named coordinator's slower promotion push. A peer now claims
+        only when the named coordinator is down, frozen, or has never been heard from."""
+        named = str(getattr(self.membership.state, "coordinator", None) or "").strip()
+        me = self.config.identity.alias.strip().lower()
+        if not named or named.lower() == me:
+            return False
+        if named in self.frozen_peers():
+            return False                         # frozen cannot lead: succession goes ahead
+        try:
+            table, now = self.presence(), self.presence_clock()
+            alive = table.quiet_for(named, now) is not None and not table.is_down(named, now)
+        except Exception:                        # noqa: BLE001 - no presence: old behaviour
+            logger.debug("lease: presence unavailable; succession proceeds", exc_info=True)
+            return False
+        if alive and getattr(self, "_lease_deferred_term", None) != term:
+            self._lease_deferred_term = term
+            logger.info("lease: the lease lapsed at term %d, but %s, the coordinator the admin "
+                        "named, is up; leaving the role to it", term, named)
+        return alive
 
     async def _announce_takeover(self, term: int, why: str, claim: Any) -> None:
         """Tell the admin, once, in the channel: a takeover is theirs to know about (#83)."""
