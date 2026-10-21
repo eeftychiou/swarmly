@@ -2256,6 +2256,11 @@ class AgentChannel:
             return float("inf")
         return interval * missed
 
+    def heartbeat_plane(self) -> str:
+        """``limits.heartbeat_plane``: "telegram" (the default) or "bus"."""
+        plane = str(getattr(self.config.limits, "heartbeat_plane", "telegram") or "telegram")
+        return "bus" if plane.strip().lower() == "bus" else "telegram"
+
     def pulse_bus(self) -> Optional[PulseBus]:
         """The git ref this bot's pulse is written to, or None when the bus is off (#82).
 
@@ -2450,11 +2455,43 @@ class AgentChannel:
             term = int(self.lease_state().term or 0)
         except Exception:                          # noqa: BLE001 - a pulse without a term
             term = 0
+        status = self.status_snapshot(now).to_dict()
+        usage = self._pulse_usage(now)
+        if usage:
+            status["usage"] = usage
         return Pulse(alias=self.config.identity.alias, at=now, rev=self._running_revision,
                      role=self._role_name() if self.config.identity.role else "", term=term,
                      busy_since=now - max(durations) if durations else None,
-                     frozen=bool(self._frozen),
-                     status=self.status_snapshot(now).to_dict())
+                     frozen=bool(self._frozen), status=status)
+
+    def _pulse_usage(self, now: float) -> Dict[str, Any]:
+        """What this bot spent, from its own turn ledger: since the last beat and today (UTC).
+
+        Read from the ledger the turns already wrote, so the heartbeat costs no tokens. A number
+        a runtime never reported stays ``None``, as it does in /usage.
+        """
+        try:
+            ledger = self.usage_ledger()
+            if ledger is None:
+                return {}
+            last = float(self.__dict__.get("_pulse_usage_from") or 0.0)
+            self._pulse_usage_from = now
+            midnight = now - (now % 86400.0)
+
+            def brief(totals: Dict[str, Any]) -> Dict[str, Any]:
+                return {key: totals.get(key) for key in
+                        ("turns", "failed", "tokens_in", "tokens_out", "cost_usd")}
+
+            usage: Dict[str, Any] = {
+                "beat": brief(ledger.totals(last or now - self.heartbeat_seconds())),
+                "today": brief(ledger.totals(midnight))}
+            left, resets = ledger.quota()
+            if left is not None or resets is not None:
+                usage["quota_left"], usage["quota_resets_at"] = left, resets
+            return usage
+        except Exception:                              # noqa: BLE001 - a pulse without usage
+            logger.debug("heartbeat: no usage this beat", exc_info=True)
+            return {}
 
     # -- the status snapshot (issue #124) ---------------------------------------------
 
@@ -2590,8 +2627,14 @@ class AgentChannel:
         ephemeral `STATUS intent=PULSE` line.
         """
         moment = self.presence_clock() if now is None else now
+        try:
+            # The lease read may fetch the bus: warm its cache off the event loop (#126), so
+            # the pulse built next reads it from memory.
+            await asyncio.to_thread(self.lease_state)
+        except Exception:                              # noqa: BLE001 - a pulse without a term
+            logger.debug("heartbeat: lease not read this beat", exc_info=True)
         pulse = self.own_pulse(moment)
-        bus = self.pulse_bus()
+        bus = self.pulse_bus() if self.heartbeat_plane() == "bus" else None
         # B4: the bus half is git -- subprocesses with timeouts, and up to ~16 of them a beat.
         # Run inline they would stall the event loop (this pulse, every turn and Telegram
         # delivery with it) for as long as git takes, so they go to a worker thread.
@@ -2603,15 +2646,100 @@ class AgentChannel:
             self._save_presence()
             said = f"pulse ref rev={pulse.rev or '?'} busy_since={pulse.busy_since} peers={counted}"
         else:
-            await self.send(
-                format_message(Envelope(type=MessageType.STATUS, to="*", intent="PULSE",
-                                        ref=self._alias_ref(), rev=self._running_revision),
-                               json.dumps(pulse.to_dict(), sort_keys=True,
-                                          separators=(",", ":"))),
-                silent=True, notice=True, allow_when_frozen=True)
-            said = f"pulse rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
+            line = format_message(Envelope(type=MessageType.STATUS, to="*", intent="PULSE",
+                                           ref=self._alias_ref(), rev=self._running_revision),
+                                  json.dumps(pulse.to_dict(), sort_keys=True,
+                                             separators=(",", ":")))
+            how = await self._publish_pulse_line(line)
+            said = f"pulse {how} rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
         await self.check_peer_liveness(now=moment)
         return said
+
+    def _pulse_message_path(self) -> Optional[Path]:
+        return _state_file(self.config, "pulse-message")
+
+    def _pulse_message(self) -> Optional[Tuple[int, Optional[int], int]]:
+        """``(chat, topic, message id)`` of this bot's status message, kept across restarts."""
+        if "_pulse_message_ref" not in self.__dict__:
+            ref = None
+            path = self._pulse_message_path()
+            try:
+                if path is not None and path.is_file():
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    ref = (int(data["chat"]), data.get("topic"), int(data["message"]))
+            except Exception:                          # noqa: BLE001 - a new message, then
+                logger.warning("heartbeat: unreadable %s; posting a new status message", path)
+            self._pulse_message_ref = ref
+        return self._pulse_message_ref
+
+    def _remember_pulse_message(self, ref: Optional[Tuple[int, Optional[int], int]]) -> None:
+        self._pulse_message_ref = ref
+        path = self._pulse_message_path()
+        if path is None:
+            return
+        try:
+            if ref is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"chat": ref[0], "topic": ref[1], "message": ref[2]}),
+                                encoding="utf-8")
+        except Exception:                              # noqa: BLE001 - kept in memory only
+            logger.warning("heartbeat: cannot save %s", path, exc_info=True)
+
+    async def _publish_pulse_line(self, line: str) -> str:
+        """Put the pulse on Telegram: edit this bot's one status message, or post it once.
+
+        A new line every beat would fill the group and ping nobody usefully; an edit makes no
+        notification and no new line, and peers receive it as an ``edited_message``, which is
+        the heartbeat. A message that cannot be edited any more (deleted, /cleanup) is replaced.
+        """
+        chat = int(self.config.identity.home_channel_id or 0)
+        topic = int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0) or None
+        ref = self._pulse_message()
+        if ref is not None and (ref[0], ref[1]) != (chat, topic):
+            ref = None                                 # the home or the topic moved
+        edit = getattr(self.bot, "edit_message_text", None) if self.bot is not None else None
+        if ref is not None and edit is not None:
+            try:
+                await edit(text=Redactor.from_config(self.config).text(line), chat_id=chat,
+                           message_id=ref[2], parse_mode=None, disable_web_page_preview=True)
+                return "edited"
+            except Exception as exc:                   # noqa: BLE001 - replaced below
+                if "not modified" in str(exc).lower():
+                    return "edited"
+                logger.info("heartbeat: status message %s cannot be edited (%s); posting anew",
+                            ref[2], exc)
+        sent = await self.send(line, chat_id=chat, thread_id=topic, silent=True,
+                               return_message_id=True, allow_when_frozen=True)
+        message_id = sent if isinstance(sent, int) and not isinstance(sent, bool) else None
+        if message_id is None:
+            return "posted"
+        old = ref[2] if ref is not None else None
+        self._remember_pulse_message((chat, topic, message_id))
+        delete = getattr(self.bot, "delete_message", None) if self.bot is not None else None
+        if old is not None and delete is not None:
+            try:
+                await delete(chat_id=chat, message_id=old)
+            except Exception:                          # noqa: BLE001 - one stale line at worst
+                logger.debug("heartbeat: old status message %s not deleted", old, exc_info=True)
+        return "posted"
+
+    async def _on_aiogram_edited(self, message: Any) -> None:
+        """A peer edited a message: its status message is its heartbeat.
+
+        Only the pulse counts. An edit is never a new request, so nothing else in an edited
+        message reaches the model.
+        """
+        try:
+            event = self.event_from_aiogram(message)
+            if not event.author_is_bot or event.chat_id != int(self.config.identity.home_channel_id or 0):
+                return
+            envelope, _body = parse_message(event.text or "")
+            if envelope.type == MessageType.STATUS and (envelope.intent or "").upper() == "PULSE":
+                self._note_peer_liveness(envelope, event)
+        except Exception:                              # noqa: BLE001 - liveness must not stop
+            logger.warning("heartbeat: an edited pulse could not be read", exc_info=True)
 
     async def _heartbeat_loop(self) -> None:
         """Publish the pulse on its interval, for as long as this transport runs.
@@ -6461,6 +6589,7 @@ class AgentChannel:
                        default=DefaultBotProperties(parse_mode="HTML"))
         self.dispatcher = Dispatcher()
         self.dispatcher.message.register(self._on_aiogram_message)
+        self.dispatcher.edited_message.register(self._on_aiogram_edited)
         self._started_wall = time.time()
         me = await self.bot.get_me()
         logger.info("connected as @%s (alias %s) in chat %s",

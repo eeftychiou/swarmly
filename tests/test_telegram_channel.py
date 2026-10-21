@@ -1656,6 +1656,7 @@ class TestOnlineNoticeRevision(unittest.TestCase):
 
         dispatcher = types.SimpleNamespace(
             message=types.SimpleNamespace(register=lambda *a, **k: None),
+            edited_message=types.SimpleNamespace(register=lambda *a, **k: None),
             start_polling=noop, stop_polling=noop)
 
         fake_client = types.ModuleType("aiogram.client")

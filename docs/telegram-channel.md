@@ -598,12 +598,12 @@ last worked in, asking it to look at the round and act on whatever waits, or to 
 it stops a day after the last turn. `0` turns it off.
 **A bot that dies says nothing, so the swarm listens for its pulse.** Every transport writes one
 heartbeat every `limits.heartbeat_minutes` (default 2) carrying its revision, term, role and,
-while a turn is running, `busy_since`. With the bus on it is a **parentless commit on the bot's own
-ref, `refs/pulse/<alias>`**, force-updated every beat: a mailbox, not a history — the bus branch
-grows nothing, `main` never learns a pulse happened, and nobody races the only writer. A commit on
-the bus branch every two minutes would be ~180 commits an hour, forever. With no bus, or when a
-beat's push fails, the pulse is the ephemeral `STATUS to=* intent=PULSE` line instead, which is
-machine-class traffic and wakes no turn. The pulse is its own task, never the turn lock, so a turn
+while a turn is running, `busy_since`. It is **one status message per bot, edited in place**
+every beat (`limits.heartbeat_plane: telegram`, the default): peers receive the edit, which is
+the heartbeat, and the group gets no new line and no notification. A deleted status message is
+posted again. `heartbeat_plane: bus` keeps the earlier per-bot git ref, `refs/pulse/<alias>`,
+but a heartbeat is a push and a fetch every beat on GitHub, so it is off by default. The pulse
+is machine-class traffic and wakes no turn. The pulse is its own task, never the turn lock, so a turn
 that runs for half an hour still pulses and shows `busy_since` — a long turn reads as work, not as
 a die-off.
 
