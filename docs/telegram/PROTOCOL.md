@@ -566,13 +566,12 @@ A participant conforms to v1.1 if it:
 ## Peer liveness: pulse and DOWN (issue #82)
 
 Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2). By default
-(`limits.heartbeat_plane: telegram`) it is **one status message per bot, edited in place**: the
-first beat posts a `STATUS to=* intent=PULSE` line (silently, in the topic
-`limits.heartbeat_topic_id`, General when 0), and every later beat edits that same message.
-Peers receive the edit as an `edited_message` update (Bot-to-Bot mode), and the edit is the
-heartbeat. An edit makes no notification and no new line in the group. A status message that
-can no longer be edited (deleted, `/cleanup`) is posted again, and the old one deleted. Only a
-pulse counts in an edited message: an edit never reaches the model.
+(`limits.heartbeat_plane: telegram`) it is a silent `STATUS to=* intent=PULSE` line in the topic
+`limits.heartbeat_topic_id` (General when 0), and **each beat deletes the bot's previous pulse**
+(`limits.heartbeat_style: repost`), so the topic always holds one current line per bot. With
+`heartbeat_style: edit` the bot edits one status message in place instead, and peers receive the
+edit as an `edited_message` update; only a pulse counts in an edited message, and an edit never
+reaches the model. A status message that can no longer be edited is posted again.
 
 A heartbeat does not belong on GitHub: at five bots it was about 150 pushes an hour plus the
 fetches to read them, so the bus carries only what must last (messages, round state, the lease).

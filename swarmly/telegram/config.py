@@ -685,6 +685,10 @@ class ChannelLimits:
     heartbeat_plane: str = "telegram"
     #: The forum topic the status message lives in; 0 is General.
     heartbeat_topic_id: int = 0
+    #: On the Telegram plane: "repost" posts each beat as a new silent line and deletes the
+    #: previous one, so peers receive an ordinary message; "edit" edits one message in place,
+    #: which relies on Telegram delivering a bot's edits to the other bots.
+    heartbeat_style: str = "repost"
     #: How many heartbeats a peer may miss before it is DOWN (advisory: the lease, not this,
     #: decides who coordinates).
     peer_down_after: float = 3.0

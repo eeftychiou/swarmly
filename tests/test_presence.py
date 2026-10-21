@@ -411,9 +411,9 @@ class FakeEditingBot:
 class TestThePulseOnTelegram(unittest.TestCase):
     """A heartbeat does not belong on GitHub: by default each bot edits one status message."""
 
-    def channel(self, bot):
+    def channel(self, bot, style="edit"):
         from types import SimpleNamespace
-        channel = live_channel()
+        channel = live_channel(heartbeat_style=style)
         channel.bot = bot
         recorder = channel._sender
         ids = iter(range(500, 600))
@@ -455,6 +455,17 @@ class TestThePulseOnTelegram(unittest.TestCase):
         bot.editable = True
         run(channel._heartbeat_tick())
         self.assertEqual(bot.edits[-1][1], 501)
+
+    def test_by_default_each_beat_is_a_new_line_and_the_last_one_goes(self):
+        bot = FakeEditingBot()
+        channel = self.channel(bot, style="repost")
+        for step in range(3):
+            channel._test_presence_clock["t"] = NOW + 120 * step
+            self.assertIn("pulse posted", run(channel._heartbeat_tick()))
+        self.assertEqual(bot.edits, [])
+        self.assertEqual(len(channel._test_sender.sent), 3)
+        home = channel.config.identity.home_channel_id
+        self.assertEqual(bot.deleted, [(home, 500), (home, 501)])   # one line left: the newest
 
     def test_a_peers_edited_pulse_is_its_heartbeat(self):
         from types import SimpleNamespace

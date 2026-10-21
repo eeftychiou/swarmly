@@ -2688,18 +2688,22 @@ class AgentChannel:
             logger.warning("heartbeat: cannot save %s", path, exc_info=True)
 
     async def _publish_pulse_line(self, line: str) -> str:
-        """Put the pulse on Telegram: edit this bot's one status message, or post it once.
+        """Put the pulse on Telegram, as one current line per bot.
 
-        A new line every beat would fill the group and ping nobody usefully; an edit makes no
-        notification and no new line, and peers receive it as an ``edited_message``, which is
-        the heartbeat. A message that cannot be edited any more (deleted, /cleanup) is replaced.
+        ``limits.heartbeat_style`` "repost" (the default) posts the beat as a new silent line
+        and deletes the previous one, so peers receive an ordinary message. "edit" edits the one
+        status message in place instead (peers receive an ``edited_message``), and a message
+        that cannot be edited any more (deleted, /cleanup) is replaced.
         """
         chat = int(self.config.identity.home_channel_id or 0)
         topic = int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0) or None
         ref = self._pulse_message()
         if ref is not None and (ref[0], ref[1]) != (chat, topic):
             ref = None                                 # the home or the topic moved
+        style = str(getattr(self.config.limits, "heartbeat_style", "repost") or "repost")
         edit = getattr(self.bot, "edit_message_text", None) if self.bot is not None else None
+        if style.strip().lower() != "edit":
+            edit = None                                # repost: a new line, the old one deleted
         if ref is not None and edit is not None:
             try:
                 await edit(text=Redactor.from_config(self.config).text(line), chat_id=chat,
