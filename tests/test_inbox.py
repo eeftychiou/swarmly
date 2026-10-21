@@ -269,3 +269,69 @@ class HardeningTests(unittest.TestCase):
 
         asyncio.run(scenario())
         self.assertEqual(channel._inbox._entries, {}, "nothing left, not even the key")
+
+class ResumeNoticeAndAttachmentsTests(unittest.TestCase):
+    """Issue #103 items 7 and 8: a notice that fails must not spend the replay, and a request
+    that came with files resumes with them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def channel(self):
+        config = make_config(fallback={"gitbus_root": self.tmp.name})
+        config.source_path = Path(self.tmp.name) / "agent.local.yaml"
+        channel = make_channel(config)
+        channel.bot = object()
+        return channel
+
+    def test_a_failed_resume_notice_does_not_spend_the_replay(self):
+        channel = self.channel()
+        channel._inbox.record(admin("@HermesBot finish me", message_id=31))
+        sent_notices = []
+
+        async def send(text, **kwargs):
+            if "↻ resuming" in text:
+                sent_notices.append(text)
+                raise RuntimeError("telegram is down")
+            sent_notices.append(text)
+
+        channel.send = send
+
+        async def scenario():
+            self.assertEqual(channel.replay_interrupted(), 1)
+            for _ in range(5):
+                pending = [t for t in channel._self_tasks if not t.done()]
+                if not pending:
+                    break
+                await asyncio.gather(*pending)
+
+        asyncio.run(scenario())
+        self.assertTrue(sent_notices, "the turn ran anyway")
+        prompts = [t for t in sent_notices if "cut off by a restart" in t]
+        self.assertEqual(len(prompts), 1, sent_notices)      # the resume still happened
+        self.assertEqual(channel._inbox._entries, {}, "and it closed its record")
+
+    def test_an_attachment_only_request_resumes_with_its_attachment(self):
+        channel = self.channel()
+        channel._inbox.record(event("", message_id=33, attachments=[
+            {"file_id": "abc", "file_name": "log.txt", "mime_type": "text/plain"}]))
+        seen = []
+
+        async def capture(task, *args, **kwargs):
+            seen.append(task)
+
+        channel.handle_event = capture
+
+        async def scenario():
+            channel.replay_interrupted()
+            for _ in range(5):
+                pending = [t for t in channel._self_tasks if not t.done()]
+                if not pending:
+                    break
+                await asyncio.gather(*pending)
+
+        asyncio.run(scenario())
+        resumed = [t for t in seen if "cut off by a restart" in str(getattr(t, "text", ""))]
+        self.assertEqual(len(resumed), 1, seen)
+        self.assertEqual(resumed[0].attachments[0]["file_name"], "log.txt")

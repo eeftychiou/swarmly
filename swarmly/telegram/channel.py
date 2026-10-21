@@ -3369,10 +3369,19 @@ class AgentChannel:
 
     async def _run_resumed(self, event: ChannelEvent, when: str, note: str) -> None:
         """The resumed turn itself, owning the interrupted message's inbox entry."""
-        await self.send(f"↻ resuming the turn cut off at {when}.", chat_id=event.chat_id,
-                        thread_id=event.thread_id, notice=True, silent=True)
+        try:
+            # Best effort (#103): the notice is a courtesy, the resume is the point. A `send()`
+            # that raises must not spend the one replay this record has before the turn starts.
+            await self.send(f"↻ resuming the turn cut off at {when}.", chat_id=event.chat_id,
+                            thread_id=event.thread_id, notice=True, silent=True)
+        except Exception:                      # noqa: BLE001 - resuming matters more
+            logger.warning("inbox: could not post the resume notice; resuming anyway",
+                           exc_info=True)
         task = ChannelEvent(text=note, chat_id=event.chat_id, thread_id=event.thread_id,
                             topic_name=event.topic_name, self_task=True,
+                            # #103: the request came with files, so the resume carries them --
+                            # an attachment-only brief has no text to quote.
+                            attachments=list(getattr(event, "attachments", None) or []),
                             author_username=f"{self.config.identity.alias} (own brief)")
         try:
             await self.handle_event(task)
