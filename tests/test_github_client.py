@@ -233,3 +233,19 @@ class TestGitHubClient(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGhOutputIsUtf8(unittest.TestCase):
+    """Live: on Windows the gh output was decoded with the ANSI code page, so an issue body
+    with a character outside it (byte 0x8f) killed the reader thread and /cleanup never
+    answered. gh writes UTF-8, and that is how it is read."""
+
+    def test_utf8_output_is_read_whole(self):
+        import sys
+        client = GitHubClient(token_env="TEST_GH_TOKEN", alias="Antigravity")
+        script = ("import sys; sys.stdout.buffer.write("
+                  "'{\"body\": \"round \u2192 done \u2713 \u008f\"}'.encode('utf-8'))")
+        with patch("swarmly.github.client.shutil.which", return_value=sys.executable):
+            code, out, err = client._run(["-c", script])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["body"], "round \u2192 done \u2713 \u008f")

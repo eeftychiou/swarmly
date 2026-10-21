@@ -49,6 +49,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from swarmly.telegram.cli_defaults import reported_model
 from swarmly.telegram.adapters.base import (
     AdapterReply,
     IncomingMessage,
@@ -185,6 +186,9 @@ class ClaudeAdapter(SubprocessAdapter):
             return super().parse_output(out, duration)
         meta = {key: data[key] for key in ("session_id", "total_cost_usd", "num_turns")
                 if key in data}
+        model = reported_model(data.get("modelUsage"))
+        if model:
+            meta["model"] = model                         # the online notice names it
         result = str(data.get("result") or "").strip()
         if data.get("is_error") or data.get("subtype") not in (None, "success"):
             reason = result or str(data.get("subtype") or "error")

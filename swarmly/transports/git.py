@@ -17,7 +17,8 @@ import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from swarmly.transports.base import is_envelope_name, write_envelope
+from swarmly.transports.base import (ROUNDS_RELPATH, is_bus_document,
+                                     is_envelope_name, write_envelope)
 
 logger = logging.getLogger("swarmly.transports.git")
 
@@ -57,9 +58,13 @@ class GitTransport:
         return f"git: {self.inbox_dir} ({where})"
 
     # -- reading ---------------------------------------------------------------------
-    def refresh(self) -> None:
-        """Fetch only. The working tree is never touched, so a dirty or diverged checkout
-        cannot block delivery (the reader prefers the fetched ref anyway)."""
+    def refresh(self) -> bool:
+        """Fetch only, and say whether the ref is now trustworthy.
+
+        The working tree is never touched, so a dirty or diverged checkout cannot block
+        delivery. ``False`` means the fetch did not succeed: a caller that arbitrates on the
+        bus (a wake claim) must not treat a stale ref as an empty one.
+        """
         argv = ["git", "-C", str(self.root), "fetch", "--quiet", self.remote]
         prefix = f"{self.remote}/"
         if self.ref and self.ref.startswith(prefix):
@@ -72,7 +77,7 @@ class GitTransport:
                 result = subprocess.run(argv, capture_output=True, text=True, timeout=60,
                                         check=False)
                 if result.returncode == 0:
-                    return
+                    return True
                 # Two agents fetching one checkout at once: one loses the ref lock. A
                 # second try a moment later finds the ref already updated.
                 if attempt == 0 and "cannot lock ref" in (result.stderr or ""):
@@ -80,9 +85,11 @@ class GitTransport:
                     continue
                 logger.warning("gitbus: git fetch exited %s: %s", result.returncode,
                                (result.stderr or "").strip()[:200])
-                return
+                return False
         except Exception:  # noqa: BLE001 - refresh is best-effort
             logger.warning("gitbus: git fetch could not run", exc_info=True)
+            return False
+        return False
 
     def list_messages(self) -> List[Tuple[str, str]]:
         if self.ref:
@@ -107,6 +114,78 @@ class GitTransport:
                                   check=True).stdout
             items.append((name, data))
         return items
+
+    def list_at_ref(self, relpath: str) -> Optional[List[str]]:
+        """File names directly under *relpath* at the bus ref (a round's segments).
+
+        Issue #86 review: the round state is a bus *document*, not an envelope, so it has
+        its own read path. ``[]`` means the ref was read and holds nothing there; ``None``
+        means it could not be read at all. The two are never the same answer: a caller that
+        conflates them reports a broken bus as an empty round (PR #89 review, blocker 1).
+        """
+        if not self.ref:
+            return None
+        prefix = relpath.rstrip("/") + "/"
+        result = self._git("ls-tree", "-r", "--name-only", self.ref, prefix, timeout=30)
+        if result.returncode != 0:
+            logger.warning("gitbus: could not list %s at %s: %s", relpath, self.ref,
+                           (result.stderr or "").strip()[:200])
+            return None
+        return sorted(path[len(prefix):] for path in (result.stdout or "").splitlines()
+                      if path.startswith(prefix))
+
+    def commit_depth(self, relpath: str) -> Optional[int]:
+        """How many commits reach the one that added *relpath*: its depth in the branch.
+
+        Unlike ``arrival_rank`` -- commits *after* it, which every new commit on the branch
+        changes -- this is a property of the commit itself and never moves. Ordering by it means
+        a cached answer stays true when the tip advances (#93, Codex's blocker at lease.py:289).
+        """
+        if not self.ref:
+            return None
+        added = self._git("log", "-1", "--format=%H", "--diff-filter=A", self.ref, "--",
+                          relpath, timeout=30)
+        commit = (added.stdout or "").strip().splitlines()
+        if added.returncode != 0 or not commit:
+            return None
+        counted = self._git("rev-list", "--count", commit[-1], timeout=30)
+        if counted.returncode != 0:
+            return None
+        try:
+            return int((counted.stdout or "").strip())
+        except ValueError:
+            return None
+
+    def arrival_rank(self, relpath: str) -> Optional[int]:
+        """How many commits on the bus branch came *after* the one that added *relpath*.
+
+        This is the only ordering a bot cannot forge and a slow push cannot backdate: a commit
+        records its own author's clock, and a commit is created before it is pushed, so both a
+        stamp inside a file and a commit time are earlier than the moment the bus saw it. The
+        **position in the branch** is not: a push that loses the race is replayed onto the tip,
+        which puts it after everything that landed while it was in flight. Higher is earlier.
+        """
+        if not self.ref:
+            return None
+        added = self._git("log", "-1", "--format=%H", "--diff-filter=A", self.ref, "--",
+                          relpath, timeout=30)
+        commit = (added.stdout or "").strip().splitlines()
+        if added.returncode != 0 or not commit:
+            return None
+        after = self._git("rev-list", "--count", f"{commit[-1]}..{self.ref}", timeout=30)
+        if after.returncode != 0:
+            return None
+        try:
+            return int((after.stdout or "").strip())
+        except ValueError:
+            return None
+
+    def read_at_ref(self, relpath: str) -> Optional[str]:
+        """The bytes of one bus document at the ref, or ``None`` when it is not there."""
+        if not self.ref:
+            return None
+        result = self._git("show", f"{self.ref}:{relpath}", timeout=30)
+        return result.stdout if result.returncode == 0 else None
 
     def _list_local(self) -> List[Tuple[str, str]]:
         if not self.inbox_dir.is_dir():
@@ -204,10 +283,14 @@ class GitTransport:
         # files this post staged (commit_and_push lists them), never "whatever HEAD has".
         # It also carries bus files committed here earlier whose own push failed (a
         # checkout that fell behind kept them only locally, and they were never delivered).
+        # Issue #86: round state is a bus document under .agents/rounds, so a lost push
+        # that kept it local is carried forward too -- an envelope-only filter here would
+        # drop a state rewrite silently and leave the bus a sequence behind.
         unpushed = self._git("diff", "--name-only", "--diff-filter=A", f"{tip}...HEAD", "--",
-                             INBOX_RELPATH)
+                             INBOX_RELPATH, ROUNDS_RELPATH)
         earlier = [path for path in unpushed.stdout.splitlines()
-                   if unpushed.returncode == 0 and is_envelope_name(Path(path).name)]
+                   if unpushed.returncode == 0
+                   and (is_envelope_name(Path(path).name) or is_bus_document(path))]
         changed = list(dict.fromkeys([*files, *earlier]))
         if not changed:
             return subprocess.CompletedProcess(

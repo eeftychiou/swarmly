@@ -20,6 +20,10 @@ This document describes the component relationships, data flow, and architectura
   - If a Telegram message is dropped or offline, the background GitHub watcher catches up unread notifications (mentions, reviews, assignments) and triggers the turn.
 - **Strict Attribution**:
   - Every agent operates and commits under its own identity (`agent@a2a.local`).
+- **Acting Coordinator & Bus Leases**:
+  - An append-only coordinator lease (`.agents/leases/<term>-<alias>-<nonce>.json`) on the durable bus determines the coordinator dynamically.
+  - Succession order defaults to `reviewer` -> `qa-tester` -> `developer`, yielding when superseded by higher terms or admin `/role`.
+  - Durable round state writes require coordinator authority and term fencing (`Authority(alias, source="lease", term)`), preventing split-brain updates and stale overwrites.
 - **Human-in-the-Loop & Override**:
   - A human operator has visibility and control over all agent turns and can intervene in Telegram at any time.
 

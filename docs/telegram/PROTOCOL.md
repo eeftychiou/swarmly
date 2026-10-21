@@ -319,7 +319,110 @@ existed on no remote branch — the claim, not the intent, is what the protocol 
 nothing. HELLO is answered with the current state pointer, which is also how a restarted agent
 re-syncs.
 
+### Round state on the bus (issue #86)
+
+What a round waits on must outlive the coordinator's process. After every coordinator turn the
+transport writes the round's state to the bus and strips it from the posted reply.
+
+**Placement.** `.agents/rounds/<round>/<term>-<seq>-<writer>-<nonce>.json`, where `<round>` is
+`<owner>_<repo>#<tracking issue>` sanitized to a directory name. Each write is **its own file**:
+the bus retries a push that lost a race onto the remote's tip, so two writers in one window both
+land — a single mutable file would silently lose an update, while a lost push here costs one
+segment. Readers fold the segments in `(term, seq, at, writer)` order, so every bot that reads the
+same bus computes the same state.
+
+**The block.** The coordinator's reply carries one machine block, on its own line:
+
+```
+ROUND_STATE {"version":1,"round":88,"repo":"owner/project","term":3,"items":{"86":{...}}}
+```
+
+It is taken out of the adapter's **raw** text, before `limits.reply_chars` clamps or the reply is
+split, so it is never counted against the channel budget and never posted. **Exactly one block per
+reply**: every block is stripped from the text in every case, and a reply carrying two has its
+state refused (the last good state stands). It is capped at `limits.round_state_chars` (default
+8000 — a six-item round with heads and verdicts is about 2000); a block over the cap, unclosed,
+or not a JSON object is dropped whole. Only the coordinator writes it — a block from any other bot
+is dropped.
+
+A refusal is **visible**: the posted reply ends with `⚠️ round state: <reason>`, because a silent
+one reads exactly like success to the next turn and to any successor.
+
+**Segment fields.** `version` (reader refuses a newer one), `round`, `repo`, `writer`, `term`,
+`seq`, `at`, `items`, `order`, `blockers`, `timers`, `note`, `head`. Unknown fields are ignored
+forward-compatibly; a wrong type, a bad `version` or a missing `round` refuses the whole segment.
+
+Item patches carry `issue`, `pr`, `owner`, `head`, `ci`, `waits_on`, `state`, and one `review`
+and one `qa` verdict. `state` is what closes an item: `merged`, `closed` or `done` removes it from
+the open set, so a round can actually end. **A verdict is bound to a head**: `{"verdict":"merge","sha":"<40 hex>",
+"by":"Codex","at":"<iso>"}`. A short SHA may be written when the block also carries `head`, and
+is expanded against it; a prefix that does not identify that head is refused. Reading a verdict
+for a different head returns nothing — a new head clears the verdict instead of carrying an
+approval onto code nobody reviewed.
+
+**Authority.** GitHub wins for what exists, merged/closed state, the PR head and CI on that head;
+the file wins for owners' intent, order, blockers, verdicts, timers and term. `coordinator.json`
+(#83) is the authority for `term`; a segment from a lower term than the bus already holds is
+refused, so a returning coordinator cannot overwrite its successor's state. `term` and `seq` are
+**never** taken from the block — a model cannot give itself a term.
+
+**Reads are labelled.** A state read at the bus ref is `source=ref` and the only kind that is
+actionable. Segments that exist on this checkout but not yet on the ref (a push in flight) are
+`source=local` with `pending=N`; a ref that cannot be read is `unreadable`, never `absent`, and a
+local copy is reported as `local` (with the reason) rather than presented as bus state. A round
+with no segments anywhere is `absent`. Neither `unreadable` nor `local` may become a round
+report, and `usable` is false for both.
+
+**Concurrent writers.** `base_seq` records the `seq` the writer saw. Two segments with the same
+`term` and the same `base_seq` are concurrent. Disjoint fields both survive the fold; two
+concurrent writes to the *same* field keep a deterministic winner **and** are reported in
+`conflicts` (`<item>.<field>`), which marks the state stale. An update is never silently lost.
+
+A conflict is a **report, not a mark**: it clears when a later segment writes that field on a
+basis above the contested one (`base_seq` greater than the conflict's), which is what any ordinary
+next write does. The same holds for a two-way claim (`holder`). A round does not stay unusable
+because two bots once wrote at the same moment.
+
+**Fencing and fail-closed.** `holder` is set by the transport to the writing bot. Once a round has
+a holder at a term, another bot is refused (`RoundFenced`) at that term or below; only a higher
+term may take the round over. If the bus cannot be read, or the state is only on this checkout,
+the write is refused outright: a term and a seq that cannot be verified are not written.
+
+A **claim race** (two bots writing a round that has no segments yet) is decided by the fold, not by
+whoever pushes last: the highest term wins, and among simultaneous claims at that term the lowest
+alias does. The other claim is reported in `conflicts` as `holder`.
+
+**Writing is not holding.** After a write, the store re-reads and compares the fold's holder with
+the writer: a bot that wrote a claim it did not win gets `RoundFenced`, so a stale coordinator (a
+configured role that outlived its term) cannot become a second writer of a round another bot holds,
+and the refusal is visible in its reply. Until #83 lands the lease, the term only ever comes from the bus, which is why a bot
+whose bus checkout is broken cannot write round state at all.
+
+**All segments unreadable is `unreadable`,** not an empty round: no item, no owner and no verdict
+is claimed from a state nothing could be read from.
+
+**Missing is not empty.** A round with no segments is `absent`; a bus that cannot be read is
+`unreadable`. Neither is "no open items", and neither may produce a round report. `/round[@bot]
+[issue]` fetches the bus ref first, then prints the folded state with its age and writer; it answers
+with the reason when the state is not usable, so a fresh checkout cannot report a round as absent
+from a ref it has not fetched.
+
 ---
+
+### Coordinator lease and acting coordinator (issue #83)
+
+When the appointed coordinator is offline or fails to renew, another peer takes over to keep the
+round moving.
+
+- **Append-only lease records:** `.agents/leases/<term>-<alias>-<nonce>.json`.
+- **Folded state:** Highest term wins; ties within a term are broken by succession rank then
+  alias, ordered by `arrival_rank` on the bus. Unranked claims fail closed.
+- **Renewal:** The active holder renews its lease every `lease_renew_seconds`.
+- **Takeover:** If a lease expires beyond `takeover_minutes` or is yielded, the first UP,
+  non-frozen successor in succession order (`reviewer` -> `qa-tester` -> `developer`) claims term
+  `N+1`.
+- **Round authority:** Every durable round write carries `Authority(alias, source="lease", term)`.
+  Writes below the folded round term or by non-holders are refused.
 
 ## 8. Loop safety and pacing
 
@@ -349,6 +452,76 @@ is what the parts are joined on, so two replies by one sender that interleave ne
 written without a token cannot be attributed to a reply, so it is not joined — its part 1 stands
 alone and its continuations start no turn. A peer that needs the full text of a long
 handoff should still read it from the durable record (`bus=`).
+
+### Self-wake timers (issue #81)
+
+A bot that must act later arms its own timer. It is a machine line in the reply, stripped before
+posting like the other directives:
+
+```
+WAKE in=10m every=5m until=120m check="gh pr checks 75 --required" then="merge it if review and QA still hold"
+```
+
+`in=` is when the first check runs, `every=` re-arms a check that is not ready yet (optional),
+`until=` is when the wait expires, `check` is the command and `then` is what the bot should do
+when it is ready. The transport runs the check **itself**, with no model turn, and decides on the
+exit code:
+
+| exit | meaning | what happens |
+|---|---|---|
+| 0 | ready | one turn carrying `then` and the last 20 lines of output; the timer is done |
+| the command's documented *pending* code (8 for `gh pr checks`) | not yet | re-arm at `every`, silently, until `until` |
+| anything else, or a timeout | the check itself failed | one turn, with the tail, so the bot decides. Not re-armed |
+| past `until` | the wait expired | one turn saying so, so the bot escalates or re-arms |
+
+**The check is a read-only command, matched argv-to-argv.** `check` is untrusted model output
+running outside a turn, so it may only start with one of the read-only prefixes in
+`swarmly.telegram.wake.ALLOWED_ARGV` (`gh pr checks|view|list|status|diff`, `gh run view|list`,
+`gh api` with GET only, `gh issue view`, `gh search`, `git status|log|diff|show|rev-parse` —
+`git fetch` and `git ls-remote` are deliberately not allowed: both take a repository argument that
+accepts `ext::<command>`, which git runs as a remote helper).
+It is parsed with `shlex` and run without a shell, so shell metacharacters are refused, as are
+`-X`/`--method`/`-f`/`--input` and anything not on `PATH`. A refused line is stripped from the
+reply and the refusal is posted in its place.
+
+**A fire is claimed before it happens, and the claim must settle.** Timers live one file per timer under `wake-<alias>/` in the
+state dir, so a restart resumes the schedule (times are absolute: `next_at` and `expires_at`, never
+`in=` re-derived) and two parallel turns cannot rewrite each other's schedule. Each firing writes an
+append-only claim to `.agents/wakes/<alias>/<timer>-<firing>-<alias>.json` on the bus *before* the
+turn starts (the claim carries the whole timer, so a successor can adopt it) — keyed on the firing's scheduled time, so a stale claim from an earlier firing (or from
+a bot that has since died) never blocks the next one. The claims for that firing are **re-read
+after the push**, and ordered by **where each claim sits in the bus's history** — how many commits landed after the one
+that added the file (`git rev-list --count <commit>..<ref>`), ties by lowest alias. Nothing inside
+the file decides it: a timestamp a bot writes is advisory, and so is a commit date, because both
+are set before the push; a push that loses the race is replayed onto the tip, which puts its claim
+*after* everything that landed while it was in flight. A claim is not honoured the tick it
+is written: with `limits.wake_claim_settle_seconds` (default 30) the writer waits one window
+**measured from when the bus first had its claim**, so a claim still in flight cannot be overtaken
+and every bot folds the same winner. A claim whose own write cannot be confirmed, or that
+cannot be pushed, or whose fetch failed, does not fire: a stale or broken bus is not "I am the
+only one".
+
+**A ready firing is written down before its turn starts.** The timer records the turn text and
+moves to `firing`; the transport starts it and then retires the timer. A crash in between replays
+that one turn on the next tick instead of losing it, at most once, and the replay tells the bot
+it may already have acted: exactly-once is not available to an agent that cannot commit its side
+effects, and losing the turn is worse than repeating it with a warning. A successor also adopts an armed timer it
+finds on the bus (`adopt()`), because a timer is a promise to the swarm, not to one bot: each
+transition publishes a state record (`<id>-state.json`), a successor adopts only the **newest**
+record per timer, and never one that has finished, expired or been cancelled. An adopted record
+is **untrusted input** — anyone who can push to the bus writes one — so its argv goes through the
+same allowlist and the bot's `limits.wake_check_allow` before it is written or run.
+`attempts` is persisted and bounded by `limits.wake_max_attempts`.
+
+**Commands.** `/wakes` lists the live timers with their next time, check and attempt count;
+`/wakes cancel <id>` drops one (admin only); `/status` carries `wakes=N`. A bot runs no check while
+it is frozen.
+
+**No silent promises.** A promise to act later is a WAKE armed in the same turn, not a sentence.
+The coordinator role says so: for a PR blocked only on CI, the coordinator arms the timer itself
+and does not count on an external CI wake.
+
+---
 
 **Messages that arrive mid-turn are queued.** With `busy_behavior: queue` (the default) an
 addressed message that arrives while a turn is running waits, up to `busy_queue_max`, and runs
@@ -385,3 +558,61 @@ A participant conforms to v1.1 if it:
 - [ ] mirrors every decision with a verifiable `path@commit` pointer
 - [ ] commits under its own identity
 - [ ] announces every escalation rung
+- [ ] carries its round state as a `ROUND_STATE` block that is stripped before posting (§7)
+- [ ] turns a promise to act later into a `WAKE` line in the same turn (§8)
+
+## Peer liveness: pulse and DOWN (issue #82)
+
+Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2), and it goes
+to the **durable plane** whenever there is one: a parentless commit on this bot's own ref,
+`refs/pulse/<alias>`, force-updated every beat (one blob, `pulse.json`, no parent chain). The ref
+is a mailbox, not a history: the bus branch grows no commits, `main` never learns a pulse
+happened, and the only writer of a bot's ref is that bot, so there is no push race. Peers read
+`refs/pulse/*` on the same interval, so the facts survive a restart -- including a die-off seen
+while this bot was being restarted.
+
+A commit on the bus branch every two minutes would be ~180 commits an hour of history, forever;
+that is why the pulse gets its own ref rather than a lane of the bus branch.
+
+**Telegram is the fallback.** With no bus (a bare transport, no checkout) or when this beat's
+push failed, the pulse goes out as the ephemeral `STATUS intent=PULSE` line instead -- and only
+then. `PULSE` is machine-class traffic (#43): it is recorded as state, wakes no model turn, and
+is swept from General like the other machine notices.
+
+The bus half runs in a worker thread (`asyncio.to_thread`), never inline in the beat: a slow or
+hung git must not stall the pulse loop, a turn, or Telegram delivery. `refs/pulse/<alias>` is
+the pulse's identity -- a payload whose alias does not encode to the ref it came from is
+ignored, because every writer can push any ref.
+
+The pulse commit is authored by the bot itself (`DeepSeek <deepseek@a2a.local>`), named on the
+command line rather than read from the host's git config, and it writes a ref of its own --
+never a branch -- so the push guard sees no push to `main`. A role that may not push at all
+(`reviewer`, `researcher`) has no bus half and keeps the Telegram line, which is the
+fallback working as designed.
+
+A pulse carries `{alias, at, rev, role, term, busy_since, frozen}`. The pulse is emitted by its
+own task, never the turn lock, so a long turn keeps pulsing and `busy_since` says since when.
+
+**DOWN** means silent on *both* planes: no pulse and no Telegram traffic for
+`heartbeat_minutes × peer_down_after` (default 6 minutes). Any pulse, `HELLO` or message brings a
+peer back UP, so a bot whose git remote died — or one partitioned away from the bus — is not
+declared dead while it is still talking to us. A peer never heard from is `unknown`, not DOWN, and
+a freshly started transport gets one interval of grace before anyone can be judged DOWN.
+
+The table survives a restart: each transport saves `presence-<alias>.json` (peer
+`last_seen`/`busy_since`/`term`/`rev`, and any DOWN episode already announced) beside its
+other state and restores it at start, so a die-off seen before a restart is still known
+after it and one admin line is still one line. A stop shorter than one interval missed no
+pulse, so the saved verdicts stand; after a longer stop the bot cannot know what it did not
+hear and rejudges from now under the fresh grace.
+
+DOWN is **advisory**. It says "this peer has not been heard from"; it never says "somebody else
+should lead". The lease (#83) decides who coordinates — using DOWN to start a takeover would let
+a partition elect a second coordinator.
+
+What DOWN changes: a hand-off to a DOWN peer is returned to the sender at once (no reminder, no
+wait), the same as FROZEN, and no reminder is ever sent to a DOWN or busy peer. When the
+coordinator, or the acting coordinator when the coordinator is the one down, hears a peer go
+DOWN, it posts one line to the admin — "⚠️ DeepSeek has been silent since 18:30" — deduped once
+per episode. A peer that comes back gets one "back" line and nothing more. `/status` and `/swarm`
+show `peers=Claudebot:up,DeepSeek:down(12m)`; a busy peer shows `busy(3m)`.

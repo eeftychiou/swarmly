@@ -147,3 +147,48 @@ def is_envelope_name(name: str) -> bool:
     """True for an envelope file name; false for temp files, dotfiles and other clutter."""
     base = name.rsplit("/", 1)[-1]
     return base.endswith(".md") and not base.startswith((".", "~"))
+
+
+#: Where the durable round state lives on the bus (issue #86). One directory per round,
+#: one file per write, so two bots never replace each other's file.
+ROUNDS_RELPATH = ".agents/rounds"
+
+#: Where a bot's self-wake timers keep their fire claims (issue #81): append-only records,
+#: one per firing, so a takeover or a restart can neither miss a fire nor make it twice.
+WAKES_RELPATH = ".agents/wakes"
+
+#: Where the coordinator lease keeps its claims (issue #83): append-only, one per renewal, at
+#: `.agents/leases/<term>-<alias>-<nonce>.json`. A single mutable file would have the
+#: last-writer-wins race the wake claims were built to avoid.
+LEASES_RELPATH = ".agents/leases"
+
+#: The directories a bus *document* may live in.
+BUS_DOCUMENT_DIRS = (ROUNDS_RELPATH, WAKES_RELPATH, LEASES_RELPATH)
+
+
+def is_bus_document(relpath: str) -> bool:
+    """True for a bus *document* -- round state (#86) or a wake claim (#81) -- else False.
+
+    A document is state, not a message: it is not an envelope, it may be nested one
+    directory deep (one per round), and it is only ever written whole, under a name that
+    is unique to that write. Everything that could escape ``.agents/rounds`` -- an
+    absolute path, a ``..``, a drive letter, a control character -- is refused, the same
+    way :func:`checked_envelope_name` refuses a path masquerading as a message id.
+    Documents live in one of :data:`BUS_DOCUMENT_DIRS`, one directory deep.
+    """
+    if not isinstance(relpath, str) or not relpath:
+        return False
+    path = relpath.replace("\\", "/")
+    if not path.endswith(".json"):
+        return False
+    if ":" in path or ".." in path.split("/") or any(ord(char) < 32 for char in path):
+        return False
+    for directory in BUS_DOCUMENT_DIRS:
+        if not path.startswith(directory + "/"):
+            continue
+        parts = path[len(directory) + 1:].split("/")
+        # Round state and wake claims live in one directory per round or per bot; a lease
+        # claim is one file directly in `.agents/leases/`.
+        depth = 1 if directory == LEASES_RELPATH else 2
+        return len(parts) == depth and all(part and not part.startswith(".") for part in parts)
+    return False

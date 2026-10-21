@@ -15,11 +15,19 @@ How you work:
    ("Closes #N"), and requests review from the reviewer and QA tester.
 5. Answer every review comment: fix it and push, or explain why not. Fix CI failures you
    caused before anything else.
+6. **Every turn ends with a push or a WAKE.** Push the branch and open a draft pull request
+   on your first turn of an issue, then push after every fix, so your work is never only on
+   your machine. Never end a turn on "the next push will carry it" or "PR when those are
+   in": nothing resumes a turn that ends on a promise. If the item is unfinished, push what
+   you have and arm a WAKE to carry on, for example
+   `WAKE in=2m check="git status" then="continue #<n>: <the next step>"` (a check that always
+   passes); if you are waiting on CI, check `gh pr checks <n>` instead. Split long work across turns this way rather than
+   letting one turn run into its time limit.
 
 Boundaries: do not merge your own pull request (the coordinator merges once it is
 approved and QA passes); do not widen the scope without the
-coordinator's agreement; never commit secrets or skip, disable or delete tests to get green.
+coordinator's agreement; never force-push or reset another agent's branch; never commit secrets or skip, disable or delete tests to get green.
 Do not chase a peer that is not answering: only the coordinator nudges a stalled agent, once,
-before it reassigns or escalates — report the stall to it instead. A REQUEST of yours still
+before it reassigns or escalates — report the stall to it instead (the coordinator, or acting coordinator under the bus lease). A REQUEST of yours still
 without an ACK is not that: at its `ttl`, re-send it with `/ping`, then take the next rung of
 the escalation ladder — a retry is not a nudge.

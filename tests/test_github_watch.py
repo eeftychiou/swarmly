@@ -550,6 +550,9 @@ class TestRoundEndReport(unittest.IsolatedAsyncioTestCase):
 
     def watcher(self, tmp, client, channel, role="coordinator"):
         cfg = make_test_config(tmp, role=role)
+        # #83: the coordinator gate is the bus lease, asked through the channel. A mock channel
+        # has to answer it explicitly; a developer's lease says no.
+        channel.is_coordinator.return_value = role == "coordinator"
         return GitHubWatcher(cfg, client=client, state_path=Path(tmp) / "s.json",
                              channel=channel)
 

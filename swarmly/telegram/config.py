@@ -180,7 +180,7 @@ def _parse_int(where: str, value: Any, default: int, *, positive: bool = False) 
 #: against :class:`ChannelLimits`.
 KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "": ("agent", "peers", "adapter", "limits", "fallback", "bus", "projects", "github",
-         "public_redactions"),
+         "public_redactions", "swarm"),
     "agent": ("name", "alias", "bot_token", "bot_token_env", "home_channel_id",
               "admin_user_id", "maintainer_username", "allowed_users", "git_name",
               "git_email", "role"),
@@ -194,6 +194,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "fallback": ("gitbus_root", "gitbus_ref", "gitbus_poll_minutes"),
     "projects": ("repo", "cwd", "topics", "worktrees", "reply_chars"),
     "github": ("login", "token_env", "poll_minutes", "mark_read", "tracking_label"),
+    "swarm": ("succession",),
 }
 
 
@@ -212,7 +213,7 @@ def unknown_keys(data: Dict[str, Any]) -> List[str]:
             found.append(f"{where}: unknown key, ignored{hint}")
 
     report("", data, KNOWN_KEYS[""])
-    for section in ("agent", "adapter", "bus", "fallback", "github"):
+    for section in ("agent", "adapter", "bus", "fallback", "github", "swarm"):
         raw = data.get(section)
         if isinstance(raw, dict):
             report(section, raw, KNOWN_KEYS[section])
@@ -656,6 +657,51 @@ class ChannelLimits:
     work_in_topics: bool = True                         # General is for setup; work moves to a topic
     handoff_nudge_minutes: float = 10.0                 # a hand-off with no word from its bot: remind it, then the admin; 0 = off
     max_reply_parts: int = 4                            # a long reply is split into at most this many messages
+    #: Issue #86: how large a coordinator's ``ROUND_STATE`` block may be, in characters. It
+    #: is carried inside a reply but is not part of the reply budget, and it is stripped
+    #: before posting. A six-item round with heads and verdicts is ~2,000 characters, so the
+    #: ceiling is generous by design: too small a value silently refuses a real round.
+    round_state_chars: int = 8000
+    #: Issue #81: how many self-wake timers one bot may have armed at once, and how many a
+    #: single reply may arm (a reply that arms ten is refused, not silently trimmed).
+    wake_max: int = 10
+    wake_max_per_reply: int = 3
+    #: How often the transport looks for due timers.
+    wake_tick_seconds: float = 15.0
+    #: A check's own budget; past it the process group is killed and the turn says so.
+    wake_check_seconds: float = 120.0
+    #: How many firings one timer may have before it gives up with a turn that says so. 0
+    #: leaves the bound to `until` alone.
+    wake_max_attempts: int = 50
+    #: Issue #82: how often each transport publishes a liveness pulse. Liveness rides the
+    #: ephemeral Telegram line, not a bus commit -- 6 bots at 2 min is ~180 commits an hour on
+    #: the bus, forever, each a push race with real traffic. `heartbeat_minutes * peer_down_after`
+    #: is therefore measured in minutes of Telegram silence, not bus commits.
+    heartbeat_minutes: float = 2.0
+    #: How many heartbeats a peer may miss before it is DOWN (advisory: the lease, not this,
+    #: decides who coordinates).
+    peer_down_after: float = 3.0
+    #: How long a takeover claim is left to settle before the claimant re-folds and acts, so two
+    #: bots claiming the next term do not both act (#83). 0 acts at once, which only a test wants.
+    lease_settle_seconds: float = 30.0
+    #: How long the folded coordinator lease is cached before the bus is read again (#83). 0
+    #: reads on every question, which is what a test wants and what a bus under load does not.
+    lease_cache_seconds: float = 5.0
+    #: How long a claim must be visible on the bus before its writer may fire it. Two pushes
+    #: that overlap can otherwise each read "no claims" and both fire; waiting one settle
+    #: window makes the second read see both claims, and the lowest alias wins for everyone.
+    wake_claim_settle_seconds: float = 30.0
+    #: The argv prefixes a WAKE check may start with. `gh` and `git` are allowed only through
+    #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate.
+    wake_check_allow: List[str] = field(default_factory=lambda: ["gh", "git"])
+    #: The coordinator's own watchdog: after this long with no turn while the swarm has been
+    #: active, it gets one turn to check the round and act on whatever waits, or say it is done.
+    #: Doubles after each quiet check, up to 8 hours; any other turn resets it. 0 = off.
+    coordinator_watch_minutes: float = 30.0
+    #: Issue #83: how long without a renewal before successors take over the coordinator lease.
+    takeover_minutes: float = 10.0
+    #: How often the active coordinator renews its lease.
+    lease_renew_seconds: float = 120.0
     #: Issue #31: the channel's reply budget, in characters (the swarm's 500-char convention).
     #: A project may override it per topic (``projects.<key>.reply_chars``); everything else
     #: -- General, unbound topics, the reply tickets -- uses this.
@@ -689,6 +735,15 @@ class ChannelLimits:
             raise ConfigError(
                 f"limits.multi_mention must be one of {list(MULTI_MENTIONS)} "
                 f"(got {self.multi_mention!r}).")
+        for key in ("wake_check_seconds", "wake_tick_seconds", "wake_claim_settle_seconds"):
+            value = getattr(self, key)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ConfigError(f"limits.{key} must be a number of seconds, 0 or more "
+                                  f"(got {value!r}).")
+        if self.wake_check_seconds <= 0:
+            raise ConfigError("limits.wake_check_seconds must be more than 0 seconds; a check "
+                              f"that may not finish is not a check (got {self.wake_check_seconds!r}).")
         attachment_mb = self.max_attachment_mb
         if (isinstance(attachment_mb, bool) or not isinstance(attachment_mb, (int, float))
                 or not math.isfinite(attachment_mb) or attachment_mb <= 0):
@@ -696,7 +751,7 @@ class ChannelLimits:
                               f"(got {attachment_mb!r}).")
         for key in ("min_seconds_between_messages", "min_seconds_between_agent_turns",
                     "handoff_nudge_minutes", "cleanup_idle_hours",
-                    "ephemeral_notices_minutes"):
+                    "ephemeral_notices_minutes", "coordinator_watch_minutes"):
             value = getattr(self, key)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):
@@ -709,7 +764,8 @@ class ChannelLimits:
             raise ConfigError("limits.max_messages_per_minute must be a whole number, 0 for "
                               f"max_group_messages_per_minute (got {rate!r}).")
         for key in ("busy_queue_max", "max_reply_parts", "max_parallel_turns",
-                    "reply_chars", "max_group_messages_per_minute"):
+                    "reply_chars", "max_group_messages_per_minute", "round_state_chars",
+                    "wake_max", "wake_max_per_reply", "wake_max_attempts"):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ConfigError(f"limits.{key} must be a whole number of at least 1 "
@@ -876,6 +932,7 @@ class AgentConfig:
     #: payloads and GitHub-facing text). Empty by default: nothing is redacted until the
     #: operator names what is sensitive on this machine.
     public_redactions: Dict[str, str] = field(default_factory=dict)
+    swarm: Dict[str, Any] = field(default_factory=dict)
     source_path: Optional[Path] = None
     # Whether ``bus.poll_minutes`` was explicitly present in the raw config.
     # Validation must name the key the operator actually wrote — the resolved
@@ -1226,9 +1283,11 @@ class AgentConfig:
                     if not name.lstrip("-").isdigit()]
         for line in unknown:
             logger.warning("config: %s", line)
+        swarm_raw = data.get("swarm") or {}
+        swarm = dict(swarm_raw) if isinstance(swarm_raw, dict) else {}
         return cls(identity=identity, peers=peers, peer_roles=peer_roles, adapter=adapter, limits=limits,
                    fallback=fallback, bus=bus, projects=projects_dict, github=github,
-                   public_redactions=public_redactions, source_path=source_path,
+                   public_redactions=public_redactions, swarm=swarm, source_path=source_path,
                    _bus_poll_minutes_explicit=bool(bus_poll_explicit),
                    unknown_keys=unknown)
 

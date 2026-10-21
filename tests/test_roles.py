@@ -296,6 +296,22 @@ class TestTheAdminDeploys(unittest.TestCase):
                       "runs on", prompt)
         self.assertIn("A post-merge notice says what landed", prompt)
 
+    def test_the_coordinator_arms_a_wake_instead_of_promising(self):
+        """Issue #81: a promise to act later is a WAKE armed in the same turn."""
+        prompt = " ".join(load_role("coordinator").prompt().split())
+        self.assertIn("Never promise to act later without arming a WAKE", prompt)
+        self.assertIn("arm the timer yourself in the same turn", prompt)
+        self.assertIn("do not count on the GitHub CI wake", prompt)
+        self.assertIn('check="gh pr checks', prompt)
+        # The example in the prompt is one the parser accepts.
+        from swarmly.telegram.wake import parse_line
+        for line in load_role("coordinator").instructions.splitlines():
+            text = line.strip().lstrip("`—").strip()
+            if text.startswith("WAKE "):
+                spec = parse_line(text.replace("<n>", "75").strip("`"))
+                # CI for a PR, or the standing check on the tracking issue while a round runs.
+                self.assertIn(spec.argv[:3], {("gh", "pr", "checks"), ("gh", "issue", "view")})
+
     def test_other_roles_do_not_carry_the_coordinator_rule(self):
         for name in ("developer", "reviewer", "qa-tester", "researcher"):
             with self.subTest(role=name):
@@ -305,3 +321,9 @@ class TestTheAdminDeploys(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_every_other_role_names_the_acting_coordinator(self):
+        for name in ("developer", "reviewer", "qa-tester", "researcher"):
+            with self.subTest(role=name):
+                instructions = flat(name)
+                self.assertIn("acting coordinator under the bus lease", instructions)

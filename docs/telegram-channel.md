@@ -562,6 +562,69 @@ above for every bot.) A hand-off to a peer that is frozen (quota or pause) gets 
 and no notice at all: the bot that handed it off is asked straight away to give the work to
 someone else or to wait until the peer resumes.
 
+**Except the coordinator.** A hand-off *to* the coordinator, and a peer's answer to it, is
+waited on by the bot that sent it, which does post the reminder and the notice: nobody else
+would ever follow it up. The coordinator's next post in that discussion answers it.
+
+**A restart loses no message.** A message accepted for a turn (queued or running, a reply not
+yet posted) is kept in `inbox-<alias>.json` beside the transport's state until its turn is
+done; the next start runs whatever is still there (younger than 12 hours). That is
+at-least-once: a crash right after a reply is posted can repeat that one turn. Commands are
+never kept, and the same message arriving twice at once (a replay and Telegram's redelivery)
+runs once.
+
+**A turn cut off by a die-off is resumed once, and never loops** (issue #84). The record
+kept for an accepted message is the turn's own: its topic, message id, sender, the text the
+reply has to answer, and when it started. When a restart finds one still on disk, the
+transport posts one line — `↻ resuming the turn cut off at 18:30` — and runs the turn again in
+the same topic with a prompt that quotes the original request and says to check what was
+already pushed or posted before doing anything twice. The resumed turn is the record's
+second try and it is what removes the record, so a turn that finishes (or chooses silence)
+leaves nothing behind. The try is counted **before** the turn starts: if that resume is cut
+off too, the record is dropped instead of replayed a third time and one line says so —
+`⚠️ <coordinator or admin>: could not finish the turn on message <id> in <topic> after two
+restarts` — because a turn that kills the transport twice will not finish by being started
+again, and a loop of them is how a swarm spends a night doing nothing. A record older than
+`resume_max_age` (one hour) is **reported, never resumed** -- restarting work an hour after
+it was cut off means acting on a topic that has moved on -- and one older than 12 hours is
+dropped without a word. A restart that interrupted several turns resumes them one at a
+time, oldest first: each resumed turn claims the next when it finishes, so six cut-off turns
+never become six turns at once.
+
+**The coordinator checks in when nothing wakes it.** A coordinator that holds no WAKE and has
+had no turn for `limits.coordinator_watch_minutes` (default 30) gets one turn in the topic it
+last worked in, asking it to look at the round and act on whatever waits, or to answer
+`NO_REPLY`. The wait doubles after each check (up to 8 hours), any other turn resets it, and
+it stops a day after the last turn. `0` turns it off.
+**A bot that dies says nothing, so the swarm listens for its pulse.** Every transport writes one
+heartbeat every `limits.heartbeat_minutes` (default 2) carrying its revision, term, role and,
+while a turn is running, `busy_since`. With the bus on it is a **parentless commit on the bot's own
+ref, `refs/pulse/<alias>`**, force-updated every beat: a mailbox, not a history — the bus branch
+grows nothing, `main` never learns a pulse happened, and nobody races the only writer. A commit on
+the bus branch every two minutes would be ~180 commits an hour, forever. With no bus, or when a
+beat's push fails, the pulse is the ephemeral `STATUS to=* intent=PULSE` line instead, which is
+machine-class traffic and wakes no turn. The pulse is its own task, never the turn lock, so a turn
+that runs for half an hour still pulses and shows `busy_since` — a long turn reads as work, not as
+a die-off.
+
+A peer silent on **both** planes for `heartbeat_minutes * peer_down_after` (default 3 misses, so
+6 minutes) is **DOWN**. Any message from a peer counts as liveness, whatever plane it is on; a
+peer that has not been heard from at all is `unknown`, not DOWN, and a freshly started transport
+gets one interval of grace before it may judge anybody — otherwise a restart would declare the
+whole swarm dead. The table is saved beside the transport's other state as
+`presence-<alias>.json` and restored at start, so a die-off seen before a restart is still
+known after it and one admin line stays one line. The coordinator posts one line to the
+admin per episode (the acting coordinator
+does it when the coordinator is the silent one) and one line when the peer comes back. DOWN is
+**advisory**: it says "not heard from", never "somebody else should lead" — the lease (#83) alone
+decides who coordinates, because using DOWN to start a takeover would let a partition elect a
+second coordinator. A hand-off to a DOWN peer gets no reminder: like a frozen peer, the work
+comes straight back with a turn asking what happens to it. A busy peer — one pulsing with
+`busy_since` — gets no reminder either: its hand-off clock restarts instead, so the reminder
+does not land in the middle of a long turn. `/status` and `/swarm` carry the
+liveness line, e.g. `peers=Claudebot:up,DeepSeek:down(12m),Reasonix:busy(25m)`. Either limit at
+`0` turns the rule off and nobody is ever DOWN.
+
 **Busy is not gone.** A message that queues behind a turn running for two minutes or more
 gets one "⏳ <alias> is busy with a turn running since HH:MM UTC" line in its topic (at
 most one per topic per five minutes), so peers and people see a working bot rather than a
@@ -887,6 +950,42 @@ recorded while running: a per-chat ledger keeps them with their timestamps and p
 past 48 h, and the dry run says how many it can no longer reach. Older General messages stay
 the admin's to delete by hand.
 
+**Self-wake timers (issue #81).** A reply can arm a timer the transport fires without a model
+turn: `WAKE in=10m every=5m until=2h check="gh pr checks 75" then="merge it"`. The line is
+stripped like the other directives and answered with one line in the topic (`⏰ wake <id>: … at
+<first fire>, every 5m, until <expiry>`), so what will run and when is auditable. The check is
+parsed with `shlex`, run without a shell in the checkout the topic uses, and may only start with
+a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|list|status|diff`,
+`gh run view|list`, `gh api` GET only, `gh issue view`, `gh search`, and
+`git status|log|diff|show|rev-parse` — never `git fetch` or `git ls-remote`, whose `ext::`
+remotes run a command); `-X`/`--method`/`-f`/`--input`/`--output`, shell
+metacharacters and anything not on `PATH` are refused, and the refusal is posted in place of the
+line. Times are absolute, so a restart resumes the schedule instead of re-arming it. Limits:
+
+| `limits.` | default | what it bounds |
+|---|---|---|
+| `wake_max` | 10 | live timers one bot may hold |
+| `wake_max_per_reply` | 3 | timers one reply may arm (the overflow is refused, not trimmed) |
+| `wake_tick_seconds` | 15 | how often the transport looks for due timers; `0` disables the loop |
+| `wake_check_seconds` | 120 | a check's own budget; past it the process group is killed |
+| `wake_max_attempts` | 50 | firings of one timer before it gives up with a turn saying so |
+| `wake_claim_settle_seconds` | 30 | how long a claim must be visible before its writer may fire it, so two overlapping pushes cannot both fire |
+| `wake_check_allow` | `["gh", "git"]` | the outer gate on which binary a check may start with |
+
+The check is parsed token by token and every flag is normalized first, so an attached value
+(`-XPOST`, `--field=body=x`, `--output=/path`) cannot smuggle a write past the allowlist; `gh api`
+carries only read flags (`--jq`, `--paginate`, `--slurp`, `-i`, `-H`). `check=` and `then=` must be
+quoted — an unquoted `then` would silently keep only its first word.
+
+A timer whose state the bus refuses is still armed (the local schedule stands) but the ack says
+`⚠️ WAKE armed locally only: …`, because the swarm cannot adopt a promise the bus does not have.
+
+`/wakes@<bot>` lists the live timers with their next time, check and attempt count;
+`/wakes@<bot> cancel <id>` drops one (admin only); `/status@<bot>` carries `wakes=N`. A frozen
+bot runs no check, and neither does a paused one. The fire claims live on the bus under
+`.agents/wakes/<alias>/`, one per timer per firing, so an acting
+coordinator (#83) can see a timer a dead bot left armed, and two bots cannot fire it twice.
+
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt
 failures. Each transport deletes **its own** notices from General once they are older than
@@ -1028,7 +1127,7 @@ ignored, whatever its header says.
    group as an **admin** (or disable its group privacy).
 2. Copy the example config onto that machine; set `name`, `alias`, `bot_token`, the shared
    `home_channel_id` and `admin_user_id`.
-3. Run `check`, then `run`. On start it posts `HELLO intent=ONLINE ref=<alias>`.
+3. Run `check`, then `run`. On start it posts `HELLO intent=ONLINE ref=<alias>`, with a line naming its adapter, role, the model and reasoning effort General really runs at, and its revision. Each comes from `/model` and `/reasoning`, else `adapter.model` and `adapter.effort`, else the CLI's own settings (`swarmly/telegram/cli_defaults.py`: Codex `~/.codex/config.toml`, Reasonix `reasonix.toml` / its global `config.toml`, Claude Code `ANTHROPIC_MODEL` / `CLAUDE_CODE_EFFORT_LEVEL` / `settings.json`), else the model the CLI reported on its last turn (Claude's `modelUsage`). What none of these names reads `not known until its first turn` or `the model default`; effort is left out for an adapter without one.
 4. In the group, the admin sends `/admit @newbot`. Every running bot that saw the newcomer's
    HELLO adds it to its peers and answers with a silent `HELLO intent=WELCOME` mentioning it;
    the newcomer, having seen itself admitted, adds each bot that welcomes it in the next 10

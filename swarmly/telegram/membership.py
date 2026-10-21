@@ -309,6 +309,13 @@ class Membership:
         return self.cfg.peer_username_for(coord)
 
     def is_coordinator(self) -> bool:
+        if self.ch is not None and hasattr(self.ch, "is_coordinator"):
+            try:
+                res = self.ch.is_coordinator()
+                if isinstance(res, bool):
+                    return res
+            except Exception:
+                pass
         return (self.state.role or "") == "coordinator"
 
     def _role_names(self) -> List[str]:
@@ -850,6 +857,8 @@ class Membership:
             self._demote_coordinators(but=alias)
         if mine:
             self.set_own_role(role, by="admin")
+            if role == "coordinator" and hasattr(self.ch, "_on_promoted_to_coordinator"):
+                self.ch._on_promoted_to_coordinator()
         else:
             self._set_peer_role(alias, role, coordinator=True)
             self._save()
@@ -859,15 +868,26 @@ class Membership:
         """The admin made *but* the coordinator: whoever coordinated before becomes a
         developer (every agent applies the same /role, so all of them agree)."""
         demoted = DEFAULT_ROLE_ORDER[0]
+        was_coord = self.is_coordinator()
         for alias, role in list(self.cfg.peer_roles.items()):
             if role == "coordinator" and alias.lower() != but.lower():
                 self._set_peer_role(alias, demoted)
-        if self.is_coordinator() and self.alias.lower() != but.lower():
+        if was_coord and self.alias.lower() != but.lower():
             self.set_own_role(demoted, by="admin: a new coordinator")
+            if hasattr(self.ch, "_on_demoted_from_coordinator"):
+                self.ch._on_demoted_from_coordinator()
 
     async def status_text(self) -> str:
         lines = [f"SWARM bus: {self.bus_location() or 'unknown'}",
                  f"coordinator: {self.state.coordinator or 'none'}"]
+        # Issue #82: the same liveness line /status carries, so a peer that has gone quiet is
+        # visible where the swarm is listed as well as where its own bot reports.
+        presence_line = getattr(self.ch, "presence_line", None)
+        if callable(presence_line):
+            try:
+                lines.append(presence_line())
+            except Exception:                       # noqa: BLE001 - /swarm must answer
+                logger.warning("membership: no presence line for /swarm", exc_info=True)
         for alias, role in sorted(self.team().items()):
             if alias == self.alias:
                 state = "online (me)"
