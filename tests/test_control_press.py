@@ -275,5 +275,68 @@ class TestAnotherBotsControl(unittest.TestCase):
         self.assertFalse(channel._frozen)
 
 
+class TestSwarmWideAndNudge(unittest.TestCase):
+    """The controls that reach past one bot: pause everything, and nudge an item's owner."""
+
+    def channel(self, items=None):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.presence_clock = lambda: NOW
+        state = round_state(items or {})
+        channel.control_round = lambda: state
+        return channel
+
+    def test_pause_all_holds_this_bot_and_broadcasts_the_hold(self):
+        channel = self.channel()
+        asked = run(channel.handle_control_press(press("ctl:swarm.pause_all")))
+        self.assertIn("Tap again", asked)
+        self.assertFalse(channel._frozen)                     # the first tap changes nothing
+        code = channel.control_policy().pending()[0].code
+        done = run(channel.handle_control_press(press("ctl:confirm:" + code)))
+        self.assertIn("Pause all done", done)
+        self.assertTrue(channel._frozen)
+        lines = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL swarm.pause_all" in entry["text"]]
+        self.assertTrue(any("target=*" in line for line in lines))   # every bot applies it
+        self.assertTrue(any("by=%d" % ADMIN_ID in line for line in lines))
+
+    def test_another_bot_applies_a_broadcast(self):
+        channel = self.channel()
+        line = "CONTROL bot.pause target=* by=%d at=2027-01-15T08:00:00Z state=done" % ADMIN_ID
+        self.assertEqual(channel.apply_control_note(line), "applied: bot.pause")
+        self.assertTrue(channel._frozen)
+
+    def test_a_broadcast_from_a_stranger_still_authorises_nothing(self):
+        channel = self.channel()
+        line = "CONTROL bot.pause target=* by=42 at=2027-01-15T08:00:00Z state=done"
+        self.assertIn("not the admin", channel.apply_control_note(line))
+        self.assertFalse(channel._frozen)
+
+    def test_a_nudge_names_the_owner_and_the_item(self):
+        channel = self.channel({"129": {"issue": 129, "owner": "Codex", "pr": 129}})
+        text = run(channel.handle_control_press(press("ctl:item.nudge:129")))
+        self.assertIn("Nudge done", text)
+        nudges = [entry["text"] for entry in channel._test_sender.sent
+                  if "carry on with #129" in entry["text"]]
+        self.assertEqual(len(nudges), 1)
+        self.assertIn("@CodexBot", nudges[0])                 # the peer's handle, not the alias
+
+    def test_a_nudge_for_an_item_with_no_owner_says_so(self):
+        channel = self.channel({"131": {"issue": 131}})
+        text = run(channel.handle_control_press(press("ctl:item.nudge:131")))
+        self.assertIn("no owner", text)
+
+    def test_a_nudge_for_an_item_the_round_does_not_have_says_so(self):
+        channel = self.channel({})
+        self.assertIn("no owner", run(channel.handle_control_press(press("ctl:item.nudge:999"))))
+
+
+def round_state(items):
+    from swarmly.telegram.rounds import RoundState
+    state = RoundState(round="5", status="ok", term=4)
+    state.items = dict(items)
+    state.order = list(items)
+    return state
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

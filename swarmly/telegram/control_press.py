@@ -113,6 +113,17 @@ def parse(data: str) -> Optional[Command]:
     return Command(action=head, target=rest.strip())
 
 
+def every_bot(action: str, actor: str, moment: Optional[float] = None) -> str:
+    """A CONTROL line for the whole swarm: ``target=*``, so every bot applies it.
+
+    It keeps the *presser's* Telegram id in ``by``: the press was authorised where it landed,
+    and each target repeats that check against its own admin, so a broadcast is exactly as
+    trusted as a press, and no bot acts on a line that names nobody.
+    """
+    return PressPolicy.log_line(action, "*", actor,
+                                time.time() if moment is None else moment, done=True)
+
+
 def callback_data(action: str, target: str = "") -> str:
     """The callback data for one control, so the keyboard and the parser cannot drift."""
     return f"{PREFIX}{action}" + (f":{target}" if target else "")

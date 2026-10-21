@@ -361,6 +361,10 @@ class ChannelEvent:
     reassembled: bool = False              # #29: the split parts of one reply, joined already
 
 
+class ControlRefused(Exception):
+    """A control that cannot be carried out here, with the words to answer the presser."""
+
+
 @dataclass
 class ChannelStats:
     handled: int = 0
@@ -2718,7 +2722,7 @@ class AgentChannel:
         if note is None:
             return "not a control note"
         target = note.target.strip().lower()
-        if target not in ("", "self", self.config.identity.alias.lower()):
+        if target not in ("", "self", "*", self.config.identity.alias.lower()):
             return f"for {note.target}: not mine"
         if not self._is_my_admin(note.by):
             logger.warning("control note for %s refused: by=%s is not the admin",
@@ -2761,7 +2765,8 @@ class AgentChannel:
         WAKE, the swarm-wide controls -- joins this tuple as each is wired; until then they
         are neither shown nor run.
         """
-        return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart")
+        return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart",
+                "swarm.pause_all", "item.nudge")
 
     def control_policy(self) -> Any:
         """The press policy: admin-only, a second tap for anything that stops, one log line."""
@@ -2784,20 +2789,35 @@ class AgentChannel:
         try:
             decision = self.control_policy().decide(press, actor=str(press.user_id))
             if decision.verdict == press_mod.RUN:
-                await self._run_control(decision.action, decision.target)
+                await self._run_control(decision.action, decision.target,
+                                        presser=str(press.user_id))
             if decision.log:
-                await self.send(format_message(
-                    Envelope(type=MessageType.NOTE, to="*", intent="CONTROL",
-                             ref=self._alias_ref()),
-                    decision.log), silent=True, notice=True, allow_when_frozen=True)
+                await self._post_control_note(decision.log)
             self._control_answer = decision.text
             return decision.text
+        except ControlRefused as exc:
+            return str(exc)
         except Exception:                      # noqa: BLE001 - a press must not break the bot
             logger.warning("control centre: the press failed", exc_info=True)
             return "the press failed; the log has the reason"
 
-    async def _run_control(self, action: str, target: str) -> None:
-        """Carry out one wired control. The transport only ever controls *itself* here."""
+    async def _post_control_note(self, line: str) -> None:
+        """Put a CONTROL line on the durable plane: how a press reaches the other bots."""
+        await self.send(format_message(
+            Envelope(type=MessageType.NOTE, to="*", intent="CONTROL", ref=self._alias_ref()),
+            line), silent=True, notice=True, allow_when_frozen=True)
+
+    async def _run_control(self, action: str, target: str, *, presser: str = "") -> None:
+        """Carry out one wired control, here and -- for a swarm-wide one -- everywhere else."""
+        if action == "swarm.pause_all":
+            # Hold this bot, and broadcast the hold: every peer applies the same note, so one
+            # press stops the swarm instead of only the bot that owns the message.
+            self._set_frozen(True, "pause")
+            await self._post_control_note(press_mod.every_bot(action, presser or "0"))
+            return
+        if action == "item.nudge":
+            await self._nudge_item(target)
+            return
         if target and target.strip().lower() not in ("", "self",
                                                      self.config.identity.alias.lower()):
             # Another bot's control travels as the CONTROL note the press already posts; that
@@ -2806,6 +2826,23 @@ class AgentChannel:
         # The launcher starts the transport again on a restart; nothing is left running when
         # it does, which is why that control asks for a second tap (#117).
         self._run_control_now(action)
+
+    async def _nudge_item(self, key: str) -> None:
+        """Send the owner of round item *key* a short "carry on" — it costs that bot a turn."""
+        key = str(key or "").strip().lstrip("#")
+        if not key:
+            raise ControlRefused("nudge needs an item: press it under that item's line")
+        owner = ""
+        for item_key, item in getattr(self.control_round(), "items", {}).items():
+            if str(item_key) == key and isinstance(item, dict):
+                owner = str(item.get("owner") or "").strip()
+        if not owner:
+            raise ControlRefused(f"# {key}: the round records no owner, so there is nobody "
+                                 "to nudge")
+        handle = str(self.config.peers.get(owner, owner)).lstrip("@")
+        await self.send(f"@{handle} carry on with #{key} please — the dashboard has no "
+                        "movement on it.", notice=True)
+        logger.info("control: nudged %s about #%s", owner, key)
 
     async def refresh_control_center(self, *, now: Optional[float] = None) -> Optional[Any]:
         """Edit the pinned dashboard for this beat. Never raises; ``None`` when there is none."""
