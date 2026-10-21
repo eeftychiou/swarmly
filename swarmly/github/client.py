@@ -192,11 +192,15 @@ class GitHubClient:
                 [gh_bin, *args],
                 env=self._env(),
                 capture_output=True,
-                text=True,
+                # gh writes UTF-8. Without this, Windows decodes with the ANSI code page, and an
+                # issue body with a character outside it (live: byte 0x8f) kills the reader
+                # thread: stdout comes back None and /cleanup never answered.
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 check=False,
             )
-            return res.returncode, res.stdout, res.stderr
+            return res.returncode, res.stdout or "", res.stderr or ""
         except subprocess.TimeoutExpired:
             logger.warning("gh command timed out after %ss: gh %s", timeout, " ".join(args[:4]))
             return 124, "", "command timed out"
