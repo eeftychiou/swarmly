@@ -945,7 +945,8 @@ the coordinator posts the dry run once in General and asks the admin whether to 
 **The status snapshot on every heartbeat (issue #124).** Each beat carries one structured
 record of what the bot is doing, taken in code — no adapter call, no model turn, no tokens:
 state (`idle`, `busy`, `paused`, `frozen` or `stuck`, where `stuck` is a turn that has run past
-`adapter.timeout_seconds`), how long it has been in that state, the discussion it is working in
+`adapter.timeout_seconds`), **when that state began** — recorded at the transition, so it
+holds across heartbeats instead of resetting each beat — the discussion it is working in
 (as its `tg-…` token, never a chat id), the turn's elapsed time against its timeout, the queue
 of messages waiting for it, the armed `WAKE` timers with their next fire time, the model and
 effort, `rev:`, uptime, the restart count, and its lease term and expiry when it holds the

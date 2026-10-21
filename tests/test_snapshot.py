@@ -156,10 +156,29 @@ class TestOnTheChannel(unittest.TestCase):
         snap = channel.status_snapshot(NOW)
         self.assertEqual(snap.wakes, ((live.id, NOW + 600),))
 
-    def test_the_lease_fields_appear_only_for_the_holder(self):
+    def test_a_bot_without_the_lease_reports_no_term(self):
         channel = live_channel()
         snap = channel.status_snapshot(NOW)
         self.assertEqual((snap.term, snap.lease_ends), (0, 0.0))
+
+    def test_the_holder_reports_its_term_and_expiry(self):
+        """#124 review: the lease fields were only ever tested for the *non*-holder."""
+        from swarmly.telegram.lease import LeaseState
+
+        channel = live_channel()
+        channel.lease_state = lambda now=None: LeaseState(
+            status="ok", term=4, holder=channel.config.identity.alias, expires_at=NOW + 540.0)
+        snap = channel.status_snapshot(NOW)
+        self.assertEqual((snap.term, snap.lease_ends), (4, NOW + 540.0))
+        self.assertIn("term=4", snap.line(NOW))
+
+    def test_a_lease_held_by_someone_else_is_not_this_bots_term(self):
+        from swarmly.telegram.lease import LeaseState
+
+        channel = live_channel()
+        channel.lease_state = lambda now=None: LeaseState(
+            status="ok", term=4, holder="Claudebot", expires_at=NOW + 540.0)
+        self.assertEqual(channel.status_snapshot(NOW).term, 0)
 
     def test_uptime_and_restarts_come_from_the_process(self):
         channel = live_channel()
@@ -167,6 +186,76 @@ class TestOnTheChannel(unittest.TestCase):
         snap = channel.status_snapshot(NOW)
         self.assertEqual(snap.uptime, 7200.0)
         self.assertGreaterEqual(snap.restarts, 0)
+
+
+class TestWhenTheStateBegan(unittest.TestCase):
+    """#124 review: `since` is when the state began, and it holds across beats.
+
+    A snapshot is taken every heartbeat. If `since` were "now" each time, a bot paused for an
+    hour would report `for 0s` for ever, and a frozen bot reported the *expiry* of its freeze as
+    the moment it began.
+    """
+
+    def beats(self, channel, count=3, every=120.0):
+        """Take *count* heartbeats, moving the presence clock between them."""
+        snaps = []
+        for _ in range(count):
+            channel._test_wall["t"] += every
+            snaps.append(channel.status_snapshot())
+        return snaps
+
+    def test_idle_since_holds_across_beats(self):
+        channel = live_channel()
+        started = channel.status_snapshot().at                # the first beat in this state
+        snaps = self.beats(channel)
+        self.assertEqual([snap.since for snap in snaps], [started] * len(snaps))
+        self.assertEqual(snaps[-1].state, sn.IDLE)
+        self.assertEqual(snaps[-1].age(snaps[-1].at), 0.0)
+        # ...and the line says how long, which is the number a reader actually wants.
+        self.assertIn("for 6m", snaps[-1].line(snaps[-1].at))   # three 2m beats
+
+    def test_paused_since_holds_across_beats(self):
+        channel = live_channel()
+        channel._pause_pending = True                     # /pause, at this moment
+        channel._note_state(paused=True)
+        paused_at = channel._test_wall["t"]
+        snaps = self.beats(channel)
+        self.assertEqual({snap.state for snap in snaps}, {sn.PAUSED})
+        self.assertEqual({snap.since for snap in snaps}, {paused_at})
+
+    def test_frozen_since_is_when_the_freeze_began_not_when_it_ends(self):
+        channel = live_channel()
+        channel._set_frozen(True, "quota", NOW + 7200)    # the expiry is two hours away
+        frozen_at = channel._test_wall["t"]
+        snap = channel.status_snapshot()
+        self.assertEqual(snap.state, sn.FROZEN)
+        self.assertEqual(snap.since, frozen_at)
+        self.assertLess(snap.since, NOW + 7200)           # never the expiry
+        later = self.beats(channel)[-1]
+        self.assertEqual(later.since, frozen_at)          # and it does not drift per beat
+
+    def test_a_resumed_bot_is_idle_since_it_resumed(self):
+        channel = live_channel()
+        channel._set_frozen(True, "pause", None)
+        channel._test_wall["t"] += 600
+        channel._set_frozen(False, None)
+        resumed_at = channel._test_wall["t"]
+        snap = channel.status_snapshot()
+        self.assertEqual(snap.state, sn.IDLE)
+        self.assertEqual(snap.since, resumed_at)
+
+    def test_a_turn_that_ends_restarts_the_idle_clock(self):
+        channel = live_channel()
+        channel._busy_since[(GROUP, 307)] = channel._clock() - 30
+        busy = channel.status_snapshot()
+        self.assertEqual(busy.state, sn.BUSY)
+        self.assertEqual(busy.since, busy.at - 30)        # the turn's own start
+        channel._test_wall["t"] += 30
+        channel._busy_since.clear()
+        channel._note_state(busy=False)                   # the turn finished
+        idle = channel.status_snapshot()
+        self.assertEqual(idle.state, sn.IDLE)
+        self.assertEqual(idle.since, channel._test_wall["t"])
 
 
 class TestNoTurnAndNoIdentifiers(unittest.TestCase):

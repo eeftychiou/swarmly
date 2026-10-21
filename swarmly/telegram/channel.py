@@ -572,6 +572,11 @@ class AgentChannel:
         # for the status snapshot; the count is kept beside the other state, so a restart shows
         # up in the record instead of looking like an uptime that never ends.
         self._booted_at = self._clock()
+        # Issue #124 review: `since` is *when this state began*, not when this beat was taken.
+        # Each state records the wall time it was entered, so the answer is stable across beats
+        # instead of resetting every heartbeat (a paused bot is not "paused since a moment ago"
+        # for ever, and a frozen one did not begin freezing when its quota comes back).
+        self._state_since: Dict[str, float] = {}
         self._boots = 1
         boots_path = _state_file(config, "boots")
         if boots_path is not None:
@@ -2036,6 +2041,7 @@ class AgentChannel:
 
     def _set_frozen(self, frozen: bool, ref: Optional[str],
                     until: Optional[float] = None) -> None:
+        self._note_state(frozen=frozen, ref=ref)
         """Apply and persist the freeze flag so a restart cannot silently release it."""
         self._frozen = frozen
         self._freeze_ref = ref if frozen else None
@@ -2446,6 +2452,23 @@ class AgentChannel:
 
     # -- the status snapshot (issue #124) ---------------------------------------------
 
+    def _note_state(self, *, frozen: Optional[bool] = None, ref: Optional[str] = None,
+                    busy: Optional[bool] = None, paused: Optional[bool] = None) -> None:
+        """Record when a state began. Called at the transition, never from the snapshot."""
+        moment = self.presence_clock()
+        if frozen is True:
+            self._state_since["frozen" if ref == "quota" else "paused"] = moment
+        elif frozen is False:
+            self._state_since["idle"] = moment
+        if busy is True:
+            self._state_since["busy"] = moment
+        elif busy is False:
+            self._state_since["idle"] = moment
+        if paused is True:
+            self._state_since["paused"] = moment
+        elif paused is False:
+            self._state_since["idle"] = moment
+
     def status_snapshot(self, now: Optional[float] = None) -> "snapshot_mod.Snapshot":
         """This bot's state right now, as one record: what it is doing and what is waiting.
 
@@ -2461,22 +2484,29 @@ class AgentChannel:
         busy = {key: start for key, start in self._busy_since.items()
                 if isinstance(start, (int, float))}
         elapsed = max((self._clock() - start for start in busy.values()), default=0.0)
-        state, since, topic = snapshot_mod.IDLE, 0.0, "general"
+        state, topic = snapshot_mod.IDLE, "general"
         if self._frozen:
-            state = snapshot_mod.FROZEN
-            since = float(self._freeze_until) if self._freeze_until else moment
+            state = (snapshot_mod.FROZEN if self._freeze_ref == "quota"
+                     else snapshot_mod.PAUSED)
         elif self._pause_pending or self._paused_topics:
-            state, since = snapshot_mod.PAUSED, moment
+            state = snapshot_mod.PAUSED
         if busy:
             state = (snapshot_mod.STUCK if turn_timeout and elapsed > turn_timeout
                      else snapshot_mod.BUSY)
-            key = next(iter(busy))
+        if busy:
+            # A turn's start is known exactly from its own clock, so busy/stuck do not need the
+            # table: elapsed is measured, not remembered.
             since = moment - elapsed
+            key = next(iter(busy))
             try:
                 chat_id, thread_id = key if isinstance(key, tuple) else (key, None)
                 topic = self.topics.context(int(chat_id), thread_id) or "general"
             except Exception:                          # noqa: BLE001 - a name, not a fact
                 topic = "general"
+        else:
+            # First seen in this state: this beat is the moment it began. Recorded, so the next
+            # beat reports the same answer instead of moving with the clock.
+            since = float(self._state_since.setdefault(state, moment))
         queue = int(self._busy_waiting) + sum(self._cooldown_waiting.values())
 
         wakes: List[Tuple[str, float]] = []
@@ -4243,6 +4273,7 @@ class AgentChannel:
             self._set_frozen(True, "pause")
             return f"⏸ {alias} paused. /resume to continue."
         self._pause_pending = True
+        self._note_state(paused=True)
         self._pause_where = (event.chat_id, event.thread_id)
         return (f"⏸ {alias} pausing: it finishes the turn it is running, then holds. "
                 "/resume to continue.")
@@ -4512,6 +4543,7 @@ class AgentChannel:
             asyncio.ensure_future(self._ack_reaction(event))
         busy_topic = (event.chat_id, event.thread_id)
         self._busy_since[busy_topic] = self._clock()
+        self._note_state(busy=True)
         started = time.monotonic()
         logger.info("turn start: message %s from %s in chat %s%s (%d chars) -> %s",
                     event.message_id, incoming.author_alias, event.chat_id,
@@ -4569,6 +4601,7 @@ class AgentChannel:
             self._turns.discard(turn)
             self._turn_keys.pop(turn, None)
             self._busy_since.pop(busy_topic, None)
+            self._note_state(busy=False)
             if self._current_turn is turn:
                 self._current_turn = None
             self._stopping_turns.discard(turn)
