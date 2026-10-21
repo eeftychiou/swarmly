@@ -3548,9 +3548,10 @@ class AgentChannel:
             logger.warning("lease: check_lease could not read lease state", exc_info=True)
             return None
 
-        async def claim_at(term: int) -> Any:
+        async def claim_at(term: int, promoted: bool = False) -> Any:
             async with self._lease_lock():
-                return await asyncio.to_thread(store.claim, term=term, now=moment)
+                return await asyncio.to_thread(store.claim, term=term, now=moment,
+                                               promoted=promoted)
 
         alias = self.config.identity.alias.strip().lower()
 
@@ -3569,8 +3570,13 @@ class AgentChannel:
                     logger.warning("lease: failed to renew lease at term %d", state.term, exc_info=True)
             return state.claim
 
-        # Case 2: Lease is not live (absent, expired, or yielded)
-        if not state.live(moment):
+        # A holder that presence marks DOWN has lost the lease now, not when it expires: the
+        # lease is renewed rarely (a commit every half hour, not a heartbeat on GitHub), and
+        # liveness comes from Telegram.
+        holder_down = self._lease_holder_down(state)
+
+        # Case 2: Lease is not live (absent, expired, or yielded), or its holder is DOWN
+        if not state.live(moment) or holder_down:
             from swarmly.telegram.lease import succession_order
             role = str(self.config.identity.role or "").strip().lower()
             succession = getattr(self.config, "swarm", {}).get("succession") or ()
@@ -3599,7 +3605,7 @@ class AgentChannel:
             if self._defer_to_named_coordinator(state.term):
                 return None
             try:
-                mine = await claim_at(next_term)
+                mine = await claim_at(next_term, promoted=holder_down)
             except Exception as exc:
                 logger.warning("lease: %s could not claim term %d: %s", self.config.identity.alias,
                                next_term, exc)
@@ -3627,6 +3633,18 @@ class AgentChannel:
             await self._announce_takeover(next_term, state.status, mine)
             return mine
         return None
+
+    def _lease_holder_down(self, state: Any) -> bool:
+        """Whether the live lease's holder is DOWN on Telegram presence (and is not us)."""
+        holder = str(getattr(state, "holder", "") or "").strip()
+        if not holder or holder.lower() == self.config.identity.alias.strip().lower():
+            return False
+        try:
+            if not state.live(self._lease_clock()):
+                return False
+            return bool(self.presence().is_down(holder, self.presence_clock()))
+        except Exception:                        # noqa: BLE001 - unknown is not DOWN
+            return False
 
     def _defer_to_named_coordinator(self, term: int) -> bool:
         """Whether a lapsed lease is left to the coordinator the admin named, which is up.

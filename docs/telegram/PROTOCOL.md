@@ -417,7 +417,7 @@ round moving.
 - **Append-only lease records:** `.agents/leases/<term>-<alias>-<nonce>.json`.
 - **Folded state:** Highest term wins; ties within a term are broken by succession rank then
   alias, ordered by `arrival_rank` on the bus. Unranked claims fail closed.
-- **Renewal:** The active holder renews its lease every `lease_renew_seconds` (300 s by default,
+- **Renewal:** The active holder renews its lease every `lease_renew_seconds` (1800 s by default, against a 60-minute lease; a holder that Telegram presence marks DOWN loses the lease at once, so renewals are rare commits, not a heartbeat on git. Earlier default: 300 s,
   half the 10-minute lease). Claims, renewals and yields run in a worker thread, never on the
   bot's event loop, and the admin's `/role` gets a reply once the claim is on the bus.
 - **Takeover:** If a lease expires beyond `takeover_minutes` or is yielded, the first UP,
