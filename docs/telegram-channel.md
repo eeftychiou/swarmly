@@ -942,6 +942,17 @@ and the topic-name cache — and posts one machine `NOTE intent=TOPIC_GONE ref=<
 peers forget it too, with no model turn on either side. When a round's tracking issue closes,
 the coordinator posts the dry run once in General and asks the admin whether to delete it.
 
+**What a bot has spent — `/usage` (no model turn).** Every model turn appends one row to a
+per-bot ledger (`usage-<alias>.json`, beside the transport's other state): when it started and
+ended, the discussion as its token, the outcome, and the tokens in and out and the cost **when
+the runtime reports them** — Claude reports `total_cost_usd` and its token usage, Codex reports
+input tokens. `/usage@<bot>` answers from the ledger alone, so it costs nothing: turns and
+tokens for today, the same since this process started, quota left and its reset time when the
+runtime's own records expose them, and the last few turns. A number the runtime did not report
+is shown as **unknown**, never as zero, and a total says how many of its rows reported one. The
+ledger survives a restart and is capped (2000 rows, then the oldest are dropped — and the
+output says where its history now starts).
+
 **Native CLI commands — `/cli` (admin only, no model turn).** Swarmly does not reimplement
 what each CLI already does. `/cli@<bot> <command>` runs the command on that bot's CLI and
 streams the output back into one message that is edited as it goes. It never sends a prompt and

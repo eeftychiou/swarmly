@@ -186,6 +186,15 @@ class ClaudeAdapter(SubprocessAdapter):
             return super().parse_output(out, duration)
         meta = {key: data[key] for key in ("session_id", "total_cost_usd", "num_turns")
                 if key in data}
+        # Issue #125: the turn ledger wants the tokens, not just the money. Claude reports them
+        # per turn under `usage`; when it does not, the ledger records unknown rather than zero.
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            for name, source in (("tokens_in", "input_tokens"),
+                                 ("tokens_out", "output_tokens")):
+                value = usage.get(source)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    meta[name] = value
         model = reported_model(data.get("modelUsage"))
         if model:
             meta["model"] = model                         # the online notice names it

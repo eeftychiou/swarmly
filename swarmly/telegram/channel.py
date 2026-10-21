@@ -63,6 +63,7 @@ from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig
 from swarmly.telegram import native as native_cli
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.presence import Presence, Pulse
+from swarmly.telegram import usage as usage_mod
 from swarmly.telegram.pulsebus import PulseBus, notes_from
 from swarmly.telegram.projects import ProjectRouter
 from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
@@ -1449,7 +1450,8 @@ class AgentChannel:
         command, target = parsed
         if command == "effort":
             command = "reasoning"
-        if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes"):
+        if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes",
+                            "usage"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1465,6 +1467,8 @@ class AgentChannel:
             return self._round_summary(event)
         if command == "wakes":
             return self._wakes_command(event)
+        if command == "usage":
+            return self.usage_text(event)
         return self._command_reply(command, event)
 
     # ------------------------------------------------------------------------------
@@ -2427,6 +2431,47 @@ class AgentChannel:
                      role=self._role_name() if self.config.identity.role else "", term=term,
                      busy_since=now - max(durations) if durations else None,
                      frozen=bool(self._frozen))
+
+    # -- the turn ledger (issue #125) ---------------------------------------------------
+
+    def usage_ledger(self) -> Any:
+        """This bot's turn ledger: rows on disk, appended once per model turn.
+
+        One per channel: the file is the record, so a second instance would only append twice.
+        """
+        existing = getattr(self, "_usage_ledger", None)
+        if existing is not None:
+            return existing
+        ledger = usage_mod.Ledger(_state_file(self.config, "usage"),
+                                  alias=self.config.identity.alias, clock=time.time)
+        self._usage_ledger = ledger
+        return ledger
+
+    def record_turn(self, *, started: float, ended: float, event: Any, reply: Any) -> Any:
+        """Put one model turn in the ledger. Never raises: accounting must not fail a turn."""
+        try:
+            topic = "general"
+            if event is not None:
+                topic = self.topics.context(event.chat_id, event.thread_id) or "general"
+            entry = usage_mod.Entry.from_reply(
+                alias=self.config.identity.alias, started=started, ended=ended,
+                topic=topic, reply=reply)
+            entry = dataclasses.replace(
+                entry, model=entry.model or str(self.config.adapter.model or ""))
+            return self.usage_ledger().append(entry)
+        except Exception:                                  # noqa: BLE001 - accounting is a bonus
+            logger.warning("usage: could not record the turn", exc_info=True)
+            return None
+
+    def usage_text(self, event: Optional[Any] = None) -> str:
+        """``/usage``: what this bot has spent -- answered from the ledger, in code."""
+        boot = getattr(self, "_booted_at", None)
+        since = None
+        if boot is not None:
+            # The boot clock is monotonic and the ledger keeps wall time; anchor one on the other.
+            since = time.time() - max(0.0, self._clock() - boot)
+        return self.usage_ledger().render(since_boot=since)
+
 
     async def _heartbeat_tick(self, *, now: Optional[float] = None) -> str:
         """Publish one pulse, then judge the peers. Returns what it said, for a test.
@@ -4602,9 +4647,13 @@ class AgentChannel:
     async def _run_turn(self, event: ChannelEvent, envelope: Envelope,
                         incoming: IncomingMessage, ticket: Optional[Dict[str, Any]]):
         started = self._clock()
+        # Wall-clock start for the ledger (#125): the turn clock is monotonic, the ledger's rows
+        # are read against days, so one is anchored here and the other derived from it.
+        wall_started = time.time()
         self._note_turn_for_watch(event)
         try:
             reply = await self._respond(incoming, event)
+            self.record_turn(started=wall_started, ended=time.time(), event=event, reply=reply)
         except Exception as exc:                          # noqa: BLE001 - a broken adapter must not kill the loop
             if ticket:
                 self.replies.queue_failed(ticket['id'], "adapter raised before queue confirmation")
