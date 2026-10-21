@@ -34,6 +34,8 @@ INDEX_LOCK_WAIT_SECONDS = 0.5
 #: another agent's, so the retry on the remote's tip runs a few times, with a short pause.
 TIP_RETRIES = 4
 TIP_RETRY_WAIT_SECONDS = 1.0
+#: A single git call slower than this is logged with its subcommand and duration.
+SLOW_GIT_SECONDS = 5.0
 
 
 class BusPushError(RuntimeError):
@@ -221,8 +223,15 @@ class GitTransport:
             name, email = self.identity
             env.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
                        GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
-        return subprocess.run(["git", "-C", str(self.root), *args], check=False,
-                              capture_output=True, text=True, timeout=timeout, env=env)
+        started = time.monotonic()
+        try:
+            return subprocess.run(["git", "-C", str(self.root), *args], check=False,
+                                  capture_output=True, text=True, timeout=timeout, env=env)
+        finally:
+            took = time.monotonic() - started
+            if took >= SLOW_GIT_SECONDS:
+                # #126: a lease push took about 40 s with no trace of which step was slow.
+                logger.info("gitbus: git %s took %.1fs", args[0] if args else "", took)
 
     def _push_target(self) -> Tuple[str, str]:
         """``(remote, branch)`` to push the bus commit to: the current branch's upstream,
@@ -288,8 +297,16 @@ class GitTransport:
         # drop a state rewrite silently and leave the bus a sequence behind.
         unpushed = self._git("diff", "--name-only", "--diff-filter=A", f"{tip}...HEAD", "--",
                              INBOX_RELPATH, ROUNDS_RELPATH)
+        # #126: the local branch is never fast-forwarded, so "added since the merge base" grows
+        # with every bus file this bot ever pushed through this retry, and each one costs two
+        # git calls below (live: one lease push took about 40 s). Only the files the remote's
+        # tip does not have yet still need carrying.
+        missing = self._git("diff", "--name-only", "--diff-filter=A", tip, "HEAD", "--",
+                            INBOX_RELPATH, ROUNDS_RELPATH)
+        absent = set(missing.stdout.splitlines()) if missing.returncode == 0 else None
         earlier = [path for path in unpushed.stdout.splitlines()
                    if unpushed.returncode == 0
+                   and (absent is None or path in absent)
                    and (is_envelope_name(Path(path).name) or is_bus_document(path))]
         changed = list(dict.fromkeys([*files, *earlier]))
         if not changed:
@@ -344,6 +361,7 @@ class GitTransport:
         :class:`BusPushError` carrying git's stderr and a recovery hint.
         """
         pathspec = list(paths or [INBOX_RELPATH])
+        started, attempts = time.monotonic(), 0
         try:
             # P1-4 re-review B1: another git command (a pull, a concurrent post) holding
             # .git/index.lock made the add fail and the post still report success.
@@ -398,9 +416,14 @@ class GitTransport:
                                 ((push.stderr or push.stdout or "").strip().splitlines()
                                  or ["rejected"])[0])
                     time.sleep(TIP_RETRY_WAIT_SECONDS * attempt)
+                attempts += 1
                 push = self._push_onto_remote_tip(remote, branch, carry, commit_msg)
                 if push.returncode == 0 or not _remote_moved(push):
                     break
+            took = time.monotonic() - started
+            if took >= SLOW_GIT_SECONDS:
+                logger.info("gitbus: commit and push of %s took %.1fs (%d retr%s)",
+                            commit_msg, took, attempts, "y" if attempts == 1 else "ies")
             if push.returncode != 0:
                 detail = (push.stderr or push.stdout or "").strip().splitlines()
                 summary = detail[-1] if detail else f"exit code {push.returncode}"

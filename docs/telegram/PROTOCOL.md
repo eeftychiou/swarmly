@@ -417,7 +417,9 @@ round moving.
 - **Append-only lease records:** `.agents/leases/<term>-<alias>-<nonce>.json`.
 - **Folded state:** Highest term wins; ties within a term are broken by succession rank then
   alias, ordered by `arrival_rank` on the bus. Unranked claims fail closed.
-- **Renewal:** The active holder renews its lease every `lease_renew_seconds`.
+- **Renewal:** The active holder renews its lease every `lease_renew_seconds` (300 s by default,
+  half the 10-minute lease). Claims, renewals and yields run in a worker thread, never on the
+  bot's event loop, and the admin's `/role` gets a reply once the claim is on the bus.
 - **Takeover:** If a lease expires beyond `takeover_minutes` or is yielded, the first UP,
   non-frozen successor in succession order (`reviewer` -> `qa-tester` -> `developer`) claims term
   `N+1`.

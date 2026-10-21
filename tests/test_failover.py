@@ -122,7 +122,9 @@ class TestTheCoordinatorComesBack(GroupCase):
 
         # The admin hands the role back: /role writes a new term, and there is still one merge.
         group.run(back.channel.handle_event(_admin_event("/role @claude_obot coordinator")))
+        group.run(back.channel.lease_settled())      # the claim is pushed off the event loop
         self.assertTrue(back.lease_fence())
+        self.assertTrue(any("coordinator at term 3" in text for text in group.said_by("Claudebot")))
         self.assertEqual(group.github.merges, [(109, "Codex")])
 
 

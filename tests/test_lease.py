@@ -323,11 +323,109 @@ class TestLeaseSuccession(unittest.IsolatedAsyncioTestCase):
             }), encoding="utf-8")
 
             # Admin promotes Hermes to coordinator
-            ch._on_promoted_to_coordinator()
+            await ch._on_promoted_to_coordinator()
             state = ch.lease_store().state(now=1000.0)
             self.assertEqual(state.holder, "Hermes")
             self.assertEqual(state.term, 2)
             self.assertTrue(state.live(1000.0))
+
+    async def test_role_promotion_answers_in_the_chat(self):
+        # #126: /role changed the lease and said nothing, so the admin could not tell it landed.
+        from tests.test_telegram_channel import event as make_event
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ch = self.channel(root, "Hermes", "developer", {"Claude": "coordinator"},
+                              {"t": 1000.0})
+            await ch._on_promoted_to_coordinator(make_event("/role @HermesBot coordinator",
+                                                            message_id=77))
+            sent = ch._test_sender.sent
+            self.assertEqual(sent[-1]["text"], "\u2705 Hermes is coordinator at term 1.")
+            self.assertEqual(sent[-1]["reply_to"], 77)
+
+    async def test_a_promotion_that_does_not_reach_the_bus_says_so(self):
+        from swarmly.telegram import lease as lease_mod
+        with TemporaryDirectory() as tmp:
+            ch = self.channel(Path(tmp), "Hermes", "developer", {}, {"t": 1000.0})
+            original = ch.lease_store
+
+            def failing():
+                store = original()
+
+                def claim(**_kwargs):
+                    raise lease_mod.LeasePushError("git push failed (rejected)")
+                store.claim = claim
+                return store
+
+            ch.lease_store = failing
+            await ch._on_promoted_to_coordinator()
+            self.assertIn("did not reach the bus: git push failed (rejected)",
+                          ch._test_sender.last)
+
+    async def test_a_slow_claim_does_not_stop_the_bot(self):
+        # #126, live: a /role claim whose push retried for minutes ran on the event loop, and
+        # the bot handled no message and fired no timer until git was done.
+        import asyncio
+        import time as time_mod
+        with TemporaryDirectory() as tmp:
+            ch = self.channel(Path(tmp), "Hermes", "developer", {}, {"t": 1000.0})
+            original = ch.lease_store
+
+            def slow():
+                store = original()
+                claim = store.claim
+
+                def slow_claim(**kwargs):
+                    time_mod.sleep(0.5)                  # a push that takes its time
+                    return claim(**kwargs)
+                store.claim = slow_claim
+                return store
+
+            ch.lease_store = slow
+            ticks = 0
+
+            async def other_work():
+                nonlocal ticks
+                for _ in range(20):
+                    await asyncio.sleep(0.01)
+                    ticks += 1
+
+            await asyncio.gather(ch._on_promoted_to_coordinator(), other_work())
+            self.assertEqual(ticks, 20)
+            self.assertIn("is coordinator at term 1", ch._test_sender.last)
+
+    async def test_a_slow_renewal_does_not_stop_the_bot(self):
+        import asyncio
+        import time as time_mod
+        with TemporaryDirectory() as tmp:
+            ch = self.channel(Path(tmp), "Claude", "coordinator", {}, {"t": 1000.0})
+            original = ch.lease_store
+            loop_thread = []
+
+            def slow():
+                store = original()
+                claim = store.claim
+
+                def slow_claim(**kwargs):
+                    import threading
+                    loop_thread.append(threading.current_thread() is threading.main_thread())
+                    time_mod.sleep(0.3)
+                    return claim(**kwargs)
+                store.claim = slow_claim
+                return store
+
+            ch.lease_store = slow
+            ticks = 0
+
+            async def other_work():
+                nonlocal ticks
+                for _ in range(10):
+                    await asyncio.sleep(0.01)
+                    ticks += 1
+
+            first, _ = await asyncio.gather(ch.check_lease(now=1000.0), other_work())
+            self.assertEqual(first.term, 1)
+            self.assertEqual(ticks, 10)
+            self.assertEqual(loop_thread, [False])
 
 
 class TestNoAuthorityOnAFailedClaim(unittest.TestCase):

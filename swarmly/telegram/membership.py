@@ -858,7 +858,7 @@ class Membership:
         if mine:
             self.set_own_role(role, by="admin")
             if role == "coordinator" and hasattr(self.ch, "_on_promoted_to_coordinator"):
-                self.ch._on_promoted_to_coordinator()
+                self.ch._on_promoted_to_coordinator(event)
         else:
             self._set_peer_role(alias, role, coordinator=True)
             self._save()

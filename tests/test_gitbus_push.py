@@ -134,6 +134,41 @@ class TestGitbusPush(_Repos):
         self.assertIn(".agents/inbox/20261010T000000Z-a-b-first.md", files)
         self.assertIn(".agents/inbox/20261010T000001Z-a-b-second.md", files)
 
+    def test_the_retry_does_not_carry_files_the_remote_already_has(self):
+        # #126: the local branch is never fast-forwarded, so every bus file this checkout ever
+        # pushed through a retry looked "added since the merge base" and was staged again on
+        # each later retry -- two git calls per file, and one lease push took about 40 s.
+        other = self.clone_as("two")
+
+        def move_remote(n):
+            git(other, "pull", "-q", "--no-rebase", "origin", "main")
+            (other / f"other{n}.txt").write_text("y\n", encoding="utf-8")
+            git(other, "add", f"other{n}.txt")
+            git(other, "commit", "-q", "-m", f"other {n}")
+            git(other, "push", "-q", "origin", "main")
+
+        names = [f"20261010T00000{n}Z-a-b-post{n}.md" for n in range(3)]
+        for n, name in enumerate(names):
+            move_remote(n)
+            self.post(self.clone, name)
+        move_remote(9)
+        staged = []
+        original = GitTransport._git
+
+        def recording(transport, *args, **kwargs):
+            if args and args[0] == "update-index":
+                staged.append(args[-1].split(",", 2)[-1])
+            return original(transport, *args, **kwargs)
+
+        last = "20261010T000009Z-a-b-last.md"
+        with patch.object(GitTransport, "_git", recording):
+            self.post(self.clone, last)
+        self.assertEqual(staged, [f".agents/inbox/{last}"])
+        files = git(self.base, "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",
+                    "main").splitlines()
+        for name in [*names, last]:
+            self.assertIn(f".agents/inbox/{name}", files)
+
     def test_a_retry_with_nothing_to_carry_is_an_error(self):
         transport = GitTransport(self.clone)
         result = transport._push_onto_remote_tip("origin", "main",
