@@ -67,11 +67,6 @@ USERNAMES = {
 USER_IDS = {alias: 900 + index for index, alias in enumerate(USERNAMES)}
 
 
-def run(coro):
-    """Drive one coroutine to completion, as a transport would."""
-    return asyncio.run(coro)
-
-
 def username(alias: str) -> str:
     return USERNAMES.get(alias, f"{alias}_bot")
 
@@ -268,9 +263,9 @@ class FakeGitHub:
             if pr is None:
                 return 1
             return 0 if self.green(number) else 8
-        if argv[:2] == ["gh", "pr", "view"]:
+        if argv[:3] == ["gh", "pr", "view"]:
             return 0
-        return 0
+        return 1                    # a check this fake cannot answer is not a passing one
 
 
 class ScriptedAdapter(EchoAdapter):
@@ -319,8 +314,10 @@ class GroupSender:
 
     async def __call__(self, payload: str, reply_to_message_id: Any = None) -> str:
         self.sent.append({"text": payload, "reply_to": reply_to_message_id})
+        # ``reply_to_message_id`` is the message being answered, never a topic: the transport
+        # knows which topic it posts into, so that -- not the reply-to -- is the thread.
         self.group.post(self.group.bots.get(self.alias), payload,
-                        thread=reply_to_message_id, author=self.alias)
+                        thread=self.group.thread, author=self.alias)
         return payload
 
     @property
@@ -388,8 +385,40 @@ class Group:
         self.cut: Set[frozenset] = set()         # Telegram delivery stops between these pairs
         self.term = 0
         self.succession = tuple(succession or ())
+        #: The topic bots post into, as the transport knows it (None = General).
+        self.thread: Optional[int] = None
+        #: One event loop for the whole swarm. A channel holds asyncio locks and background
+        #: tasks, so a fresh loop per delivered event means every lock is bound to a loop that
+        #: is already closed -- fine only until a turn actually waits on one.
+        self.loop = asyncio.new_event_loop()
         self._message_id = 1000
         self._pending: List[Dict[str, Any]] = []
+
+    def close(self) -> None:
+        """Close the swarm's loop, and let its outstanding work end first.
+
+        A drill stops mid-flight by design (a killed bot, a closed bus), and a wake check runs on
+        a worker thread, so there is often one task or one thread still pending when the test
+        ends. Cancelling and draining here keeps that from surfacing as a "task was destroyed"
+        warning that a real failure would hide behind.
+        """
+        loop = self.loop
+        if loop.is_closed():
+            return
+        try:
+            pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+        finally:
+            loop.close()
+
+    def run(self, coro: Any) -> Any:
+        """Drive one coroutine on the swarm's loop -- the only loop these channels ever see."""
+        return self.loop.run_until_complete(coro)
 
     # -- the swarm -------------------------------------------------------------------
     def join(self, alias: str, role: str, *, replies: Optional[str] = None) -> Bot:
@@ -550,7 +579,14 @@ class Group:
                             attachments=[], raw=None)
 
     def pump(self, rounds: int = 40) -> int:
-        """Deliver every queued line, and whatever it provokes, until the group is quiet."""
+        """Deliver every queued line, and whatever it provokes, until the group is quiet.
+
+        The whole delivery -- every bot, every round -- runs on the swarm's loop, so the bots
+        share one loop the way they share one group.
+        """
+        return self.run(self._apump(rounds))
+
+    async def _apump(self, rounds: int) -> int:
         delivered = 0
         for _ in range(rounds):
             if not self._pending:
@@ -564,19 +600,22 @@ class Group:
                         continue
                     delivered += 1
                     try:
-                        run(bot.channel.handle_event(self._event(row, bot.alias)))
+                        await bot.channel.handle_event(self._event(row, bot.alias))
                     except Exception as exc:         # noqa: BLE001 - a failed turn is not a stop
                         row.setdefault("errors", []).append(f"{bot.alias}: {exc!r}")
-            self.drain()
+            await self._adrain()
         return delivered
 
     def drain(self) -> None:
         """Let the channels' own background work (mirrors, receipts) finish."""
+        self.run(self._adrain())
+
+    async def _adrain(self) -> None:
         for bot in self.live():
             tasks = [task for task in getattr(bot.channel, "_mirror_tasks", set())
                      if not task.done()]
             if tasks:
-                run(asyncio.gather(*tasks, return_exceptions=True))
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     # -- time ------------------------------------------------------------------------
     def advance(self, seconds: float) -> float:
@@ -588,27 +627,31 @@ class Group:
         if seconds:
             self.advance(seconds)
         out: Dict[str, Any] = {"lease": {}, "presence": {}, "wake": {}}
+        self.run(self._atick(out, lease=lease, presence=presence, wakes=wakes))
+        self.pump()
+        return out
+
+    async def _atick(self, out: Dict[str, Any], *, lease: bool, presence: bool,
+                     wakes: bool) -> None:
         for bot in self.live():
             channel = bot.channel
             if lease:
                 try:
-                    claim = run(channel.check_lease())
+                    claim = await channel.check_lease()
                     out["lease"][bot.alias] = claim
                     self.term = max(self.term, int(getattr(claim, "term", 0) or 0))
                 except Exception as exc:             # noqa: BLE001 - a failed tick is data
                     out["lease"][bot.alias] = exc
             if presence:
                 try:
-                    out["presence"][bot.alias] = run(channel.check_peer_liveness())
+                    out["presence"][bot.alias] = await channel.check_peer_liveness()
                 except Exception as exc:             # noqa: BLE001
                     out["presence"][bot.alias] = exc
             if wakes:
                 try:
-                    out["wake"][bot.alias] = run(channel._wake_tick(now=self.clock.now()))
+                    out["wake"][bot.alias] = await channel._wake_tick(now=self.clock.now())
                 except Exception as exc:             # noqa: BLE001
                     out["wake"][bot.alias] = exc
-        self.pump()
-        return out
 
     def beats(self, every: float = 120.0, times: int = 1) -> None:
         """Every live bot pulses, *times* times, one *every* apart -- the heartbeat task."""
