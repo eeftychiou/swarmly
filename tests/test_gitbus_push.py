@@ -121,6 +121,30 @@ class TestGitbusPush(_Repos):
         self.assertIn(f".agents/inbox/{ENVELOPE}", files)
         self.assertIn("race.txt", files)
 
+    def test_configured_bus_ref_retries_when_remote_moves_during_push(self):
+        racer = self.clone_as("two")
+        original = GitTransport._git
+        raced = []
+
+        def racing(transport, *args, **kwargs):
+            if args and args[0] == "push" and not raced:
+                raced.append(True)
+                (racer / "race.txt").write_text("r\n", encoding="utf-8")
+                git(racer, "add", ".")
+                git(racer, "commit", "-q", "-m", "race")
+                git(racer, "push", "-q", "origin", "main")
+            return original(transport, *args, **kwargs)
+
+        with patch.object(GitTransport, "_git", racing), \
+                patch.object(gitbus, "TIP_RETRY_WAIT_SECONDS", 0):
+            GitTransport(self.clone, ref="origin/main").post(
+                ENVELOPE, "---\nid: x\n---\nbody\n")
+        files = git(self.base, "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",
+                    "main").splitlines()
+        self.assertIn(f".agents/inbox/{ENVELOPE}", files)
+        self.assertIn("race.txt", files)
+        self.assertEqual(git(self.clone, "log", "-1", "--format=%s"), "init")
+
     def test_an_earlier_post_stuck_locally_rides_the_next_retry(self):
         self._moved_remote()
         failed = subprocess.CompletedProcess(args=["git", "push"], returncode=1, stdout="",

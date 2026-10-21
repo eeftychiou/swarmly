@@ -360,8 +360,9 @@ class GitTransport:
         Every git call has a timeout. A push rejected because the remote moved on is
         retried once as a commit on the remote's tip, without touching the working tree.
 
-        A failed push must never be silent (drill finding, PR #78): the local
-        commit remains so the message is not lost, but the caller gets a
+        A failed push must never be silent (drill finding, PR #78): the bus
+        document remains in the working tree so the message is not lost, but the caller
+        gets a
         :class:`BusPushError` carrying git's stderr and a recovery hint.
         """
         pathspec = list(paths or [INBOX_RELPATH])
@@ -371,6 +372,14 @@ class GitTransport:
         if self.ref and self.ref.startswith(f"{self.remote}/"):
             branch = self.ref[len(self.remote) + 1:]
             result = self._push_onto_remote_tip(self.remote, branch, pathspec, commit_msg)
+            for attempt in range(TIP_RETRIES if _remote_moved(result) else 0):
+                logger.info("gitbus: push lost a race to another agent (%s); retrying",
+                            ((result.stderr or result.stdout or "").strip().splitlines()
+                             or ["rejected"])[0])
+                time.sleep(TIP_RETRY_WAIT_SECONDS * (attempt + 1))
+                result = self._push_onto_remote_tip(self.remote, branch, pathspec, commit_msg)
+                if result.returncode == 0 or not _remote_moved(result):
+                    break
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "push failed").strip()
                 raise BusPushError(f"could not publish bus state to {self.ref}: {detail}")
