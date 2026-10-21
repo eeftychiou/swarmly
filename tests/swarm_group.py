@@ -67,11 +67,6 @@ USERNAMES = {
 USER_IDS = {alias: 900 + index for index, alias in enumerate(USERNAMES)}
 
 
-def run(coro):
-    """Drive one coroutine to completion, as a transport would."""
-    return asyncio.run(coro)
-
-
 def username(alias: str) -> str:
     return USERNAMES.get(alias, f"{alias}_bot")
 
@@ -268,7 +263,7 @@ class FakeGitHub:
             if pr is None:
                 return 1
             return 0 if self.green(number) else 8
-        if argv[:2] == ["gh", "pr", "view"]:
+        if argv[:3] == ["gh", "pr", "view"]:
             return 0
         return 1                    # a check this fake cannot answer is not a passing one
 

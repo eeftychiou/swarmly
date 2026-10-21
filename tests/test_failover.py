@@ -340,6 +340,8 @@ class TestTheHarness(GroupCase):
 
     def test_a_check_the_fake_cannot_answer_is_not_green(self):
         self.assertEqual(self.group.github.check_returncode(["gh", "pr", "list"]), 1)
+        # A check the fake does know: `gh pr checks` reports readiness, `gh pr view` is a read.
+        self.assertEqual(self.group.github.check_returncode(["gh", "pr", "view", "1"]), 0)
         self.group.github.open_pr(111, checks={"lint": "pass", "unittest": "pending"})
         self.assertEqual(self.group.github.check_returncode(["gh", "pr", "checks", "111"]), 8)
         self.group.github.go_green(111)
