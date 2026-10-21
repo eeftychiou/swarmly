@@ -560,3 +560,59 @@ A participant conforms to v1.1 if it:
 - [ ] announces every escalation rung
 - [ ] carries its round state as a `ROUND_STATE` block that is stripped before posting (§7)
 - [ ] turns a promise to act later into a `WAKE` line in the same turn (§8)
+
+## Peer liveness: pulse and DOWN (issue #82)
+
+Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2), and it goes
+to the **durable plane** whenever there is one: a parentless commit on this bot's own ref,
+`refs/pulse/<alias>`, force-updated every beat (one blob, `pulse.json`, no parent chain). The ref
+is a mailbox, not a history: the bus branch grows no commits, `main` never learns a pulse
+happened, and the only writer of a bot's ref is that bot, so there is no push race. Peers read
+`refs/pulse/*` on the same interval, so the facts survive a restart -- including a die-off seen
+while this bot was being restarted.
+
+A commit on the bus branch every two minutes would be ~180 commits an hour of history, forever;
+that is why the pulse gets its own ref rather than a lane of the bus branch.
+
+**Telegram is the fallback.** With no bus (a bare transport, no checkout) or when this beat's
+push failed, the pulse goes out as the ephemeral `STATUS intent=PULSE` line instead -- and only
+then. `PULSE` is machine-class traffic (#43): it is recorded as state, wakes no model turn, and
+is swept from General like the other machine notices.
+
+The bus half runs in a worker thread (`asyncio.to_thread`), never inline in the beat: a slow or
+hung git must not stall the pulse loop, a turn, or Telegram delivery. `refs/pulse/<alias>` is
+the pulse's identity -- a payload whose alias does not encode to the ref it came from is
+ignored, because every writer can push any ref.
+
+The pulse commit is authored by the bot itself (`DeepSeek <deepseek@a2a.local>`), named on the
+command line rather than read from the host's git config, and it writes a ref of its own --
+never a branch -- so the push guard sees no push to `main`. A role that may not push at all
+(`reviewer`, `researcher`) has no bus half and keeps the Telegram line, which is the
+fallback working as designed.
+
+A pulse carries `{alias, at, rev, role, term, busy_since, frozen}`. The pulse is emitted by its
+own task, never the turn lock, so a long turn keeps pulsing and `busy_since` says since when.
+
+**DOWN** means silent on *both* planes: no pulse and no Telegram traffic for
+`heartbeat_minutes × peer_down_after` (default 6 minutes). Any pulse, `HELLO` or message brings a
+peer back UP, so a bot whose git remote died — or one partitioned away from the bus — is not
+declared dead while it is still talking to us. A peer never heard from is `unknown`, not DOWN, and
+a freshly started transport gets one interval of grace before anyone can be judged DOWN.
+
+The table survives a restart: each transport saves `presence-<alias>.json` (peer
+`last_seen`/`busy_since`/`term`/`rev`, and any DOWN episode already announced) beside its
+other state and restores it at start, so a die-off seen before a restart is still known
+after it and one admin line is still one line. A stop shorter than one interval missed no
+pulse, so the saved verdicts stand; after a longer stop the bot cannot know what it did not
+hear and rejudges from now under the fresh grace.
+
+DOWN is **advisory**. It says "this peer has not been heard from"; it never says "somebody else
+should lead". The lease (#83) decides who coordinates — using DOWN to start a takeover would let
+a partition elect a second coordinator.
+
+What DOWN changes: a hand-off to a DOWN peer is returned to the sender at once (no reminder, no
+wait), the same as FROZEN, and no reminder is ever sent to a DOWN or busy peer. When the
+coordinator, or the acting coordinator when the coordinator is the one down, hears a peer go
+DOWN, it posts one line to the admin — "⚠️ DeepSeek has been silent since 18:30" — deduped once
+per episode. A peer that comes back gets one "back" line and nothing more. `/status` and `/swarm`
+show `peers=Claudebot:up,DeepSeek:down(12m)`; a busy peer shows `busy(3m)`.

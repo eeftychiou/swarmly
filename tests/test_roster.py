@@ -196,7 +196,12 @@ class SwarmBotsAdmitTests(unittest.TestCase):
             await channel.handle_event(hello("Grok", "grok_x_bot"))
             await channel.handle_event(admin("/admit @grok_x_bot"))
             return await channel.handle_event(admin("/status@HermesBot", message_id=52))
-        self.assertIn("peers=Codex,Antigravity,Grok", run(scenario()))
+        answer = run(scenario())
+        # #82: the line carries liveness now (`Grok:up`), not a bare list -- so the property
+        # is that every peer appears with a state, including the runtime-admitted one.
+        self.assertIn("peers=", answer)
+        for alias in ("Codex", "Antigravity", "Grok"):
+            self.assertIn(f"{alias}:", answer)
 
     def test_the_online_notice_names_the_alias(self):
         self.assertIn("intent=ONLINE ref=Hermes", make_channel().online_notice())

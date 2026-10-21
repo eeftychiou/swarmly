@@ -673,6 +673,14 @@ class ChannelLimits:
     #: How many firings one timer may have before it gives up with a turn that says so. 0
     #: leaves the bound to `until` alone.
     wake_max_attempts: int = 50
+    #: Issue #82: how often each transport publishes a liveness pulse. Liveness rides the
+    #: ephemeral Telegram line, not a bus commit -- 6 bots at 2 min is ~180 commits an hour on
+    #: the bus, forever, each a push race with real traffic. `heartbeat_minutes * peer_down_after`
+    #: is therefore measured in minutes of Telegram silence, not bus commits.
+    heartbeat_minutes: float = 2.0
+    #: How many heartbeats a peer may miss before it is DOWN (advisory: the lease, not this,
+    #: decides who coordinates).
+    peer_down_after: float = 3.0
     #: How long a takeover claim is left to settle before the claimant re-folds and acts, so two
     #: bots claiming the next term do not both act (#83). 0 acts at once, which only a test wants.
     lease_settle_seconds: float = 30.0
