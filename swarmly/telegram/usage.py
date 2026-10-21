@@ -212,7 +212,10 @@ class Ledger:
             "tokens_in": sum(known_in) if known_in else None,
             "tokens_out": sum(known_out) if known_out else None,
             "cost_usd": round(sum(known_cost), 4) if known_cost else None,
-            "cost_known": len(known_cost), "tokens_known": len(known_in),
+            # Each side is counted on its own: a runtime that reports input only (Codex) must
+            # not make the output column look more covered than it is (#125 review).
+            "cost_known": len(known_cost),
+            "tokens_in_known": len(known_in), "tokens_out_known": len(known_out),
             "since": moment,
         }
 
@@ -276,9 +279,9 @@ def _money_text(value: Optional[float]) -> str:
 
 def _totals_line(totals: Dict[str, Any]) -> str:
     """One line for a window: turns, tokens and cost, each saying how much was reported."""
-    turns, known = totals["turns"], totals["tokens_known"]
-    return (f"{turns} turns, in={_partial(totals['tokens_in'], known, turns)} "
-            f"out={_partial(totals['tokens_out'], known, turns)} "
+    turns = totals["turns"]
+    return (f"{turns} turns, in={_partial(totals['tokens_in'], totals['tokens_in_known'], turns)} "
+            f"out={_partial(totals['tokens_out'], totals['tokens_out_known'], turns)} "
             f"cost={_partial_money(totals['cost_usd'], totals['cost_known'], turns)}")
 
 

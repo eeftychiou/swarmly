@@ -170,6 +170,22 @@ class TestTheRendering(unittest.TestCase):
         self.assertIn("in=7 out=3 cost=$0.0100", text)
         self.assertNotIn("1/1 reported", text)      # complete: no caveat on the numbers
 
+    def test_each_side_of_the_token_total_is_counted_on_its_own(self):
+        """#125 review: a row that reports only input must not cover the output column.
+
+        Two rows — one with both sides, one with input only — are fully reported for `in` and
+        half-reported for `out`; sharing one known-count would claim `out` was 2/2 covered.
+        """
+        ledger = us.Ledger(None, alias="DeepSeek", clock=lambda: NOW)
+        ledger.append(us.Entry(alias="DeepSeek", started=NOW - 30, ended=NOW - 20,
+                               tokens_in=7, tokens_out=3, cost_usd=0.01))
+        ledger.append(us.Entry(alias="DeepSeek", started=NOW - 10, ended=NOW,
+                               tokens_in=5, cost_usd=0.01))
+        text = ledger.render(now=NOW)
+        self.assertIn("in=12 ", text)                   # both rows reported input: no caveat
+        self.assertIn("out=3 (1/2 reported)", text)     # only one row reported output
+        self.assertIn("cost=$0.0200", text)
+
     def test_silent_rows_are_counted_as_unreported(self):
         ledger = us.Ledger(None, alias="DeepSeek", clock=lambda: NOW)
         ledger.append(us.Entry(alias="DeepSeek", started=NOW - 30, ended=NOW - 20))
