@@ -868,6 +868,9 @@ class TestTipAdvancing(unittest.TestCase):
                                                              identity=("t", "t@t")),
                               root=bus, clock=lambda: now, ttl_seconds=60.0, rank=2)
         first.claim(term=1)                     # the first claim, worse role, arrives first
+        # LeaseStore pushes through a detached ref; advance the test worktree before adding noise.
+        run_git(bus, "fetch", "origin", "main")
+        run_git(bus, "reset", "--hard", "origin/main")
         # Warm the cache *before* the tip moves: without this the test would pass even with the
         # old arrival-rank ordering, because nothing stale would ever have been cached (#93).
         warm = ls.LeaseStore("Zulu", transport=GitTransport(bus, ref="origin/main",
@@ -879,7 +882,7 @@ class TestTipAdvancing(unittest.TestCase):
             (bus / f"noise{index}.txt").write_text("x", encoding="utf-8")
             run_git(bus, "add", f"noise{index}.txt")
             run_git(bus, "commit", "-q", "-m", f"noise {index}")
-        run_git(bus, "push", "-q")
+        run_git(bus, "push", "-q", "origin", "main")
         # Alpha's claim lands after the noise: written as a bus fact, since `claim()` refuses a
         # live holder's term (that guard is a different test).
         import json as _json
@@ -890,7 +893,7 @@ class TestTipAdvancing(unittest.TestCase):
              "nonce": "late0001"}), encoding="utf-8")
         run_git(bus, "add", ".agents/leases")
         run_git(bus, "commit", "-q", "-m", "alpha claims later")
-        run_git(bus, "push", "-q")
+        run_git(bus, "push", "-q", "origin", "main")
 
         reader = ls.LeaseStore("Zulu", transport=GitTransport(bus, ref="origin/main",
                                                               identity=("t", "t@t")),
@@ -1047,3 +1050,40 @@ class TestTheNamedCoordinatorKeepsTheRole(TestSuccessionOnExpiry):
         channel.presence().seen("Claude", channel.presence_clock())
         channel.frozen_peers = lambda: {"Claude": {"ref": "quota"}}
         self.assertIsNotNone(asyncio.run(channel.check_lease(now=later)))
+
+
+class TestADownHolderLosesTheLease(TestSuccessionOnExpiry):
+    """Admin, 2026-10-21: the lease is no longer a heartbeat on GitHub. It is renewed rarely
+    (an hour-long lease, renewed every half hour), and a holder that Telegram presence marks
+    DOWN loses it at once, so a die-off is still taken over in minutes."""
+
+    def held(self):
+        channel, bus, _ = self.channel(
+            role="reviewer", peers={"Claude": {"username": "claude_bot", "role": "coordinator"}})
+        now = channel._clock()
+        holder = ls.LeaseStore("Claude", transport=channel.lease_store().transport, root=bus,
+                               clock=lambda: now, ttl_seconds=3600.0, rank=3)
+        holder.claim(term=1)
+        return channel, now + 600                      # ten minutes in: the lease is live
+
+    def test_a_down_holder_is_taken_over_before_its_lease_expires(self):
+        import asyncio
+        from unittest import mock
+        channel, later = self.held()
+        channel.presence().seen("Claude", channel.presence_clock())
+        with mock.patch.object(type(channel.presence()), "is_down", return_value=True):
+            claim = asyncio.run(channel.check_lease(now=later))
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.term, 2)
+
+    def test_a_holder_that_is_up_keeps_its_lease(self):
+        import asyncio
+        channel, later = self.held()
+        channel.presence().seen("Claude", channel.presence_clock())
+        self.assertIsNone(asyncio.run(channel.check_lease(now=later)))
+
+    def test_the_defaults_renew_rarely(self):
+        from tests.test_telegram_channel import make_config
+        limits = make_config().limits
+        self.assertGreaterEqual(limits.lease_renew_seconds, 1800)
+        self.assertGreaterEqual(limits.takeover_minutes, 60)

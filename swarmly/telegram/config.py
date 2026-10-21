@@ -680,6 +680,17 @@ class ChannelLimits:
     #: the bus, forever, each a push race with real traffic. `heartbeat_minutes * peer_down_after`
     #: is therefore measured in minutes of Telegram silence, not bus commits.
     heartbeat_minutes: float = 2.0
+    #: Where the pulse goes. "telegram": each bot keeps one status message in the home channel
+    #: and edits it in place every beat; peers receive the edit, which is the heartbeat, and no
+    #: notification or new line appears. "bus": the old per-bot git ref on the bus repository,
+    #: a push and a fetch every beat (a heartbeat does not belong on GitHub, so off by default).
+    heartbeat_plane: str = "telegram"
+    #: The forum topic the status message lives in; 0 is General.
+    heartbeat_topic_id: int = 0
+    #: On the Telegram plane: "repost" posts each beat as a new silent line and deletes the
+    #: previous one, so peers receive an ordinary message; "edit" edits one message in place,
+    #: which relies on Telegram delivering a bot's edits to the other bots.
+    heartbeat_style: str = "repost"
     #: How many heartbeats a peer may miss before it is DOWN (advisory: the lease, not this,
     #: decides who coordinates).
     peer_down_after: float = 3.0
@@ -707,10 +718,11 @@ class ChannelLimits:
     #: Doubles after each quiet check, up to 8 hours; any other turn resets it. 0 = off.
     coordinator_watch_minutes: float = 30.0
     #: Issue #83: how long without a renewal before successors take over the coordinator lease.
-    takeover_minutes: float = 10.0
-    #: How often the active coordinator renews its lease. Half the 10-minute lease: every
-    #: renewal is a push to the shared bus branch, and fewer of them means fewer races (#126).
-    lease_renew_seconds: float = 300.0
+    takeover_minutes: float = 60.0
+    #: How often the active coordinator renews its lease: every renewal is a commit pushed to
+    #: the shared bus branch, so it is rare. Liveness is Telegram's job (presence), and a holder
+    #: that goes DOWN loses the lease at once, whatever its expiry (admin, 2026-10-21).
+    lease_renew_seconds: float = 1800.0
     #: Issue #31: the channel's reply budget, in characters (the swarm's 500-char convention).
     #: A project may override it per topic (``projects.<key>.reply_chars``); everything else
     #: -- General, unbound topics, the reply tickets -- uses this.

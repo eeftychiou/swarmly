@@ -228,7 +228,12 @@ class TestTheChannelWiresIt(unittest.TestCase):
 
 
 class TestWhatEachBotSpent(unittest.TestCase):
-    """Every bot's tokens and cost, without asking any bot for a turn (issue #117)."""
+    """Every bot's tokens and cost, without asking any bot for a turn (issue #117).
+
+    Usage rides the pulse's status record (the shape #117's heartbeat carries): each bot's own
+    ledger, briefed to today plus the beat. The dashboard reads peers' numbers from there and
+    its own from the ledger directly, never by asking anyone for a turn.
+    """
 
     def channel(self):
         channel = make_channel(make_config(control={"chat_id": GROUP, "topic_id": 307},
@@ -238,69 +243,60 @@ class TestWhatEachBotSpent(unittest.TestCase):
         channel.presence_clock = lambda: 1_800_000_000.0
         return channel
 
-    def test_a_pulse_carries_todays_totals_from_the_ledger(self):
+    def test_todays_totals_come_from_the_ledger_with_their_coverage(self):
         from swarmly.telegram import usage as us
         channel = self.channel()
         day = 1_800_000_000.0 - (1_800_000_000.0 % 86400)
         channel.usage_ledger().append(us.Entry(alias="Hermes", started=day + 10, ended=day + 20,
                                                tokens_in=1200, tokens_out=340,
                                                cost_usd=0.42, outcome=us.OK))
-        carried = channel.own_pulse(1_800_000_000.0).usage
-        self.assertEqual((carried["tokens_in"], carried["tokens_out"]), (1200, 340))
-        self.assertEqual((carried["tokens_in_known"], carried["turns"]), (1, 1))
-        self.assertEqual(carried["cost_usd"], 0.42)
+        today = channel.own_pulse(1_800_000_000.0).status["usage"]["today"]
+        self.assertEqual((today["tokens_in"], today["tokens_out"]), (1200, 340))
+        self.assertEqual((today["tokens_in_known"], today["turns"]), (1, 1))
+        self.assertEqual(today["cost_usd"], 0.42)
+
+    def test_reading_the_dashboard_does_not_move_the_beats_window(self):
+        channel = self.channel()
+        before = dict(channel._pulse_usage(1_800_000_000.0))
+        channel.control_text()
+        after = dict(channel._pulse_usage(1_800_000_000.0))
+        self.assertEqual(before["beat"], after["beat"])
 
     def test_a_bot_with_no_turns_says_nothing_rather_than_zero(self):
         channel = self.channel()
-        self.assertIsNone(channel.own_pulse(1_800_000_000.0).usage)
-        self.assertEqual(channel.control_usage(), {})
+        self.assertEqual(channel.control_usage().get("Hermes", {}).get("tokens_in"), None)
 
     def test_a_peers_spend_arrives_on_its_pulse(self):
         from swarmly.telegram.presence import Pulse
         channel = self.channel()
         channel.presence().note(Pulse(alias="Codex", at=1_800_000_010.0, rev="abc1234",
-                                      usage={"at": 1_800_000_010.0, "turns": 3,
-                                             "tokens_in": 900, "tokens_out": None,
-                                             "tokens_in_known": 3, "tokens_out_known": 0,
-                                             "cost_usd": 0.10, "cost_known": 3}))
+                                      status={"at": 1_800_000_010.0, "alias": "Codex",
+                                              "state": "busy",
+                                              "usage": {"today": {
+                                                  "turns": 3, "tokens_in": 900,
+                                                  "tokens_out": None, "tokens_in_known": 3,
+                                                  "tokens_out_known": 0, "cost_usd": 0.10,
+                                                  "cost_known": 3}}}))
         text = channel.control_text()
         self.assertIn("Codex:", text)
         self.assertIn("900", text)                     # its input tokens
         self.assertIn("unknown", text)                 # output was never reported: not a zero
 
-    def test_an_older_beat_cannot_lower_a_peers_reported_spend(self):
+    def test_the_snapshot_carries_the_usage_and_a_peer_keeps_the_newest(self):
         from swarmly.telegram.presence import Pulse
         channel = self.channel()
         table = channel.presence()
         table.note(Pulse(alias="Codex", at=1_800_000_020.0,
-                         usage={"at": 1_800_000_020.0, "turns": 5, "tokens_in": 5000,
-                                "tokens_out": 900, "tokens_in_known": 5,
-                                "tokens_out_known": 5, "cost_usd": 1.0, "cost_known": 5}))
+                         status={"at": 1_800_000_020.0, "usage": {"today": {
+                             "turns": 5, "tokens_in": 5000, "tokens_out": 900,
+                             "tokens_in_known": 5, "tokens_out_known": 5, "cost_usd": 1.0,
+                             "cost_known": 5}}}))
         table.note(Pulse(alias="Codex", at=1_800_000_001.0,
-                         usage={"at": 1_800_000_001.0, "turns": 1, "tokens_in": 10,
-                                "tokens_out": 2, "tokens_in_known": 1}))
-        self.assertEqual(table.peers["Codex"].usage["tokens_in"], 5000)
-
-    def test_the_usage_survives_a_restart_with_the_presence_table(self):
-        from swarmly.telegram.presence import Peer, Pulse
-        channel = self.channel()
-        table = channel.presence()
-        table.note(Pulse(alias="Codex", at=1_800_000_020.0,
-                         usage={"at": 1_800_000_020.0, "turns": 2, "tokens_in": 700,
-                                "tokens_out": 90, "tokens_in_known": 2}))
-        saved = table.to_dict(1_800_000_030.0)
-        again = Peer.from_dict(saved["peers"]["Codex"])
-        self.assertEqual(again.usage["tokens_in"], 700)
-
-    def test_the_pulse_round_trips_its_usage(self):
-        from swarmly.telegram.presence import Pulse
-        pulse = Pulse(alias="Hermes", at=1_800_000_000.0,
-                      usage={"at": 1_800_000_000.0, "turns": 1, "tokens_in": 12,
-                             "tokens_out": 3, "tokens_in_known": 1, "tokens_out_known": 1,
-                             "cost_usd": 0.01, "cost_known": 1})
-        again = Pulse.from_dict(pulse.to_dict())
-        self.assertEqual(again.usage, pulse.usage)
-
+                         status={"at": 1_800_000_001.0, "usage": {"today": {
+                             "turns": 1, "tokens_in": 10, "tokens_out": 2,
+                             "tokens_in_known": 1}}}))
+        usage = (table.peers["Codex"].snapshot or {}).get("usage") or {}
+        self.assertEqual(usage["today"]["tokens_in"], 5000)
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

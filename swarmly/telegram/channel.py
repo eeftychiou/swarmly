@@ -2264,6 +2264,11 @@ class AgentChannel:
             return float("inf")
         return interval * missed
 
+    def heartbeat_plane(self) -> str:
+        """``limits.heartbeat_plane``: "telegram" (the default) or "bus"."""
+        plane = str(getattr(self.config.limits, "heartbeat_plane", "telegram") or "telegram")
+        return "bus" if plane.strip().lower() == "bus" else "telegram"
+
     def pulse_bus(self) -> Optional[PulseBus]:
         """The git ref this bot's pulse is written to, or None when the bus is off (#82).
 
@@ -2458,45 +2463,46 @@ class AgentChannel:
             term = int(self.lease_state().term or 0)
         except Exception:                          # noqa: BLE001 - a pulse without a term
             term = 0
+        status = self.status_snapshot(now).to_dict()
+        usage = self._pulse_usage(now)
+        if usage:
+            status["usage"] = usage
         return Pulse(alias=self.config.identity.alias, at=now, rev=self._running_revision,
                      role=self._role_name() if self.config.identity.role else "", term=term,
                      busy_since=now - max(durations) if durations else None,
-                     frozen=bool(self._frozen),
-                     status=self.status_snapshot(now).to_dict(),
-                     usage=self.pulse_usage(now))
+                     frozen=bool(self._frozen), status=status)
 
-    # -- what this bot has spent (issue #117) -----------------------------------------
+    def _pulse_usage(self, now: float, *, advance: bool = True) -> Dict[str, Any]:
+        """What this bot spent, from its own turn ledger: since the last beat and today (UTC).
 
-    def pulse_usage(self, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
-        """Today's totals for the pulse, from this bot's own ledger (#125).
-
-        Nothing is invented: a token count the runtime never reported is left as ``None`` and
-        rendered as unknown, and coverage travels with the number (``*_known``) so a reader can
-        say how much of the day was actually reported. Only the compact numbers ride the beat;
-        the ledger keeps the detail.
+        Read from the ledger the turns already wrote, so the heartbeat costs no tokens. A number
+        a runtime never reported stays ``None``, as it does in /usage.
         """
-        moment = self.presence_clock() if now is None else float(now)
         try:
             ledger = self.usage_ledger()
-            totals = ledger.totals(moment - (moment % 86400))
+            if ledger is None:
+                return {}
+            last = float(self.__dict__.get("_pulse_usage_from") or 0.0)
+            if advance:
+                # The dashboard reads the same window without consuming it (#117).
+                self._pulse_usage_from = now
+            midnight = now - (now % 86400.0)
+
+            def brief(totals: Dict[str, Any]) -> Dict[str, Any]:
+                return {key: totals.get(key) for key in
+                        ("turns", "failed", "tokens_in", "tokens_out", "cost_usd",
+                         "tokens_in_known", "tokens_out_known", "cost_known")}
+
+            usage: Dict[str, Any] = {
+                "beat": brief(ledger.totals(last or now - self.heartbeat_seconds())),
+                "today": brief(ledger.totals(midnight))}
             left, resets = ledger.quota()
-        except Exception:                          # noqa: BLE001 - a beat needs no ledger
-            logger.warning("usage: no totals for the pulse", exc_info=True)
-            return None
-        if not totals.get("turns") and left is None:
-            return None                            # nothing happened yet: nothing to say
-        return {
-            "at": moment,
-            "turns": int(totals.get("turns") or 0),
-            "tokens_in": totals.get("tokens_in"),
-            "tokens_out": totals.get("tokens_out"),
-            "tokens_in_known": int(totals.get("tokens_in_known") or 0),
-            "tokens_out_known": int(totals.get("tokens_out_known") or 0),
-            "cost_usd": totals.get("cost_usd"),
-            "cost_known": int(totals.get("cost_known") or 0),
-            "quota_left": left,
-            "quota_resets_at": resets,
-        }
+            if left is not None or resets is not None:
+                usage["quota_left"], usage["quota_resets_at"] = left, resets
+            return usage
+        except Exception:                              # noqa: BLE001 - a pulse without usage
+            logger.debug("heartbeat: no usage this beat", exc_info=True)
+            return {}
 
     # -- the status snapshot (issue #124) ---------------------------------------------
 
@@ -2622,6 +2628,7 @@ class AgentChannel:
             since = time.time() - max(0.0, self._clock() - boot)
         return self.usage_ledger().render(since_boot=since)
 
+
     # -- the control centre (issue #117) ------------------------------------------------
     def control_center(self) -> Optional[Any]:
         """The pinned dashboard, when ``control`` names a chat. Built once, reused.
@@ -2699,14 +2706,20 @@ class AgentChannel:
         A peer that has not said is *absent* from the map, so the dashboard renders ``unknown``
         for it -- never a zero it did not report (#117).
         """
+        moment = self.presence_clock()
         usage: Dict[str, Dict[str, Any]] = {}
-        mine = self.pulse_usage()
-        if mine:
-            usage[self.config.identity.alias] = mine
+        mine = self._pulse_usage(moment, advance=False)
+        if mine.get("today"):
+            usage[self.config.identity.alias] = dict(
+                mine["today"], quota_left=mine.get("quota_left"),
+                quota_resets_at=mine.get("quota_resets_at"))
         try:
             for alias, peer in self.presence().peers.items():
-                if peer.usage:
-                    usage[alias] = dict(peer.usage)
+                record = (peer.snapshot or {}).get("usage") or {}
+                today = record.get("today")
+                if isinstance(today, dict):
+                    usage[alias] = dict(today, quota_left=record.get("quota_left"),
+                                        quota_resets_at=record.get("quota_resets_at"))
         except Exception:                      # noqa: BLE001 - a dashboard without peers
             logger.warning("control centre: peer usage is not readable", exc_info=True)
         return usage
@@ -2870,8 +2883,14 @@ class AgentChannel:
         ephemeral `STATUS intent=PULSE` line.
         """
         moment = self.presence_clock() if now is None else now
+        try:
+            # The lease read may fetch the bus: warm its cache off the event loop (#126), so
+            # the pulse built next reads it from memory.
+            await asyncio.to_thread(self.lease_state)
+        except Exception:                              # noqa: BLE001 - a pulse without a term
+            logger.debug("heartbeat: lease not read this beat", exc_info=True)
         pulse = self.own_pulse(moment)
-        bus = self.pulse_bus()
+        bus = self.pulse_bus() if self.heartbeat_plane() == "bus" else None
         # B4: the bus half is git -- subprocesses with timeouts, and up to ~16 of them a beat.
         # Run inline they would stall the event loop (this pulse, every turn and Telegram
         # delivery with it) for as long as git takes, so they go to a worker thread.
@@ -2883,19 +2902,108 @@ class AgentChannel:
             self._save_presence()
             said = f"pulse ref rev={pulse.rev or '?'} busy_since={pulse.busy_since} peers={counted}"
         else:
-            await self.send(
-                format_message(Envelope(type=MessageType.STATUS, to="*", intent="PULSE",
-                                        ref=self._alias_ref(), rev=self._running_revision),
-                               json.dumps(pulse.to_dict(), sort_keys=True,
-                                          separators=(",", ":"))),
-                silent=True, notice=True, allow_when_frozen=True)
-            said = f"pulse rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
+            line = format_message(Envelope(type=MessageType.STATUS, to="*", intent="PULSE",
+                                           ref=self._alias_ref(), rev=self._running_revision),
+                                  json.dumps(pulse.to_dict(), sort_keys=True,
+                                             separators=(",", ":")))
+            how = await self._publish_pulse_line(line)
+            said = f"pulse {how} rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
         await self.check_peer_liveness(now=moment)
         # The pinned dashboard rides the beat, and only its holder edits it: every bot
         # refreshing one message would fight over it (#117).
         if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
             await self.refresh_control_center(now=moment)
         return said
+
+    def _pulse_message_path(self) -> Optional[Path]:
+        return _state_file(self.config, "pulse-message")
+
+    def _pulse_message(self) -> Optional[Tuple[int, Optional[int], int]]:
+        """``(chat, topic, message id)`` of this bot's status message, kept across restarts."""
+        if "_pulse_message_ref" not in self.__dict__:
+            ref = None
+            path = self._pulse_message_path()
+            try:
+                if path is not None and path.is_file():
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    ref = (int(data["chat"]), data.get("topic"), int(data["message"]))
+            except Exception:                          # noqa: BLE001 - a new message, then
+                logger.warning("heartbeat: unreadable %s; posting a new status message", path)
+            self._pulse_message_ref = ref
+        return self._pulse_message_ref
+
+    def _remember_pulse_message(self, ref: Optional[Tuple[int, Optional[int], int]]) -> None:
+        self._pulse_message_ref = ref
+        path = self._pulse_message_path()
+        if path is None:
+            return
+        try:
+            if ref is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"chat": ref[0], "topic": ref[1], "message": ref[2]}),
+                                encoding="utf-8")
+        except Exception:                              # noqa: BLE001 - kept in memory only
+            logger.warning("heartbeat: cannot save %s", path, exc_info=True)
+
+    async def _publish_pulse_line(self, line: str) -> str:
+        """Put the pulse on Telegram, as one current line per bot.
+
+        ``limits.heartbeat_style`` "repost" (the default) posts the beat as a new silent line
+        and deletes the previous one, so peers receive an ordinary message. "edit" edits the one
+        status message in place instead (peers receive an ``edited_message``), and a message
+        that cannot be edited any more (deleted, /cleanup) is replaced.
+        """
+        chat = int(self.config.identity.home_channel_id or 0)
+        topic = int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0) or None
+        ref = self._pulse_message()
+        if ref is not None and (ref[0], ref[1]) != (chat, topic):
+            ref = None                                 # the home or the topic moved
+        style = str(getattr(self.config.limits, "heartbeat_style", "repost") or "repost")
+        edit = getattr(self.bot, "edit_message_text", None) if self.bot is not None else None
+        if style.strip().lower() != "edit":
+            edit = None                                # repost: a new line, the old one deleted
+        if ref is not None and edit is not None:
+            try:
+                await edit(text=Redactor.from_config(self.config).text(line), chat_id=chat,
+                           message_id=ref[2], parse_mode=None, disable_web_page_preview=True)
+                return "edited"
+            except Exception as exc:                   # noqa: BLE001 - replaced below
+                if "not modified" in str(exc).lower():
+                    return "edited"
+                logger.info("heartbeat: status message %s cannot be edited (%s); posting anew",
+                            ref[2], exc)
+        sent = await self.send(line, chat_id=chat, thread_id=topic, silent=True,
+                               return_message_id=True, allow_when_frozen=True)
+        message_id = sent if isinstance(sent, int) and not isinstance(sent, bool) else None
+        if message_id is None:
+            return "posted"
+        old = ref[2] if ref is not None else None
+        self._remember_pulse_message((chat, topic, message_id))
+        delete = getattr(self.bot, "delete_message", None) if self.bot is not None else None
+        if old is not None and delete is not None:
+            try:
+                await delete(chat_id=chat, message_id=old)
+            except Exception:                          # noqa: BLE001 - one stale line at worst
+                logger.debug("heartbeat: old status message %s not deleted", old, exc_info=True)
+        return "posted"
+
+    async def _on_aiogram_edited(self, message: Any) -> None:
+        """A peer edited a message: its status message is its heartbeat.
+
+        Only the pulse counts. An edit is never a new request, so nothing else in an edited
+        message reaches the model.
+        """
+        try:
+            event = self.event_from_aiogram(message)
+            if not event.author_is_bot or event.chat_id != int(self.config.identity.home_channel_id or 0):
+                return
+            envelope, _body = parse_message(event.text or "")
+            if envelope.type == MessageType.STATUS and (envelope.intent or "").upper() == "PULSE":
+                self._note_peer_liveness(envelope, event)
+        except Exception:                              # noqa: BLE001 - liveness must not stop
+            logger.warning("heartbeat: an edited pulse could not be read", exc_info=True)
 
     async def _heartbeat_loop(self) -> None:
         """Publish the pulse on its interval, for as long as this transport runs.
@@ -2953,8 +3061,7 @@ class AgentChannel:
         logger.info("machine event recorded without dispatch: kind=%s from=%s ref=%s",
                     kind, alias, envelope.ref)
         if (envelope.type == MessageType.NOTE
-                and (envelope.intent or "").upper() == "CONTROL"
-                and event.text):
+                and (envelope.intent or "").upper() == "CONTROL" and event.text):
             # Issue #117: a control pressed on another bot's dashboard, for this one. The admin
             # check is repeated here: the note only ever carries the presser's Telegram id. The
             # envelope's own header is not part of the line, so the body is what is parsed.
@@ -3840,9 +3947,10 @@ class AgentChannel:
             logger.warning("lease: check_lease could not read lease state", exc_info=True)
             return None
 
-        async def claim_at(term: int) -> Any:
+        async def claim_at(term: int, promoted: bool = False) -> Any:
             async with self._lease_lock():
-                return await asyncio.to_thread(store.claim, term=term, now=moment)
+                return await asyncio.to_thread(store.claim, term=term, now=moment,
+                                               promoted=promoted)
 
         alias = self.config.identity.alias.strip().lower()
 
@@ -3861,8 +3969,13 @@ class AgentChannel:
                     logger.warning("lease: failed to renew lease at term %d", state.term, exc_info=True)
             return state.claim
 
-        # Case 2: Lease is not live (absent, expired, or yielded)
-        if not state.live(moment):
+        # A holder that presence marks DOWN has lost the lease now, not when it expires: the
+        # lease is renewed rarely (a commit every half hour, not a heartbeat on GitHub), and
+        # liveness comes from Telegram.
+        holder_down = self._lease_holder_down(state)
+
+        # Case 2: Lease is not live (absent, expired, or yielded), or its holder is DOWN
+        if not state.live(moment) or holder_down:
             from swarmly.telegram.lease import succession_order
             role = str(self.config.identity.role or "").strip().lower()
             succession = getattr(self.config, "swarm", {}).get("succession") or ()
@@ -3891,7 +4004,7 @@ class AgentChannel:
             if self._defer_to_named_coordinator(state.term):
                 return None
             try:
-                mine = await claim_at(next_term)
+                mine = await claim_at(next_term, promoted=holder_down)
             except Exception as exc:
                 logger.warning("lease: %s could not claim term %d: %s", self.config.identity.alias,
                                next_term, exc)
@@ -3919,6 +4032,18 @@ class AgentChannel:
             await self._announce_takeover(next_term, state.status, mine)
             return mine
         return None
+
+    def _lease_holder_down(self, state: Any) -> bool:
+        """Whether the live lease's holder is DOWN on Telegram presence (and is not us)."""
+        holder = str(getattr(state, "holder", "") or "").strip()
+        if not holder or holder.lower() == self.config.identity.alias.strip().lower():
+            return False
+        try:
+            if not state.live(self._lease_clock()):
+                return False
+            return bool(self.presence().is_down(holder, self.presence_clock()))
+        except Exception:                        # noqa: BLE001 - unknown is not DOWN
+            return False
 
     def _defer_to_named_coordinator(self, term: int) -> bool:
         """Whether a lapsed lease is left to the coordinator the admin named, which is up.
@@ -6758,6 +6883,7 @@ class AgentChannel:
         presses = getattr(getattr(self.dispatcher, "callback_query", None), "register", None)
         if presses is not None:
             presses(self._on_aiogram_callback)
+        self.dispatcher.edited_message.register(self._on_aiogram_edited)
         self._started_wall = time.time()
         me = await self.bot.get_me()
         logger.info("connected as @%s (alias %s) in chat %s",

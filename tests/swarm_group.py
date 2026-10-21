@@ -443,7 +443,9 @@ class Group:
             "bus": {"repo": str(self.root)},
             "limits": {"min_seconds_between_messages": 0, "min_seconds_between_agent_turns": 0,
                        "selftest_seconds": 0, "heartbeat_minutes": 2, "peer_down_after": 3,
-                       "wake_claim_settle_seconds": 0},
+                       "wake_claim_settle_seconds": 0,
+                       # The drills time the lease path itself: a 10-minute lease.
+                       "takeover_minutes": 10, "lease_renew_seconds": 120},
         }
         if self.succession:
             data["swarm"] = {"succession": list(self.succession)}
