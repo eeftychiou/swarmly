@@ -530,6 +530,13 @@ class AgentChannel:
         self._running_revision = _local_revision()
         self._running_revision_full = _local_revision_full()
         self._wall: Callable[[], float] = time.time
+        # The coordinator lease is compared across hosts, so it runs on wall time. A monotonic
+        # clock counts from each host's boot: live, a Linux peer up 34 days read the Windows
+        # coordinator's lease as long expired and took over, and its own lease then looked
+        # valid for a month on Windows, where nobody could take it back.
+        # (A test that injects its own clock drives the lease with it too.)
+        self._lease_clock: Callable[[], float] = (time.time if clock is time.monotonic
+                                                  else clock)
         self._frozen_told: Dict[Tuple[int, Optional[int]], float] = {}   # topic -> clock
         self._announce_resumed = False             # a /model lifted a quota freeze
         # Peers that said they are frozen: alias -> {"ref", "until"} (wall time or None).
@@ -2581,7 +2588,7 @@ class AgentChannel:
         effect asks this first: no answer, a stale ref, or a different holder all mean "do not
         act" (#93, Codex's inline blocker).
         """
-        moment = self._clock() if now is None else now
+        moment = self._lease_clock() if now is None else now
         try:
             store = self.lease_store()
             if not store.refresh(force=True):
@@ -2599,7 +2606,7 @@ class AgentChannel:
 
     def lease_state(self, *, now: Optional[float] = None) -> Any:
         """Cached folded lease state to prevent subprocess storms (Reasonix B5)."""
-        moment = self._clock() if now is None else now
+        moment = self._lease_clock() if now is None else now
         limits = getattr(self.config, "limits", None)
         window = float(getattr(limits, "lease_cache_seconds", 5.0) or 0.0)
         cached = getattr(self, "_cached_lease_state", None)
@@ -2617,7 +2624,7 @@ class AgentChannel:
     def current_coordinator(self, *, now: Optional[float] = None) -> Optional[str]:
         """Who leads the swarm right now, decided by the bus lease."""
         try:
-            moment = self._clock() if now is None else now
+            moment = self._lease_clock() if now is None else now
             state = self.lease_state(now=moment)
             if state.live(moment):
                 return state.holder
@@ -2631,7 +2638,7 @@ class AgentChannel:
         if leader:
             return leader.strip().lower() == self.config.identity.alias.strip().lower()
         try:
-            moment = self._clock() if now is None else now
+            moment = self._lease_clock() if now is None else now
             state = self.lease_state(now=moment)
             if state.status == "absent":
                 coord = (getattr(self.membership.state, "coordinator", None) or "").strip()
@@ -3129,7 +3136,7 @@ class AgentChannel:
         if self._frozen or self._pause_pending:
             return None
 
-        moment = self._clock() if now is None else now
+        moment = self._lease_clock() if now is None else now
         store = self.lease_store()
         try:
             state = store.state(now=moment)
@@ -3196,12 +3203,12 @@ class AgentChannel:
                                next_term)
                 return None
             try:
-                fresh = store.state(now=self._clock())
+                fresh = store.state(now=self._lease_clock())
             except Exception:
                 logger.warning("lease: could not re-read the lease after claiming term %d",
                                next_term, exc_info=True)
                 return None
-            if not fresh.holds(self.config.identity.alias, self._clock()):
+            if not fresh.holds(self.config.identity.alias, self._lease_clock()):
                 logger.info("lease: %s claimed term %d but %s holds it; yielding",
                             self.config.identity.alias, next_term, fresh.holder or "nobody")
                 return None
