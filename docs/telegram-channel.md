@@ -573,6 +573,20 @@ at-least-once: a crash right after a reply is posted can repeat that one turn. C
 never kept, and the same message arriving twice at once (a replay and Telegram's redelivery)
 runs once.
 
+**A turn cut off by a die-off is resumed once, and never loops** (issue #84). The record
+kept for an accepted message is the turn's own: its topic, message id, sender, the text the
+reply has to answer, and when it started. When a restart finds one still on disk, the
+transport posts one line — `↻ resuming the turn cut off at 18:30` — and runs the turn again in
+the same topic with a prompt that quotes the original request and says to check what was
+already pushed or posted before doing anything twice. The resumed turn is the record's
+second try and it is what removes the record, so a turn that finishes (or chooses silence)
+leaves nothing behind. The try is counted **before** the turn starts: if that resume is cut
+off too, the record is dropped instead of replayed a third time and one line says so —
+`⚠️ <coordinator or admin>: could not finish the turn on message <id> in <topic> after two
+restarts` — because a turn that kills the transport twice will not finish by being started
+again, and a loop of them is how a swarm spends a night doing nothing. Records older than 12
+hours are dropped unrun: the work has moved on.
+
 **The coordinator checks in when nothing wakes it.** A coordinator that holds no WAKE and has
 had no turn for `limits.coordinator_watch_minutes` (default 30) gets one turn in the topic it
 last worked in, asking it to look at the round and act on whatever waits, or to answer

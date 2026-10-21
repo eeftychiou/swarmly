@@ -3323,19 +3323,98 @@ class AgentChannel:
             _INBOX_KEYS.get().append((event.chat_id, event.message_id))
 
     def replay_interrupted(self) -> int:
-        """Run again what a previous run accepted and never finished. Returns how many."""
+        """Resume what a restart cut off -- **once** -- and report what could not be finished.
+
+        Issue #84: a turn killed by a die-off has to come back, in the same topic, quoting the
+        request it was working on, and it must never turn into a restart loop. The inbox counts
+        the try before it starts, so a second cut-off drops the record and the coordinator (or
+        the admin) is told which item is stalled instead of a third attempt.
+        """
         from swarmly.telegram.inbox import event_from
-        events = self._inbox.interrupted()
-        for data in events:
+        runnable, dropped = self._inbox.claim_replay()
+        for entry in dropped:
+            self._report_abandoned(entry)
+        for attempt, data in runnable:
             try:
-                event = event_from(data, ChannelEvent)
-            except TypeError:
+                event = event_from(data["event"], ChannelEvent)
+            except (TypeError, KeyError):
                 logger.warning("inbox: could not rebuild an interrupted message; skipping it")
                 continue
-            logger.info("inbox: replaying message %s from @%s that a restart interrupted",
-                        event.message_id, event.author_username)
-            self._self_tasks.add(asyncio.create_task(self.handle_event(event)))
-        return len(events)
+            logger.info("inbox: resuming message %s from @%s (try %d) after a restart",
+                        event.message_id, event.author_username, attempt)
+            self._resume_turn(event, data)
+        return len(runnable)
+
+    def _resume_turn(self, event: ChannelEvent, record: Dict[str, Any]) -> None:
+        """Run the turn again in the same topic, saying why -- and close its record (#84).
+
+        The resumed turn *is* the record's second try, so it is what removes the entry: not the
+        original event (which nobody handles again), and not the passage of time. If this turn
+        finishes, or chooses silence, the record is gone and nothing is replayed next start; if
+        it is killed too, the entry survives with its try already counted and the next start
+        reports it instead of running a third.
+        """
+        cut_at = record.get("at")
+        when = time.strftime("%H:%M UTC", time.localtime(
+            float(cut_at) if isinstance(cut_at, (int, float)) else self._wall()))
+        quoted = resume_quote(str(record.get("event", {}).get("text") or ""))
+        self._self_tasks.add(asyncio.create_task(
+            self._run_resumed(event, when, RESUME_NOTE.format(
+                when=when, sender=event.author_username or "a peer", quote=quoted))))
+
+    async def _run_resumed(self, event: ChannelEvent, when: str, note: str) -> None:
+        """The resumed turn itself, owning the interrupted message's inbox entry."""
+        await self.send(f"↻ resuming the turn cut off at {when}.", chat_id=event.chat_id,
+                        thread_id=event.thread_id, notice=True, silent=True)
+        task = ChannelEvent(text=note, chat_id=event.chat_id, thread_id=event.thread_id,
+                            topic_name=event.topic_name, self_task=True,
+                            author_username=f"{self.config.identity.alias} (own brief)")
+        try:
+            await self.handle_event(task)
+        except asyncio.CancelledError:
+            if not self._shutting_down:
+                self._inbox.done(event.chat_id, event.message_id)
+            raise
+        except Exception:                      # noqa: BLE001 - a failed resume is still a try
+            logger.exception("inbox: the resumed turn failed; its record is closed")
+            self._inbox.done(event.chat_id, event.message_id)
+        else:
+            self._inbox.done(event.chat_id, event.message_id)
+
+    def _report_abandoned(self, record: Dict[str, Any]) -> None:
+        """A resume that was cut off too: drop it and tell the one who can act (#84).
+
+        No third try -- a turn that kills the transport twice is not going to finish by being
+        started again, and a loop of them is how a swarm spends a night doing nothing.
+        """
+        from swarmly.telegram.inbox import event_from
+        data = record.get("event") or {}
+        try:
+            event = event_from(data, ChannelEvent)
+        except (TypeError, KeyError):
+            logger.warning("inbox: abandoned an unreadable interrupted message: %s",
+                           str(data)[:200])
+            return
+        lead = self._stall_lead()
+        admin = self.config.identity.maintainer_username
+        at = f"@{str(admin).lstrip('@')} " if admin and lead else ""
+        chat_id, thread_id = event.chat_id, event.thread_id
+        self._self_tasks.add(asyncio.create_task(self.send(
+            f"⚠️ {at}{lead}could not finish the turn on message {event.message_id} in "
+            f"{self.topics.name(chat_id, thread_id)} after two restarts; dropping it.",
+            silent=True, notice=True, allow_when_frozen=True)))
+        logger.warning("inbox: dropped message %s after two restarts", event.message_id)
+
+    def _stall_lead(self) -> str:
+        """Who is told about a stalled item: the coordinator, or the admin when it is me (#84)."""
+        try:
+            leader = str(self.current_coordinator() or self.membership.state.coordinator or "")
+        except Exception:                       # noqa: BLE001 - the admin hears it anyway
+            leader = ""
+        leader = leader.strip()
+        if leader and leader.lower() != self.config.identity.alias.strip().lower():
+            return f"{leader}: "
+        return ""
 
     async def _route_event(self, event: ChannelEvent) -> Optional[str]:
         in_home_channel = (self.config.identity.home_channel_id is None
@@ -6198,6 +6277,18 @@ def _state_file(config: AgentConfig, stem: str, suffix: Optional[str] = None) ->
         return None
 
 
+def resume_quote(text: str, limit: int = 600) -> str:
+    """The request a resumed turn quotes, indented and trimmed (issue #84).
+
+    The prompt has to carry the original ask -- a bot cannot finish work it cannot see -- but
+    it is context, not the brief: past a few hundred characters the turn is better spent on the
+    topic it is already in.
+    """
+    lines = ["    " + line for line in str(text or "").strip().splitlines() if line.strip()]
+    quoted = "\n".join(lines) or "    (no text: the message carried an attachment)"
+    return quoted if len(quoted) <= limit else quoted[:limit] + "\n    …"
+
+
 def _truncate_utf16(text: str, max_units: int) -> str:
     """Cut *text* to at most *max_units* UTF-16 units without splitting a surrogate pair.
 
@@ -6251,6 +6342,12 @@ DOWN_REASSIGN_NOTE = ("{alias} is DOWN: it has not pulsed and has not posted for
                       "the work now: hand it to another peer whose role fits, or do it "
                       "yourself, and say so here. If it can wait for {alias} to come back, "
                       "reply exactly NO_REPLY.")
+#: Run when a restart cut a turn off: the same work, in the same topic, saying why (#84).
+RESUME_NOTE = ("Your turn for {sender} was cut off by a restart at {when}. The request was:"
+               "\n\n{quote}\n\n"
+               "Check what you already pushed or posted before doing anything again, then "
+               "finish it and answer in this topic. If it is already done, say what you "
+               "completed and nothing else.")
 #: Run after a topic turn hit the time limit in a resumable session.
 CONTINUE_NOTE = ("Your previous turn in this topic hit the time limit and was stopped. Your "
                  "session still holds the work so far: continue the task from where it "
