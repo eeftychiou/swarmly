@@ -11,6 +11,7 @@ import asyncio
 import json
 from datetime import datetime, timezone
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -210,6 +211,37 @@ class TestFolderTransport(unittest.TestCase):
 
 
 class TestGitTransport(unittest.TestCase):
+    def test_bus_ref_publish_does_not_commit_to_feature_branch(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "work"
+            remote = Path(tmp) / "origin.git"
+            root.mkdir()
+            def git(*args):
+                return subprocess.run(["git", "-C", str(root), *args], check=True,
+                                      capture_output=True, text=True, env=git_env())
+            subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                           capture_output=True)
+            git("init", "-b", "main")
+            git("config", "user.name", "Codex")
+            git("config", "user.email", "codex@a2a.local")
+            (root / "README").write_text("base")
+            git("add", "README")
+            git("commit", "-m", "base")
+            git("remote", "add", "origin", str(remote))
+            git("push", "-u", "origin", "main")
+            git("switch", "-c", "feature")
+            before = git("rev-parse", "HEAD").stdout.strip()
+            state = ".agents/wakes/codex/timer-state.json"
+            (root / state).parent.mkdir(parents=True)
+            (root / state).write_text('{"state":"armed"}')
+
+            GitTransport(root, ref="origin/main").commit_and_push("wake state", paths=[state])
+
+            self.assertEqual(git("rev-parse", "HEAD").stdout.strip(), before)
+            self.assertEqual(subprocess.run(["git", "--git-dir", str(remote), "show",
+                                             f"main:{state}"], check=True, capture_output=True,
+                                            text=True).stdout, '{"state":"armed"}')
+
     def test_local_listing_without_ref(self):
         with TemporaryDirectory() as tmp:
             transport = GitTransport(Path(tmp))
