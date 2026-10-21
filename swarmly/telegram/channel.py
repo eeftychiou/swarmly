@@ -60,6 +60,7 @@ from swarmly.telegram.commands import (
 from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig,
                                      MODEL_NAME, MODEL_TYPES, effort_problem,
                                      model_problem)
+from swarmly.telegram import native as native_cli
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.presence import Presence, Pulse
 from swarmly.telegram.pulsebus import PulseBus, notes_from
@@ -564,6 +565,8 @@ class AgentChannel:
         self._busy_waiting = 0                 # "queue": handlers waiting for the turn lock
         self._busy_waiting_by: Dict[Any, int] = {}   # the same, per topic (parallel turns)
         self._busy_since: Dict[Any, float] = {}      # topic -> clock its running turn started
+        # Issue #116: the `/cli` run in flight per topic, so /stop can end it.
+        self._native_runners: Dict[Any, Any] = {}
         self._busy_noticed: Dict[Any, float] = {}    # topic -> clock of the last ⏳ busy notice
         self._queue_seq: Dict[Any, int] = {}         # topic -> number of the last queued message
         self._folded: Dict[Any, List[str]] = {}      # topic -> queued messages awaiting one turn
@@ -1494,6 +1497,142 @@ class AgentChannel:
         """A command answered by the transport: /cleanup first (it awaits), then the rest."""
         reply = await self._handle_cleanup(event)
         return reply if reply is not None else self._handle_command(event)
+
+    # -- /cli: a native command from the CLI itself, with no model turn (issue #116) ---------
+
+    async def _handle_native(self, event: ChannelEvent) -> Tuple[bool, Any]:
+        """Answer ``/cli[!]@bot COMMAND`` in code. ``(handled, what was sent)``.
+
+        It runs before the turn machinery on purpose: a passthrough costs no tokens, so it must
+        work while the bot is paused or out of quota, and it must never be mistaken for a
+        message that deserves a turn.
+        """
+        request = native_cli.parse_request(event.text or "")
+        if request is None:
+            return False, None
+        target = native_cli.target_of(event.text or "")
+        if target:
+            if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
+                return False, None                        # another bot's command
+        elif not (self.mentions_me(event.text or "") or event.replies_to_bot
+                  or self._direct_chat(event)):
+            return False, None
+        confirmed, command = request
+        if not self.config.is_admin(event.author_id):
+            self.stats.ignored += 1
+            return True, await self.send(
+                "⛔ `/cli` is the admin's: a native command runs as this bot, unsandboxed.",
+                reply_to_message_id=event.message_id, chat_id=event.chat_id,
+                thread_id=event.thread_id, allow_when_frozen=True)
+        plan = self._native_plan(event, command, confirmed=confirmed)
+        self.stats.handled += 1
+        if not plan.runs:
+            return True, await self.send(plan.describe(),
+                                         reply_to_message_id=event.message_id,
+                                         chat_id=event.chat_id, thread_id=event.thread_id,
+                                         allow_when_frozen=True)
+        return True, await self._run_native(plan, event)
+
+    def _native_plan(self, event: ChannelEvent, command: str, *, confirmed: bool) -> Any:
+        """What this request comes to on this bot: a refusal, a confirmation, or a run."""
+        adapter = self.config.adapter
+        unavailable = native_cli.available(adapter.type, command=adapter.command)
+        if unavailable:
+            return native_cli.Native(native_cli.REFUSE, reason=unavailable)
+        if self._lock_for(event).locked():
+            return native_cli.Native(
+                native_cli.REFUSE,
+                reason="a turn is running in this topic; a passthrough would share its session")
+        return native_cli.plan(adapter.type, command, confirmed=confirmed,
+                               command=adapter.command, session=self._native_session(event))
+
+    def _native_session(self, event: ChannelEvent) -> Optional[str]:
+        """The discussion's own CLI session, so a slash command lands where the turn does."""
+        derive = getattr(type(self.adapter), "derived_session_id", None)
+        if derive is None:
+            return None
+        context = self.topics.context(event.chat_id, event.thread_id)
+        try:
+            return derive(self.config.identity.alias, self.config.adapter.cwd, context)
+        except Exception:                                  # noqa: BLE001 - optional
+            logger.warning("native: no session id for this topic", exc_info=True)
+            return None
+
+    async def _run_native(self, plan: Any, event: ChannelEvent) -> Any:
+        """Run one allowlisted command, editing one message as it goes. No turn is taken."""
+        limits = self.config.limits
+        runner = native_cli.Runner(
+            cwd=self.config.adapter.cwd,
+            timeout=float(getattr(limits, "native_timeout_seconds", 20.0) or 20.0),
+            max_chars=int(getattr(self.config.adapter, "max_output_chars", 3500) or 3500),
+            env=native_cli.sanitized_env(self.config.adapter.extra_env),
+            redact=Redactor.from_config(self.config).text)
+        key = (event.chat_id, event.thread_id)
+        message_id = await self.send(plan.describe(), chat_id=event.chat_id,
+                                     thread_id=event.thread_id,
+                                     reply_to_message_id=event.message_id,
+                                     return_message_id=True, allow_when_frozen=True)
+        message_id = message_id or self.last_sent_message_id
+        self._native_runners[key] = runner
+        task = asyncio.ensure_future(asyncio.to_thread(runner.run, plan))
+        every = float(getattr(limits, "native_stream_seconds", 3.0) or 0.0)
+        try:
+            while True:
+                done, _pending = await asyncio.wait({task}, timeout=every or None)
+                if done:
+                    break
+                partial = self._native_partial(plan, runner)
+                if partial:
+                    await self._edit_native(event.chat_id, message_id, partial)
+        finally:
+            self._native_runners.pop(key, None)
+        outcome = task.result()
+        await self._edit_native(event.chat_id, message_id,
+                                self._native_output(plan, outcome, runner))
+        return message_id
+
+    def _native_partial(self, plan: Any, runner: Any) -> str:
+        """What a run in flight has shown so far (an interactive session only)."""
+        session = getattr(runner, "session", None)
+        if session is None or plan.mode != native_cli.SLASH:
+            return ""
+        try:
+            body = session.text()
+        except Exception:                                  # noqa: BLE001 - a partial is a bonus
+            return ""
+        cleaned, _truncated = native_cli.clean(body, max_chars=runner.max_chars)
+        return f"{plan.describe()}\n\n{cleaned}" if cleaned else ""
+
+    def _native_output(self, plan: Any, outcome: Any, runner: Any) -> str:
+        head = outcome.line(plan, runner.timeout)
+        return f"{head}\n\n{outcome.text}".strip() if outcome.text else head
+
+    async def _edit_native(self, chat_id: int, message_id: Any, text: str) -> None:
+        """Stream into the one message: edit it, or post a new one where editing is impossible."""
+        body = Redactor.from_config(self.config).text(text)
+        edit = getattr(self.bot, "edit_message_text", None)
+        if message_id is not None and edit is not None:
+            try:
+                await edit(text=body, chat_id=int(chat_id), message_id=int(message_id),
+                           parse_mode=None, disable_web_page_preview=True)
+                return
+            except Exception:                              # noqa: BLE001 - fall back to a post
+                logger.warning("native: could not edit the output message; posting it",
+                               exc_info=True)
+        await self.send(body, chat_id=chat_id, allow_when_frozen=True)
+
+    def _stop_native(self, chat_id: int, thread_id: Optional[int], *,
+                     everything: bool) -> int:
+        """Kill the ``/cli`` run in flight. Returns how many were stopped."""
+        keys = [key for key in list(self._native_runners)
+                if everything or key == (chat_id, thread_id)]
+        stopped = 0
+        for key in keys:
+            runner = self._native_runners.pop(key, None)
+            if runner is not None and runner.stop():
+                stopped += 1
+                logger.info("native: /stop killed the passthrough in %s", key)
+        return stopped
 
     # -- what /cleanup needs from the channel -------------------------------------------
 
@@ -3627,6 +3766,9 @@ class AgentChannel:
         if self._frozen or self._pause_pending:
             if self._may_start_turns(event):
                 await self._look_up_models(event)
+            native_handled, native_sent = await self._handle_native(event)
+            if native_handled:
+                return native_sent        # a passthrough costs no tokens: it works even frozen
             command_reply = (await self._transport_command(event)
                              if self._may_start_turns(event) else None)
             if command_reply is not None:
@@ -3678,6 +3820,9 @@ class AgentChannel:
 
         # §6: /ping /status /diag are transport-level liveness — answered without a runtime turn.
         await self._look_up_models(event)
+        native_handled, native_sent = await self._handle_native(event)
+        if native_handled:
+            return native_sent        # /cli: the CLI's own answer, and no model turn at all
         command_reply = await self._transport_command(event)
         if command_reply is not None:
             self.stats.handled += 1
@@ -4205,7 +4350,9 @@ class AgentChannel:
             self._stop_topic_generation[key] = self._stop_topic_generation.get(key, 0) + 1
             running = [turn for turn in self._turns
                        if not turn.done() and self._turn_keys.get(turn) == key]
-        if not running:
+        stopped_native = self._stop_native(event.chat_id, event.thread_id,
+                                          everything=everything)
+        if not running and not stopped_native:
             done = "nothing was running" + ("" if everything else " in this topic")
         else:
             for turn in running:
@@ -4214,6 +4361,10 @@ class AgentChannel:
             self.stats.stopped += len(running)
             done = ("stopped the running turn" if len(running) == 1
                     else f"stopped {len(running)} running turns")
+        if stopped_native:
+            done += ((" and " if running else "") +
+                     ("killed the /cli run" if stopped_native == 1
+                      else f"killed {stopped_native} /cli runs"))
         if cleared:
             done += f" and cleared {cleared} queued message(s)"
         others = 0 if everything else sum(

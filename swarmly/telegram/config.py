@@ -694,6 +694,12 @@ class ChannelLimits:
     #: The argv prefixes a WAKE check may start with. `gh` and `git` are allowed only through
     #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate.
     wake_check_allow: List[str] = field(default_factory=lambda: ["gh", "git"])
+    #: Issue #116: how long `/cli` may run one native command before it is killed. It exists so
+    #: a passthrough cannot hold a topic's session open, not to give a long command more room.
+    native_timeout_seconds: float = 20.0
+    #: Issue #116: how often a running `/cli` session's screen is edited into its message, so a
+    #: slash command that takes a few seconds is visibly working rather than silent.
+    native_stream_seconds: float = 3.0
     #: The coordinator's own watchdog: after this long with no turn while the swarm has been
     #: active, it gets one turn to check the round and act on whatever waits, or say it is done.
     #: Doubles after each quiet check, up to 8 hours; any other turn resets it. 0 = off.

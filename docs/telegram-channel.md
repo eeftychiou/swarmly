@@ -942,6 +942,31 @@ and the topic-name cache — and posts one machine `NOTE intent=TOPIC_GONE ref=<
 peers forget it too, with no model turn on either side. When a round's tracking issue closes,
 the coordinator posts the dry run once in General and asks the admin whether to delete it.
 
+**Native CLI commands — `/cli` (admin only, no model turn).** Swarmly does not reimplement
+what each CLI already does. `/cli@<bot> <command>` runs the command on that bot's CLI and
+streams the output back into one message that is edited as it goes. It never sends a prompt and
+never starts a turn, so it costs **no tokens** — and it works while the bot is paused or out of
+quota, which is exactly when someone wants to ask it a question.
+
+- `/cli@<bot> --version`, `mcp list`, `login status`, `models` — one-shot subcommands, run as a
+  plain subprocess (`limits.native_timeout_seconds`, default 20s).
+- `/cli@<bot> /cost`, `/context`, `/status`, `/model`, `/mcp` — interactive slash commands. The
+  CLI resumes **the discussion's own session** in a short-lived terminal, is given the command,
+  prints its answer, and exits. Nothing is typed into it but that command.
+- `/cli!@<bot> /clear` — the `!` is required for a command that *changes* something. The bot
+  answers with what it would do and how to allow it; it does not run anything on the first ask.
+- Refused outright: `/compact`, `/review`, `/init` and every other command that would call the
+  model (paying tokens from a path built to spend none), `/login`, `/logout` and anything
+  touching credentials, and any command not on that runtime's allowlist. A refusal says which,
+  and why.
+- `/stop@<bot>` also kills a passthrough that is still running.
+
+**What it will not do.** A picker (Claude's `/model` list) prints its options but cannot take a
+selection through Telegram: choosing stays with swarmly's `/model` and `/reasoning`. A
+passthrough is refused while a turn is running in that topic, because both would drive the same
+CLI session. The output is stripped of terminal escapes, capped at
+`adapter.max_output_chars` (default 3500) and redacted like any other outbound text.
+
 **Two Telegram limits shape this.** `deleteForumTopic` reaches a topic of any age, but the
 Bot API cannot *list* a group's topics, so the topics offered are the ones the transports
 know (`topics-<alias>.json`). `deleteMessage` works only on messages younger than 48 hours
