@@ -46,12 +46,18 @@ class Pulse:
     #: a command centre to render. Kept as the record itself, never as a typed object, so a
     #: peer on an older build reads the fields it knows and ignores the rest.
     status: Optional[Dict[str, Any]] = None
+    #: What this bot has spent today (issue #117): totals from its own ledger (#125), so the
+    #: dashboard can show every bot's tokens and cost without asking a peer for a turn. A
+    #: number the runtime never reported stays out of the record rather than becoming a zero.
+    usage: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = {"alias": self.alias, "at": self.at, "rev": self.rev, "role": self.role,
                 "term": self.term, "busy_since": self.busy_since, "frozen": self.frozen}
         if self.status:
             data["status"] = dict(self.status)
+        if self.usage:
+            data["usage"] = dict(self.usage)
         return data
 
     @classmethod
@@ -74,11 +80,15 @@ class Pulse:
         status = data.get("status")
         if status is not None and not isinstance(status, dict):
             raise ValueError("'status' must be an object or null")
+        usage = data.get("usage")
+        if usage is not None and not isinstance(usage, dict):
+            raise ValueError("'usage' must be an object or null")
         return cls(alias=alias.strip(), at=float(at), rev=str(data.get("rev") or ""),
                    role=str(data.get("role") or ""), term=term,
                    busy_since=None if busy is None else float(busy),
                    frozen=bool(data.get("frozen")),
-                   status=dict(status) if status else None)
+                   status=dict(status) if status else None,
+                   usage=dict(usage) if usage else None)
 
 
 @dataclass
@@ -96,6 +106,8 @@ class Peer:
     down_notified_at: Optional[float] = None
     #: The latest status snapshot this peer published (issue #124), as it published it.
     snapshot: Optional[Dict[str, Any]] = None
+    #: What this peer said it spent today (issue #117), as it said it.
+    usage: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = {"alias": self.alias, "last_seen": self.last_seen,
@@ -104,6 +116,8 @@ class Peer:
                 "down_notified_at": self.down_notified_at}
         if self.snapshot:
             data["snapshot"] = dict(self.snapshot)
+        if self.usage:
+            data["usage"] = dict(self.usage)
         return data
 
     @classmethod
@@ -119,12 +133,14 @@ class Peer:
         busy = data.get("busy_since")
         notified = data.get("down_notified_at")
         snapshot = data.get("snapshot")
+        usage = data.get("usage")
         return cls(alias=alias.strip(), last_seen=float(last_seen),
                    busy_since=None if busy is None else float(busy),
                    frozen=bool(data.get("frozen")), term=int(data.get("term") or 0),
                    rev=str(data.get("rev") or ""), role=str(data.get("role") or ""),
                    down_notified_at=None if notified is None else float(notified),
-                   snapshot=dict(snapshot) if isinstance(snapshot, dict) else None)
+                   snapshot=dict(snapshot) if isinstance(snapshot, dict) else None,
+                   usage=dict(usage) if isinstance(usage, dict) else None)
 
 
 class Presence:
@@ -172,6 +188,12 @@ class Presence:
             older = (peer.snapshot or {}).get("at") or 0.0
             if float(pulse.status.get("at") or 0.0) >= float(older):
                 peer.snapshot = dict(pulse.status)
+        if pulse.usage:
+            # Issue #117: the same newest-beat-wins rule the snapshot follows, so a beat that
+            # arrives out of order cannot lower a peer's reported spend.
+            older = float((peer.usage or {}).get("at") or 0.0)
+            if float(pulse.usage.get("at") or 0.0) >= older:
+                peer.usage = dict(pulse.usage)
         if peer.down_notified_at is not None:
             peer.down_notified_at = None        # a new episode may be reported again
         self.peers[pulse.alias] = peer

@@ -2458,7 +2458,41 @@ class AgentChannel:
                      role=self._role_name() if self.config.identity.role else "", term=term,
                      busy_since=now - max(durations) if durations else None,
                      frozen=bool(self._frozen),
-                     status=self.status_snapshot(now).to_dict())
+                     status=self.status_snapshot(now).to_dict(),
+                     usage=self.pulse_usage(now))
+
+    # -- what this bot has spent (issue #117) -----------------------------------------
+
+    def pulse_usage(self, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Today's totals for the pulse, from this bot's own ledger (#125).
+
+        Nothing is invented: a token count the runtime never reported is left as ``None`` and
+        rendered as unknown, and coverage travels with the number (``*_known``) so a reader can
+        say how much of the day was actually reported. Only the compact numbers ride the beat;
+        the ledger keeps the detail.
+        """
+        moment = self.presence_clock() if now is None else float(now)
+        try:
+            ledger = self.usage_ledger()
+            totals = ledger.totals(moment - (moment % 86400))
+            left, resets = ledger.quota()
+        except Exception:                          # noqa: BLE001 - a beat needs no ledger
+            logger.warning("usage: no totals for the pulse", exc_info=True)
+            return None
+        if not totals.get("turns") and left is None:
+            return None                            # nothing happened yet: nothing to say
+        return {
+            "at": moment,
+            "turns": int(totals.get("turns") or 0),
+            "tokens_in": totals.get("tokens_in"),
+            "tokens_out": totals.get("tokens_out"),
+            "tokens_in_known": int(totals.get("tokens_in_known") or 0),
+            "tokens_out_known": int(totals.get("tokens_out_known") or 0),
+            "cost_usd": totals.get("cost_usd"),
+            "cost_known": int(totals.get("cost_known") or 0),
+            "quota_left": left,
+            "quota_resets_at": resets,
+        }
 
     # -- the status snapshot (issue #124) ---------------------------------------------
 
@@ -2649,20 +2683,29 @@ class AgentChannel:
     def control_text(self, now: Optional[float] = None) -> str:
         """The dashboard's text, built in code from this bot's own records -- no turn."""
         moment = self.presence_clock() if now is None else float(now)
-        ledger = self.usage_ledger()
-        since = time.time() - max(0.0, self._clock() - getattr(self, "_booted_at", self._clock()))
-        usage = {self.config.identity.alias: self._usage_totals(ledger, since)}
+        usage = self.control_usage()
         return control_mod.dashboard(now=moment, snapshots=self.control_snapshots(moment),
                                      round_state=self.control_round(), usage=usage,
                                      coordinator=str(self.current_coordinator() or ""),
                                      limit=self.config.limits.max_message_chars)
 
-    def _usage_totals(self, ledger: Any, start_of_day: float) -> Dict[str, Any]:
-        """One bot's day, plus its quota: what the dashboard shows beside its state."""
-        totals = dict(ledger.totals(start_of_day))
-        left, resets = ledger.quota()
-        totals["quota_left"], totals["quota_resets_at"] = left, resets
-        return totals
+    def control_usage(self) -> Dict[str, Dict[str, Any]]:
+        """What each bot spent today: this bot from its ledger, peers from their own pulses.
+
+        A peer that has not said is *absent* from the map, so the dashboard renders ``unknown``
+        for it -- never a zero it did not report (#117).
+        """
+        usage: Dict[str, Dict[str, Any]] = {}
+        mine = self.pulse_usage()
+        if mine:
+            usage[self.config.identity.alias] = mine
+        try:
+            for alias, peer in self.presence().peers.items():
+                if peer.usage:
+                    usage[alias] = dict(peer.usage)
+        except Exception:                      # noqa: BLE001 - a dashboard without peers
+            logger.warning("control centre: peer usage is not readable", exc_info=True)
+        return usage
 
     def control_actions(self) -> Tuple[str, ...]:
         """The controls this build can actually carry out, so no button is offered in vain.

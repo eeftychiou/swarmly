@@ -988,6 +988,12 @@ restarts, today's tokens and cost, quota and its reset. Then the **round board**
 owner, PR, head, CI, the review and QA verdicts — a verdict counts only on the head it names —
 and whether it can merge. A number no runtime reported stays **unknown**, never zero.
 
+Each bot's spend rides its own heartbeat: the pulse carries today's totals from that bot's
+ledger (`turns`, tokens in and out, cost, quota and its reset time, each with the count of
+rows that actually reported one), so the dashboard shows every bot's tokens and cost without
+asking any of them for a turn. A peer that has not said anything is `unknown` there — never a
+zero it did not report.
+
 Telegram allows 4,096 characters in one message, so the layout drops whole lines in that
 order when it runs out of room — the round board first, the alerts last — and says how many
 it hid. The pin is the state: a new coordinator (a failover, #83) reads the chat's pinned
