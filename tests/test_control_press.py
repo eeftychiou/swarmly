@@ -14,7 +14,8 @@ import unittest
 
 from swarmly.telegram import control as ct
 from swarmly.telegram import control_press as cp
-from tests.test_telegram_channel import ADMIN_ID, make_channel, make_config, run
+from tests.test_telegram_channel import (ADMIN_ID, event, make_channel, make_config,
+                                        run)
 
 NOW = 1_800_000_000.0
 
@@ -197,6 +198,81 @@ class TestTheAiogramCallback(unittest.TestCase):
         run(channel._on_aiogram_callback(self.callback("v2:elsewhere", answered)))
         self.assertEqual(answered, [])
         self.assertEqual(channel.bot.sent, [])
+
+
+class TestAnotherBotsControl(unittest.TestCase):
+    """A press meant for another bot travels as the note the press already posts (#117)."""
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        return channel
+
+    def note(self, action: str, target: str, by: int = ADMIN_ID) -> str:
+        return cp.PressPolicy.log_line(action, target, str(by), NOW, done=True)
+
+    def test_a_press_for_another_bot_does_not_act_here(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.pause:Codex")))
+        self.assertFalse(channel._frozen)                    # not this bot's pause
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL bot.pause target=Codex" in entry["text"]]
+        self.assertEqual(len(notes), 1)                      # but it is on the record
+
+    def test_the_note_is_read_as_a_command_only_in_its_exact_shape(self):
+        self.assertEqual(cp.parse_note(self.note("bot.pause", "Codex")),
+                         cp.Note("bot.pause", "Codex", str(ADMIN_ID)))
+        self.assertIsNone(cp.parse_note("CONTROL is not a command, it is a word"))
+        self.assertIsNone(cp.parse_note("the admin pressed CONTROL bot.pause"))
+
+    def test_this_bot_applies_a_note_addressed_to_it(self):
+        channel = self.channel()
+        self.assertEqual(channel.apply_control_note(self.note("bot.pause", "Hermes")),
+                         "applied: bot.pause")
+        self.assertTrue(channel._frozen)
+
+    def test_a_note_for_another_bot_is_ignored(self):
+        channel = self.channel()
+        self.assertIn("not mine", channel.apply_control_note(self.note("bot.pause", "Codex")))
+        self.assertFalse(channel._frozen)
+
+    def test_a_note_from_a_stranger_is_refused(self):
+        channel = self.channel()
+        self.assertIn("not the admin",
+                      channel.apply_control_note(self.note("bot.pause", "Hermes", by=42)))
+        self.assertFalse(channel._frozen)
+
+    def test_a_note_with_a_malformed_id_authorises_nothing(self):
+        channel = self.channel()
+        line = "CONTROL bot.pause target=Hermes by=nobody at=2027-01-15T08:00:00Z state=done"
+        self.assertIn("not the admin", channel.apply_control_note(line))
+        self.assertFalse(channel._frozen)
+
+    def test_a_note_for_a_control_this_build_lacks_is_refused(self):
+        channel = self.channel()
+        self.assertIn("not a control here",
+                      channel.apply_control_note(self.note("swarm.cleanup", "Hermes")))
+
+    def test_the_note_arrives_through_the_machine_path_and_is_applied(self):
+        """End to end: a peer posts `NOTE intent=CONTROL`; this bot holds without a turn."""
+        from swarmly.telegram.wire import Envelope, MessageType, format_message
+        channel = self.channel()
+        channel.presence_clock = lambda: NOW
+        payload = format_message(
+            Envelope(type=MessageType.NOTE, to="*", intent="CONTROL", ref="HERMES"),
+            self.note("bot.pause", "Hermes"))
+        run(channel.handle_event(event(payload, author_id=303, username="ClaudeBot")))
+        self.assertTrue(channel._frozen)
+
+    def test_freeze_holds_the_bot_until_it_is_resumed(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:" + "bot.freeze")))
+        asked = channel.control_policy().pending()                 # freeze asks twice
+        self.assertTrue(asked)
+        run(channel.handle_control_press(press("ctl:confirm:" + asked[0].code)))
+        self.assertTrue(channel._frozen)
+        run(channel.handle_control_press(press("ctl:bot.resume")))
+        self.assertFalse(channel._frozen)
 
 
 if __name__ == "__main__":  # pragma: no cover

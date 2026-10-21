@@ -2707,6 +2707,53 @@ class AgentChannel:
             logger.warning("control centre: peer usage is not readable", exc_info=True)
         return usage
 
+    def apply_control_note(self, text: str) -> str:
+        """Apply a ``CONTROL`` note addressed to this bot. Returns what it did, for a test.
+
+        A note is only obeyed when it names this bot and the Telegram user it carries is this
+        bot's admin: the id is the whole authorisation, so prose that merely looks like a note
+        (or a stranger's) is a refusal, not a pause.
+        """
+        note = press_mod.parse_note(text)
+        if note is None:
+            return "not a control note"
+        target = note.target.strip().lower()
+        if target not in ("", "self", self.config.identity.alias.lower()):
+            return f"for {note.target}: not mine"
+        if not self._is_my_admin(note.by):
+            logger.warning("control note for %s refused: by=%s is not the admin",
+                           self.config.identity.alias, note.by)
+            return f"refused: {note.by} is not the admin"
+        if note.action not in self.control_actions():
+            return f"refused: {note.action} is not a control here"
+        try:
+            # Synchronous on purpose: this runs inside the machine-note path, which must not
+            # need an event loop of its own to hold a bot.
+            self._run_control_now(note.action)
+        except Exception:                      # noqa: BLE001 - a note must not break routing
+            logger.warning("control note: %s failed", note.action, exc_info=True)
+            return f"failed: {note.action}"
+        logger.info("control: %s applied from a peer note (by=%s)", note.action, note.by)
+        return f"applied: {note.action}"
+
+    def _is_my_admin(self, user_id: Any) -> bool:
+        """Whether a note's id is this bot's admin. A malformed id authorises nothing."""
+        try:
+            return self.config.is_admin(int(str(user_id).strip()))
+        except (TypeError, ValueError):
+            return False
+
+    def _run_control_now(self, action: str) -> None:
+        """The synchronous half of :meth:`_run_control`: the controls that only set state."""
+        if action == "bot.pause":
+            self._set_frozen(True, "pause")
+        elif action == "bot.resume":
+            self._set_frozen(False, None)
+        elif action == "bot.freeze":
+            self._set_frozen(True, "freeze")
+        elif action == "bot.restart":
+            self.request_restart()
+
     def control_actions(self) -> Tuple[str, ...]:
         """The controls this build can actually carry out, so no button is offered in vain.
 
@@ -2714,7 +2761,7 @@ class AgentChannel:
         WAKE, the swarm-wide controls -- joins this tuple as each is wired; until then they
         are neither shown nor run.
         """
-        return ("bot.pause", "bot.resume", "bot.restart")
+        return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart")
 
     def control_policy(self) -> Any:
         """The press policy: admin-only, a second tap for anything that stops, one log line."""
@@ -2753,15 +2800,12 @@ class AgentChannel:
         """Carry out one wired control. The transport only ever controls *itself* here."""
         if target and target.strip().lower() not in ("", "self",
                                                      self.config.identity.alias.lower()):
-            raise ValueError(f"{action} for {target}: this transport controls only itself")
-        if action == "bot.pause":
-            self._set_frozen(True, "pause")
-        elif action == "bot.resume":
-            self._set_frozen(False, None)
-        elif action == "bot.restart":
-            # The launcher starts the transport again; nothing is running when it does, which
-            # is why this control asks for a second tap (#117).
-            self.request_restart()
+            # Another bot's control travels as the CONTROL note the press already posts; that
+            # bot applies it to itself (#117). Nothing to do here, and nothing to double-apply.
+            return
+        # The launcher starts the transport again on a restart; nothing is left running when
+        # it does, which is why that control asks for a second tap (#117).
+        self._run_control_now(action)
 
     async def refresh_control_center(self, *, now: Optional[float] = None) -> Optional[Any]:
         """Edit the pinned dashboard for this beat. Never raises; ``None`` when there is none."""
@@ -2834,7 +2878,8 @@ class AgentChannel:
     # Machine-class envelope kinds recorded as state without waking the adapter (token
     # economy, issue #43). REQUEST/RESPONSE/BLOCKED are never machine-class.
     _MACHINE_STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED", "PULSE"})
-    _MACHINE_NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE"})
+    _MACHINE_NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE",
+                                       "CONTROL"})
 
     def _machine_event_class(self, envelope: Envelope) -> Optional[str]:
         """Classify a machine-only envelope; ``None`` means it follows the normal path.
@@ -2870,6 +2915,13 @@ class AgentChannel:
         self.stats.machine_events += 1
         logger.info("machine event recorded without dispatch: kind=%s from=%s ref=%s",
                     kind, alias, envelope.ref)
+        if (envelope.type == MessageType.NOTE
+                and (envelope.intent or "").upper() == "CONTROL"
+                and event.text):
+            # Issue #117: a control pressed on another bot's dashboard, for this one. The admin
+            # check is repeated here: the note only ever carries the presser's Telegram id. The
+            # envelope's own header is not part of the line, so the body is what is parsed.
+            self.apply_control_note(parse_message(event.text)[1])
         if (envelope.type == MessageType.NOTE
                 and (envelope.intent or "").upper() == "TOPIC_GONE" and envelope.ref):
             # Issue #63: one bot ran /cleanup and deleted a topic; every peer forgets it here,

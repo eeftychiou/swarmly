@@ -1017,6 +1017,13 @@ message). Three rules bound every press:
   `CONTROL bot.restart target=self by=<user id> at=<UTC> state=done` — so the durable plane
   says who stopped what and when.
 
+That note is also how a control reaches **another** bot: the transport that holds the message
+carries out a press for itself, and for any other bot the same `CONTROL` line *is* the
+dispatch. The target applies it when the note names it and the Telegram id it carries is its
+own admin's, so a press behaves the same whether the button was under the target's own line or
+under somebody else's. A note that names another bot, carries a stranger's id or asks for a
+control that build does not have is refused and only logged.
+
 Deploy, upgrade, merging a PR and editing configs or secrets are not on the keyboard at all.
 
 **Native CLI commands — `/cli` (admin only, no model turn).** Swarmly does not reimplement

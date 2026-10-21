@@ -60,6 +60,35 @@ class Press:
 
 
 @dataclass(frozen=True)
+class Note:
+    """A ``CONTROL`` line off the bus: another bot passing on the admin's press."""
+
+    action: str
+    target: str = ""
+    by: str = ""
+
+
+def parse_note(text: str) -> Optional[Note]:
+    """``CONTROL <action> target=<t> by=<id> at=<utc> state=done`` -> a :class:`Note`.
+
+    None for anything that is not one of these lines, so a peer's prose can never be read as
+    a command: the shape is fixed, and a missing field means the note is not ours.
+    """
+    if not isinstance(text, str):
+        return None
+    words = text.strip().split()
+    if len(words) < 2 or words[0] != "CONTROL":
+        return None
+    fields = {}
+    for word in words[2:]:
+        key, _, value = word.partition("=")
+        fields[key] = value
+    if "by" not in fields or "target" not in fields:
+        return None
+    return Note(action=words[1], target=fields["target"], by=fields["by"])
+
+
+@dataclass(frozen=True)
 class Command:
     """What a button's callback data says: the action, its target, and a code when confirming."""
 
