@@ -63,6 +63,7 @@ from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig
 from swarmly.telegram import native as native_cli
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.presence import Presence, Pulse
+from swarmly.telegram import snapshot as snapshot_mod
 from swarmly.telegram.pulsebus import PulseBus, notes_from
 from swarmly.telegram.projects import ProjectRouter
 from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
@@ -567,6 +568,25 @@ class AgentChannel:
         self._busy_since: Dict[Any, float] = {}      # topic -> clock its running turn started
         # Issue #116: the `/cli` run in flight per topic, so /stop can end it.
         self._native_runners: Dict[Any, Any] = {}
+        # Issue #124: when this process started, and how many starts this bot has had. Both are
+        # for the status snapshot; the count is kept beside the other state, so a restart shows
+        # up in the record instead of looking like an uptime that never ends.
+        self._booted_at = self._clock()
+        # Issue #124 review: `since` is *when this state began*, not when this beat was taken.
+        # Each state records the wall time it was entered, so the answer is stable across beats
+        # instead of resetting every heartbeat (a paused bot is not "paused since a moment ago"
+        # for ever, and a frozen one did not begin freezing when its quota comes back).
+        self._state_since: Dict[str, float] = {}
+        self._boots = 1
+        boots_path = _state_file(config, "boots")
+        if boots_path is not None:
+            try:
+                previous = load_state(boots_path, "boot count").get("count")
+                if isinstance(previous, int) and not isinstance(previous, bool):
+                    self._boots = previous + 1
+                save_state(boots_path, {"count": self._boots}, "boot count")
+            except Exception:                          # noqa: BLE001 - a count is a bonus
+                logger.warning("snapshot: could not keep the boot count", exc_info=True)
         self._busy_noticed: Dict[Any, float] = {}    # topic -> clock of the last ⏳ busy notice
         self._queue_seq: Dict[Any, int] = {}         # topic -> number of the last queued message
         self._folded: Dict[Any, List[str]] = {}      # topic -> queued messages awaiting one turn
@@ -2021,6 +2041,7 @@ class AgentChannel:
 
     def _set_frozen(self, frozen: bool, ref: Optional[str],
                     until: Optional[float] = None) -> None:
+        self._note_state(frozen=frozen, ref=ref)
         """Apply and persist the freeze flag so a restart cannot silently release it."""
         self._frozen = frozen
         self._freeze_ref = ref if frozen else None
@@ -2426,7 +2447,92 @@ class AgentChannel:
         return Pulse(alias=self.config.identity.alias, at=now, rev=self._running_revision,
                      role=self._role_name() if self.config.identity.role else "", term=term,
                      busy_since=now - max(durations) if durations else None,
-                     frozen=bool(self._frozen))
+                     frozen=bool(self._frozen),
+                     status=self.status_snapshot(now).to_dict())
+
+    # -- the status snapshot (issue #124) ---------------------------------------------
+
+    def _note_state(self, *, frozen: Optional[bool] = None, ref: Optional[str] = None,
+                    busy: Optional[bool] = None, paused: Optional[bool] = None) -> None:
+        """Record when a state began. Called at the transition, never from the snapshot."""
+        moment = self.presence_clock()
+        if frozen is True:
+            self._state_since["frozen" if ref == "quota" else "paused"] = moment
+        elif frozen is False:
+            self._state_since["idle"] = moment
+        if busy is True:
+            self._state_since["busy"] = moment
+        elif busy is False:
+            self._state_since["idle"] = moment
+        if paused is True:
+            self._state_since["paused"] = moment
+        elif paused is False:
+            self._state_since["idle"] = moment
+
+    def status_snapshot(self, now: Optional[float] = None) -> "snapshot_mod.Snapshot":
+        """This bot's state right now, as one record: what it is doing and what is waiting.
+
+        Built in code from state the channel already keeps -- no adapter call, no model turn,
+        no identifiers: the topic is its discussion token, never a chat or thread id (#22).
+        Everything optional is read defensively; a snapshot is a dashboard's input, and it must
+        never be the reason a heartbeat fails.
+        """
+        moment = self.presence_clock() if now is None else float(now)
+        every = self.heartbeat_seconds()
+        turn_timeout = float(getattr(self.config.adapter, "timeout_seconds", 0) or 0)
+
+        busy = {key: start for key, start in self._busy_since.items()
+                if isinstance(start, (int, float))}
+        elapsed = max((self._clock() - start for start in busy.values()), default=0.0)
+        state, topic = snapshot_mod.IDLE, "general"
+        if self._frozen:
+            state = (snapshot_mod.FROZEN if self._freeze_ref == "quota"
+                     else snapshot_mod.PAUSED)
+        elif self._pause_pending or self._paused_topics:
+            state = snapshot_mod.PAUSED
+        if busy:
+            state = (snapshot_mod.STUCK if turn_timeout and elapsed > turn_timeout
+                     else snapshot_mod.BUSY)
+        if busy:
+            # A turn's start is known exactly from its own clock, so busy/stuck do not need the
+            # table: elapsed is measured, not remembered.
+            since = moment - elapsed
+            key = next(iter(busy))
+            try:
+                chat_id, thread_id = key if isinstance(key, tuple) else (key, None)
+                topic = self.topics.context(int(chat_id), thread_id) or "general"
+            except Exception:                          # noqa: BLE001 - a name, not a fact
+                topic = "general"
+        else:
+            # First seen in this state: this beat is the moment it began. Recorded, so the next
+            # beat reports the same answer instead of moving with the clock.
+            since = float(self._state_since.setdefault(state, moment))
+        queue = int(self._busy_waiting) + sum(self._cooldown_waiting.values())
+
+        wakes: List[Tuple[str, float]] = []
+        try:
+            wakes = [(timer.id, float(timer.next_at))
+                     for timer in self.wake_store().load() if timer.live][:20]
+        except Exception:                              # noqa: BLE001 - no timer list, no fun
+            logger.debug("snapshot: no wake timers this beat", exc_info=True)
+
+        term, lease_ends = 0, 0.0
+        try:
+            lease = self.lease_state(now=moment)
+            if lease.holds(self.config.identity.alias, moment):
+                term, lease_ends = int(lease.term or 0), float(lease.expires_at or 0.0)
+        except Exception:                              # noqa: BLE001 - no lease, no fields
+            logger.debug("snapshot: no lease this beat", exc_info=True)
+
+        adapter = self.config.adapter
+        return snapshot_mod.Snapshot(
+            alias=self.config.identity.alias, state=state, since=since, at=moment,
+            every=every, topic=str(topic), turn_elapsed=elapsed, turn_timeout=turn_timeout,
+            queue=queue, wakes=tuple(wakes),
+            model=str(adapter.model or ""), effort=str(adapter.effort or ""),
+            rev=str(self._running_revision or ""),
+            uptime=max(0.0, self._clock() - self._booted_at), restarts=max(0, self._boots - 1),
+            term=term, lease_ends=lease_ends)
 
     async def _heartbeat_tick(self, *, now: Optional[float] = None) -> str:
         """Publish one pulse, then judge the peers. Returns what it said, for a test.
@@ -4167,6 +4273,7 @@ class AgentChannel:
             self._set_frozen(True, "pause")
             return f"⏸ {alias} paused. /resume to continue."
         self._pause_pending = True
+        self._note_state(paused=True)
         self._pause_where = (event.chat_id, event.thread_id)
         return (f"⏸ {alias} pausing: it finishes the turn it is running, then holds. "
                 "/resume to continue.")
@@ -4436,6 +4543,7 @@ class AgentChannel:
             asyncio.ensure_future(self._ack_reaction(event))
         busy_topic = (event.chat_id, event.thread_id)
         self._busy_since[busy_topic] = self._clock()
+        self._note_state(busy=True)
         started = time.monotonic()
         logger.info("turn start: message %s from %s in chat %s%s (%d chars) -> %s",
                     event.message_id, incoming.author_alias, event.chat_id,
@@ -4493,6 +4601,7 @@ class AgentChannel:
             self._turns.discard(turn)
             self._turn_keys.pop(turn, None)
             self._busy_since.pop(busy_topic, None)
+            self._note_state(busy=False)
             if self._current_turn is turn:
                 self._current_turn = None
             self._stopping_turns.discard(turn)

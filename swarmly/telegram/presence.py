@@ -42,10 +42,17 @@ class Pulse:
     #: look dead however long its turn runs.
     busy_since: Optional[float] = None
     frozen: bool = False
+    #: The per-bot status snapshot this beat carried (issue #124): what the bot is doing, for
+    #: a command centre to render. Kept as the record itself, never as a typed object, so a
+    #: peer on an older build reads the fields it knows and ignores the rest.
+    status: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"alias": self.alias, "at": self.at, "rev": self.rev, "role": self.role,
+        data = {"alias": self.alias, "at": self.at, "rev": self.rev, "role": self.role,
                 "term": self.term, "busy_since": self.busy_since, "frozen": self.frozen}
+        if self.status:
+            data["status"] = dict(self.status)
+        return data
 
     @classmethod
     def from_dict(cls, data: Any) -> "Pulse":
@@ -64,10 +71,14 @@ class Pulse:
         term = data.get("term", 0)
         if not isinstance(term, int) or isinstance(term, bool) or term < 0:
             raise ValueError("'term' must be a non-negative integer")
+        status = data.get("status")
+        if status is not None and not isinstance(status, dict):
+            raise ValueError("'status' must be an object or null")
         return cls(alias=alias.strip(), at=float(at), rev=str(data.get("rev") or ""),
                    role=str(data.get("role") or ""), term=term,
                    busy_since=None if busy is None else float(busy),
-                   frozen=bool(data.get("frozen")))
+                   frozen=bool(data.get("frozen")),
+                   status=dict(status) if status else None)
 
 
 @dataclass
@@ -83,12 +94,17 @@ class Peer:
     role: str = ""
     #: Set once a DOWN episode has been reported, so a restart cannot repeat the notice.
     down_notified_at: Optional[float] = None
+    #: The latest status snapshot this peer published (issue #124), as it published it.
+    snapshot: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"alias": self.alias, "last_seen": self.last_seen,
+        data = {"alias": self.alias, "last_seen": self.last_seen,
                 "busy_since": self.busy_since, "frozen": self.frozen, "term": self.term,
                 "rev": self.rev, "role": self.role,
                 "down_notified_at": self.down_notified_at}
+        if self.snapshot:
+            data["snapshot"] = dict(self.snapshot)
+        return data
 
     @classmethod
     def from_dict(cls, data: Any) -> "Peer":
@@ -102,11 +118,13 @@ class Peer:
             raise ValueError("a peer record needs 'last_seen'")
         busy = data.get("busy_since")
         notified = data.get("down_notified_at")
+        snapshot = data.get("snapshot")
         return cls(alias=alias.strip(), last_seen=float(last_seen),
                    busy_since=None if busy is None else float(busy),
                    frozen=bool(data.get("frozen")), term=int(data.get("term") or 0),
                    rev=str(data.get("rev") or ""), role=str(data.get("role") or ""),
-                   down_notified_at=None if notified is None else float(notified))
+                   down_notified_at=None if notified is None else float(notified),
+                   snapshot=dict(snapshot) if isinstance(snapshot, dict) else None)
 
 
 class Presence:
@@ -148,6 +166,12 @@ class Presence:
         peer.term = max(peer.term, pulse.term)
         peer.rev = pulse.rev or peer.rev
         peer.role = pulse.role or peer.role
+        if pulse.status:
+            # Issue #124: the snapshot this beat carried, kept as published: an older beat's
+            # record is never allowed to overwrite a newer one.
+            older = (peer.snapshot or {}).get("at") or 0.0
+            if float(pulse.status.get("at") or 0.0) >= float(older):
+                peer.snapshot = dict(pulse.status)
         if peer.down_notified_at is not None:
             peer.down_notified_at = None        # a new episode may be reported again
         self.peers[pulse.alias] = peer
