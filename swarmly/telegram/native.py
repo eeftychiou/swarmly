@@ -549,6 +549,13 @@ class Runner:
                 return Outcome(False, "", killed=True)
             session.send(native.line)
             body = session.read_until_quiet()
+            with self._lock:
+                killed_during = self.killed
+            if killed_during:
+                # `/stop` closed the session under the read: what came back is the screen at the
+                # moment it was killed, not an answer, so the run must not read as ok.
+                text, truncated = clean(body, max_chars=self.max_chars)
+                return Outcome(False, text, killed=True, truncated=truncated)
             if getattr(session, "expired", False):
                 # The deadline ended the read, so the command did not finish: a cut-off screen
                 # is not an answer, and reporting it as one would hide a command that hung.

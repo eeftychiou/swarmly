@@ -357,6 +357,38 @@ class FakeExpiredSession(FakeSession):
         super().__init__(reply, **kwargs)
 
 
+class StoppedSession(FakeSession):
+    """A session that is killed while it is reading: `/stop` closes it under the read."""
+
+    def __init__(self, reply="half an answer", *, on_read=None, **kwargs):
+        super().__init__(reply, **kwargs)
+        self.on_read = on_read
+
+    def read_until_quiet(self, *, deadline=None):
+        if self.on_read is not None:
+            self.on_read()
+            self.on_read = None
+        return self.reply
+
+
+class TestASlashStoppedMidRead(unittest.TestCase):
+    """#121 review: a stopped SLASH run is a kill, not an answer."""
+
+    def test_stop_during_the_read_is_not_ok(self):
+        runner = nv.Runner()
+        session = StoppedSession(argv=("claude",), on_read=lambda: runner.stop())
+        runner.session_factory = lambda argv, **kw: session
+        outcome = runner.run(nv.plan("claude", "/cost"))
+        self.assertFalse(outcome.ok)
+        self.assertTrue(outcome.killed)
+        self.assertIn("stopped on request", outcome.line(nv.plan("claude", "/cost"), 20.0))
+        self.assertIn("half an answer", outcome.text)      # the screen when it was stopped
+
+    def test_a_stop_that_never_happens_is_still_ok(self):
+        runner = nv.Runner(session_factory=lambda argv, **kw: FakeSession(argv=argv))
+        self.assertTrue(runner.run(nv.plan("claude", "/cost")).ok)
+
+
 class TestSlashDeadlines(unittest.TestCase):
     """#121 review: a SLASH command that hits its deadline is a timeout, not an ok."""
 
