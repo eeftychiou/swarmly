@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 
 from swarmly.telegram import wake as wk
-from tests.swarm_group import (ADMIN_USERNAME, GROUP, Bus, Group, needs_swarm, run)
+from tests.swarm_group import ADMIN_USERNAME, GROUP, Group, needs_swarm
 from tempfile import TemporaryDirectory
 
 #: The swarm the documentation describes: one bot per role.
@@ -34,6 +34,9 @@ class GroupCase(unittest.TestCase):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.group = Group(self.tmp.name, succession=["reviewer", "qa-tester", "developer"])
+        # A cleanup, not tearDown: cleanups run last-in first-out, so the swarm's loop is closed
+        # before the directory it wrote into is removed (Windows cannot delete an open file).
+        self.addCleanup(self.group.close)
         for alias, role in ROLES.items():
             self.group.join(alias, role)
         self.group.get("Claudebot").channel.membership.state.coordinator = "Claudebot"
@@ -45,8 +48,7 @@ class GroupCase(unittest.TestCase):
 
     # -- what the drills assert ------------------------------------------------------
     def holder(self) -> str:
-        return self.group.bus_holder() if hasattr(self.group, "bus_holder") else \
-            self.lease_state().holder
+        return self.lease_state().holder
 
     def lease_state(self):
         from swarmly.telegram.lease import LeaseStore
@@ -119,7 +121,7 @@ class TestTheCoordinatorComesBack(GroupCase):
         self.assertEqual(group.github.merges, [(109, "Codex")])
 
         # The admin hands the role back: /role writes a new term, and there is still one merge.
-        run(back.channel.handle_event(_admin_event("/role @claude_obot coordinator")))
+        group.run(back.channel.handle_event(_admin_event("/role @claude_obot coordinator")))
         self.assertTrue(back.lease_fence())
         self.assertEqual(group.github.merges, [(109, "Codex")])
 
@@ -205,16 +207,16 @@ class TestTheDeveloperDies(GroupCase):
 
         group.get("DeepSeek").heartbeat()            # it was alive a moment ago
         group.pump()
-        run(_hand_off(lead.channel, "@DeepSeek_dd_bot please land #85 on a branch"))
+        group.run(_hand_off(lead.channel, "@DeepSeek_dd_bot please land #85 on a branch"))
         group.kill("DeepSeek")                       # no BYE: the process died
         group.advance(7 * 60)                        # past the 6-minute DOWN window
 
-        run(lead.channel.check_peer_liveness())
+        group.run(lead.channel.check_peer_liveness())
         self.assertEqual(len(lead.said("DeepSeek has been silent since")), 1)
-        run(lead.channel.check_peer_liveness())      # nothing new to say
+        group.run(lead.channel.check_peer_liveness())      # nothing new to say
         self.assertEqual(len(lead.said("DeepSeek has been silent since")), 1)
 
-        run(lead.channel.check_stalled_handoffs())
+        group.run(lead.channel.check_stalled_handoffs())
         self.assertEqual(len(started), 1)            # the item comes back, in a turn
         self.assertIn("DeepSeek is DOWN", started[0])
         self.assertIn("hand it to another peer", started[0])
@@ -236,7 +238,7 @@ class TestOnlyTheReviewerIsFrozen(GroupCase):
         lead.adapter.on("#109 needs a second verdict",
                         "@agy_dd_bot please take the review of #109 — Codex is frozen")
 
-        run(_hand_off(lead.channel, "@codex_dd_bot review #109 at cf0b82a"))
+        group.run(_hand_off(lead.channel, "@codex_dd_bot review #109 at cf0b82a"))
 
         # The reviewer's quota runs out: it says so, on the wire, to everybody.
         reviewer.channel._set_frozen(True, "quota", group.clock.now() + 7200)
@@ -244,15 +246,17 @@ class TestOnlyTheReviewerIsFrozen(GroupCase):
         group.pump()
         self.assertIn("Codex", lead.channel.frozen_peers())
 
-        run(lead.channel.check_stalled_handoffs())
+        group.run(lead.channel.check_stalled_handoffs())
         self.assertEqual(len(started), 1)
         self.assertIn("Codex is frozen", started[0])
-        run(lead.channel.handle_event(_admin_event("@Claude_obot #109 needs a second verdict")))
+        group.run(lead.channel.handle_event(_admin_event("@Claude_obot #109 needs a second verdict")))
         self.assertEqual(len(lead.said("@agy_dd_bot please take the review of #109")), 1)
         self.assertEqual(lead.said("@codex_dd_bot review"), [])   # not back to the frozen bot
         self.assertEqual(group.bots["Codex"].alive, True)      # frozen, not dead
 
 
+@needs_swarm
+class TestEveryBotDiesAndRestarts(GroupCase):
     """6. Every bot dies and restarts: the schedule and the round state come back."""
 
     def test_timers_and_round_state_survive_a_full_outage(self):
@@ -317,6 +321,29 @@ class TestAWakeThatKeepsFailing(GroupCase):
         self.assertEqual(started and len(started), 1)          # one escalation turn, not a chain
         self.assertIn("expired", started[0])
         self.assertEqual(bot.channel.wake_store().live_count, 0)
+
+
+@needs_swarm
+class TestTheHarness(GroupCase):
+    """What the harness itself promises the drills, so a fix here is not only a comment."""
+
+    def test_a_bots_post_lands_in_the_groups_topic(self):
+        """A reply-to is a message id; the topic a bot posts into is the group's topic."""
+        group = self.group
+        group.thread = 1336
+        bot = group.get("Claudebot")
+        bot.channel.bot = object()
+        group.run(bot.channel.send("@codex_dd_bot review #109", reply_to_message_id=61))
+        rows = [row for row in group.log if row["author"] == "Claudebot" and "#109" in row["text"]]
+        self.assertTrue(rows)
+        self.assertEqual({row["thread"] for row in rows}, {1336})
+
+    def test_a_check_the_fake_cannot_answer_is_not_green(self):
+        self.assertEqual(self.group.github.check_returncode(["gh", "pr", "list"]), 1)
+        self.group.github.open_pr(111, checks={"lint": "pass", "unittest": "pending"})
+        self.assertEqual(self.group.github.check_returncode(["gh", "pr", "checks", "111"]), 8)
+        self.group.github.go_green(111)
+        self.assertEqual(self.group.github.check_returncode(["gh", "pr", "checks", "111"]), 0)
 
 
 async def _hand_off(channel, text: str, thread: int = 1336, message_id: int = 55) -> None:
