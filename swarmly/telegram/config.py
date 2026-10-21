@@ -678,6 +678,17 @@ class ChannelLimits:
     #: the bus, forever, each a push race with real traffic. `heartbeat_minutes * peer_down_after`
     #: is therefore measured in minutes of Telegram silence, not bus commits.
     heartbeat_minutes: float = 2.0
+    #: Where the pulse goes. "telegram": each bot keeps one status message in the home channel
+    #: and edits it in place every beat; peers receive the edit, which is the heartbeat, and no
+    #: notification or new line appears. "bus": the old per-bot git ref on the bus repository,
+    #: a push and a fetch every beat (a heartbeat does not belong on GitHub, so off by default).
+    heartbeat_plane: str = "telegram"
+    #: The forum topic the status message lives in; 0 is General.
+    heartbeat_topic_id: int = 0
+    #: On the Telegram plane: "repost" posts each beat as a new silent line and deletes the
+    #: previous one, so peers receive an ordinary message; "edit" edits one message in place,
+    #: which relies on Telegram delivering a bot's edits to the other bots.
+    heartbeat_style: str = "repost"
     #: How many heartbeats a peer may miss before it is DOWN (advisory: the lease, not this,
     #: decides who coordinates).
     peer_down_after: float = 3.0

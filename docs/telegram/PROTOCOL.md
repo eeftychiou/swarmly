@@ -565,21 +565,22 @@ A participant conforms to v1.1 if it:
 
 ## Peer liveness: pulse and DOWN (issue #82)
 
-Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2), and it goes
-to the **durable plane** whenever there is one: a parentless commit on this bot's own ref,
-`refs/pulse/<alias>`, force-updated every beat (one blob, `pulse.json`, no parent chain). The ref
-is a mailbox, not a history: the bus branch grows no commits, `main` never learns a pulse
-happened, and the only writer of a bot's ref is that bot, so there is no push race. Peers read
-`refs/pulse/*` on the same interval, so the facts survive a restart -- including a die-off seen
-while this bot was being restarted.
+Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2). By default
+(`limits.heartbeat_plane: telegram`) it is a silent `STATUS to=* intent=PULSE` line in the topic
+`limits.heartbeat_topic_id` (General when 0), and **each beat deletes the bot's previous pulse**
+(`limits.heartbeat_style: repost`), so the topic always holds one current line per bot. With
+`heartbeat_style: edit` the bot edits one status message in place instead, and peers receive the
+edit as an `edited_message` update; only a pulse counts in an edited message, and an edit never
+reaches the model. A status message that can no longer be edited is posted again.
 
-A commit on the bus branch every two minutes would be ~180 commits an hour of history, forever;
-that is why the pulse gets its own ref rather than a lane of the bus branch.
+A heartbeat does not belong on GitHub: at five bots it was about 150 pushes an hour plus the
+fetches to read them, so the bus carries only what must last (messages, round state, the lease).
 
-**Telegram is the fallback.** With no bus (a bare transport, no checkout) or when this beat's
-push failed, the pulse goes out as the ephemeral `STATUS intent=PULSE` line instead -- and only
-then. `PULSE` is machine-class traffic (#43): it is recorded as state, wakes no model turn, and
-is swept from General like the other machine notices.
+`limits.heartbeat_plane: bus` keeps the earlier design: a parentless commit on this bot's own ref,
+`refs/pulse/<alias>`, force-updated every beat (one blob, `pulse.json`, no parent chain), with
+peers reading `refs/pulse/*` on the same interval, and the Telegram line as the fallback when a
+push fails. `PULSE` is machine-class traffic (#43) on either plane: it is recorded as state and
+wakes no model turn.
 
 The bus half runs in a worker thread (`asyncio.to_thread`), never inline in the beat: a slow or
 hung git must not stall the pulse loop, a turn, or Telegram delivery. `refs/pulse/<alias>` is

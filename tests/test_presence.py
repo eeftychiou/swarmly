@@ -151,7 +151,7 @@ class TestThePulse(unittest.TestCase):
         payload = pr.Pulse.from_dict(json.loads(sent.split("\n\n", 1)[1]))
         self.assertEqual(payload.alias, "Hermes")
         self.assertEqual(payload.rev, channel._running_revision)
-        self.assertIn("pulse rev=", said)
+        self.assertIn("pulse posted rev=", said)
         # The bus is what this must never become: exactly one Telegram line, no bus write.
         self.assertEqual(len(channel._test_sender.sent), 1)
 
@@ -391,6 +391,149 @@ class TestTheBusyWindowAndTheClock(unittest.TestCase):
         channel._test_presence_clock["t"] = NOW + 400
         self.assertTrue(channel.presence().is_down("Codex", NOW + 400))
 
+class FakeEditingBot:
+    """The two Bot API calls the status message uses: edit it, and delete a replaced one."""
+
+    def __init__(self, *, editable=True):
+        self.editable = editable
+        self.edits = []
+        self.deleted = []
+
+    async def edit_message_text(self, *, text, chat_id, message_id, **_kwargs):
+        if not self.editable:
+            raise RuntimeError("Bad Request: message to edit not found")
+        self.edits.append((chat_id, message_id, text))
+
+    async def delete_message(self, *, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+
+
+class TestThePulseOnTelegram(unittest.TestCase):
+    """A heartbeat does not belong on GitHub: by default each bot edits one status message."""
+
+    def channel(self, bot, style="edit"):
+        from types import SimpleNamespace
+        channel = live_channel(heartbeat_style=style)
+        channel.bot = bot
+        recorder = channel._sender
+        ids = iter(range(500, 600))
+
+        async def sender(payload, reply_to_message_id=None):
+            await recorder(payload, reply_to_message_id)
+            return SimpleNamespace(message_id=next(ids))   # Telegram's id for the new message
+
+        channel._sender = sender
+        return channel
+
+    def test_the_bus_is_not_used_by_default(self):
+        channel = live_channel()
+        channel._pulsebus = FakePulseBus()
+        channel._pulsebus_checked = True
+        run(channel._heartbeat_tick())
+        self.assertEqual(channel._pulsebus.published, [])
+        self.assertIn("STATUS to=* intent=PULSE", channel._test_sender.last)
+
+    def test_the_first_beat_posts_and_the_next_ones_edit_it(self):
+        bot = FakeEditingBot()
+        channel = self.channel(bot)
+        self.assertIn("pulse posted", run(channel._heartbeat_tick()))
+        channel._test_presence_clock["t"] = NOW + 120
+        self.assertIn("pulse edited", run(channel._heartbeat_tick()))
+        self.assertIn("pulse edited", run(channel._heartbeat_tick()))
+        self.assertEqual(len(channel._test_sender.sent), 1)      # one line in the group, ever
+        self.assertEqual([edit[1] for edit in bot.edits], [500, 500])
+        self.assertIn("STATUS to=* intent=PULSE", bot.edits[-1][2])
+
+    def test_a_status_message_that_is_gone_is_posted_again(self):
+        bot = FakeEditingBot()
+        channel = self.channel(bot)
+        run(channel._heartbeat_tick())
+        bot.editable = False                                    # /cleanup deleted it
+        self.assertIn("pulse posted", run(channel._heartbeat_tick()))
+        self.assertEqual(len(channel._test_sender.sent), 2)
+        self.assertEqual(bot.deleted, [(channel.config.identity.home_channel_id, 500)])
+        bot.editable = True
+        run(channel._heartbeat_tick())
+        self.assertEqual(bot.edits[-1][1], 501)
+
+    def test_by_default_each_beat_is_a_new_line_and_the_last_one_goes(self):
+        bot = FakeEditingBot()
+        channel = self.channel(bot, style="repost")
+        for step in range(3):
+            channel._test_presence_clock["t"] = NOW + 120 * step
+            self.assertIn("pulse posted", run(channel._heartbeat_tick()))
+        self.assertEqual(bot.edits, [])
+        self.assertEqual(len(channel._test_sender.sent), 3)
+        home = channel.config.identity.home_channel_id
+        self.assertEqual(bot.deleted, [(home, 500), (home, 501)])   # one line left: the newest
+
+    def test_a_peers_edited_pulse_is_its_heartbeat(self):
+        from types import SimpleNamespace
+        channel = live_channel()
+        message = SimpleNamespace(
+            text=pulse_text("Codex", NOW), caption=None, message_id=9, reply_to_message=None,
+            chat=SimpleNamespace(id=channel.config.identity.home_channel_id),
+            from_user=SimpleNamespace(id=202, username="CodexBot", is_bot=True),
+            is_topic_message=False, message_thread_id=None)
+        run(channel._on_aiogram_edited(message))
+        self.assertEqual(channel.presence().status("Codex", NOW), "up")
+
+    def test_an_edited_message_that_is_not_a_pulse_does_nothing(self):
+        from types import SimpleNamespace
+        channel = live_channel()
+        message = SimpleNamespace(
+            text="@HermesBot please merge #12", caption=None, message_id=9,
+            reply_to_message=None,
+            chat=SimpleNamespace(id=channel.config.identity.home_channel_id),
+            from_user=SimpleNamespace(id=202, username="CodexBot", is_bot=True),
+            is_topic_message=False, message_thread_id=None)
+        run(channel._on_aiogram_edited(message))
+        self.assertNotIn("Codex", channel.presence().peers)
+        self.assertEqual(channel._test_sender.sent, [])
+
+
+class TestThePulseCarriesUsage(unittest.TestCase):
+    """The pulse says what the bot spent, read from its ledger: the heartbeat costs no tokens."""
+
+    def test_usage_since_the_last_beat_and_today(self):
+        from swarmly.telegram import usage as usage_mod
+        channel = live_channel()
+        ledger = usage_mod.Ledger(None, alias="Hermes", clock=lambda: NOW)
+        ledger.append(usage_mod.Entry(alias="Hermes", started=NOW - 60, ended=NOW - 30,
+                                      tokens_in=1200, tokens_out=300, cost_usd=0.02))
+        ledger.append(usage_mod.Entry(alias="Hermes", started=NOW - 3 * 3600, ended=NOW - 3 * 3600,
+                                      tokens_in=5000, tokens_out=1000, cost_usd=0.1))
+        channel._usage_ledger = ledger
+        status = channel.own_pulse(NOW).status
+        self.assertEqual(status["usage"]["beat"]["tokens_in"], 1200)
+        self.assertEqual(status["usage"]["beat"]["turns"], 1)
+        # The next beat counts only what came after this one.
+        later = channel.own_pulse(NOW + 120).status
+        self.assertEqual(later["usage"]["beat"]["turns"], 0)
+        self.assertIsNone(later["usage"]["beat"]["tokens_in"])
+
+    def test_a_beat_never_runs_a_model_turn(self):
+        class CountingAdapter:
+            model, effort = "m", "e"
+            calls = 0
+
+            async def respond(self, message):
+                CountingAdapter.calls += 1
+
+        channel = live_channel()
+        channel.adapter = CountingAdapter()
+        run(channel._heartbeat_tick())
+        from types import SimpleNamespace
+        message = SimpleNamespace(
+            text=pulse_text("Codex", NOW), caption=None, message_id=9, reply_to_message=None,
+            chat=SimpleNamespace(id=channel.config.identity.home_channel_id),
+            from_user=SimpleNamespace(id=202, username="CodexBot", is_bot=True),
+            is_topic_message=False, message_thread_id=None)
+        run(channel._on_aiogram_edited(message))
+        hear(channel, pulse_text("Codex", NOW), message_id=10)
+        self.assertEqual(CountingAdapter.calls, 0)
+
+
 class FakePulseBus:
     """A pulse ref, without a git repo: publish() records, read() returns the others."""
 
@@ -413,7 +556,7 @@ class TestThePulseOnTheBus(unittest.TestCase):
     """Review B1 on #94: when the bus is on, the pulse is written there, not to Telegram."""
 
     def channel_with(self, bus):
-        channel = live_channel()
+        channel = live_channel(heartbeat_plane="bus")
         channel._pulsebus = bus
         channel._pulsebus_checked = True
         return channel
@@ -432,14 +575,14 @@ class TestThePulseOnTheBus(unittest.TestCase):
         bus = FakePulseBus(push_ok=False)
         channel = self.channel_with(bus)
         said = run(channel._heartbeat_tick())
-        self.assertIn("pulse rev=", said)
+        self.assertIn("pulse posted rev=", said)
         self.assertIn("STATUS to=* intent=PULSE", channel._test_sender.last)
 
     def test_a_transport_with_no_config_has_no_bus(self):
         # A unit test or an ad-hoc run has no checkout to write a ref into: Telegram carries it.
         channel = live_channel()
         self.assertIsNone(channel.pulse_bus())
-        self.assertIn("pulse rev=", run(channel._heartbeat_tick()))
+        self.assertIn("pulse posted rev=", run(channel._heartbeat_tick()))
 
 class BlockingPulseBus:
     """A pulse bus whose git calls block, as a slow git subprocess does (review B4)."""
