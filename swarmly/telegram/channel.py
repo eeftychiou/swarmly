@@ -2770,6 +2770,29 @@ class AgentChannel:
             self._set_frozen(True, "freeze")
         elif action == "bot.restart":
             self.request_restart()
+        elif action == "bot.stop_turn":
+            self._stop_every_turn()
+
+    def _stop_every_turn(self) -> str:
+        """Stop this bot's turns and queued messages: what ``/stop all`` does, from a button.
+
+        The dashboard is per bot rather than per topic, so a stop pressed there is the
+        everything form: the running turns are cancelled, the messages waiting behind them are
+        dropped, and any ``/cli`` run in flight is killed. What was already answered stays
+        answered; a message a turn was cut off from is not re-sent (the inbox keeps the ones it
+        accepted, and a restart replays those).
+        """
+        cleared = self._busy_waiting + sum(self._cooldown_waiting.values())
+        self._stop_generation += 1
+        running = [turn for turn in self._turns if not turn.done()]
+        for turn in running:
+            self._stopping_turns.add(turn)
+            turn.cancel()
+        self.stats.stopped += len(running)
+        native = self._stop_native(self.config.identity.home_channel_id, None, everything=True)
+        logger.info("control: stopped %d turn(s), dropped %d queued, killed %d /cli run(s)",
+                    len(running), cleared, native)
+        return f"{len(running)} turn(s), {cleared} queued message(s), {native} /cli run(s)"
 
     def control_actions(self) -> Tuple[str, ...]:
         """The controls this build can actually carry out, so no button is offered in vain.
@@ -2778,7 +2801,7 @@ class AgentChannel:
         WAKE, the swarm-wide controls -- joins this tuple as each is wired; until then they
         are neither shown nor run.
         """
-        return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart",
+        return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart", "bot.stop_turn",
                 "swarm.pause_all", "item.nudge")
 
     def control_policy(self) -> Any:

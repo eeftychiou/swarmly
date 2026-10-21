@@ -1005,8 +1005,10 @@ The buttons under it come from `CONTROLS` in `swarmly/telegram/control.py` — p
 stop turn, restart, model, effort, WAKE, freeze and read-only `/cli` per bot; pause-all, the
 lease, roles, cleanup, sync and admit for the swarm; and a nudge that costs the owner a turn.
 Only a control the running transport can actually carry out is shown, so a button that exists
-is a button that works (today: pause, resume, freeze and a safe restart of one bot; pause
-*everything*; and a nudge to an item's owner, which costs that bot a turn). Three rules bound every press:
+is a button that works (today: pause, resume, freeze, a safe restart and a stop of one bot;
+pause *everything*; and a nudge to an item's owner, which costs that bot a turn). **Stop**
+cancels the turns in flight, drops the messages queued behind them and kills any `/cli` run —
+the `/stop all` form, because the dashboard speaks for the whole bot rather than one topic. Three rules bound every press:
 
 - **The admin only.** The presser's Telegram user id is checked before the action is even
   looked up, so a stranger is refused and learns nothing about what the buttons do.

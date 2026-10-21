@@ -275,6 +275,60 @@ class TestAnotherBotsControl(unittest.TestCase):
         self.assertFalse(channel._frozen)
 
 
+class TestStoppingEverything(unittest.TestCase):
+    """`bot.stop_turn` from the dashboard: the `/stop all` form, behind a second tap."""
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        channel.presence_clock = lambda: NOW
+        return channel
+
+    def test_a_stop_press_stops_on_the_second_tap(self):
+        channel = self.channel()
+        asked = run(channel.handle_control_press(press("ctl:bot.stop_turn")))
+        self.assertIn("Tap again", asked)
+        self.assertEqual(channel._stop_generation, 0)          # the first tap stops nothing
+        code = channel.control_policy().pending()[0].code
+        done = run(channel.handle_control_press(press("ctl:confirm:" + code)))
+        self.assertIn("Stop turn done", done)
+        self.assertEqual(channel._stop_generation, 1)
+
+    def test_the_stop_drops_what_queue_behind_the_turn(self):
+        channel = self.channel()
+        channel._busy_waiting = 3
+        channel._cooldown_waiting[(1, None)] = 2
+        said = channel._stop_every_turn()
+        self.assertIn("5 queued message(s)", said)              # 3 waiting + 2 cooling down
+
+    def test_a_stop_cancels_a_running_turn(self):
+        import asyncio
+
+        class Turn:
+            done_flag = False
+
+            def done(self):
+                return self.done_flag
+
+            def cancel(self):
+                self.done_flag = True
+
+        channel = self.channel()
+        turn = Turn()
+        channel._turns.add(turn)
+        said = channel._stop_every_turn()
+        self.assertIn("1 turn(s)", said)
+        self.assertTrue(turn.done_flag)
+        self.assertEqual(channel.stats.stopped, 1)
+        asyncio.run(asyncio.sleep(0))
+
+    def test_another_bot_applies_a_stop_note(self):
+        channel = self.channel()
+        line = "CONTROL bot.stop_turn target=Hermes by=%d at=2027-01-15T08:00:00Z state=done" % ADMIN_ID
+        self.assertEqual(channel.apply_control_note(line), "applied: bot.stop_turn")
+        self.assertEqual(channel._stop_generation, 1)
+
+
 class TestSwarmWideAndNudge(unittest.TestCase):
     """The controls that reach past one bot: pause everything, and nudge an item's owner."""
 
