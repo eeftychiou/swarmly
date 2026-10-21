@@ -17,6 +17,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from swarmly.telegram.adapters.base import load_state
+from tests.aio import run
 from swarmly.telegram.channel import AgentChannel, ChannelEvent
 from swarmly.telegram.cleanup import (CONFIRM_SECONDS, LEDGER_TTL_SECONDS, Cleanup,
                                       GeneralLedger, TopicInfo)
@@ -30,10 +31,6 @@ ADMIN_ID = 1234567890
 OTHER_ID = 555
 NOW = 1_700_000_000.0
 HOUR = 3600.0
-
-
-def run(coro):
-    return asyncio.run(coro)
 
 
 class FakeHost:

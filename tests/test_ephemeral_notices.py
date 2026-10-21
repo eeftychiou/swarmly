@@ -23,6 +23,7 @@ from swarmly.telegram.channel import AgentChannel
 from swarmly.telegram.cleanup import LEDGER_TTL_SECONDS, GeneralLedger
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.adapters import EchoAdapter
+from tests.aio import run
 
 GROUP = -1001234567890
 ADMIN_ID = 1234567890
@@ -30,10 +31,6 @@ ADMIN_ID = 1234567890
 #: would age out of the 48-hour window and every test would pass for the wrong reason.
 NOW = time.time()
 MINUTE = 60.0
-
-
-def run(coro):
-    return asyncio.run(coro)
 
 
 class Sent:
