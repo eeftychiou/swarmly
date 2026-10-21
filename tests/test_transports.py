@@ -220,7 +220,7 @@ class TestGitTransport(unittest.TestCase):
                 return subprocess.run(["git", "-C", str(root), *args], check=True,
                                       capture_output=True, text=True, env=git_env())
             subprocess.run(["git", "init", "--bare", str(remote)], check=True,
-                           capture_output=True)
+                           capture_output=True, env=git_env())
             git("init", "-b", "main")
             git("config", "user.name", "Codex")
             git("config", "user.email", "codex@a2a.local")
@@ -240,7 +240,7 @@ class TestGitTransport(unittest.TestCase):
             self.assertEqual(git("rev-parse", "HEAD").stdout.strip(), before)
             self.assertEqual(subprocess.run(["git", "--git-dir", str(remote), "show",
                                              f"main:{state}"], check=True, capture_output=True,
-                                            text=True).stdout, '{"state":"armed"}')
+                                            text=True, env=git_env()).stdout, '{"state":"armed"}')
 
     def test_local_listing_without_ref(self):
         with TemporaryDirectory() as tmp:
