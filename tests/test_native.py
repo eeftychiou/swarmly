@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -420,6 +421,13 @@ class TestSlashDeadlines(unittest.TestCase):
                                         quiet_seconds=0.2)
         try:
             session.open()
+            # Wait for the CLI to be *talking* before starting the deadline's clock: the test is
+            # about a session that never goes quiet, not about how fast Python starts on a busy
+            # host (1.0s deadline, and a cold interpreter can take most of it).
+            for _ in range(200):
+                if "still working" in session.text():
+                    break
+                time.sleep(0.05)
             text = session.read_until_quiet()
         finally:
             session.close()
