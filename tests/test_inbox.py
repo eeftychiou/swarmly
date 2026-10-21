@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 from swarmly.telegram.channel import ChannelEvent
+from swarmly.telegram.inbox import event_from
 from swarmly.telegram.inbox import MAX_AGE_SECONDS, RESUME_MAX_AGE_SECONDS, Inbox
 from tests.test_telegram_channel import ADMIN_ID, event, make_channel, make_config
 
@@ -335,3 +336,52 @@ class ResumeNoticeAndAttachmentsTests(unittest.TestCase):
         resumed = [t for t in seen if "cut off by a restart" in str(getattr(t, "text", ""))]
         self.assertEqual(len(resumed), 1, seen)
         self.assertEqual(resumed[0].attachments[0]["file_name"], "log.txt")
+
+class ClaimReleaseTests(unittest.TestCase):
+    """#104 review (Codex): a claim that starts nothing must not leave the queue stalled."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def channel(self):
+        config = make_config(fallback={"gitbus_root": self.tmp.name})
+        config.source_path = Path(self.tmp.name) / "agent.local.yaml"
+        channel = make_channel(config)
+        channel.bot = object()
+        return channel
+
+    def test_a_claim_that_starts_nothing_does_not_stall_the_queue(self):
+        channel = self.channel()
+        channel._inbox.record(admin("@HermesBot one", message_id=61))
+        channel._inbox.record(admin("@HermesBot two", message_id=62))
+
+        def fail(event, record):
+            raise RuntimeError("the resume could not be started")
+
+        channel._resume_turn = fail
+        self.assertEqual(channel.replay_interrupted(), 0)
+        self.assertFalse(channel._inbox.claiming(), "the claim is released, not held")
+
+        started = []
+        channel._resume_turn = lambda event, record: started.append(event.message_id)
+        self.assertEqual(channel.replay_interrupted(), 1)      # the queue still moves
+        self.assertEqual(started, [62])
+
+    def test_an_unrebuildable_record_is_closed_not_left_on_disk(self):
+        channel = self.channel()
+        channel._inbox.record(admin("@HermesBot broken", message_id=63))
+        channel._resume_turn = lambda event, record: None
+        original = event_from
+
+        def refuse(data, event_type):
+            raise TypeError("cannot rebuild this one")
+
+        import swarmly.telegram.inbox as inbox_module
+        inbox_module.event_from = refuse
+        try:
+            self.assertEqual(channel.replay_interrupted(), 0)
+        finally:
+            inbox_module.event_from = original
+        self.assertFalse(channel._inbox.claiming())
+        self.assertEqual(channel._inbox._entries, {}, "dropped, not claimed forever")

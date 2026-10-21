@@ -3337,18 +3337,36 @@ class AgentChannel:
         # second claim while one resume is running, which is what makes a re-entered start()
         # harmless: it cannot spend another try.
         runnable, dropped = self._inbox.claim_replay()
-        for entry in dropped:
-            self._report_abandoned(entry, str(entry.get("reason") or "twice"))
-        for attempt, data in runnable:
-            try:
-                event = event_from(data["event"], ChannelEvent)
-            except (TypeError, KeyError):
-                logger.warning("inbox: could not rebuild an interrupted message; skipping it")
-                continue
-            logger.info("inbox: resuming message %s from @%s (try %d) after a restart",
-                        event.message_id, event.author_username, attempt)
-            self._resume_turn(event, data)
-        return len(runnable)
+        started = 0
+        try:
+            for entry in dropped:
+                self._report_abandoned(entry, str(entry.get("reason") or "twice"))
+            for attempt, data in runnable:
+                try:
+                    event = event_from(data["event"], ChannelEvent)
+                except (TypeError, KeyError):
+                    # Nothing to rebuild means nothing to resume: close the record rather than
+                    # leave it on disk to be claimed and blamed again (#104 review).
+                    logger.warning("inbox: could not rebuild an interrupted message; dropping it")
+                    raw = data.get("event") or {}
+                    self._inbox.done(raw.get("chat_id"), raw.get("message_id"))
+                    continue
+                logger.info("inbox: resuming message %s from @%s (try %d) after a restart",
+                            event.message_id, event.author_username, attempt)
+                try:
+                    self._resume_turn(event, data)
+                except Exception:              # noqa: BLE001 - one bad record, not the queue
+                    logger.exception("inbox: could not start the resume for message %s",
+                                     event.message_id)
+                    self._inbox.done(event.chat_id, event.message_id)
+                    continue
+                started += 1
+        finally:
+            if not started:
+                # A claim that started nothing holds nothing: without this, one unreadable
+                # record would leave `_claiming` set and stall every later resume (#104 review).
+                self._inbox.released()
+        return started
 
     def _resume_turn(self, event: ChannelEvent, record: Dict[str, Any]) -> None:
         """Run the turn again in the same topic, saying why -- and close its record (#84).
