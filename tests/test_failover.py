@@ -280,15 +280,20 @@ class TestOnlyTheReviewerIsFrozen(GroupCase):
 
 @needs_swarm
 class TestAWakeThatKeepsFailing(GroupCase):
-    """7. A WAKE check keeps failing: it re-arms until `until`, escalates once, and stops."""
+    """7. A WAKE check keeps failing: it re-arms until `until`, escalates once, and stops.
+
+    The coordinator's own timer, fired through the harness tick: waking is every bot's promise
+    whatever its role (#96), and the harness tick is the path a drill actually takes -- so the
+    wake pass must read the group clock, not real time, for advancing the clock to fire it.
+    """
 
     def test_a_pending_check_rearms_then_escalates_once(self):
         group = self.group
-        bot = group.get("DeepSeek")
+        bot = group.get("Claudebot")
         now = group.clock.now()
         timer = wk.WakeTimer(argv=("gh", "pr", "checks", "109"), then="merge it if green",
                              next_at=now + 10, expires_at=now + 150, every_seconds=60,
-                             chat_id=GROUP, alias="DeepSeek", topic="Round 4")
+                             chat_id=GROUP, alias="Claudebot", topic="Round 4")
         bot.channel.wake_store().add(timer, max_timers=10)
         group.github.open_pr(109, checks={"lint": "pass", "unittest": "pending"})
 
@@ -301,8 +306,10 @@ class TestAWakeThatKeepsFailing(GroupCase):
         with mock.patch("swarmly.telegram.wake.run_check_async", pending_check):
             done = []
             for _ in range(8):
-                group.advance(60)
-                done.extend(run(bot.channel._wake_tick(now=group.clock.now())))
+                # Through the harness tick, on the group clock -- the path a drill uses, and
+                # the one that must not read real time out from under an advanced clock.
+                out = group.tick(60, wakes=True)
+                done.extend(out["wake"]["Claudebot"])
 
         actions = [line.split(": ", 1)[1] for line in done if line.startswith(timer.id)]
         self.assertIn("rearm", actions)

@@ -604,7 +604,7 @@ class Group:
                     out["presence"][bot.alias] = exc
             if wakes:
                 try:
-                    out["wake"][bot.alias] = run(channel._wake_tick(now=time.time()))
+                    out["wake"][bot.alias] = run(channel._wake_tick(now=self.clock.now()))
                 except Exception as exc:             # noqa: BLE001
                     out["wake"][bot.alias] = exc
         self.pump()
