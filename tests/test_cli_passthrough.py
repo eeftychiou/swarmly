@@ -88,6 +88,17 @@ class TestTheAdminGate(unittest.TestCase):
         run(made.handle_event(event("/cli@CodexBot --version")))
         self.assertEqual(made._test_sender.sent, [])
 
+    def test_a_longer_command_is_not_cli(self):
+        """`/clinic` is not `/cli nic`: a passthrough must not answer a different command."""
+        made, _ = channel()
+        with mock.patch("swarmly.telegram.native.subprocess.Popen") as spawned:
+            run(made.handle_event(event("/clinic@HermesBot", author_id=ADMIN_ID,
+                                        username="alice", is_bot=False)))
+        self.assertEqual(spawned.call_args_list, [])
+        # It is not a passthrough: whatever else happens, no CLI command is run for it.
+        self.assertFalse([row["text"] for row in made._test_sender.sent
+                          if "running one-shot" in row["text"]])
+
 
 class TestARun(unittest.TestCase):
     """The admin's read-only command: it runs, its output streams, and no turn happens."""
@@ -239,6 +250,59 @@ class TestStopAndTheLock(unittest.TestCase):
 
         self.assertTrue(asyncio.run(scenario()))
         self.assertFalse(made._lock_for(event("x")).locked())     # and released afterwards
+
+
+class TestASlashThatNeverFinishes(unittest.TestCase):
+    """#121 review: a session that hits its deadline is a timeout, not an answer."""
+
+    def session(self, *, expired):
+        class Session(FakeProcess):
+            pass
+
+        made_sessions = []
+
+        class FakeTerminal:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.expired = expired
+                self.sent = []
+                made_sessions.append(self)
+
+            def open(self):
+                return self
+
+            def send(self, line):
+                self.sent.append(line)
+
+            def read_until_quiet(self, *, deadline=None):
+                return "half an answer"
+
+            def close(self):
+                self.closed = True
+
+            text = lambda self: "half an answer"            # noqa: E731 - a stand-in
+
+        return FakeTerminal, made_sessions
+
+    def test_a_deadline_is_reported_as_killed_not_ok(self):
+        made, sessions = self.session(expired=True)
+        bot, _ = channel()
+        with mock.patch("swarmly.telegram.native.InteractiveSession", made):
+            run(bot.handle_event(event("/cli@HermesBot /cost", author_id=ADMIN_ID,
+                                       username="alice", is_bot=False)))
+        self.assertEqual(sessions[0].sent, ["/cost"])
+        text = bot.bot.edit_message_text.await_args.kwargs["text"]
+        self.assertIn("killed after", text)
+        self.assertNotIn(": ok", text)
+        self.assertIn("half an answer", text)          # a cut-off screen is still shown
+
+    def test_a_session_that_finishes_is_still_ok(self):
+        made, sessions = self.session(expired=False)
+        bot, _ = channel()
+        with mock.patch("swarmly.telegram.native.InteractiveSession", made):
+            run(bot.handle_event(event("/cli@HermesBot /cost", author_id=ADMIN_ID,
+                                       username="alice", is_bot=False)))
+        self.assertIn(": ok", bot.bot.edit_message_text.await_args.kwargs["text"])
 
 
 class TestFrozenAndStop(unittest.TestCase):

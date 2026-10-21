@@ -316,6 +316,9 @@ class InteractiveSession:
         self._buf: List[str] = []
         self._lock = threading.Lock()
         self._eof = threading.Event()
+        #: ``read_until_quiet`` ran out of time instead of going quiet: an answer cut off, not
+        #: a finished command. The run is reported as a timeout, never as ok.
+        self.expired = False
 
     # -- opening -------------------------------------------------------------------
     def open(self) -> "InteractiveSession":
@@ -384,14 +387,23 @@ class InteractiveSession:
             raise SessionError(f"the session would not take the command: {exc}") from exc
 
     def read_until_quiet(self, *, deadline: Optional[float] = None) -> str:
-        """Read until the CLI has said nothing for ``quiet_seconds``, or the deadline."""
+        """Read until the CLI has said nothing for ``quiet_seconds``, or the deadline.
+
+        ``expired`` is set when the *deadline* ended the read: the command did not finish, so
+        what came back is a cut-off screen and the run must not read as ok.
+        """
         limit = time.monotonic() + (self.deadline if deadline is None else float(deadline))
         last_len, last_change = -1, time.monotonic()
-        while time.monotonic() < limit:
+        self.expired = False
+        while True:
+            moment = time.monotonic()
+            if moment >= limit:
+                self.expired = True
+                break
             size = len(self.text())
             if size != last_len:
-                last_len, last_change = size, time.monotonic()
-            elif self._eof.is_set() or (time.monotonic() - last_change) >= self.quiet:
+                last_len, last_change = size, moment
+            elif self._eof.is_set() or (moment - last_change) >= self.quiet:
                 break
             time.sleep(0.05)
         return self.text()
@@ -523,6 +535,7 @@ class Runner:
                        truncated=truncated)
 
     def _slash(self, native: Native) -> Outcome:
+        session: Optional[InteractiveSession] = None
         try:
             session = self.session_factory(native.argv, cwd=self.cwd, env=self.env,
                                            quiet_seconds=self.quiet_seconds,
@@ -536,14 +549,23 @@ class Runner:
                 return Outcome(False, "", killed=True)
             session.send(native.line)
             body = session.read_until_quiet()
+            if getattr(session, "expired", False):
+                # The deadline ended the read, so the command did not finish: a cut-off screen
+                # is not an answer, and reporting it as one would hide a command that hung.
+                text, truncated = clean(body, max_chars=self.max_chars)
+                return Outcome(False, text, timed_out=True, truncated=truncated)
         except (SessionError, OSError) as exc:
             return Outcome(False, str(exc))
         except subprocess.TimeoutExpired:
             return Outcome(False, "", timed_out=True)
         finally:
             with self._lock:
-                session, self.session = self.session, None
-            if session is not None:
+                mine, self.session = self.session, None
+            # Only the session this run opened is closed -- and a factory that raised leaves
+            # nothing to close at all.
+            if mine is not None:
+                mine.close()
+            elif session is not None:
                 session.close()
         text, truncated = clean(body, max_chars=self.max_chars)
         return Outcome(True, text, truncated=truncated)
@@ -605,7 +627,8 @@ def parse_request(text: str) -> Optional[Tuple[bool, str]]:
     The ``!`` is the whole difference between "read that" and "change that", so it is read
     from the command word itself rather than from a second argument nobody remembers.
     """
-    match = re.match(r"^/cli(?P<bang>!)?(?:@(?P<target>[A-Za-z0-9_]+))?\s*(?P<rest>.*)$",
+    match = re.match(r"^/cli(?P<bang>!)?(?:@(?P<target>[A-Za-z0-9_]+))?"
+                     r"(?:\s+(?P<rest>.*))?$",
                      str(text or "").strip(), re.IGNORECASE | re.DOTALL)
     if not match:
         return None
@@ -614,8 +637,8 @@ def parse_request(text: str) -> Optional[Tuple[bool, str]]:
 
 def target_of(text: str) -> Optional[str]:
     """The bot a ``/cli@bot`` request names, if any."""
-    match = re.match(r"^/cli!?(?:@(?P<target>[A-Za-z0-9_]+))?", str(text or "").strip(),
-                     re.IGNORECASE)
+    match = re.match(r"^/cli!?(?:@(?P<target>[A-Za-z0-9_]+))?(?=\s|$)",
+                     str(text or "").strip(), re.IGNORECASE)
     return match.group("target") if match else None
 
 

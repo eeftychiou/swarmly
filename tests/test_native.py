@@ -37,9 +37,11 @@ for line in sys.stdin:
         break
 '''
 
+#: A CLI that never goes quiet: what a deadline is for.
+CHATTY_CLI = "import time\nwhile True:\n    print('still working')\n    time.sleep(0.05)\n"
+
 
 class TestTheAllowlist(unittest.TestCase):
-
     def test_a_read_only_one_shot_command_runs_its_own_argv(self):
         for runtime, tokens in (("claude", ["--version"]),
                                 ("claude", ["mcp", "list"]),
@@ -124,6 +126,16 @@ class TestTheAllowlist(unittest.TestCase):
         self.assertIsNone(nv.parse_request("/cleanup"))
         self.assertEqual(nv.target_of("/cli@claudebot /cost"), "claudebot")
         self.assertIsNone(nv.target_of("/cli /cost"))
+
+    def test_a_longer_command_that_starts_with_cli_is_not_cli(self):
+        """`/clinic` is not `/cli nic`: the word has to end, or be followed by an argument."""
+        for text in ("/clinic", "/clients --json", "/cli2 --version"):
+            with self.subTest(text=text):
+                self.assertIsNone(nv.parse_request(text))
+                self.assertIsNone(nv.target_of(text))
+        self.assertEqual(nv.parse_request("/cli"), (False, ""))
+        self.assertEqual(nv.parse_request("/cli@claudebot"), (False, ""))
+        self.assertEqual(nv.target_of("/cli@claudebot"), "claudebot")
 
 
 class TestClean(unittest.TestCase):
@@ -334,6 +346,53 @@ class TestTheInteractiveRunner(unittest.TestCase):
         self.assertFalse(outcome.ok)
         self.assertIn("no terminal", outcome.text)
         self.assertTrue(made[0].closed)
+
+
+class FakeExpiredSession(FakeSession):
+    """A session that never went quiet: it hit its deadline with the command unfinished."""
+
+    expired = True
+
+    def __init__(self, reply="half an answer", **kwargs):
+        super().__init__(reply, **kwargs)
+
+
+class TestSlashDeadlines(unittest.TestCase):
+    """#121 review: a SLASH command that hits its deadline is a timeout, not an ok."""
+
+    def test_a_session_that_ran_out_of_time_is_not_ok(self):
+        runner = nv.Runner(session_factory=lambda argv, **kw: FakeExpiredSession(argv=argv))
+        outcome = runner.run(nv.plan("claude", "/cost"))
+        self.assertFalse(outcome.ok)
+        self.assertTrue(outcome.timed_out)
+        self.assertIn("half an answer", outcome.text)      # what was on screen is still shown
+        self.assertIn("killed after", outcome.line(nv.plan("claude", "/cost"), 20.0))
+
+    def test_a_factory_that_raises_is_a_failure_not_a_crash(self):
+        def boom(argv, **kwargs):
+            raise OSError("no terminal here")
+
+        outcome = nv.Runner(session_factory=boom).run(nv.plan("claude", "/cost"))
+        self.assertFalse(outcome.ok)
+        self.assertIn("no terminal here", outcome.text)
+
+    def test_a_real_session_hitting_its_deadline_sets_expired(self):
+        """A CLI that keeps talking never goes quiet: the deadline ends the read, not the CLI."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "chatty.py"
+        script.write_text(CHATTY_CLI, encoding="utf-8")
+        # -u: a piped CLI buffers its output, and this test is about seeing it pour out.
+        session = nv.InteractiveSession([sys.executable, "-u", str(script)],
+                                        deadline=1.0,
+                                        quiet_seconds=0.2)
+        try:
+            session.open()
+            text = session.read_until_quiet()
+        finally:
+            session.close()
+        self.assertIn("still working", text)
+        self.assertTrue(session.expired)
 
 
 class TestARealSession(unittest.TestCase):
