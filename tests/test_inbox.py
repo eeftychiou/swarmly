@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
+
+from dataclasses import fields
 
 from swarmly.telegram.channel import ChannelEvent
 from swarmly.telegram.inbox import event_from
@@ -385,3 +388,51 @@ class ClaimReleaseTests(unittest.TestCase):
             inbox_module.event_from = original
         self.assertFalse(channel._inbox.claiming())
         self.assertEqual(channel._inbox._entries, {}, "dropped, not claimed forever")
+
+class QueueAndAgesTests(unittest.TestCase):
+    """Issue #105: one age for the read and the claim, and no chain during a shutdown."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def channel(self):
+        config = make_config(fallback={"gitbus_root": self.tmp.name})
+        config.source_path = Path(self.tmp.name) / "agent.local.yaml"
+        channel = make_channel(config)
+        channel.bot = object()
+        return channel
+
+    def test_the_read_and_the_claim_use_the_same_age(self):
+        # An hour-old record is neither "would resume" nor "would resume": the two must agree.
+        world = self.channel()
+        world._inbox.record(admin("@HermesBot borderline", message_id=81))
+        world._inbox.clock = lambda: time.time() + RESUME_MAX_AGE_SECONDS + 1
+        self.assertEqual(world._inbox.interrupted(), [])
+        self.assertEqual(world._inbox.claim_replay()[0], [])
+
+    def test_the_drain_chain_does_not_start_another_resume_during_shutdown(self):
+        channel = self.channel()
+        channel._inbox.record(admin("@HermesBot first", message_id=71))
+        channel._inbox.record(admin("@HermesBot second", message_id=72))
+
+        async def no_turn(event):
+            return None
+
+        channel.handle_event = no_turn
+        runnable, _dropped = channel._inbox.claim_replay()
+        event = ChannelEvent(**_event_fields(runnable[0][1]["event"]))
+
+        async def scenario():
+            channel._shutting_down = True
+            await channel._run_resumed(event, "18:30", "resume note")
+
+        asyncio.run(scenario())
+        self.assertEqual(channel._inbox.attempts(event.chat_id, 72), 0,
+                         "the shutdown stops the chain; the next record waits for a real start")
+        self.assertEqual(channel._inbox.attempts(event.chat_id, 71), 0, "closed by the resume")
+
+
+def _event_fields(data):
+    known = {f.name for f in fields(ChannelEvent)}
+    return {k: v for k, v in data.items() if k in known}

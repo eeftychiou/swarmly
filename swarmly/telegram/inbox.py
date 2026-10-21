@@ -127,11 +127,11 @@ class Inbox:
         now = self.clock()
         runnable: List[Tuple[int, Dict[str, Any]]] = []
         dropped: List[Dict[str, Any]] = []
-        stale: List[str] = []
+        forgotten: List[str] = []          # older than MAX_AGE_SECONDS: dropped without a word
         for key, entry in sorted(self._entries.items(), key=lambda kv: kv[1].get("at", 0)):
             age = now - float(entry.get("at", 0) or 0)
             if not (0 <= age <= MAX_AGE_SECONDS):
-                stale.append(key)
+                forgotten.append(key)
                 continue
             attempts = int(entry.get("attempts", 0) or 0)
             if attempts >= MAX_REPLAYS:
@@ -140,7 +140,7 @@ class Inbox:
                 continue
             if age > self.resume_max_age:
                 # Too old to be worth restarting, but somebody has to hear about it (#103).
-                dropped.append(dict(entry, reason="stale"))
+                dropped.append(dict(entry, reason="aged"))   # not "stale": nothing else is
                 self._entries.pop(key, None)
                 continue
             if len(runnable) >= max(1, limit):
@@ -149,11 +149,11 @@ class Inbox:
             runnable.append((entry["attempts"], entry))
         if runnable:
             self._claiming = True
-        for key in stale:
+        for key in forgotten:
             self._entries.pop(key, None)
-        if stale:
+        if forgotten:
             logger.info("inbox: dropped %d interrupted message(s) older than %d h",
-                        len(stale), MAX_AGE_SECONDS // 3600)
+                        len(forgotten), MAX_AGE_SECONDS // 3600)
         if dropped or runnable:
             self._save()
         return runnable, dropped
@@ -168,7 +168,9 @@ class Inbox:
         fresh = []
         for _key, entry in sorted(self._entries.items(), key=lambda kv: kv[1].get("at", 0)):
             age = now - float(entry.get("at", 0) or 0)
-            if 0 <= age <= MAX_AGE_SECONDS:
+            if 0 <= age <= self.resume_max_age:
+                # The same age the claim uses: what this reports is exactly what a restart
+                # would resume, so the read and the claim cannot disagree (#105).
                 fresh.append(entry["event"])
         return fresh
 

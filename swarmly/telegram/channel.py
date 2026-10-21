@@ -3427,9 +3427,10 @@ class AgentChannel:
 
         Two ways to get here, and they are different news. "twice": a turn that kills the
         transport twice is not going to finish by being started again, and a loop of them is how
-        a swarm spends a night doing nothing. "stale": the record is older than
-        `resume_max_age`, so resuming it would act on a topic that has moved on -- report, never
-        replay.
+        a swarm spends a night doing nothing. "aged": the record is older than `resume_max_age`,
+        so resuming it would act on a topic that has moved on -- report, never replay. (Called
+        "aged", not "stale": in this file "stale" already means something else, and two things
+        with one name is how a report about the wrong one gets written -- #105.)
         """
         from swarmly.telegram.inbox import event_from
         data = record.get("event") or {}
@@ -3444,7 +3445,7 @@ class AgentChannel:
         at = f"@{str(admin).lstrip('@')} " if admin and lead else ""
         chat_id, thread_id = event.chat_id, event.thread_id
         topic = self.topics.name(chat_id, thread_id)
-        if reason == "stale":
+        if reason == "aged":
             hours = max(1, int(round(self._inbox.resume_max_age / 3600)))
             said = (f"⚠️ {lead}did not resume the turn on message {event.message_id} in {topic}: "
                     f"it was cut off more than {hours} h ago, so restarting it would act on "
