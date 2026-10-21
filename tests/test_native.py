@@ -143,21 +143,49 @@ class TestClean(unittest.TestCase):
         self.assertIn("truncated", text)
 
 
-class FakeResult:
-    def __init__(self, stdout="", stderr="", returncode=0):
+class FakeProcess:
+    """A one-shot process, in place of ``subprocess.Popen``: killable, like the real thing."""
+
+    def __init__(self, stdout="", stderr="", returncode=0, *, timeout_once=False):
         self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+        self.timeout_once = timeout_once
+        self.terminated = False
+        self.killed = False
+
+    def communicate(self, timeout=None):
+        if self.timeout_once:
+            self.timeout_once = False
+            raise subprocess.TimeoutExpired(["fake"], timeout)
+        return self.stdout, self.stderr
+
+    def poll(self):
+        """Still running until something ends it — the case `/stop` and the timeout exist for."""
+        return self.returncode if (self.terminated or self.killed) else None
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
 
 
 class TestTheExecRunner(unittest.TestCase):
 
-    def runner(self, **kwargs):
+    def runner(self, process=None, **kwargs):
         calls = []
+        proc = process or FakeProcess(stdout="ok\n")
 
-        def run(argv, **options):
+        def spawn(argv, **options):
             calls.append((argv, options))
-            return FakeResult(stdout="ok\n", returncode=0)
+            return proc
 
-        return nv.Runner(runner=run, **kwargs), calls
+        runner = nv.Runner(spawn=spawn, **kwargs)
+        return runner, calls
 
     def test_a_read_only_command_runs_once_and_returns_its_output(self):
         runner, calls = self.runner(cwd="work")
@@ -176,25 +204,55 @@ class TestTheExecRunner(unittest.TestCase):
         self.assertIn("refused", outcome.text)
 
     def test_a_failure_keeps_its_exit_code_and_stderr(self):
-        calls = []
-
-        def run(argv, **options):
-            calls.append(argv)
-            return FakeResult(stdout="", stderr="nope", returncode=2)
-
-        outcome = nv.Runner(runner=run).run(nv.plan("codex", "login status"))
+        proc = FakeProcess(stdout="", stderr="nope", returncode=2)
+        outcome = nv.Runner(spawn=lambda argv, **kw: proc).run(nv.plan("codex", "login status"))
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.exit_code, 2)
         self.assertEqual(outcome.text, "nope")
 
     def test_a_timeout_is_reported_not_raised(self):
-        def run(argv, **options):
-            raise subprocess.TimeoutExpired(argv, 1)
-
-        outcome = nv.Runner(runner=run, timeout=1).run(nv.plan("claude", "--version"))
+        proc = FakeProcess(timeout_once=True)
+        outcome = nv.Runner(spawn=lambda argv, **kw: proc, timeout=1).run(
+            nv.plan("claude", "--version"))
         self.assertTrue(outcome.timed_out)
         self.assertFalse(outcome.ok)
+        self.assertTrue(proc.terminated)             # the stuck process is ended, not orphaned
         self.assertIn("killed", outcome.line(nv.plan("claude", "--version"), 1.0))
+
+    def test_stop_ends_a_one_shot_process(self):
+        """`/stop` has to reach a subprocess too: a hanging command is the one somebody stops."""
+        import threading
+        import time
+
+        started, stopping = threading.Event(), threading.Event()
+
+        class Slow(FakeProcess):
+            def communicate(self, timeout=None):
+                started.set()
+                stopping.wait(10)
+                return "", ""
+
+        proc = Slow()
+        runner = nv.Runner(spawn=lambda argv, **kw: proc)
+        outcome = {}
+
+        def go():
+            outcome["o"] = runner.run(nv.plan("claude", "--version"))
+
+        thread = threading.Thread(target=go)
+        thread.start()
+        started.wait(5)
+        self.assertTrue(runner.stop())
+        stopping.set()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(proc.terminated)
+        self.assertTrue(outcome["o"].killed)
+        self.assertIn("stopped on request",
+                      outcome["o"].line(nv.plan("claude", "--version"), 20.0))
+
+    def test_stop_with_nothing_running_is_false(self):
+        self.assertFalse(nv.Runner(spawn=lambda argv, **kw: FakeProcess()).stop())
 
     def test_the_runtime_never_inherits_a_secret(self):
         runner, calls = self.runner()
@@ -212,7 +270,7 @@ class TestTheExecRunner(unittest.TestCase):
         self.assertEqual(env.get("GIT_TERMINAL_PROMPT"), "0")
 
     def test_the_output_is_redacted_last(self):
-        runner = nv.Runner(runner=lambda argv, **kw: FakeResult(stdout="user @alice here"),
+        runner = nv.Runner(spawn=lambda argv, **kw: FakeProcess(stdout="user @alice here"),
                             redact=lambda text: text.replace("@alice", "@maintainer"))
         outcome = runner.run(nv.plan("claude", "--version"))
         self.assertEqual(outcome.text, "user @maintainer here")
@@ -308,7 +366,7 @@ class TestARealSession(unittest.TestCase):
 
     def test_an_exec_run_against_a_real_process(self):
         script = self.script()
-        runner = nv.Runner(runner=None)
+        runner = nv.Runner()
         native = nv.Native(nv.RUN, mode=nv.EXEC,
                            argv=(sys.executable, script, "one-shot"))
         outcome = runner.run(native)

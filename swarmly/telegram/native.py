@@ -262,10 +262,14 @@ class Outcome:
     exit_code: Optional[int] = None
     timed_out: bool = False
     truncated: bool = False
+    #: ``/stop`` ended it: distinct from a timeout, which is the bot's own clock.
+    killed: bool = False
 
     def line(self, native: Native, seconds: float) -> str:
         """The one-line verdict the channel posts above the output."""
         command = native.line if native.mode == SLASH else " ".join(native.argv[1:])
+        if self.killed:
+            return f"/cli {command}: stopped on request"
         if self.timed_out:
             return f"/cli {command}: killed after {seconds:.0f}s"
         code = "" if self.exit_code is None else f" (exit {self.exit_code})"
@@ -414,6 +418,20 @@ class InteractiveSession:
             self._proc = None
 
 
+def _end(process: "subprocess.Popen[str]") -> None:
+    """End a child process, without waiting on a pipe it may still hold."""
+    if process.poll() is None:
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                process.kill()
+                process.wait(timeout=3)
+            except (subprocess.TimeoutExpired, OSError):     # pragma: no cover - stubborn
+                pass
+
+
 def sanitized_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """The host environment minus the variables a runtime must never inherit.
 
@@ -434,7 +452,7 @@ class Runner:
     """One passthrough run, with the timeout, the cap and the kill the issue asks for."""
 
     def __init__(self, *, cwd: Optional[str] = None, timeout: float = 20.0,
-                 max_chars: int = 3500, runner: Optional[Callable[..., Any]] = None,
+                 max_chars: int = 3500, spawn: Optional[Callable[..., Any]] = None,
                  env: Optional[Dict[str, str]] = None,
                  session_factory: Optional[Callable[..., InteractiveSession]] = None,
                  redact: Optional[Callable[[str], str]] = None,
@@ -442,28 +460,66 @@ class Runner:
         self.cwd = cwd
         self.timeout = float(timeout)
         self.max_chars = int(max_chars)
-        self._run = runner or subprocess.run
+        #: How a one-shot command is started: ``subprocess.Popen``, injectable for tests. It is
+        #: a *process*, not ``subprocess.run``, because `/stop` has to be able to end one.
+        self._spawn = spawn or subprocess.Popen
         self.env = env if env is not None else sanitized_env()
         self.session_factory = session_factory or InteractiveSession
         self.redact = redact
         self.quiet_seconds = quiet_seconds
         #: The session of the run in flight, so `/stop` can end it.
         self.session: Optional[InteractiveSession] = None
+        #: The one-shot process of the run in flight, for the same reason. `/stop` has to be
+        #: able to end a subprocess too: a command that hangs (a CLI waiting on a lock, a
+        #: network read) is exactly the one somebody stops.
+        self.process: Optional[subprocess.Popen] = None
+        #: Set by `/stop`, read by both mechanisms. A stop can land in the window between "the
+        #: run is registered" and "the process exists", and it must still end the command rather
+        #: than be missed by a few microseconds.
+        self.killed = False
+        self.running = False
+        #: Set by the channel before the run starts, so a `/stop` that lands in the window
+        #: between "this run exists" and "run() has begun" is honoured rather than missed.
+        self.armed = False
         self._lock = threading.Lock()
+
+    def arm(self) -> "Runner":
+        """Announce that a run is about to start, so a stop cannot fall in the gap."""
+        with self._lock:
+            self.armed = True
+            self.killed = False
+        return self
 
     # -- the two mechanisms ---------------------------------------------------------
     def _exec(self, native: Native) -> Outcome:
         try:
-            result = self._run(list(native.argv), cwd=self.cwd, capture_output=True,
-                               text=True, timeout=self.timeout, env=self.env, check=False,
-                               shell=False)      # a list argv, never a shell string
-        except subprocess.TimeoutExpired:
-            return Outcome(False, "", timed_out=True)
+            process = self._spawn(
+                list(native.argv), cwd=self.cwd, env=self.env, shell=False,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace")
         except OSError as exc:
             return Outcome(False, str(exc))
-        body = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        with self._lock:
+            self.process = process
+            killed_early = self.killed
+        if killed_early:                             # `/stop` beat the spawn
+            _end(process)
+            return Outcome(False, "", exit_code=process.returncode, killed=True)
+        try:
+            try:
+                out, err = process.communicate(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                _end(process)
+                out, err = process.communicate()
+                return Outcome(False, "", timed_out=True)
+            if self.killed:
+                return Outcome(False, "", exit_code=process.returncode, killed=True)
+        finally:
+            with self._lock:
+                self.process = None
+        body = "\n".join(part for part in (out, err) if part)
         text, truncated = clean(body, max_chars=self.max_chars)
-        return Outcome(result.returncode == 0, text, exit_code=result.returncode,
+        return Outcome(process.returncode == 0, text, exit_code=process.returncode,
                        truncated=truncated)
 
     def _slash(self, native: Native) -> Outcome:
@@ -474,6 +530,10 @@ class Runner:
             with self._lock:
                 self.session = session
             session.open()
+            with self._lock:
+                killed_early = self.killed
+            if killed_early:                         # `/stop` beat the session
+                return Outcome(False, "", killed=True)
             session.send(native.line)
             body = session.read_until_quiet()
         except (SessionError, OSError) as exc:
@@ -489,23 +549,41 @@ class Runner:
         return Outcome(True, text, truncated=truncated)
 
     def stop(self) -> bool:
-        """Kill the run in flight. ``False`` when nothing was running."""
+        """Kill the run in flight, whichever mechanism it is using.
+
+        ``False`` only when nothing was running: a one-shot subprocess is as stoppable as an
+        interactive session, so a hanging ``--version`` is not something the admin has to wait
+        out.
+        """
         with self._lock:
-            session = self.session
-        if session is None:
-            return False
-        session.close()
+            session, process = self.session, self.process
+            waiting = self.armed or self.running
+            if session is None and process is None and not waiting:
+                return False
+            self.killed = True
+        if session is not None:
+            session.close()
+        if process is not None:
+            _end(process)
         return True
 
     def run(self, native: Native) -> Outcome:
         """Run an allowlisted plan. A plan that is not ``run`` is never executed."""
         if not native.runs:
             return Outcome(False, native.describe())
+        with self._lock:
+            if self.killed:                          # stopped before it began
+                self.armed = False
+                return Outcome(False, "", killed=True)
+            self.running = True
         try:
             outcome = self._exec(native) if native.mode == EXEC else self._slash(native)
         finally:
             with self._lock:
                 self.session = None
+                self.process = None
+                self.running = False
+                self.armed = False
         if self.redact is not None:
             outcome.text = self.redact(outcome.text or "")
         return outcome

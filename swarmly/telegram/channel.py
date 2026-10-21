@@ -1539,10 +1539,6 @@ class AgentChannel:
         unavailable = native_cli.available(adapter.type, command=adapter.command)
         if unavailable:
             return native_cli.Native(native_cli.REFUSE, reason=unavailable)
-        if self._lock_for(event).locked():
-            return native_cli.Native(
-                native_cli.REFUSE,
-                reason="a turn is running in this topic; a passthrough would share its session")
         return native_cli.plan(adapter.type, command, confirmed=confirmed,
                                command=adapter.command, session=self._native_session(event))
 
@@ -1559,7 +1555,26 @@ class AgentChannel:
             return None
 
     async def _run_native(self, plan: Any, event: ChannelEvent) -> Any:
-        """Run one allowlisted command, editing one message as it goes. No turn is taken."""
+        """Run one allowlisted command under the topic's own lock, editing one message.
+
+        The lock is the point, not a detail: a passthrough drives the same CLI session a turn
+        would, so asking "is a turn running?" and then running without the lock leaves a window
+        where a turn starts mid-passthrough. Holding the topic's admission for the (bounded)
+        run closes it -- a message that arrives meanwhile waits, exactly as it would behind a
+        turn. A turn that is already running is refused rather than queued behind.
+        """
+        lock = self._lock_for(event)
+        if lock.locked():
+            return await self.send(
+                "⛔ a turn is running in this topic; a passthrough would share its session. "
+                "Stop it or wait for it to finish.",
+                reply_to_message_id=event.message_id, chat_id=event.chat_id,
+                thread_id=event.thread_id, allow_when_frozen=True)
+        async with lock:
+            return await self._run_native_locked(plan, event)
+
+    async def _run_native_locked(self, plan: Any, event: ChannelEvent) -> Any:
+        """The passthrough itself, with the topic's admission already held."""
         limits = self.config.limits
         runner = native_cli.Runner(
             cwd=self.config.adapter.cwd,
@@ -1573,7 +1588,8 @@ class AgentChannel:
                                      reply_to_message_id=event.message_id,
                                      return_message_id=True, allow_when_frozen=True)
         message_id = message_id or self.last_sent_message_id
-        self._native_runners[key] = runner
+        # Armed and registered before the thread starts: a `/stop` arriving now must end it.
+        self._native_runners[key] = runner.arm()
         task = asyncio.ensure_future(asyncio.to_thread(runner.run, plan))
         every = float(getattr(limits, "native_stream_seconds", 3.0) or 0.0)
         try:
@@ -3786,6 +3802,19 @@ class AgentChannel:
             self.stats.ignored += 1
             return None
 
+        # /stop cancels the running turn and clears the queue; it never waits for the turn.
+        # It is answered before the admission gate on purpose: a `/cli` passthrough holds the
+        # topic's lock for its whole run, and /stop exists to break exactly that -- behind the
+        # gate it would wait for the very thing it was sent to end (#121 review).
+        stop_reply = self._handle_stop(event)
+        if stop_reply == "":
+            return None                        # a peer's /stop: consumed, never a turn
+        if stop_reply is not None:
+            self.stats.handled += 1
+            return await self.send(stop_reply, reply_to_message_id=event.message_id,
+                                   chat_id=event.chat_id, thread_id=event.thread_id,
+                                   allow_when_frozen=True)
+
         decision, reason = self.should_respond(event)
         logger.info("routing decision: respond=%s (reason: %s)", decision, reason)
         if decision and event.message_id is not None:
@@ -3807,16 +3836,6 @@ class AgentChannel:
             return None
         topic_key = (event.chat_id, event.thread_id)
         generation = (self._stop_generation, self._stop_topic_generation.get(topic_key, 0))
-
-        # /stop cancels the running turn and clears the queue; it never waits for the turn.
-        stop_reply = self._handle_stop(event)
-        if stop_reply == "":
-            return None                        # a peer's /stop: consumed, never a turn
-        if stop_reply is not None:
-            self.stats.handled += 1
-            return await self.send(stop_reply, reply_to_message_id=event.message_id,
-                                   chat_id=event.chat_id, thread_id=event.thread_id,
-                                   allow_when_frozen=True)
 
         # §6: /ping /status /diag are transport-level liveness — answered without a runtime turn.
         await self._look_up_models(event)

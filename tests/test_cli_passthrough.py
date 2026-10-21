@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -41,8 +42,36 @@ def channel(**overrides):
     return made, adapter
 
 
-def fake_result(stdout="ok\n", stderr="", returncode=0):
-    return mock.Mock(stdout=stdout, stderr=stderr, returncode=returncode)
+class FakeProcess:
+    """A one-shot CLI process: it answers, or hangs until something ends it."""
+
+    def __init__(self, stdout="ok\n", stderr="", returncode=0, *, hang=None):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+        self.hang = hang                     # an Event a hanging process waits on
+        self.terminated = False
+
+    def communicate(self, timeout=None):
+        if self.hang is not None and not self.terminated:
+            self.hang.wait(10)
+        return self.stdout, self.stderr
+
+    def poll(self):
+        return self.returncode if self.terminated else None
+
+    def terminate(self):
+        self.terminated = True
+        if self.hang is not None:
+            self.hang.set()
+
+    kill = terminate
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def fake_proc(**kwargs):
+    """A ``subprocess.Popen`` stand-in the tests can also inspect."""
+    return mock.Mock(return_value=FakeProcess(**kwargs))
 
 
 class TestTheAdminGate(unittest.TestCase):
@@ -65,8 +94,8 @@ class TestARun(unittest.TestCase):
 
     def test_a_one_shot_command_is_run_and_its_output_edited_in(self):
         made, adapter = channel()
-        with mock.patch("swarmly.telegram.native.subprocess.run",
-                        return_value=fake_result("claude 2.0.1\n")):
+        with mock.patch("swarmly.telegram.native.subprocess.Popen",
+                        fake_proc(stdout="claude 2.0.1\n")):
             run(made.handle_event(event("/cli@HermesBot --version", author_id=ADMIN_ID,
                                         username="alice", is_bot=False)))
         self.assertEqual(adapter.turns, [])                     # no model turn, no tokens
@@ -77,8 +106,8 @@ class TestARun(unittest.TestCase):
 
     def test_the_argv_is_the_cli_and_the_command(self):
         made, _ = channel()
-        with mock.patch("swarmly.telegram.native.subprocess.run",
-                        return_value=fake_result()) as runner:
+        with mock.patch("swarmly.telegram.native.subprocess.Popen",
+                        fake_proc()) as runner:
             run(made.handle_event(event("/cli@HermesBot mcp list", author_id=ADMIN_ID,
                                         username="alice", is_bot=False)))
         argv = runner.call_args.args[0]
@@ -87,15 +116,15 @@ class TestARun(unittest.TestCase):
 
     def test_a_failure_keeps_its_exit_code(self):
         made, _ = channel()
-        with mock.patch("swarmly.telegram.native.subprocess.run",
-                        return_value=fake_result(stdout="", stderr="nope", returncode=2)):
+        with mock.patch("swarmly.telegram.native.subprocess.Popen",
+                        fake_proc(stdout="", stderr="nope", returncode=2)):
             run(made.handle_event(event("/cli@HermesBot --version", author_id=ADMIN_ID,
                                         username="alice", is_bot=False)))
         self.assertIn("failed (exit 2)", made.bot.edit_message_text.await_args.kwargs["text"])
 
     def test_a_refusal_is_explained_and_runs_nothing(self):
         made, adapter = channel()
-        with mock.patch("swarmly.telegram.native.subprocess.run") as runner:
+        with mock.patch("swarmly.telegram.native.subprocess.Popen") as runner:
             run(made.handle_event(event("/cli@HermesBot /compact", author_id=ADMIN_ID,
                                         username="alice", is_bot=False)))
         self.assertEqual(runner.call_args_list, [])
@@ -110,7 +139,7 @@ class TestARun(unittest.TestCase):
 
     def test_a_command_that_changes_something_asks_first(self):
         made, _ = channel()
-        with mock.patch("swarmly.telegram.native.subprocess.run") as runner:
+        with mock.patch("swarmly.telegram.native.subprocess.Popen") as runner:
             run(made.handle_event(event("/cli@HermesBot /clear", author_id=ADMIN_ID,
                                         username="alice", is_bot=False)))
         self.assertEqual(runner.call_args_list, [])
@@ -119,7 +148,7 @@ class TestARun(unittest.TestCase):
     def test_a_turn_that_is_running_refuses_the_passthrough(self):
         made, _ = channel()
         lock = made._lock_for(event("@HermesBot hi", thread_id=7))
-        with mock.patch("swarmly.telegram.native.subprocess.run") as runner:
+        with mock.patch("swarmly.telegram.native.subprocess.Popen") as runner:
             run(_hold(lock, made))
         self.assertEqual(runner.call_args_list, [])
         self.assertIn("a turn is running in this topic", made._test_sender.last)
@@ -135,8 +164,8 @@ class TestOutputHandling(unittest.TestCase):
 
     def test_the_output_is_redacted_and_stripped_before_it_is_posted(self):
         made, _ = channel()
-        with mock.patch("swarmly.telegram.native.subprocess.run",
-                        return_value=fake_result("\x1b[31mred\x1b[0m ok\n")):
+        with mock.patch("swarmly.telegram.native.subprocess.Popen",
+                        fake_proc(stdout="\x1b[31mred\x1b[0m ok\n")):
             run(made.handle_event(event("/cli@HermesBot --version", author_id=ADMIN_ID,
                                         username="alice", is_bot=False)))
         text = made.bot.edit_message_text.await_args.kwargs["text"]
@@ -146,12 +175,70 @@ class TestOutputHandling(unittest.TestCase):
     def test_a_message_that_cannot_be_edited_is_posted_instead(self):
         made, _ = channel()
         made.bot.edit_message_text = mock.AsyncMock(side_effect=RuntimeError("too old"))
-        with mock.patch("swarmly.telegram.native.subprocess.run",
-                        return_value=fake_result("v1\n")):
+        with mock.patch("swarmly.telegram.native.subprocess.Popen",
+                        fake_proc(stdout="v1\n")):
             with self.assertLogs("swarmly.telegram", "WARNING"):
                 run(made.handle_event(event("/cli@HermesBot --version", author_id=ADMIN_ID,
                                             username="alice", is_bot=False)))
         self.assertIn("v1", made._test_sender.last)
+
+
+class TestStopAndTheLock(unittest.TestCase):
+    """#121 fix-first: `/stop` reaches the process, and the topic's lock covers the whole run."""
+
+    def test_stop_kills_a_one_shot_passthrough(self):
+        made, _ = channel()
+        started = []
+
+        def spawn(argv, **options):
+            process = FakeProcess(stdout="working\n", hang=threading.Event())
+            started.append(process)
+            return process
+
+        async def scenario():
+            with mock.patch("swarmly.telegram.native.subprocess.Popen", spawn):
+                run_in_background = asyncio.ensure_future(made.handle_event(
+                    event("/cli@HermesBot --version", author_id=ADMIN_ID, username="alice",
+                          is_bot=False, message_id=1)))
+                for _ in range(200):
+                    if started and started[0].terminated is False and made._native_runners:
+                        break
+                    await asyncio.sleep(0.01)
+                stop = await made.handle_event(event("/stop@HermesBot", author_id=ADMIN_ID,
+                                                     username="alice", is_bot=False,
+                                                     message_id=2))
+                await run_in_background
+                return stop
+
+        asyncio.run(scenario())
+        self.assertTrue(started and started[0].terminated)
+        self.assertIn("stopped on request", made.bot.edit_message_text.await_args.kwargs["text"])
+
+    def test_the_topic_lock_is_held_for_the_whole_run(self):
+        """A turn must not start mid-passthrough: both would drive the same CLI session."""
+        made, _ = channel()
+        release = threading.Event()
+
+        def spawn(argv, **options):
+            process = FakeProcess(stdout="slow\n", hang=release)
+            return process
+
+        async def scenario():
+            with mock.patch("swarmly.telegram.native.subprocess.Popen", spawn):
+                task = asyncio.ensure_future(made.handle_event(
+                    event("/cli@HermesBot --version", author_id=ADMIN_ID, username="alice",
+                          is_bot=False, message_id=1)))
+                for _ in range(200):
+                    if made._native_runners:
+                        break
+                    await asyncio.sleep(0.01)
+                held = made._lock_for(event("x")).locked()
+                release.set()
+                await task
+                return held
+
+        self.assertTrue(asyncio.run(scenario()))
+        self.assertFalse(made._lock_for(event("x")).locked())     # and released afterwards
 
 
 class TestFrozenAndStop(unittest.TestCase):
@@ -159,8 +246,8 @@ class TestFrozenAndStop(unittest.TestCase):
     def test_a_frozen_bot_still_answers_a_passthrough(self):
         made, _ = channel()
         made._frozen = True
-        with mock.patch("swarmly.telegram.native.subprocess.run",
-                        return_value=fake_result("v2\n")):
+        with mock.patch("swarmly.telegram.native.subprocess.Popen",
+                        fake_proc(stdout="v2\n")):
             run(made.handle_event(event("/cli@HermesBot --version", author_id=ADMIN_ID,
                                         username="alice", is_bot=False)))
         self.assertIn("v2", made.bot.edit_message_text.await_args.kwargs["text"])
@@ -188,7 +275,7 @@ class TestNoCli(unittest.TestCase):
     def test_an_adapter_without_a_cli_refuses(self):
         adapter = CountingAdapter()
         made = make_channel(make_config(), adapter=adapter)
-        with mock.patch("swarmly.telegram.native.subprocess.run") as runner:
+        with mock.patch("swarmly.telegram.native.subprocess.Popen") as runner:
             run(made.handle_event(event("/cli@HermesBot --version", author_id=ADMIN_ID,
                                         username="alice", is_bot=False)))
         self.assertEqual(runner.call_args_list, [])
