@@ -2277,10 +2277,13 @@ class AgentChannel:
         moment = self.presence_clock() if now is None else now
         pulse = self.own_pulse(moment)
         bus = self.pulse_bus()
-        on_ref = bool(bus and bus.publish(pulse))
+        # B4: the bus half is git -- subprocesses with timeouts, and up to ~16 of them a beat.
+        # Run inline they would stall the event loop (this pulse, every turn and Telegram
+        # delivery with it) for as long as git takes, so they go to a worker thread.
+        on_ref = bool(bus and await asyncio.to_thread(bus.publish, pulse))
         table = self.presence()
         if on_ref:
-            counted = notes_from(bus.read(), table, now=moment,
+            counted = notes_from(await asyncio.to_thread(bus.read), table, now=moment,
                                  skip=[self.config.identity.alias])
             self._save_presence()
             said = f"pulse ref rev={pulse.rev or '?'} busy_since={pulse.busy_since} peers={counted}"

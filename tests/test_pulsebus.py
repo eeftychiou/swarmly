@@ -131,6 +131,23 @@ class TestThePulseRef(unittest.TestCase):
         # The local ref still holds the pulse, so a later beat is not the first one ever.
         self.assertEqual(bus.aliases(), ["Hermes"])
 
+    def test_a_payload_cannot_claim_somebody_elses_identity(self):
+        # S6: every writer can push any ref, so the ref name is who the pulse is from.
+        self.bus.publish(pulse("Hermes", NOW, rev="mine"))
+        forged = self.bus.publish(pulse("Hermes", NOW, rev="forged"))
+        self.assertTrue(forged)
+        git(self.work, "update-ref", "refs/pulse/Codex", "refs/pulse/Hermes")
+        pulses = self.bus.read()
+        self.assertEqual(sorted(pulses), ["Hermes"])     # Codex is not kept alive by a forgery
+
+    def test_two_aliases_that_differ_never_share_a_ref(self):
+        # S7: `a b` and `a-b` are different bots, so they must be different refs.
+        self.assertNotEqual(PulseBus._safe("a b"), PulseBus._safe("a-b"))
+        self.assertEqual(self.bus.ref("Codex"), "refs/pulse/Codex")
+        weird = self.bus.ref("codex bot/2")
+        self.assertNotEqual(weird, self.bus.ref("codex-bot-2"))
+        self.assertNotIn(" ", weird)
+
     def test_an_unreadable_pulse_on_a_ref_is_skipped_not_fatal(self):
         self.bus.publish(pulse("Hermes", NOW, rev="mine"))
         git(self.work, "update-ref", "refs/pulse/Broken", "HEAD")   # a ref with no pulse.json

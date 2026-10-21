@@ -579,6 +579,11 @@ push failed, the pulse goes out as the ephemeral `STATUS intent=PULSE` line inst
 then. `PULSE` is machine-class traffic (#43): it is recorded as state, wakes no model turn, and
 is swept from General like the other machine notices.
 
+The bus half runs in a worker thread (`asyncio.to_thread`), never inline in the beat: a slow or
+hung git must not stall the pulse loop, a turn, or Telegram delivery. `refs/pulse/<alias>` is
+the pulse's identity -- a payload whose alias does not encode to the ref it came from is
+ignored, because every writer can push any ref.
+
 The pulse commit is authored by the bot itself (`DeepSeek <deepseek@a2a.local>`), named on the
 command line rather than read from the host's git config, and it writes a ref of its own --
 never a branch -- so the push guard sees no push to `main`. A role that may not push at all

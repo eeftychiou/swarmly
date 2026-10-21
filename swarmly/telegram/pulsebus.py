@@ -60,9 +60,25 @@ class PulseBus:
 
     @staticmethod
     def _safe(alias: str) -> str:
-        """A git-ref-safe form of an alias (refs cannot hold spaces or a few odd characters)."""
-        cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in alias.strip())
-        return cleaned.strip("._") or "agent"
+        r"""A git-ref-safe form of an alias, **injectively**: `a b` and `a-b` must not collide.
+
+        A ref name may not hold spaces, `~^:?*[\`, control characters, `..` or `@{`, so every
+        other character is percent-encoded instead of being flattened to `_` -- two aliases that
+        differ must stay two aliases, or one bot reads another's liveness.
+        """
+        text = alias.strip()
+        if not text:
+            return "agent"
+        out = []
+        for ch in text:
+            if ch.isalnum() or ch in "-_.":
+                out.append(ch)
+            else:
+                out.extend("%%%02X" % byte for byte in ch.encode("utf-8"))
+        cleaned = "".join(out)
+        # A name may not begin with `-` or `.`, nor end with `.lock` or a dot.
+        cleaned = cleaned.lstrip(".- ").rstrip(".") or "agent"
+        return cleaned if not cleaned.endswith(".lock") else cleaned + "_"
 
     def available(self) -> bool:
         """Whether there is a git checkout to hold pulses at all."""
@@ -172,8 +188,9 @@ class PulseBus:
         pulses: Dict[str, Dict[str, Any]] = {}
         for line in listing.splitlines():
             ref = line.strip()
-            if not ref:
+            if not ref.startswith(PULSE_REF_PREFIX):
                 continue
+            on_ref = ref[len(PULSE_REF_PREFIX):]
             body = self._ok("show", f"{ref}:{PULSE_PATH}")
             if not body:
                 continue
@@ -181,6 +198,12 @@ class PulseBus:
                 pulse = Pulse.from_dict(json.loads(body))
             except (ValueError, TypeError):
                 logger.warning("pulsebus: unreadable pulse on %s; skipping it", ref)
+                continue
+            if self._safe(pulse.alias) != on_ref:
+                # Every writer can push any ref, so the *ref* is who this pulse is from: a
+                # payload naming somebody else is either a mistake or a forgery, and either way
+                # it must not keep a peer that is not there looking alive.
+                logger.warning("pulsebus: %s claims to be %r; ignoring it", ref, pulse.alias)
                 continue
             pulses[pulse.alias] = pulse.to_dict()
         return pulses

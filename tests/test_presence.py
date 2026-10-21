@@ -5,7 +5,9 @@ peer is never DOWN, a restart never turns "not heard yet" into "everyone is down
 notice happens once per episode.
 """
 
+import asyncio
 import json
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -438,3 +440,46 @@ class TestThePulseOnTheBus(unittest.TestCase):
         channel = live_channel()
         self.assertIsNone(channel.pulse_bus())
         self.assertIn("pulse rev=", run(channel._heartbeat_tick()))
+
+class BlockingPulseBus:
+    """A pulse bus whose git calls block, as a slow git subprocess does (review B4)."""
+
+    def __init__(self, gate):
+        self.gate = gate
+
+    def publish(self, pulse):
+        self.gate.wait(5.0)
+        return True
+
+    def read(self):
+        self.gate.wait(5.0)
+        return {}
+
+
+class TestThePulseDoesNotBlockTheTransport(unittest.TestCase):
+
+    def test_a_beat_does_not_stall_the_event_loop(self):
+        # B4 on #94: publish()/read() are git subprocesses. Inline they would freeze this
+        # pulse, every turn and Telegram delivery for as long as git takes, so they run in a
+        # worker thread -- and another coroutine must keep making progress while they block.
+        gate = threading.Event()
+        channel = live_channel()
+        channel._pulsebus = BlockingPulseBus(gate)
+        channel._pulsebus_checked = True
+        progress = {"ticks": 0}
+
+        async def scenario():
+            async def other_work():
+                while not gate.is_set():
+                    progress["ticks"] += 1
+                    await asyncio.sleep(0)
+            helper = asyncio.ensure_future(other_work())
+            beat = asyncio.ensure_future(channel._heartbeat_tick())
+            await asyncio.sleep(0.05)
+            seen = progress["ticks"]
+            gate.set()
+            await asyncio.wait_for(beat, 5)
+            await asyncio.wait_for(helper, 5)
+            return seen
+
+        self.assertGreater(run(scenario()), 0)      # the loop ran while the bus was blocked
