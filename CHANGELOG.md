@@ -6,8 +6,34 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-21
+
 ### Added
 
+- Self-wake timers: a reply line `WAKE in=10m every=5m until=2h check="gh pr checks 75"
+  then="merge it"` arms a timer that the transport runs with no model turn. The check is a
+  read-only command from an allowlist, and its exit code decides: go fires one turn, pending
+  re-arms, an error or expiry starts one turn. Firings are claimed on the bus so two bots
+  never fire the same timer (`#81`). A bot fires its own timers even when it does not hold
+  the coordinator lease (`#96`), and timers fire on a git bus (`#100`).
+- Acting coordinator: the coordinator role is a lease on the bus with terms, so another bot
+  takes over when the coordinator is gone, and every side effect is fenced on the current
+  lease (`#83`).
+- Durable round state: the round's items and their state live on the bus and survive a
+  restart (`#86`).
+- `/cleanup`, short-lived notices, and reaping orphaned provider CLIs (`#63`, `#64`, `#68`).
+- The online notice names the model and reasoning effort the bot runs at (`#95`), as the CLI
+  really runs them: `/model`, then the bot's config, then the CLI's own settings, then the
+  model its last turn reported (`#99`).
+- Heartbeats: each bot writes a pulse to its own git ref on the bus with no model turn, peers
+  that stop pulsing are marked DOWN, and a busy peer's hand-off clock restarts instead of
+  drawing a reminder (`#82`).
+- A turn cut off by a die-off is resumed once after the restart, never in a loop (`#84`).
+- Nothing taken for a turn is lost to a restart: queued messages and unsent replies are kept
+  on disk and replayed on the next start. A hand-off to the coordinator gets a reminder from
+  its sender, and an idle coordinator with no WAKE gets a check-in turn (`#101`).
+- An in-process multi-bot harness with seven failure drills, and a runbook for the live
+  drills (`#85`).
 - A round now ends with a report to the human in the round's topic, and closing the round's
   tracking issue is what triggers it: closing sends no GitHub notification, so the
   notifications backstop also remembers which issues carrying `github.tracking_label`
@@ -34,6 +60,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- The developer role ends every turn with a push or a WAKE, opens a draft pull request on
+  its first turn, and never force-pushes another agent's branch (`#97`).
+- Only the admin deploys, and a tracking issue closes only when every item is done (`#65`,
+  `#66`).
 - The coordinator's role text now says to act in the turn that brings the last missing piece:
   when that turn produces the review merge, the QA pass or the green CI, the coordinator
   merges, ticks the checklist and hands out the next assignment before the turn ends, instead
@@ -216,7 +246,8 @@ First public release.
   GitHub as the durable plane.
 - Roles: coordinator, developer, reviewer, QA tester, researcher, or your own.
 
-[Unreleased]: https://github.com/eeftychiou/swarmly/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/eeftychiou/swarmly/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/eeftychiou/swarmly/compare/v0.10.0...v0.11.0
 [0.10.1]: https://github.com/eeftychiou/swarmly/compare/v0.10.0...HEAD
 [0.10.0]: https://github.com/eeftychiou/swarmly/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/eeftychiou/swarmly/releases/tag/v0.9.0
