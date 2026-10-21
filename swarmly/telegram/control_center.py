@@ -85,11 +85,13 @@ class ControlCenter:
     """
 
     def __init__(self, bot: Any, *, chat_id: int, thread_id: Optional[int] = None,
-                 render: Callable[[], str], clock: Optional[Callable[[], float]] = None):
+                 render: Callable[[], str], markup: Optional[Callable[[], Any]] = None,
+                 clock: Optional[Callable[[], float]] = None):
         self.bot = bot
         self.chat_id = int(chat_id)
         self.thread_id = thread_id
         self._render = render
+        self._markup = markup
         self._clock = clock
         self.message_id: Optional[int] = None
         self.last_text: Optional[str] = None
@@ -145,10 +147,22 @@ class ControlCenter:
         result = await self._edit(text, taken=True)
         return result
 
+    def reply_markup(self) -> Any:
+        """The buttons, as a markup object when aiogram is importable, else the bare dict."""
+        rows = self._markup() if self._markup is not None else None
+        if not rows:
+            return None
+        try:
+            from aiogram.types import InlineKeyboardMarkup
+        except Exception:                      # noqa: BLE001 - no aiogram: send the plain shape
+            return {"inline_keyboard": rows}
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     async def _create(self, text: str) -> Refreshed:
         sent = await self.bot.send_message(chat_id=self.chat_id, text=text,
                                            message_thread_id=self.thread_id,
-                                           disable_web_page_preview=True)
+                                           disable_web_page_preview=True,
+                                           reply_markup=self.reply_markup())
         message_id = getattr(sent, "message_id", None)
         self.message_id = message_id
         self.last_text = text
@@ -173,7 +187,8 @@ class ControlCenter:
         assert self.message_id is not None
         try:
             await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id,
-                                             text=text, disable_web_page_preview=True)
+                                             text=text, disable_web_page_preview=True,
+                                             reply_markup=self.reply_markup())
         except Exception as exc:                       # noqa: BLE001 - see the branches
             if _not_modified(exc):
                 self.last_text = text

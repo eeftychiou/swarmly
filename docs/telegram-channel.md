@@ -995,12 +995,23 @@ message, recognises this one by its `SWARM` marker, and edits **the same message
 is never a second dashboard. A refresh that cannot be delivered is a log line and a status,
 never a failed heartbeat, and an unchanged dashboard sends nothing at all.
 
-The buttons under it (`CONTROLS` in `swarmly/telegram/control.py`) are the controls the
-transport may offer: pause, resume, stop turn, restart, model, effort, WAKE, freeze and
-read-only `/cli` per bot; pause-all, the lease, roles, cleanup, sync and admit for the swarm;
-and a nudge that costs the owner a turn. Anything that stops or changes something needs a
-second tap, and deploy, upgrade, merging a PR and editing configs or secrets are not on it at
-all.
+The buttons under it come from `CONTROLS` in `swarmly/telegram/control.py` — pause, resume,
+stop turn, restart, model, effort, WAKE, freeze and read-only `/cli` per bot; pause-all, the
+lease, roles, cleanup, sync and admit for the swarm; and a nudge that costs the owner a turn.
+Only a control the running transport can actually carry out is shown, so a button that exists
+is a button that works (today: pause, resume and a safe restart of the bot holding the
+message). Three rules bound every press:
+
+- **The admin only.** The presser's Telegram user id is checked before the action is even
+  looked up, so a stranger is refused and learns nothing about what the buttons do.
+- **Anything that stops or changes something asks twice.** The first tap mints a one-use code
+  and says what the second tap will do; only `ctl:confirm:<code>` runs it, and the code dies
+  when it is used or after 2 minutes.
+- **Every action leaves a record.** A run posts one `NOTE intent=CONTROL` line —
+  `CONTROL bot.restart target=self by=<user id> at=<UTC> state=done` — so the durable plane
+  says who stopped what and when.
+
+Deploy, upgrade, merging a PR and editing configs or secrets are not on the keyboard at all.
 
 **Native CLI commands — `/cli` (admin only, no model turn).** Swarmly does not reimplement
 what each CLI already does. `/cli@<bot> <command>` runs the command on that bot's CLI and

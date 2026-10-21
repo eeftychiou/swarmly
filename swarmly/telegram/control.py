@@ -104,6 +104,27 @@ def needs_confirm(action: str) -> bool:
     return bool(found and found.confirm)
 
 
+#: How many buttons fit on one row of the keyboard.
+PER_ROW = 3
+
+
+def keyboard(actions: Iterable[str]) -> List[List[Dict[str, str]]]:
+    """The keyboard under the message: one button per action, three to a row.
+
+    Only actions the caller can actually carry out are offered, so a button that exists is a
+    button that works. Plain dicts, which is what aiogram's ``InlineKeyboardMarkup`` takes --
+    and what a test can read without importing aiogram.
+    """
+    from swarmly.telegram.control_press import callback_data
+    buttons = []
+    for action in actions:
+        found = control(action)
+        if found is None:
+            continue
+        buttons.append({"text": found.label, "callback_data": callback_data(action)})
+    return [buttons[index:index + PER_ROW] for index in range(0, len(buttons), PER_ROW)]
+
+
 def available(*prefixes: str) -> List[Control]:
     """The controls under one message: by prefix (``bot`` for per-bot, ``swarm``, ``item``)."""
     wanted = tuple(prefixes) or ("bot", "swarm", "item")

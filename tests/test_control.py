@@ -18,6 +18,21 @@ from swarmly.telegram.snapshot import (BUSY, DOWN, FROZEN, IDLE, PAUSED, STUCK, 
 NOW = 1_700_000_000.0
 
 
+def _imported_modules(path: str) -> set:
+    """Every module name this file imports, at any level of nesting (issue #117)."""
+    import ast
+
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
 def snap(alias: str, state: str = IDLE, **fields: Any) -> Snapshot:
     base: Dict[str, Any] = dict(alias=alias, state=state, since=NOW - 300, at=NOW - 5,
                                 every=60.0, topic="tg-307", model="deepseek", effort="high",
@@ -218,10 +233,11 @@ class TestNoAdapterCall(unittest.TestCase):
         second = ct.dashboard(now=NOW, snapshots=rows, round_state=state, coordinator="Hermes")
         self.assertEqual(first, second)                   # a pure function of the records
         self.assertTrue(first.startswith("SWARM"))
-        with open(ct.__file__, encoding="utf-8") as handle:
-            source = handle.read()
-        for forbidden in ("adapters", "aiogram", "urllib", "requests", "socket"):
-            self.assertNotIn(forbidden, source)           # nothing here can start a turn
+        imported = _imported_modules(ct.__file__)
+        for forbidden in ("swarmly.telegram.adapters", "aiogram", "urllib", "requests",
+                          "socket", "subprocess"):
+            self.assertFalse([name for name in imported if name.startswith(forbidden)],
+                             forbidden)                    # nothing here can start a turn
 
 
 if __name__ == "__main__":  # pragma: no cover

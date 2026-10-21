@@ -66,6 +66,8 @@ from swarmly.telegram.presence import Presence, Pulse
 
 from swarmly.telegram import control as control_mod
 from swarmly.telegram.control_center import ControlCenter
+from swarmly.telegram.control_press import PressPolicy
+from swarmly.telegram import control_press as press_mod
 from swarmly.telegram import snapshot as snapshot_mod
 
 from swarmly.telegram import usage as usage_mod
@@ -2600,7 +2602,8 @@ class AgentChannel:
             return None
         chat_id = settings.chat_id or self.config.identity.home_channel_id
         centre = ControlCenter(bot, chat_id=chat_id, thread_id=settings.topic_id,
-                               render=self.control_text)
+                               render=self.control_text,
+                               markup=lambda: control_mod.keyboard(self.control_actions()))
         self._control_center = centre
         return centre
 
@@ -2660,6 +2663,62 @@ class AgentChannel:
         left, resets = ledger.quota()
         totals["quota_left"], totals["quota_resets_at"] = left, resets
         return totals
+
+    def control_actions(self) -> Tuple[str, ...]:
+        """The controls this build can actually carry out, so no button is offered in vain.
+
+        The rest of the table in :mod:`swarmly.telegram.control` -- restart, model, effort,
+        WAKE, the swarm-wide controls -- joins this tuple as each is wired; until then they
+        are neither shown nor run.
+        """
+        return ("bot.pause", "bot.resume", "bot.restart")
+
+    def control_policy(self) -> Any:
+        """The press policy: admin-only, a second tap for anything that stops, one log line."""
+        existing = getattr(self, "_control_policy", None)
+        if existing is not None:
+            return existing
+        policy = PressPolicy(admin_id=self.config.identity.admin_user_id,
+                             available=self.control_actions(),
+                             code=lambda: secrets.token_hex(2))
+        self._control_policy = policy
+        return policy
+
+    async def handle_control_press(self, press: Any) -> str:
+        """One button press: decide, act, log, answer. Never raises.
+
+        Answering is what the presser sees in the chat; the log line rides the channel NOTE
+        path (and so the bus, when ``bus.repo`` is set), so a control leaves a record of who
+        stopped what.
+        """
+        try:
+            decision = self.control_policy().decide(press, actor=str(press.user_id))
+            if decision.verdict == press_mod.RUN:
+                await self._run_control(decision.action, decision.target)
+            if decision.log:
+                await self.send(format_message(
+                    Envelope(type=MessageType.NOTE, to="*", intent="CONTROL",
+                             ref=self._alias_ref()),
+                    decision.log), silent=True, notice=True, allow_when_frozen=True)
+            self._control_answer = decision.text
+            return decision.text
+        except Exception:                      # noqa: BLE001 - a press must not break the bot
+            logger.warning("control centre: the press failed", exc_info=True)
+            return "the press failed; the log has the reason"
+
+    async def _run_control(self, action: str, target: str) -> None:
+        """Carry out one wired control. The transport only ever controls *itself* here."""
+        if target and target.strip().lower() not in ("", "self",
+                                                     self.config.identity.alias.lower()):
+            raise ValueError(f"{action} for {target}: this transport controls only itself")
+        if action == "bot.pause":
+            self._set_frozen(True, "pause")
+        elif action == "bot.resume":
+            self._set_frozen(False, None)
+        elif action == "bot.restart":
+            # The launcher starts the transport again; nothing is running when it does, which
+            # is why this control asks for a second tap (#117).
+            self.request_restart()
 
     async def refresh_control_center(self, *, now: Optional[float] = None) -> Optional[Any]:
         """Edit the pinned dashboard for this beat. Never raises; ``None`` when there is none."""
@@ -6562,6 +6621,11 @@ class AgentChannel:
                        default=DefaultBotProperties(parse_mode="HTML"))
         self.dispatcher = Dispatcher()
         self.dispatcher.message.register(self._on_aiogram_message)
+        # Issue #117: the buttons under the pinned dashboard. Guarded because a test stubs the
+        # dispatcher with just the one router it needs; a real Dispatcher always has this one.
+        presses = getattr(getattr(self.dispatcher, "callback_query", None), "register", None)
+        if presses is not None:
+            presses(self._on_aiogram_callback)
         self._started_wall = time.time()
         me = await self.bot.get_me()
         logger.info("connected as @%s (alias %s) in chat %s",
@@ -6844,6 +6908,27 @@ class AgentChannel:
             topic_name_current=topic_name_current,
             attachments=attachments_from_aiogram(message),
         )
+
+    async def _on_aiogram_callback(self, callback: Any) -> None:
+        """A press under the pinned dashboard: answer it in the chat, then refresh (#117).
+
+        The policy decides; this only carries the answer back to the presser, because a
+        Telegram button that is never answered spins for the presser until it times out.
+        """
+        data = str(getattr(callback, "data", "") or "")
+        if not data.startswith(press_mod.PREFIX):
+            return                          # somebody else's keyboard: not ours to answer
+        user = getattr(callback, "from_user", None)
+        press = press_mod.Press(user_id=int(getattr(user, "id", 0) or 0), data=data,
+                                at=time.time())
+        text = await self.handle_control_press(press)
+        answer = getattr(callback, "answer", None)
+        if answer is not None:
+            try:
+                await answer(text[:200])
+            except Exception:               # noqa: BLE001 - the press already happened
+                logger.warning("control centre: could not answer the press", exc_info=True)
+        await self.refresh_control_center()
 
     async def _on_aiogram_message(self, message: Any) -> None:
         # Pending updates are kept across a restart (a peer's request must still arrive), but
