@@ -4655,6 +4655,9 @@ class AgentChannel:
             reply = await self._respond(incoming, event)
             self.record_turn(started=wall_started, ended=time.time(), event=event, reply=reply)
         except Exception as exc:                          # noqa: BLE001 - a broken adapter must not kill the loop
+            # The model may well have run before it raised: a turn that ends in an exception
+            # still spent something, so it goes in the ledger as an error row (#125 review).
+            self.record_turn(started=wall_started, ended=time.time(), event=event, reply=None)
             if ticket:
                 self.replies.queue_failed(ticket['id'], "adapter raised before queue confirmation")
             await self._note_adapter_failure(str(exc))

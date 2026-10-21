@@ -231,15 +231,9 @@ class Ledger:
         today = self.totals(start_of_day)
         lines = [f"USAGE {self.alias} turns={len(self.entries)}"
                  + (f" dropped={self.dropped}" if self.dropped else "")]
-        lines.append(f"today: {today['turns']} turns, in={_tokens(today['tokens_in'])} "
-                     f"out={_tokens(today['tokens_out'])} cost={_money_text(today['cost_usd'])}"
-                     + ("" if today["cost_known"] in (0, today["turns"])
-                        else f" ({today['cost_known']}/{today['turns']} reported)"))
+        lines.append("today: " + _totals_line(today))
         if since_boot is not None:
-            boot = self.totals(float(since_boot))
-            lines.append(f"since boot: {boot['turns']} turns, "
-                         f"in={_tokens(boot['tokens_in'])} out={_tokens(boot['tokens_out'])} "
-                         f"cost={_money_text(boot['cost_usd'])}")
+            lines.append("since boot: " + _totals_line(self.totals(float(since_boot))))
         left, resets = self.quota()
         when = time.strftime("%H:%MZ", time.gmtime(resets)) if resets else "unknown"
         lines.append(f"quota left={_tokens(left)} resets={when}"
@@ -278,3 +272,33 @@ def _tokens(value: Optional[int]) -> str:
 
 def _money_text(value: Optional[float]) -> str:
     return "unknown" if value is None else f"${value:.4f}"
+
+
+def _totals_line(totals: Dict[str, Any]) -> str:
+    """One line for a window: turns, tokens and cost, each saying how much was reported."""
+    turns, known = totals["turns"], totals["tokens_known"]
+    return (f"{turns} turns, in={_partial(totals['tokens_in'], known, turns)} "
+            f"out={_partial(totals['tokens_out'], known, turns)} "
+            f"cost={_partial_money(totals['cost_usd'], totals['cost_known'], turns)}")
+
+
+def _partial(value: Optional[int], known: int, turns: int) -> str:
+    """A token total that says how much of it was reported.
+
+    `in=7` over ten turns where the runtimes said nothing about nine is not a total: it is the
+    sum of the one row that spoke. A number is printed as a total only when every row it covers
+    reported one; otherwise the count of reporting rows sits beside it (#125 review).
+    """
+    if value is None:
+        return f"unknown (0/{turns} reported)" if turns else "unknown"
+    if known >= turns:
+        return str(int(value))
+    return f"{int(value)} ({known}/{turns} reported)"
+
+
+def _partial_money(value: Optional[float], known: int, turns: int) -> str:
+    if value is None:
+        return f"unknown (0/{turns} reported)" if turns else "unknown"
+    if known >= turns:
+        return f"${value:.4f}"
+    return f"${value:.4f} ({known}/{turns} reported)"

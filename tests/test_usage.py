@@ -150,6 +150,31 @@ class TestTheRendering(unittest.TestCase):
         self.assertIn("dropped=2", text)
         self.assertIn("older rows dropped", text)
 
+    def test_a_partial_token_total_says_how_partial(self):
+        """#125 review: `in=7` over ten turns where nine were silent is not a total."""
+        ledger = us.Ledger(None, alias="DeepSeek", clock=lambda: NOW)
+        ledger.append(us.Entry(alias="DeepSeek", started=NOW - 30, ended=NOW - 20,
+                               tokens_in=7, tokens_out=3, cost_usd=0.01))
+        for index in range(3):
+            ledger.append(us.Entry(alias="DeepSeek", started=NOW - 10 + index, ended=NOW))
+        text = ledger.render(now=NOW)
+        self.assertIn("in=7 (1/4 reported)", text)
+        self.assertIn("out=3 (1/4 reported)", text)
+        self.assertIn("cost=$0.0100 (1/4 reported)", text)
+
+    def test_a_complete_total_carries_no_caveat(self):
+        ledger = us.Ledger(None, alias="DeepSeek", clock=lambda: NOW)
+        ledger.append(us.Entry(alias="DeepSeek", started=NOW - 30, ended=NOW - 20,
+                               tokens_in=7, tokens_out=3, cost_usd=0.01))
+        text = ledger.render(now=NOW)
+        self.assertIn("in=7 out=3 cost=$0.0100", text)
+        self.assertNotIn("1/1 reported", text)      # complete: no caveat on the numbers
+
+    def test_silent_rows_are_counted_as_unreported(self):
+        ledger = us.Ledger(None, alias="DeepSeek", clock=lambda: NOW)
+        ledger.append(us.Entry(alias="DeepSeek", started=NOW - 30, ended=NOW - 20))
+        self.assertIn("in=unknown (0/1 reported)", ledger.render(now=NOW))
+
     def test_no_identifier_reaches_the_rendering(self):
         ledger = us.Ledger(None, alias="DeepSeek", clock=lambda: NOW)
         ledger.append(us.Entry(alias="DeepSeek", started=NOW - 30, ended=NOW - 20,
@@ -219,6 +244,46 @@ class TestOnTheChannel(unittest.TestCase):
         again = make_channel(channel.config)                     # the same state file
         self.assertEqual(len(again.usage_ledger().entries), 1)
         self.assertIn("turns=1", again.usage_text())
+
+
+class RaisingAdapter:
+    """A runtime that raises after the model may well have run: the spend still happened."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    async def respond(self, message):
+        raise RuntimeError("the CLI died mid-turn")
+
+
+class TestARaisedTurn(unittest.TestCase):
+
+    def test_a_turn_that_raises_still_gets_a_row(self):
+        """#125 review: `record_turn` sat only on the success path, losing that turn's spend."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config()
+        config.source_path = Path(tmp.name) / "config.yaml"
+        config.bus.repo = str(tmp.name)
+        channel = make_channel(config)
+        channel.adapter = RaisingAdapter(channel.adapter)
+        run(channel.handle_event(event("@HermesBot hello", author_id=ADMIN_ID,
+                                       username="alice", is_bot=False)))
+        rows = channel.usage_ledger().entries
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, us.ERROR)
+        self.assertIn("error", channel.usage_text())
+
+    def test_a_recorded_error_row_keeps_the_turn_visible_in_usage(self):
+        ledger = us.Ledger(None, alias="DeepSeek", clock=lambda: NOW)
+        ledger.append(us.Entry(alias="DeepSeek", started=NOW - 30, ended=NOW - 20,
+                               outcome=us.ERROR))
+        text = ledger.render(now=NOW)
+        self.assertIn("general:error", text)
+        self.assertIn("today: 1 turns", text)
 
 
 class TestTheAdapterReports(unittest.TestCase):
