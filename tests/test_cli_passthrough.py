@@ -305,6 +305,58 @@ class TestASlashThatNeverFinishes(unittest.TestCase):
         self.assertIn(": ok", bot.bot.edit_message_text.await_args.kwargs["text"])
 
 
+class TestStopDuringASlashRead(unittest.TestCase):
+    """A `/stop` while a slash command is reading: the run ends as stopped, not as ok."""
+
+    def test_stop_during_the_read_reports_stopped(self):
+        bot, _ = channel()
+        release = threading.Event()
+        sessions = []
+
+        class Terminal:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.sent = []
+                self.closed = False
+                sessions.append(self)
+
+            def open(self):
+                return self
+
+            def send(self, line):
+                self.sent.append(line)
+
+            def read_until_quiet(self, *, deadline=None):
+                release.wait(10)                    # the command is still on screen
+                return "/cost: $0.02 so far"
+
+            def close(self):
+                self.closed = True
+                release.set()
+
+            def text(self):
+                return "/cost: $0.02 so far"
+
+        async def scenario():
+            with mock.patch("swarmly.telegram.native.InteractiveSession", Terminal):
+                running = asyncio.ensure_future(bot.handle_event(
+                    event("/cli@HermesBot /cost", author_id=ADMIN_ID, username="alice",
+                          is_bot=False, message_id=1)))
+                for _ in range(200):
+                    if sessions and sessions[0].sent:
+                        break
+                    await asyncio.sleep(0.01)
+                await bot.handle_event(event("/stop@HermesBot", author_id=ADMIN_ID,
+                                             username="alice", is_bot=False, message_id=2))
+                await running
+
+        asyncio.run(scenario())
+        self.assertTrue(sessions[0].closed)
+        text = bot.bot.edit_message_text.await_args.kwargs["text"]
+        self.assertIn("stopped on request", text)
+        self.assertNotIn(": ok", text)
+
+
 class TestFrozenAndStop(unittest.TestCase):
 
     def test_a_frozen_bot_still_answers_a_passthrough(self):
