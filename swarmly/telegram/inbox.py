@@ -32,6 +32,11 @@ MAX_ENTRIES = 50
 #: the record is dropped and the stall reported: a resume that is itself cut off must never
 #: become a restart loop.
 MAX_REPLAYS = 1
+#: An interrupted turn older than this is **reported**, never resumed (issue #103): restarting
+#: work an hour after it was cut off means acting on a topic that has moved on -- the peer who
+#: asked has re-sent it, or done it itself, or the item has landed. Well inside MAX_AGE_SECONDS,
+#: which is when an entry is dropped without a word.
+RESUME_MAX_AGE_SECONDS = 3600.0
 
 #: The ChannelEvent fields a replay needs. ``raw`` (an aiogram object) is not kept.
 _FIELDS = ("text", "chat_id", "author_id", "author_username", "author_is_bot", "message_id",
@@ -46,10 +51,15 @@ def entry_key(chat_id: Any, message_id: Any) -> str:
 class Inbox:
     """``{chat:message -> {"at": wall time, "event": {...}}}`` in one JSON file."""
 
-    def __init__(self, path: Optional[Path], *, clock: Callable[[], float] = time.time):
+    def __init__(self, path: Optional[Path], *, clock: Callable[[], float] = time.time,
+                 resume_max_age: float = RESUME_MAX_AGE_SECONDS):
         self.path = path
         self.clock = clock
+        self.resume_max_age = float(resume_max_age)
         self._entries: Dict[str, Dict[str, Any]] = self._load()
+        #: A claim whose resume is still running. A second ``start()`` in the same process
+        #: (a re-entered start, a test that starts twice) must not spend a second try (#103).
+        self._claiming = False
 
     def _load(self) -> Dict[str, Dict[str, Any]]:
         if self.path is None or not self.path.is_file():
@@ -100,7 +110,8 @@ class Inbox:
     def __contains__(self, key: Tuple[Any, Any]) -> bool:
         return entry_key(*key) in self._entries
 
-    def claim_replay(self) -> Tuple[List[Tuple[int, Dict[str, Any]]], List[Dict[str, Any]]]:
+    def claim_replay(self, *, limit: int = 1
+                      ) -> Tuple[List[Tuple[int, Dict[str, Any]]], List[Dict[str, Any]]]:
         """Split what a restart interrupted into "run it again" and "give up" (issue #84).
 
         The first restart after a turn was cut off runs it again; if *that* try is cut off too,
@@ -111,6 +122,8 @@ class Inbox:
         The try is counted **before** the replay starts, not after: a process killed halfway
         through its second attempt must not be able to claim a third.
         """
+        if self._claiming:
+            return [], []               # a resume from an earlier claim is still running
         now = self.clock()
         runnable: List[Tuple[int, Dict[str, Any]]] = []
         dropped: List[Dict[str, Any]] = []
@@ -122,11 +135,20 @@ class Inbox:
                 continue
             attempts = int(entry.get("attempts", 0) or 0)
             if attempts >= MAX_REPLAYS:
-                dropped.append(entry)
+                dropped.append(dict(entry, reason="twice"))
                 self._entries.pop(key, None)
                 continue
+            if age > self.resume_max_age:
+                # Too old to be worth restarting, but somebody has to hear about it (#103).
+                dropped.append(dict(entry, reason="stale"))
+                self._entries.pop(key, None)
+                continue
+            if len(runnable) >= max(1, limit):
+                continue                # next tick: untouched, and not yet counted against it
             entry["attempts"] = attempts + 1
             runnable.append((entry["attempts"], entry))
+        if runnable:
+            self._claiming = True
         for key in stale:
             self._entries.pop(key, None)
         if stale:
@@ -137,9 +159,25 @@ class Inbox:
         return runnable, dropped
 
     def interrupted(self) -> List[Dict[str, Any]]:
-        """The events a previous run accepted and never finished, oldest first; stale ones
-        are dropped. (Counting a try as this runs: see :meth:`claim_replay`.)"""
-        return [entry["event"] for _attempt, entry in self.claim_replay()[0]]
+        """What a restart would resume, oldest first -- **read-only** (issue #103).
+
+        It counts nothing and drops nothing, so asking twice spends nothing: only
+        :meth:`claim_replay` may spend a try, and only the start path calls it.
+        """
+        now = self.clock()
+        fresh = []
+        for _key, entry in sorted(self._entries.items(), key=lambda kv: kv[1].get("at", 0)):
+            age = now - float(entry.get("at", 0) or 0)
+            if 0 <= age <= MAX_AGE_SECONDS:
+                fresh.append(entry["event"])
+        return fresh
+
+    def released(self) -> None:
+        """The claimed resume finished: the next claim may run (#103, one at a time)."""
+        self._claiming = False
+
+    def claiming(self) -> bool:
+        return self._claiming
 
     def attempts(self, chat_id: Any, message_id: Any) -> int:
         """How many times this message has been started (0 until a restart resumes it)."""
