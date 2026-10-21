@@ -904,3 +904,48 @@ class TestLeaseRunsOnWallTime(unittest.TestCase):
         channel = AgentChannel(make_config(), sender=lambda *a, **k: None)
         self.assertIs(channel._lease_clock, time.time)
         self.assertLess(abs(channel._lease_clock() - time.time()), 5)
+
+
+class TestTheNamedCoordinatorKeepsTheRole(TestSuccessionOnExpiry):
+    """Live: the admin's /role made the acting coordinator (Codex) yield, and 27 s later Codex
+    took the lapsed lease back by succession, ahead of the named coordinator's slower
+    promotion push. A lapsed lease is left to the named coordinator while it is up."""
+
+    def lapsed(self):
+        channel, bus, _ = self.channel(
+            role="reviewer", peers={"Claude": {"username": "claude_bot", "role": "coordinator"}})
+        now = channel._clock()
+        gone = ls.LeaseStore("Codex", transport=channel.lease_store().transport, root=bus,
+                             clock=lambda: now, ttl_seconds=60.0, rank=0)
+        gone.claim(term=1)
+        channel.membership.state.coordinator = "Claude"
+        return channel, now + 3600
+
+    def test_a_peer_does_not_take_the_role_from_a_named_coordinator_that_is_up(self):
+        import asyncio
+        channel, later = self.lapsed()
+        channel.presence().seen("Claude", channel.presence_clock())
+        self.assertIsNone(asyncio.run(channel.check_lease(now=later)))
+        self.assertFalse(channel.is_coordinator(now=later))
+
+    def test_it_takes_over_when_the_named_coordinator_is_down(self):
+        import asyncio
+        from unittest import mock
+        channel, later = self.lapsed()
+        channel.presence().seen("Claude", channel.presence_clock())
+        with mock.patch.object(type(channel.presence()), "is_down", return_value=True):
+            claim = asyncio.run(channel.check_lease(now=later))
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.term, 2)
+
+    def test_it_takes_over_from_a_coordinator_never_heard_from(self):
+        import asyncio
+        channel, later = self.lapsed()
+        self.assertIsNotNone(asyncio.run(channel.check_lease(now=later)))
+
+    def test_it_takes_over_from_a_frozen_coordinator(self):
+        import asyncio
+        channel, later = self.lapsed()
+        channel.presence().seen("Claude", channel.presence_clock())
+        channel.frozen_peers = lambda: {"Claude": {"ref": "quota"}}
+        self.assertIsNotNone(asyncio.run(channel.check_lease(now=later)))
