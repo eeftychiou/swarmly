@@ -3023,26 +3023,116 @@ class AgentChannel:
         """Whether this bot is the coordinator -- the only bot that writes the round state."""
         return self.is_coordinator()
 
-    def _on_demoted_from_coordinator(self) -> None:
-        if not (self.config.bus.repo or self.config.fallback.gitbus_root):
-            return
-        try:
-            self.lease_store().yield_lease(reason="superseded by /role")
-        except Exception:
-            logger.warning("lease: failed to yield on demotion", exc_info=True)
+    def _lease_lock(self) -> asyncio.Lock:
+        """One lease write at a time on this bot, on the running loop.
 
-    def _on_promoted_to_coordinator(self) -> None:
-        if not (self.config.bus.repo or self.config.fallback.gitbus_root):
-            return
+        Lease git work runs in a worker thread (#126); the lock keeps a /role promotion and the
+        lease tick from writing claims over each other. One lock per loop, because a test may
+        drive the same channel from more than one ``asyncio.run``.
+        """
+        loop = asyncio.get_running_loop()
+        locks = self.__dict__.setdefault("_lease_locks", {})
+        lock = locks.get(id(loop))
+        if lock is None:
+            locks.clear()
+            lock = locks[id(loop)] = asyncio.Lock()
+        return lock
+
+    def _spawn_lease_task(self, coro: Any) -> "asyncio.Task[Any]":
+        """Run lease work in the background, keeping a reference so it is not collected."""
+        tasks = self.__dict__.setdefault("_lease_tasks", set())
+        task = asyncio.get_running_loop().create_task(coro)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    async def lease_settled(self) -> None:
+        """Wait for the lease work started in the background (a /role claim or yield)."""
+        tasks = list(self.__dict__.get("_lease_tasks", ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _has_lease_bus(self) -> bool:
+        return bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+
+    def _on_demoted_from_coordinator(self) -> Optional["asyncio.Task[Any]"]:
+        """Yield the lease after the admin's /role named someone else.
+
+        The yield is a git push, which can take tens of seconds when the bus is busy, so on a
+        running loop it goes to a worker thread and the bot keeps handling messages (#126).
+        """
+        if not self._has_lease_bus():
+            return None
+
+        def work() -> None:
+            self.lease_store().yield_lease(reason="superseded by /role")
+
         try:
-            store = self.lease_store()
-            current = store.state()
-            row = store.claim(term=current.term + 1, promoted=True)
-            self._forget_lease_cache()
-            logger.info("lease: %s took term %d on the admin's /role",
-                        self.config.identity.alias, row.term)
-        except Exception:
-            logger.warning("lease: failed to claim on promotion", exc_info=True)
+            asyncio.get_running_loop()
+        except RuntimeError:                           # no loop: a sync caller does it inline
+            try:
+                work()
+            except Exception:
+                logger.warning("lease: failed to yield on demotion", exc_info=True)
+            return None
+
+        async def run() -> None:
+            try:
+                async with self._lease_lock():
+                    await asyncio.to_thread(work)
+                self._forget_lease_cache()
+            except Exception:
+                logger.warning("lease: failed to yield on demotion", exc_info=True)
+
+        return self._spawn_lease_task(run())
+
+    def _on_promoted_to_coordinator(self, event: Optional[ChannelEvent] = None
+                                    ) -> Optional["asyncio.Task[Any]"]:
+        """Claim the next term after the admin's /role, and say in the chat how it went.
+
+        Live (#126): the claim ran on the event loop, and while its push retried against the
+        other bots' pushes this bot handled nothing for three minutes, and /role got no answer
+        at all. The claim now runs in a worker thread, and the result is posted as a reply.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            if self._has_lease_bus():
+                self._claim_on_promotion()
+            return None
+        return self._spawn_lease_task(self._announce_promotion(event))
+
+    def _claim_on_promotion(self) -> Any:
+        """The promotion claim itself (blocking git work): term N+1 over whatever is live."""
+        store = self.lease_store()
+        current = store.state()
+        row = store.claim(term=current.term + 1, promoted=True)
+        self._forget_lease_cache()
+        logger.info("lease: %s took term %d on the admin's /role",
+                    self.config.identity.alias, row.term)
+        return row
+
+    async def _announce_promotion(self, event: Optional[ChannelEvent]) -> None:
+        alias = self.config.identity.alias
+        if not self._has_lease_bus():
+            text = f"\u2705 {alias} is coordinator."
+        else:
+            try:
+                async with self._lease_lock():
+                    row = await asyncio.to_thread(self._claim_on_promotion)
+                text = f"\u2705 {alias} is coordinator at term {row.term}."
+            except Exception as exc:                   # noqa: BLE001 - said, not swallowed
+                logger.warning("lease: failed to claim on promotion", exc_info=True)
+                text = (f"\u26a0\ufe0f {alias} has the coordinator role here, but its lease "
+                        f"claim did not reach the bus: {str(exc)[:200]}")
+        try:
+            if event is None:
+                await self.send(text, notice=True)
+            else:
+                await self.send(text, reply_to_message_id=event.message_id,
+                                chat_id=event.chat_id, thread_id=event.thread_id, notice=True)
+        except Exception:                              # noqa: BLE001 - never fatal
+            logger.warning("lease: could not post the /role answer", exc_info=True)
 
     def apply_round_block(self, text: str, event: ChannelEvent) -> str:
         """Take the ``ROUND_STATE`` block out of a reply, and put it on the bus.
@@ -3207,7 +3297,7 @@ class AgentChannel:
         # The lease fences *adoption*: only the coordinator takes over a dead bot's timers.
         # A bot's own timers are its own promises and fire whatever its role; fencing them too
         # meant no developer's or reviewer's WAKE ever fired (live, round 4).
-        coordinator = self.lease_fence()
+        coordinator = await asyncio.to_thread(self.lease_fence)   # a fresh fetch: off the loop
         own = self.config.identity.alias
         if coordinator:
             try:                                     # a dead bot's armed timers are promises
@@ -3449,11 +3539,18 @@ class AgentChannel:
 
         moment = self._lease_clock() if now is None else now
         store = self.lease_store()
+        # #126: every git call below runs in a worker thread. On the loop, a slow fetch or a
+        # push that retried against the other bots' pushes froze the bot -- no messages, no
+        # timers -- for as long as git took.
         try:
-            state = store.state(now=moment)
+            state = await asyncio.to_thread(store.state, now=moment)
         except Exception:
             logger.warning("lease: check_lease could not read lease state", exc_info=True)
             return None
+
+        async def claim_at(term: int) -> Any:
+            async with self._lease_lock():
+                return await asyncio.to_thread(store.claim, term=term, now=moment)
 
         alias = self.config.identity.alias.strip().lower()
 
@@ -3463,7 +3560,7 @@ class AgentChannel:
             last_renew = getattr(state.claim, "renews_at", 0.0) if state.claim else 0.0
             if (moment - last_renew) >= renew_interval or (state.expires_at - moment) <= (store.ttl_seconds / 2):
                 try:
-                    claim = store.claim(term=state.term, now=moment)
+                    claim = await claim_at(state.term)
                     self._forget_lease_cache()
                     logger.info("lease: %s renewed lease for term %d (expires at %.1f)",
                                 self.config.identity.alias, claim.term, claim.expires_at)
@@ -3484,7 +3581,7 @@ class AgentChannel:
                 coord = (getattr(self.membership.state, "coordinator", None) or "").strip()
                 if (coord and coord.lower() == alias) or (not coord and role == "coordinator"):
                     try:
-                        claim = store.claim(term=1, now=moment)
+                        claim = await claim_at(1)
                         self._forget_lease_cache()
                         logger.info("lease: %s claimed bootstrap term 1", self.config.identity.alias)
                         return claim
@@ -3502,7 +3599,7 @@ class AgentChannel:
             if self._defer_to_named_coordinator(state.term):
                 return None
             try:
-                mine = store.claim(term=next_term, now=moment)
+                mine = await claim_at(next_term)
             except Exception as exc:
                 logger.warning("lease: %s could not claim term %d: %s", self.config.identity.alias,
                                next_term, exc)
@@ -3511,12 +3608,12 @@ class AgentChannel:
             if settle > 0:
                 await self._sleep(settle)
             self._forget_lease_cache()
-            if not store.refresh(force=True):
+            if not await asyncio.to_thread(store.refresh, force=True):
                 logger.warning("lease: ref refresh failed after settle for term %d; refusing to act",
                                next_term)
                 return None
             try:
-                fresh = store.state(now=self._lease_clock())
+                fresh = await asyncio.to_thread(store.state, now=self._lease_clock())
             except Exception:
                 logger.warning("lease: could not re-read the lease after claiming term %d",
                                next_term, exc_info=True)

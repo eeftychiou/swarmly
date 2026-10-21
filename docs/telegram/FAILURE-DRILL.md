@@ -22,7 +22,7 @@ built on `tests/swarm_group.py`); this file is the human one.
 | heartbeat | 2 minutes | `limits.heartbeat_minutes` |
 | a peer is DOWN | 6 minutes (3 missed beats) | `limits.heartbeat_minutes` × `limits.peer_down_after` |
 | lease TTL / takeover | 10 minutes | `limits.takeover_minutes` |
-| lease renewal | every 120 seconds | `limits.lease_renew_seconds` |
+| lease renewal | every 300 seconds | `limits.lease_renew_seconds` |
 | claim settle window | 30 seconds | `limits.lease_settle_seconds` |
 
 ## 1. Kill the coordinator

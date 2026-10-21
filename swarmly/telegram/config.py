@@ -706,8 +706,9 @@ class ChannelLimits:
     coordinator_watch_minutes: float = 30.0
     #: Issue #83: how long without a renewal before successors take over the coordinator lease.
     takeover_minutes: float = 10.0
-    #: How often the active coordinator renews its lease.
-    lease_renew_seconds: float = 120.0
+    #: How often the active coordinator renews its lease. Half the 10-minute lease: every
+    #: renewal is a push to the shared bus branch, and fewer of them means fewer races (#126).
+    lease_renew_seconds: float = 300.0
     #: Issue #31: the channel's reply budget, in characters (the swarm's 500-char convention).
     #: A project may override it per topic (``projects.<key>.reply_chars``); everything else
     #: -- General, unbound topics, the reply tickets -- uses this.
