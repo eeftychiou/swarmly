@@ -584,8 +584,12 @@ leaves nothing behind. The try is counted **before** the turn starts: if that re
 off too, the record is dropped instead of replayed a third time and one line says so —
 `⚠️ <coordinator or admin>: could not finish the turn on message <id> in <topic> after two
 restarts` — because a turn that kills the transport twice will not finish by being started
-again, and a loop of them is how a swarm spends a night doing nothing. Records older than 12
-hours are dropped unrun: the work has moved on.
+again, and a loop of them is how a swarm spends a night doing nothing. A record older than
+`resume_max_age` (one hour) is **reported, never resumed** -- restarting work an hour after
+it was cut off means acting on a topic that has moved on -- and one older than 12 hours is
+dropped without a word. A restart that interrupted several turns resumes them one at a
+time, oldest first: each resumed turn claims the next when it finishes, so six cut-off turns
+never become six turns at once.
 
 **The coordinator checks in when nothing wakes it.** A coordinator that holds no WAKE and has
 had no turn for `limits.coordinator_watch_minutes` (default 30) gets one turn in the topic it
