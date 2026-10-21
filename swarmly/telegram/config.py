@@ -673,6 +673,14 @@ class ChannelLimits:
     #: How many firings one timer may have before it gives up with a turn that says so. 0
     #: leaves the bound to `until` alone.
     wake_max_attempts: int = 50
+    #: Issue #82: how often each transport publishes a liveness pulse. Liveness rides the
+    #: ephemeral Telegram line, not a bus commit -- 6 bots at 2 min is ~180 commits an hour on
+    #: the bus, forever, each a push race with real traffic. `heartbeat_minutes * peer_down_after`
+    #: is therefore measured in minutes of Telegram silence, not bus commits.
+    heartbeat_minutes: float = 2.0
+    #: How many heartbeats a peer may miss before it is DOWN (advisory: the lease, not this,
+    #: decides who coordinates).
+    peer_down_after: float = 3.0
     #: How long a takeover claim is left to settle before the claimant re-folds and acts, so two
     #: bots claiming the next term do not both act (#83). 0 acts at once, which only a test wants.
     lease_settle_seconds: float = 30.0
@@ -686,6 +694,10 @@ class ChannelLimits:
     #: The argv prefixes a WAKE check may start with. `gh` and `git` are allowed only through
     #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate.
     wake_check_allow: List[str] = field(default_factory=lambda: ["gh", "git"])
+    #: The coordinator's own watchdog: after this long with no turn while the swarm has been
+    #: active, it gets one turn to check the round and act on whatever waits, or say it is done.
+    #: Doubles after each quiet check, up to 8 hours; any other turn resets it. 0 = off.
+    coordinator_watch_minutes: float = 30.0
     #: Issue #83: how long without a renewal before successors take over the coordinator lease.
     takeover_minutes: float = 10.0
     #: How often the active coordinator renews its lease.
@@ -739,7 +751,7 @@ class ChannelLimits:
                               f"(got {attachment_mb!r}).")
         for key in ("min_seconds_between_messages", "min_seconds_between_agent_turns",
                     "handoff_nudge_minutes", "cleanup_idle_hours",
-                    "ephemeral_notices_minutes"):
+                    "ephemeral_notices_minutes", "coordinator_watch_minutes"):
             value = getattr(self, key)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):

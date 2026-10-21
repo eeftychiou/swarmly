@@ -880,6 +880,14 @@ class Membership:
     async def status_text(self) -> str:
         lines = [f"SWARM bus: {self.bus_location() or 'unknown'}",
                  f"coordinator: {self.state.coordinator or 'none'}"]
+        # Issue #82: the same liveness line /status carries, so a peer that has gone quiet is
+        # visible where the swarm is listed as well as where its own bot reports.
+        presence_line = getattr(self.ch, "presence_line", None)
+        if callable(presence_line):
+            try:
+                lines.append(presence_line())
+            except Exception:                       # noqa: BLE001 - /swarm must answer
+                logger.warning("membership: no presence line for /swarm", exc_info=True)
         for alias, role in sorted(self.team().items()):
             if alias == self.alias:
                 state = "online (me)"
