@@ -3348,8 +3348,7 @@ class AgentChannel:
                     # Nothing to rebuild means nothing to resume: close the record rather than
                     # leave it on disk to be claimed and blamed again (#104 review).
                     logger.warning("inbox: could not rebuild an interrupted message; dropping it")
-                    raw = data.get("event") or {}
-                    self._inbox.done(raw.get("chat_id"), raw.get("message_id"))
+                    self._inbox.drop_record(data)      # by identity: its ids may be what is missing
                     continue
                 logger.info("inbox: resuming message %s from @%s (try %d) after a restart",
                             event.message_id, event.author_username, attempt)
@@ -3362,9 +3361,11 @@ class AgentChannel:
                     continue
                 started += 1
         finally:
-            if not started:
-                # A claim that started nothing holds nothing: without this, one unreadable
-                # record would leave `_claiming` set and stall every later resume (#104 review).
+            if runnable and not started:
+                # A claim *this call* took and started nothing holds nothing: without this, one
+                # unreadable record would leave `_claiming` set and stall every later resume.
+                # Guarded on `runnable` because an empty claim means another resume is live --
+                # releasing here would hand its claim to somebody else (#104 review).
                 self._inbox.released()
         return started
 

@@ -368,6 +368,36 @@ class ClaimReleaseTests(unittest.TestCase):
         self.assertEqual(channel.replay_interrupted(), 1)      # the queue still moves
         self.assertEqual(started, [62])
 
+    def test_a_live_resume_keeps_its_claim(self):
+        # `claim_replay` returns nothing while a resume runs; releasing here would hand that
+        # live resume's claim to somebody else (#104 review).
+        channel = self.channel()
+        channel._inbox.record(admin("@HermesBot live", message_id=64))
+        claimed = channel._inbox.claim_replay()
+        self.assertEqual(len(claimed[0]), 1)
+        self.assertTrue(channel._inbox.claiming())
+        self.assertEqual(channel.replay_interrupted(), 0)
+        self.assertTrue(channel._inbox.claiming(), "the live resume still owns the claim")
+        channel._inbox.released()
+
+    def test_a_record_missing_its_own_ids_is_dropped_by_identity(self):
+        # `done(chat, message)` cannot close a record whose chat/message are what is missing.
+        channel = self.channel()
+        channel._inbox.record(admin("@HermesBot nameless", message_id=65))
+        entry = next(iter(channel._inbox._entries.values()))
+        entry["event"] = {"text": "no ids at all"}
+
+        import swarmly.telegram.inbox as inbox_module
+        original = inbox_module.event_from
+        inbox_module.event_from = lambda data, event_type: (_ for _ in ()).throw(
+            TypeError("cannot rebuild"))
+        try:
+            self.assertEqual(channel.replay_interrupted(), 0)
+        finally:
+            inbox_module.event_from = original
+        self.assertEqual(channel._inbox._entries, {})
+        self.assertFalse(channel._inbox.claiming())
+
     def test_an_unrebuildable_record_is_closed_not_left_on_disk(self):
         channel = self.channel()
         channel._inbox.record(admin("@HermesBot broken", message_id=63))

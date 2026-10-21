@@ -107,6 +107,21 @@ class Inbox:
         if self._entries.pop(entry_key(chat_id, message_id), None) is not None:
             self._save()
 
+    def drop_record(self, entry: Dict[str, Any]) -> bool:
+        """Remove exactly the record handed back by :meth:`claim_replay` (#104 review).
+
+        `done(chat, message)` cannot close a record whose trouble *is* a missing chat or message
+        id, and guessing at ids is how one bot's record deletes another's. Dropping by identity
+        is the honest version.
+        """
+        for key, candidate in list(self._entries.items()):
+            if candidate is not entry:
+                continue
+            self._entries.pop(key, None)
+            self._save()
+            return True
+        return False
+
     def __contains__(self, key: Tuple[Any, Any]) -> bool:
         return entry_key(*key) in self._entries
 
