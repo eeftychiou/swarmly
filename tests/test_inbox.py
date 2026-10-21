@@ -105,3 +105,79 @@ class InboxTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ResumedTurnTests(unittest.TestCase):
+    """Issue #84: a turn killed by a die-off comes back once, and never becomes a loop."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def channel(self):
+        config = make_config(fallback={"gitbus_root": self.tmp.name})
+        config.source_path = Path(self.tmp.name) / "agent.local.yaml"
+        channel = make_channel(config)
+        channel.bot = object()
+        return channel
+
+    def record(self, channel, *, message_id=42, text="@HermesBot carry on with #84",
+               thread_id=77):
+        channel._inbox.record(admin(text, message_id=message_id, thread_id=thread_id))
+
+    def test_a_resume_quotes_the_request_and_says_when_it_was_cut_off(self):
+        first = self.channel()
+        self.record(first)
+        second = self.channel()                          # the restart
+
+        async def scenario():
+            self.assertEqual(second.replay_interrupted(), 1)
+            await asyncio.gather(*list(second._self_tasks))
+
+        asyncio.run(scenario())
+        sent = [m["text"] for m in second._test_sender.sent]
+        notices = [t for t in sent if "↻ resuming the turn cut off at" in t]
+        self.assertEqual(len(notices), 1, sent)
+        prompts = [t for t in sent if "cut off by a restart" in t]
+        # The prompt names the sender, quotes the request, and tells it to check first -- and
+        # it goes to the topic the request came from, not to General.
+        self.assertEqual(len(prompts), 1, sent)
+        self.assertIn("carry on with #84", prompts[0])
+        self.assertIn("Check what you already pushed or posted", prompts[0])
+        self.assertEqual(self.channel()._inbox.interrupted(), [], "the record is closed")
+
+    def test_a_resume_that_is_cut_off_too_is_dropped_and_reported(self):
+        first = self.channel()
+        self.record(first)
+        # Try #2 is claimed and written to disk, then the process is killed outright -- no
+        # Python cleanup runs, which is exactly what a die-off looks like.
+        self.assertEqual(len(self.channel()._inbox.claim_replay()[0]), 1)
+        third = self.channel()
+
+        async def scenario():
+            self.assertEqual(third.replay_interrupted(), 0)     # no third try
+            await asyncio.gather(*list(third._self_tasks))
+
+        asyncio.run(scenario())
+        sent = [m["text"] for m in third._test_sender.sent]
+        reports = [t for t in sent if "after two restarts" in t]
+        self.assertEqual(len(reports), 1, sent)
+        self.assertIn("message 42", reports[0])
+        self.assertEqual(third._inbox._entries, {}, "dropped, not kept for a fourth try")
+
+    def test_a_turn_that_ended_normally_leaves_nothing_to_resume(self):
+        channel = self.channel()
+        asyncio.run(channel.handle_event(admin("@HermesBot hello", message_id=8)))
+        self.assertEqual(self.channel()._inbox.interrupted(), [])
+        self.assertEqual(self.channel().replay_interrupted(), 0)
+
+    def test_the_claim_counts_the_try_before_the_replay_starts(self):
+        inbox = Inbox(Path(self.tmp.name) / "inbox.json")
+        inbox.record(ChannelEvent(text="work", chat_id=1, message_id=2))
+        runnable, dropped = inbox.claim_replay()
+        self.assertEqual([attempt for attempt, _ in runnable], [1])
+        self.assertEqual(dropped, [])
+        self.assertEqual(inbox.attempts(1, 2), 1)
+        # A second claim -- a restart before the first resume finished -- gives up instead.
+        self.assertEqual(inbox.claim_replay()[0], [])
+        self.assertEqual(len(inbox.claim_replay()[1]), 0)    # already dropped by the call above
+        self.assertEqual(inbox._entries, {})

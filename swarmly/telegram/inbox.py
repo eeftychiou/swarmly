@@ -28,6 +28,10 @@ logger = logging.getLogger("swarmly.telegram.inbox")
 MAX_AGE_SECONDS = 12 * 3600
 #: Bounded: a transport that keeps failing must not build an unbounded file.
 MAX_ENTRIES = 50
+#: How many times one interrupted message may be started again (issue #84). One resume, then
+#: the record is dropped and the stall reported: a resume that is itself cut off must never
+#: become a restart loop.
+MAX_REPLAYS = 1
 
 #: The ChannelEvent fields a replay needs. ``raw`` (an aiogram object) is not kept.
 _FIELDS = ("text", "chat_id", "author_id", "author_username", "author_is_bot", "message_id",
@@ -96,21 +100,51 @@ class Inbox:
     def __contains__(self, key: Tuple[Any, Any]) -> bool:
         return entry_key(*key) in self._entries
 
-    def interrupted(self) -> List[Dict[str, Any]]:
-        """The events a previous run accepted and never finished, oldest first; stale ones
-        are dropped."""
+    def claim_replay(self) -> Tuple[List[Tuple[int, Dict[str, Any]]], List[Dict[str, Any]]]:
+        """Split what a restart interrupted into "run it again" and "give up" (issue #84).
+
+        The first restart after a turn was cut off runs it again; if *that* try is cut off too,
+        the record is dropped rather than replayed a third time, and the caller is told which
+        item to give up on. A turn that ended normally removed its entry (:meth:`done`), so
+        nothing is left to count.
+
+        The try is counted **before** the replay starts, not after: a process killed halfway
+        through its second attempt must not be able to claim a third.
+        """
         now = self.clock()
-        fresh, stale = [], []
+        runnable: List[Tuple[int, Dict[str, Any]]] = []
+        dropped: List[Dict[str, Any]] = []
+        stale: List[str] = []
         for key, entry in sorted(self._entries.items(), key=lambda kv: kv[1].get("at", 0)):
             age = now - float(entry.get("at", 0) or 0)
-            (fresh if 0 <= age <= MAX_AGE_SECONDS else stale).append((key, entry))
-        for key, _ in stale:
+            if not (0 <= age <= MAX_AGE_SECONDS):
+                stale.append(key)
+                continue
+            attempts = int(entry.get("attempts", 0) or 0)
+            if attempts >= MAX_REPLAYS:
+                dropped.append(entry)
+                self._entries.pop(key, None)
+                continue
+            entry["attempts"] = attempts + 1
+            runnable.append((entry["attempts"], entry))
+        for key in stale:
             self._entries.pop(key, None)
         if stale:
             logger.info("inbox: dropped %d interrupted message(s) older than %d h",
                         len(stale), MAX_AGE_SECONDS // 3600)
+        if dropped or runnable:
             self._save()
-        return [entry["event"] for _, entry in fresh]
+        return runnable, dropped
+
+    def interrupted(self) -> List[Dict[str, Any]]:
+        """The events a previous run accepted and never finished, oldest first; stale ones
+        are dropped. (Counting a try as this runs: see :meth:`claim_replay`.)"""
+        return [entry["event"] for _attempt, entry in self.claim_replay()[0]]
+
+    def attempts(self, chat_id: Any, message_id: Any) -> int:
+        """How many times this message has been started (0 until a restart resumes it)."""
+        entry = self._entries.get(entry_key(chat_id, message_id)) or {}
+        return int(entry.get("attempts", 0) or 0)
 
 
 def event_from(data: Dict[str, Any], event_type: Any) -> Any:
