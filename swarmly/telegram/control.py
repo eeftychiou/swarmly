@@ -43,6 +43,10 @@ MAX_CHARS = 4096
 #: How many bot lines the compact view keeps before it says how many it dropped.
 COMPACT_BOTS = 12
 
+#: The first word of the message. A pinned message is recognised as the dashboard by this
+#: marker alone (#117): change it and every pin on every host is orphaned.
+MARKER = "SWARM"
+
 #: Section order in the rendered message: an alert outranks a bot line, which outranks the
 #: round board. `_fill` walks this order and stops when the next section would not fit.
 _ORDER = ("alerts", "bots", "board")
@@ -239,7 +243,7 @@ def header(*, now: Optional[float] = None, round_state: Any = None,
            lease: Optional[Snapshot] = None) -> str:
     """``SWARM round=5 items=6/9 coord=Claude term=4 lease=12m today=1.2M/340 $0.42``."""
     moment = time.time() if now is None else float(now)
-    parts = ["SWARM"]
+    parts = [MARKER]
     round_name = str(getattr(round_state, "round", "") or "")
     status = str(getattr(round_state, "status", "") or "")
     items = _items(round_state)

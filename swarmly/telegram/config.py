@@ -180,7 +180,7 @@ def _parse_int(where: str, value: Any, default: int, *, positive: bool = False) 
 #: against :class:`ChannelLimits`.
 KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "": ("agent", "peers", "adapter", "limits", "fallback", "bus", "projects", "github",
-         "public_redactions", "swarm"),
+         "control", "public_redactions", "swarm"),
     "agent": ("name", "alias", "bot_token", "bot_token_env", "home_channel_id",
               "admin_user_id", "maintainer_username", "allowed_users", "git_name",
               "git_email", "role"),
@@ -194,6 +194,8 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "fallback": ("gitbus_root", "gitbus_ref", "gitbus_poll_minutes"),
     "projects": ("repo", "cwd", "topics", "worktrees", "reply_chars"),
     "github": ("login", "token_env", "poll_minutes", "mark_read", "tracking_label"),
+    # issue #117: where the pinned dashboard lives -- it rides the heartbeat, so no interval
+    "control": ("chat_id", "topic_id"),
     "swarm": ("succession",),
 }
 
@@ -923,6 +925,16 @@ class GitHubSettings:
 
 
 @dataclass
+class ControlSettings:
+    """Where the pinned dashboard lives (issue #117). Absent means no dashboard is kept."""
+
+    #: The chat that holds it: the admin's DM, or the group. ``None`` means the home channel.
+    chat_id: Optional[int] = None
+    #: The topic inside that chat. ``None`` means General.
+    topic_id: Optional[int] = None
+
+
+@dataclass
 class AgentConfig:
     """The whole per-agent configuration."""
 
@@ -935,6 +947,8 @@ class AgentConfig:
     bus: BusSettings = field(default_factory=BusSettings)
     projects: Dict[str, ProjectSettings] = field(default_factory=dict)
     github: Optional[GitHubSettings] = None
+    #: Issue #117: the pinned dashboard's home, when the operator wants one.
+    control: Optional[ControlSettings] = None
     #: Issue #22: literal -> replacement, applied to everything that leaves the host (bus
     #: payloads and GitHub-facing text). Empty by default: nothing is redacted until the
     #: operator names what is sensitive on this machine.
@@ -1271,6 +1285,18 @@ class AgentConfig:
         elif github_raw is not None:
             raise ConfigError("'github' must be a mapping")
 
+        # Issue #117: the pinned dashboard. No section, no dashboard -- the transport keeps
+        # nothing pinned unless the operator says which chat and topic it belongs in.
+        control_raw = data.get("control")
+        control: Optional[ControlSettings] = None
+        if isinstance(control_raw, dict):
+            control = ControlSettings(
+                chat_id=(_parse_int("control.chat_id", control_raw.get("chat_id"), 0) or None),
+                topic_id=(_parse_int("control.topic_id", control_raw.get("topic_id"), 0) or None),
+            )
+        elif control_raw is not None:
+            raise ConfigError("'control' must be a mapping")
+
         # Issue #22: what must not leave this host. The literal is the sensitive value
         # (a handle, a path); the replacement is what the bus and GitHub text carry instead.
         redactions_raw = data.get("public_redactions") or {}
@@ -1294,6 +1320,7 @@ class AgentConfig:
         swarm = dict(swarm_raw) if isinstance(swarm_raw, dict) else {}
         return cls(identity=identity, peers=peers, peer_roles=peer_roles, adapter=adapter, limits=limits,
                    fallback=fallback, bus=bus, projects=projects_dict, github=github,
+                   control=control,
                    public_redactions=public_redactions, swarm=swarm, source_path=source_path,
                    _bus_poll_minutes_explicit=bool(bus_poll_explicit),
                    unknown_keys=unknown)

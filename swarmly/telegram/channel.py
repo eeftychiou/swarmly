@@ -64,6 +64,8 @@ from swarmly.telegram import native as native_cli
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.presence import Presence, Pulse
 
+from swarmly.telegram import control as control_mod
+from swarmly.telegram.control_center import ControlCenter
 from swarmly.telegram import snapshot as snapshot_mod
 
 from swarmly.telegram import usage as usage_mod
@@ -2580,6 +2582,101 @@ class AgentChannel:
             since = time.time() - max(0.0, self._clock() - boot)
         return self.usage_ledger().render(since_boot=since)
 
+    # -- the control centre (issue #117) ------------------------------------------------
+    def control_center(self) -> Optional[Any]:
+        """The pinned dashboard, when ``control`` names a chat. Built once, reused.
+
+        No section, no dashboard: a bot that was not told where the message belongs keeps
+        nothing pinned, which is what every config without ``control`` does today.
+        """
+        settings = getattr(self.config, "control", None)
+        if settings is None:
+            return None
+        existing = getattr(self, "_control_center", None)
+        if existing is not None:
+            return existing
+        bot = getattr(self, "bot", None)
+        if bot is None:                       # not started, and no test double injected
+            return None
+        chat_id = settings.chat_id or self.config.identity.home_channel_id
+        centre = ControlCenter(bot, chat_id=chat_id, thread_id=settings.topic_id,
+                               render=self.control_text)
+        self._control_center = centre
+        return centre
+
+    def control_snapshots(self, now: Optional[float] = None) -> List[Any]:
+        """Every bot's snapshot: this one's, and each peer's as it last published it (#124)."""
+        moment = self.presence_clock() if now is None else float(now)
+        rows: List[Any] = [self.status_snapshot(moment)]
+        table = self.presence()
+        for alias, peer in sorted(table.peers.items()):
+            if alias.strip().lower() == self.config.identity.alias.strip().lower():
+                continue
+            if peer.snapshot:
+                try:
+                    rows.append(snapshot_mod.Snapshot.from_dict(peer.snapshot))
+                    continue
+                except Exception:              # noqa: BLE001 - an unreadable peer record
+                    logger.warning("control centre: unreadable snapshot from %s", alias)
+            rows.append(snapshot_mod.Snapshot(
+                alias=alias, state=table.status(alias, moment), at=peer.last_seen,
+                every=self.heartbeat_seconds(), term=peer.term, rev=peer.rev))
+        return rows
+
+    def control_round(self) -> Optional[Any]:
+        """The round the bus knows, for the dashboard's board. None when there is none.
+
+        Never raises: a dashboard without a round is a smaller dashboard, not a failed beat.
+        """
+        try:
+            from swarmly.telegram.rounds import RoundStore
+            store = self.round_store()
+            repo = str(getattr(self.config.bus, "repo", "") or "")
+            prefix = RoundStore.safe_key(f"{repo}#")[:-1] if repo else ""
+            names = sorted(name for name in store.rounds()
+                           if not prefix or name.startswith(prefix))
+            if not names:
+                return None
+            return max((store.load(name) for name in names),
+                       key=lambda state: (state.updated_at, state.seq))
+        except Exception:                      # noqa: BLE001 - see the docstring
+            logger.warning("control centre: the round state is not readable", exc_info=True)
+            return None
+
+    def control_text(self, now: Optional[float] = None) -> str:
+        """The dashboard's text, built in code from this bot's own records -- no turn."""
+        moment = self.presence_clock() if now is None else float(now)
+        ledger = self.usage_ledger()
+        since = time.time() - max(0.0, self._clock() - getattr(self, "_booted_at", self._clock()))
+        usage = {self.config.identity.alias: self._usage_totals(ledger, since)}
+        return control_mod.dashboard(now=moment, snapshots=self.control_snapshots(moment),
+                                     round_state=self.control_round(), usage=usage,
+                                     coordinator=str(self.current_coordinator() or ""),
+                                     limit=self.config.limits.max_message_chars)
+
+    def _usage_totals(self, ledger: Any, start_of_day: float) -> Dict[str, Any]:
+        """One bot's day, plus its quota: what the dashboard shows beside its state."""
+        totals = dict(ledger.totals(start_of_day))
+        left, resets = ledger.quota()
+        totals["quota_left"], totals["quota_resets_at"] = left, resets
+        return totals
+
+    async def refresh_control_center(self, *, now: Optional[float] = None) -> Optional[Any]:
+        """Edit the pinned dashboard for this beat. Never raises; ``None`` when there is none."""
+        centre = self.control_center()
+        if centre is None:
+            return None
+        try:
+            # The round state comes off the bus (git, subprocesses): off the event loop, like
+            # the pulse's own bus work, or this beat would stall delivery and every turn with it.
+            text = await asyncio.to_thread(self.control_text, now)
+            return await centre.refresh(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                      # noqa: BLE001 - a dashboard must not kill a beat
+            logger.warning("control centre: refresh failed", exc_info=True)
+            return None
+
 
     async def _heartbeat_tick(self, *, now: Optional[float] = None) -> str:
         """Publish one pulse, then judge the peers. Returns what it said, for a test.
@@ -2611,6 +2708,10 @@ class AgentChannel:
                 silent=True, notice=True, allow_when_frozen=True)
             said = f"pulse rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
         await self.check_peer_liveness(now=moment)
+        # The pinned dashboard rides the beat, and only its holder edits it: every bot
+        # refreshing one message would fight over it (#117).
+        if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
+            await self.refresh_control_center(now=moment)
         return said
 
     async def _heartbeat_loop(self) -> None:

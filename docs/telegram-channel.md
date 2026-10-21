@@ -968,6 +968,40 @@ is shown as **unknown**, never as zero, and a total says how many of its rows re
 ledger survives a restart and is capped (2000 rows, then the oldest are dropped — and the
 output says where its history now starts).
 
+**The command centre — a pinned dashboard (issue #117).** The coordinator keeps one message
+pinned in a control topic (or the admin's DM) and edits it in place on every heartbeat, so the
+swarm's state is readable at a glance without asking anyone anything and without a model turn.
+Set where it lives in `config.yaml`; with no `control` section, nothing is pinned:
+
+```yaml
+control:
+  chat_id: -1001234567890     # optional: the admin's DM, or the group; defaults to the home channel
+  topic_id: 307               # optional: the forum topic; defaults to General
+```
+
+The message is built in code from the records the transport already holds — the status
+snapshots (#124), the turn ledger (#125) and the round state (#86) — and it reads in four
+parts. **Alerts first**: a bot DOWN or stuck over its timeout, one frozen or out of quota, a
+hand-off nobody answered, the round's blockers. Then **a line per bot**: state and since when,
+the topic as its `tg-…` token, queue and armed WAKEs, model and effort, rev, uptime and
+restarts, today's tokens and cost, quota and its reset. Then the **round board**: each item's
+owner, PR, head, CI, the review and QA verdicts — a verdict counts only on the head it names —
+and whether it can merge. A number no runtime reported stays **unknown**, never zero.
+
+Telegram allows 4,096 characters in one message, so the layout drops whole lines in that
+order when it runs out of room — the round board first, the alerts last — and says how many
+it hid. The pin is the state: a new coordinator (a failover, #83) reads the chat's pinned
+message, recognises this one by its `SWARM` marker, and edits **the same message**, so there
+is never a second dashboard. A refresh that cannot be delivered is a log line and a status,
+never a failed heartbeat, and an unchanged dashboard sends nothing at all.
+
+The buttons under it (`CONTROLS` in `swarmly/telegram/control.py`) are the controls the
+transport may offer: pause, resume, stop turn, restart, model, effort, WAKE, freeze and
+read-only `/cli` per bot; pause-all, the lease, roles, cleanup, sync and admit for the swarm;
+and a nudge that costs the owner a turn. Anything that stops or changes something needs a
+second tap, and deploy, upgrade, merging a PR and editing configs or secrets are not on it at
+all.
+
 **Native CLI commands — `/cli` (admin only, no model turn).** Swarmly does not reimplement
 what each CLI already does. `/cli@<bot> <command>` runs the command on that bot's CLI and
 streams the output back into one message that is edited as it goes. It never sends a prompt and
