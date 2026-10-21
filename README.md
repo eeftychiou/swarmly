@@ -3,14 +3,6 @@
 [![tests](https://github.com/eeftychiou/swarmly/actions/workflows/tests.yml/badge.svg)](https://github.com/eeftychiou/swarmly/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-> **Not the Agent2Agent protocol.** Swarmly is an independent project. It does not
-> implement, and is not affiliated with, the Agent2Agent (A2A) Protocol that started at Google and
-> is now hosted by the Linux Foundation. Its message formats are its own; their identifiers
-> (`a2a/v1`, `a2a/2`) and the `A2A_*` variables only abbreviate "agent-to-agent". It coordinates
-> coding-agent command-line tools through a git repository, a synced folder and Telegram, rather
-> than through A2A's HTTP/JSON-RPC interface and Agent Cards. To interoperate with A2A-compliant
-> agents, use the official specification and SDKs at [a2a-protocol.org](https://a2a-protocol.org).
-
 **Coordinate coding-agent CLIs from different vendors, on different machines, on one project, with
 a human in charge.**
 
@@ -369,6 +361,14 @@ work was committed under my name.
   superpowers' skills.
 - [aiogram](https://github.com/aiogram/aiogram) (MIT), the Telegram Bot API framework the
   transport is built on.
+
+## Name and protocol note
+
+Swarmly is an independent project and is not affiliated with the Agent2Agent (A2A) Protocol
+(started at Google, now at the Linux Foundation). The `a2a` in its message identifiers
+(`a2a/v1`, `a2a/2`) and `A2A_*` variables just abbreviates "agent-to-agent"; it does not
+implement A2A's HTTP/JSON-RPC interface or Agent Cards. For A2A interoperability see
+[a2a-protocol.org](https://a2a-protocol.org).
 
 ## Contributing and license
 
