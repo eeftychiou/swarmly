@@ -73,7 +73,19 @@ the earlier write, ties broken by succession rank then alias. The other bot yiel
 its next fetch it stops acting. There is never a second merge, and a bot that lost the fold
 never posts a takeover line.
 
-## 4. Freeze the reviewer mid-review
+## 4. Freeze a developer mid-PR
+
+1. Hand a small PR to a developer and wait until it says the branch is pushed.
+2. `/pause @<developer_handle>`, and leave the hand-off unanswered for one release interval.
+3. The topic gets one line: `<alias> has been silent since HH:MM (no pulse and no message for N
+   minutes). DOWN is advisory: the lease still decides who coordinates.` — once per episode, not
+   once per pass.
+4. The bot that handed the work over is asked what happens to it and reassigns the item. The
+   round state moves the item to the new owner.
+5. `/resume @<developer_handle>`: one `🟢 <alias> is back (a pulse was heard again).` line, and
+   nothing else.
+
+## 5. Freeze the reviewer mid-review
 
 1. Ask the reviewer to review an open PR: `@<reviewer_handle> review #<n>`.
 2. Pause it before it answers: `/pause @<reviewer_handle>` (an operator pause; a quota freeze
@@ -85,18 +97,6 @@ never posts a takeover line.
 
 **Expected**: one reassignment turn, one new reviewer, no review from the coordinator of its own
 merge.
-
-## 5. Freeze a developer mid-PR
-
-1. Hand a small PR to a developer and wait until it says the branch is pushed.
-2. `/pause @<developer_handle>`, and leave the hand-off unanswered for one release interval.
-3. The topic gets one line: `<alias> has been silent since HH:MM (no pulse and no message for N
-   minutes). DOWN is advisory: the lease still decides who coordinates.` — once per episode, not
-   once per pass.
-4. The bot that handed the work over is asked what happens to it and reassigns the item. The
-   round state moves the item to the new owner.
-5. `/resume @<developer_handle>`: one `🟢 <alias> is back (a pulse was heard again).` line, and
-   nothing else.
 
 ## 6. Kill everything
 
