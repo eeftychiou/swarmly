@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.11.0] - 2026-10-20
+## [0.11.0] - 2026-10-21
 
 ### Added
 
@@ -15,14 +15,25 @@ All notable changes to this project are documented here. The format follows
   read-only command from an allowlist, and its exit code decides: go fires one turn, pending
   re-arms, an error or expiry starts one turn. Firings are claimed on the bus so two bots
   never fire the same timer (`#81`). A bot fires its own timers even when it does not hold
-  the coordinator lease (`#96`).
+  the coordinator lease (`#96`), and timers fire on a git bus (`#100`).
 - Acting coordinator: the coordinator role is a lease on the bus with terms, so another bot
   takes over when the coordinator is gone, and every side effect is fenced on the current
   lease (`#83`).
 - Durable round state: the round's items and their state live on the bus and survive a
   restart (`#86`).
 - `/cleanup`, short-lived notices, and reaping orphaned provider CLIs (`#63`, `#64`, `#68`).
-- The online notice names the model and reasoning effort the bot runs at (`#95`).
+- The online notice names the model and reasoning effort the bot runs at (`#95`), as the CLI
+  really runs them: `/model`, then the bot's config, then the CLI's own settings, then the
+  model its last turn reported (`#99`).
+- Heartbeats: each bot writes a pulse to its own git ref on the bus with no model turn, peers
+  that stop pulsing are marked DOWN, and a busy peer's hand-off clock restarts instead of
+  drawing a reminder (`#82`).
+- A turn cut off by a die-off is resumed once after the restart, never in a loop (`#84`).
+- Nothing taken for a turn is lost to a restart: queued messages and unsent replies are kept
+  on disk and replayed on the next start. A hand-off to the coordinator gets a reminder from
+  its sender, and an idle coordinator with no WAKE gets a check-in turn (`#101`).
+- An in-process multi-bot harness with seven failure drills, and a runbook for the live
+  drills (`#85`).
 - A round now ends with a report to the human in the round's topic, and closing the round's
   tracking issue is what triggers it: closing sends no GitHub notification, so the
   notifications backstop also remembers which issues carrying `github.tracking_label`
