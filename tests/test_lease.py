@@ -889,3 +889,18 @@ class TestRenewalKeepsTheEarliestDepth(unittest.TestCase):
             # ... and the times still come from the renewal, so the lease is live.
             self.assertEqual(state.expires_at, 9000.0)
             self.assertTrue(state.live(2000.0))
+
+
+class TestLeaseRunsOnWallTime(unittest.TestCase):
+    """Live: the lease was stamped with time.monotonic, which counts from each host's boot.
+    A Linux peer up 34 days read the Windows coordinator's lease as long expired and took
+    over; its own lease then looked valid for a month on Windows. Lease times must be wall
+    times, comparable across hosts."""
+
+    def test_a_production_channel_stamps_the_lease_with_wall_time(self):
+        import time
+        from swarmly.telegram.channel import AgentChannel
+        from tests.test_telegram_channel import make_config
+        channel = AgentChannel(make_config(), sender=lambda *a, **k: None)
+        self.assertIs(channel._lease_clock, time.time)
+        self.assertLess(abs(channel._lease_clock() - time.time()), 5)
