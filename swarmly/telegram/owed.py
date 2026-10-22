@@ -20,6 +20,21 @@ this module works on facts.
 alone, never treated as "no debt": an empty table would tell a coordinator that nothing is owed
 while the round is stalled.
 
+**Where each fact comes from** (#162 review). The row model is only as good as its sources, so
+they are named here rather than left to the wiring:
+
+* roles: the **roster**, never the round state -- ``identity.role`` per bot plus the ``ROLE:``
+  line ``membership.py`` applies. ``RoundState.items`` carries an owner and the two verdicts; it
+  has no role map.
+* heads and CI: a **poll of the round's items** -- ``items[*].pr`` with its ``head``, walked by
+  the transport -- not a ``ROUND_STATE`` block, which is a model's line and therefore a hint.
+  Until that poll runs, these rows do not open; no block will open them.
+* hand-offs: the durable row **is** the source. The channel's in-memory ``_pending_handoffs``
+  is the same debt in a second book, and the wiring makes the nudge read these rows so a nudge
+  cannot fire on a closed row or a row outlive a nudge.
+* admin questions: only observable in a topic this transport polls (there is no DM polling), and
+  the row it opens is a reminder, never an action.
+
 Nothing here evaluates rows, wakes a bot, or reads a model's text: that is #163 and #165. These
 are the model, the persistence, and pure functions from facts to rows.
 """
@@ -51,9 +66,54 @@ KINDS = ("handoff", "ci", "verdict", "fix", "merge", "progress", "admin")
 CI = "CI"
 ADMIN = "admin"
 
+#: The kinds whose debt is bound to one head: a result, a verdict, a fix and a merge are all
+#: about a specific commit, and `id` carries the head so a fact on another head answers nothing.
+HEAD_BOUND = ("ci", "verdict", "fix", "merge")
+
 #: The states a row may be in.
 OPEN, CLOSED = "open", "closed"
 STATES = (OPEN, CLOSED)
+
+
+#: The verdict vocabulary the inferences match on, and the words a bot actually writes.
+#: A reviewer's "changes requested" must open the developer's fix row, so the vocabulary is
+#: normalized here rather than compared as a free string (#162 review).
+VERDICT_MERGE, VERDICT_FIX, VERDICT_PASS, VERDICT_FAIL = "merge", "fix-first", "pass", "fail"
+_VERDICT_WORDS = {
+    "merge": VERDICT_MERGE, "approved": VERDICT_MERGE, "approve": VERDICT_MERGE,
+    "lgtm": VERDICT_MERGE, "ok": VERDICT_MERGE,
+    "fix-first": VERDICT_FIX, "fix first": VERDICT_FIX, "fix": VERDICT_FIX,
+    "changes requested": VERDICT_FIX, "changes-requested": VERDICT_FIX,
+    "rework": VERDICT_FIX, "request changes": VERDICT_FIX,
+    "pass": VERDICT_PASS, "passed": VERDICT_PASS, "green": VERDICT_PASS,
+    "fail": VERDICT_FAIL, "failed": VERDICT_FAIL, "red": VERDICT_FAIL,
+}
+
+_SHA_RE = __import__("re").compile(r"^[0-9a-f]{7,40}$")
+
+
+def normalize_verdict(value: Any) -> str:
+    """A verdict, in the one vocabulary the rows are written in ("" when it is not one)."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    return _VERDICT_WORDS.get(text, text)
+
+
+def normalize_head(value: Any) -> str:
+    """A head as rows compare it: lower case, 7..40 hex, else refused.
+
+    The round state stores expanded shas and ``gh pr checks`` reports the full one, while a
+    reply or an id may carry seven characters, so comparing raw strings would miss a match
+    (#162 review). Expansion against a known full sha stays the round state's job
+    (``rounds.normalize_sha``); this keeps the head honest and comparable.
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if not _SHA_RE.match(text):
+        raise OwedError(f"a row head must be a 7..40 character sha (got {value!r})")
+    return text
 
 
 class OwedError(ValueError):
@@ -85,6 +145,9 @@ class Row:
     deadline: float = 0.0           # absolute; 0 means "no deadline"
     state: str = OPEN
     closed_by: str = ""             # the fact that closed it
+    #: The bot that wrote this row, like `.agents/wakes/<alias>/` (#162 review): two observers
+    #: of the same debt write the same id in different directories, and `fold` reconciles them.
+    writer: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
     version: int = VERSION
@@ -99,7 +162,12 @@ class Row:
             raise OwedError(f"a {self.kind} row needs a debtor")
         self.owes = str(self.owes or "").strip() or "something"
         self.waiting_on = _alias(self.waiting_on)
-        self.head = str(self.head or "").strip()
+        self.head = normalize_head(self.head)
+        if self.kind in HEAD_BOUND and not self.head:
+            # The head is in the id on purpose: a verdict on older code must close nothing,
+            # so a debt that is *about* a head cannot exist without naming it.
+            raise OwedError(f"a {self.kind} row must name the head it is bound to")
+        self.writer = _alias(self.writer)
         self.state = str(self.state or OPEN).strip().lower()
         if self.state not in STATES:
             raise OwedError(f"unknown row state {self.state!r} (expected one of {list(STATES)})")
@@ -151,7 +219,8 @@ class Row:
             "debtor": self.debtor, "owes": self.owes, "waiting_on": self.waiting_on,
             "opened_by": self.opened_by, "observed": self.observed, "head": self.head,
             "topic": self.topic, "deadline": self.deadline, "state": self.state,
-            "closed_by": self.closed_by, "created_at": self.created_at,
+            "closed_by": self.closed_by, "writer": self.writer,
+            "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
 
@@ -172,6 +241,7 @@ class Row:
             topic=str(data.get("topic") or ""), deadline=data.get("deadline") or 0.0,
             state=str(data.get("state") or OPEN),
             closed_by=str(data.get("closed_by") or ""),
+            writer=str(data.get("writer") or ""),
             created_at=data.get("created_at") or 0.0,
             updated_at=data.get("updated_at") or 0.0, version=VERSION)
 
@@ -194,9 +264,10 @@ def handoff_rows(*, asked: Iterable[str], asker: str = "", item: str = "", topic
                  deadline: float = 0.0) -> List[Row]:
     """A peer mentioned with a request owes an answer -- **each** peer, not just the first.
 
-    This is the hand-off tracking the channel already does, with the case that missed DeepSeek
-    on 22 Oct put right: a line addressed to two peers opens two rows, so a request nobody
-    answered is two visible debts rather than none.
+    One row per addressee, so a line addressed to two peers opens two debts -- the case that
+    missed DeepSeek on 22 Oct. These rows are the **durable** record of a hand-off: the channel's
+    in-memory ``_pending_handoffs`` is the same debt kept twice, and the wiring makes the nudge
+    read these rows rather than its own book.
     """
     moment = time.time() if at is None else float(at)
     who = _alias(asker)
@@ -216,9 +287,11 @@ def head_rows(*, item: str, head: str, roles: Mapping[str, str],
               deadline: float = 0.0) -> List[Row]:
     """A new head on a round item: CI owes a result, and the reviewer and QA owe verdicts.
 
-    All three are bound to *that* head. ``roles`` names them (``review``, ``qa``; the developer
-    and coordinator come from the round state too). A role with no owner opens nothing: a debt
-    nobody holds is a line to post, not a row to wake.
+    All three are bound to *that* head, and the head is required: a result or a verdict on
+    older code answers nothing (#162 review). ``roles`` maps ``review``/``qa`` to an alias, and
+    the caller resolves it from the **roster** (``identity.role`` and the ``ROLE:`` line
+    ``membership.py`` applies) -- the round state has no role map. A role with no owner opens
+    nothing: a debt nobody holds is a line to post, not a row to wake.
     """
     moment = time.time() if at is None else float(at)
     where = f"{item}@{head}" if head else item
@@ -247,7 +320,7 @@ def fix_rows(*, item: str, head: str, developer: str, verdicts: Mapping[str, str
     moment = time.time() if at is None else float(at)
     alias = _alias(developer)
     failed = [kind for kind, value in (verdicts or {}).items()
-              if str(value or "").strip().lower() in ("fix-first", "fix", "fail", "failed")]
+              if normalize_verdict(value) in (VERDICT_FIX, VERDICT_FAIL)]
     if not alias or not failed:
         return []
     return [Row(kind="fix", item=item, head=head, debtor=alias,
@@ -268,8 +341,8 @@ def merge_row(*, item: str, head: str, coordinator: str, ci_green: bool,
     alias = _alias(coordinator)
     if not alias or not ci_green:
         return None
-    values = {kind: str(value or "").strip().lower() for kind, value in (verdicts or {}).items()}
-    if values.get("review") != "merge" or values.get("qa") not in ("pass", "passed", "ok"):
+    values = {kind: normalize_verdict(value) for kind, value in (verdicts or {}).items()}
+    if values.get("review") != VERDICT_MERGE or values.get("qa") != VERDICT_PASS:
         return None
     return Row(kind="merge", item=item, head=head, debtor=alias,
                owes=f"a merge of {item}" + (f" at {head}" if head else ""),
@@ -304,7 +377,11 @@ def progress_rows(*, items: Iterable[Mapping[str, Any]], at: Optional[float] = N
 
 def admin_row(*, question: str, item: str = "", topic: str = "", asked_by: str = "",
               at: Optional[float] = None, deadline: float = 0.0) -> Row:
-    """A question addressed to the admin: the admin owes an answer. A reminder, never an action."""
+    """A question addressed to the admin: the admin owes an answer. A reminder, never an action.
+
+    Only a question in a topic this transport polls is observable -- there is no DM polling --
+    so that topic, not a private message, is the trigger.
+    """
     moment = time.time() if at is None else float(at)
     text = str(question or "").strip()
     return Row(kind="admin", item=item, debtor=ADMIN, owes="an answer",
@@ -344,7 +421,11 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
     item, head = str(fact.item or "").strip(), str(fact.head or "").strip()
     who = _alias(fact.who)
     same_item = bool(item) and (item == row.item or item.lstrip("#") == row.item.lstrip("#"))
-    same_head = (not head or not row.head or head.lower() == row.head.lower())
+    try:
+        head = normalize_head(head)
+    except OwedError:
+        return None                  # not a sha: it cannot be the head a debt is bound to
+    same_head = (not head or not row.head or head == row.head)
     if fact.kind == "ci":
         # CI's own result on this head answers the CI row for it, and nothing else: a result
         # is not a review verdict, and a result on older code is not a result on this head.
@@ -368,7 +449,7 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
             return None
         if who and row.debtor and who.lower() != row.debtor.lower():
             return None
-        if head and row.head and head.lower() != row.head.lower():
+        if head and row.head and head != row.head:
             return None              # a verdict on older code answers nothing here
         return f"{row.debtor} filed {fact.verdict or 'a verdict'}"
     if fact.kind == "reply":
@@ -396,6 +477,29 @@ def settle(rows: Sequence[Row], fact: Fact, *, now: Optional[float] = None) -> L
         row.state, row.closed_by, row.updated_at = CLOSED, reason, moment
         closed.append(row)
     return closed
+
+
+def fold(rows: Iterable[Row]) -> List[Row]:
+    """One row per id across writers (#162 review).
+
+    Two observers of the same debt write the same id in their own directories. The reader's
+    rule: **closed beats open** -- a debt answered is answered, whoever noticed first -- and
+    among two opens the newest ``observed`` wins, then the newest write, then the lowest
+    writer, so every reader folds to the same row and a debt is never counted twice.
+    """
+    best: Dict[str, Row] = {}
+    for row in rows:
+        seen = best.get(row.id)
+        if seen is None:
+            best[row.id] = row
+            continue
+        if seen.is_open and not row.is_open:
+            best[row.id] = row
+            continue
+        if seen.is_open == row.is_open:
+            if (row.updated_at, bool(row.observed), str(row.writer).lower()) >                     (seen.updated_at, bool(seen.observed), str(seen.writer).lower()):
+                best[row.id] = row
+    return list(best.values())
 
 
 # -- persistence -------------------------------------------------------------------------
@@ -438,7 +542,13 @@ class OwedStore:
         return directory / f"{safe[:120]}.json"
 
     def save(self, row: Row) -> Row:
-        """Write one row, then publish it to the bus when there is one."""
+        """Write one row under this bot's own directory, then publish it to the bus.
+
+        The alias in the path is the **writer**, like `.agents/wakes/<alias>/`: two bots that
+        observe the same debt each keep their own copy, and :func:`fold` reconciles them for a
+        reader instead of one silently overwriting the other.
+        """
+        row.writer = row.writer or self.alias
         row.updated_at = float(self.clock())
         path = self._file(row)
         if path is not None:

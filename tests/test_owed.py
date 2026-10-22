@@ -137,6 +137,64 @@ class TestOpeningRowsFromFacts(unittest.TestCase):
         self.assertEqual(row.state, ow.OPEN)
 
 
+class TestTheReviewPins(unittest.TestCase):
+    """What the review of the design pinned down (#162): identity, vocabulary, two writers."""
+
+    def test_a_debt_about_a_head_cannot_exist_without_one(self):
+        for kind in ow.HEAD_BOUND:
+            with self.subTest(kind=kind), self.assertRaises(ow.OwedError):
+                ow.Row(kind=kind, item="#170", debtor="Reasonix", owes="something")
+        # A debt that is not about a head needs none.
+        self.assertEqual(ow.Row(kind="handoff", item="", debtor="Reasonix",
+                                owes="an answer").head, "")
+
+    def test_a_head_is_normalized_and_an_impossible_one_is_refused(self):
+        row = ow.Row(kind="verdict", item="#170", debtor="Reasonix", owes="a verdict",
+                     head="22E68C5")
+        self.assertEqual(row.head, "22e68c5")
+        self.assertEqual(row.id, "verdict:#170@22e68c5:Reasonix")
+        with self.assertRaises(ow.OwedError):
+            ow.Row(kind="verdict", item="#170", debtor="Reasonix", owes="a verdict",
+                   head="not-a-sha")
+
+    def test_the_verdict_vocabulary_is_what_bots_actually_write(self):
+        self.assertEqual(ow.normalize_verdict("Changes requested"), ow.VERDICT_FIX)
+        self.assertEqual(ow.normalize_verdict("LGTM"), ow.VERDICT_MERGE)
+        self.assertEqual(ow.normalize_verdict("passed"), ow.VERDICT_PASS)
+        rows = ow.fix_rows(item="#169", head="09c2c23", developer="DeepSeek",
+                           verdicts={"review": "changes requested"})
+        self.assertEqual(len(rows), 1)          # "changes requested" still opens the fix row
+        self.assertIsNotNone(ow.merge_row(item="#172", head="54960ac", coordinator="Claudebot",
+                                         ci_green=True,
+                                         verdicts={"review": "approved", "qa": "green"}))
+
+    def test_two_writers_fold_to_one_row_and_closed_beats_open(self):
+        row = ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot", at=1000.0)[0]
+        mine = ow.Row(**{**row.to_dict(), "writer": "Claudebot", "updated_at": 1000.0})
+        theirs = ow.Row(**{**row.to_dict(), "writer": "Reasonix", "state": ow.CLOSED,
+                           "closed_by": "DeepSeek answered", "updated_at": 1000.0})
+        folded = ow.fold([mine, theirs])
+        self.assertEqual(len(folded), 1)
+        self.assertFalse(folded[0].is_open)     # an answered debt is answered
+        self.assertEqual(folded[0].writer, "Reasonix")
+
+    def test_two_opens_fold_to_the_one_that_saw_more(self):
+        row = ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot", at=1000.0)[0]
+        quiet = ow.Row(**{**row.to_dict(), "writer": "Claudebot", "updated_at": 1000.0})
+        loud = ow.Row(**{**row.to_dict(), "writer": "Reasonix", "updated_at": 1200.0,
+                         "observed": "no reply for 20m"})
+        folded = ow.fold([quiet, loud])
+        self.assertEqual(folded[0].observed, "no reply for 20m")
+
+    def test_the_store_stamps_its_writer(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = ow.OwedStore("DeepSeek", state_dir=Path(tmp.name))
+        row = store.save(ow.handoff_rows(asked=["Reasonix"], asker="Claudebot", at=1000.0)[0])
+        self.assertEqual(row.writer, "DeepSeek")
+        self.assertEqual(store.load()[0].writer, "DeepSeek")
+
+
 class TestClosingOnFacts(unittest.TestCase):
 
     def rows(self):
