@@ -176,6 +176,20 @@ class TestTheStuckReport(unittest.TestCase):
         self.assertAlmostEqual(status["silent"], 420, delta=2)
 
 
+async def _cancelled(task: "asyncio.Task", ticks: int = 5) -> bool:
+    """True when ``task`` ended cancelled, after letting the loop deliver the cancellation.
+
+    ``Task.cancelling()`` would answer before the task has had a turn to run, but it is 3.11+
+    only and this suite runs on 3.10 too, so wait for the task to settle and read
+    ``cancelled()`` instead. A turn the product left running simply never settles.
+    """
+    for _ in range(ticks):
+        if task.done():
+            break
+        await asyncio.sleep(0)
+    return task.cancelled()
+
+
 class TestTheKillPath(unittest.TestCase):
     """A turn silent past the kill limit stops through /stop, and the topic is told once."""
 
@@ -194,7 +208,7 @@ class TestTheKillPath(unittest.TestCase):
         done = await channel.check_stuck_turns()
         # Read the cancellation here: once this coroutine returns, the test harness may
         # cancel whatever the scenario left pending, which would hide the answer.
-        cancelled = task.cancelled() or task.cancelling()
+        cancelled = await _cancelled(task)
         channel._turns.discard(task)
         task.cancel()
         return cancelled, done
