@@ -287,12 +287,14 @@ def _duration(seconds: float) -> str:
 # -- opening rows from facts -------------------------------------------------------------
 
 def handoff_rows(*, asked: Iterable[str], asker: str = "", item: str = "", topic: str = "",
-                 opened_by: str = "", at: Optional[float] = None,
+                 place: str = "", opened_by: str = "", at: Optional[float] = None,
                  deadline: float = 0.0) -> List[Row]:
     """A peer mentioned with a request owes an answer -- **each** peer, not just the first.
 
     One row per addressee, so a line addressed to two peers opens two debts -- the case that
-    missed DeepSeek on 22 Oct. These rows are the **durable** record of a hand-off: the channel's
+    missed DeepSeek on 22 Oct. *place* is what tells two hand-offs in tokened and untokened
+    discussions apart: the topic token when there is one, else a stable digest of the place
+    (never a chat id: these rows travel on the bus). These rows are the **durable** record of a hand-off: the channel's
     in-memory ``_pending_handoffs`` is the same debt kept twice, and the wiring makes the nudge
     read these rows rather than its own book.
     """
@@ -305,7 +307,7 @@ def handoff_rows(*, asked: Iterable[str], asker: str = "", item: str = "", topic
             continue                        # a bot does not owe itself an answer
         rows.append(Row(kind="handoff", item=item, debtor=alias, owes="an answer",
                         waiting_on=who, opened_by=opened_by or f"hand-off in {topic or 'a topic'}",
-                        topic=topic, key_extra=topic, deadline=deadline,
+                        topic=topic, key_extra=place or topic, deadline=deadline,
                         created_at=moment, updated_at=moment))
     return rows
 
@@ -502,9 +504,12 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
         # answers only rows that name none, so the fallback stays a fallback (#173 review, QA).
         here = (item or "").lower()
         if here:
-            same_place = (bool(row.topic) and here == str(row.topic).lower()) or same_item
+            # The place a row records is its topic token, or -- in a discussion with no token
+            # (General, an unbound topic) -- the digest the channel keyed it by.
+            same_place = same_item or here in (str(row.topic or "").lower(),
+                                               str(row.key_extra or "").lower())
         else:
-            same_place = not row.topic and not row.item
+            same_place = not row.topic and not row.item and not row.key_extra
         if not same_place:
             return None
         if row.kind == "handoff" and (not who or who.lower() == row.debtor.lower()):
@@ -637,21 +642,26 @@ class OwedStore:
         return row
 
     def load(self) -> List[Row]:
-        """Every row this bot can read, newest state per id."""
+        """Every row this bot can read: its own state copy **and** the bus documents.
+
+        The state copy is the writer's; the documents under the checkout are the swarm's. A
+        successor that read only its own state directory answered "nothing is owed" while the
+        bus held rows (#173 review, QA), so the two are folded here and every reader -- /owed,
+        settlement, the nudge -- sees the same table.
+        """
         directory = self.directory
         self._unreadable = []
-        if directory is None or not directory.is_dir():
-            return []
-        rows: Dict[str, Row] = {}
-        for path in sorted(directory.glob("*.json")):
-            try:
-                row = Row.from_dict(json.loads(path.read_text(encoding="utf-8")))
-            except Exception:                        # noqa: BLE001 - one bad file, one row lost
-                self._unreadable.append(path.name)
-                logger.warning("owed: unreadable row %s; skipping it", path.name)
-                continue
-            rows[row.id] = row
-        return list(rows.values())
+        rows: List[Row] = []
+        if directory is not None and directory.is_dir():
+            for path in sorted(directory.glob("*.json")):
+                try:
+                    rows.append(Row.from_dict(json.loads(path.read_text(encoding="utf-8"))))
+                except Exception:                    # noqa: BLE001 - one bad file, one row lost
+                    self._unreadable.append(path.name)
+                    logger.warning("owed: unreadable row %s; skipping it", path.name)
+        if self.root is not None:
+            rows.extend(self._read_documents(self.root))
+        return fold(rows)
 
     @property
     def unreadable(self) -> List[str]:
@@ -687,15 +697,8 @@ class OwedStore:
         return list(rows)
 
     @staticmethod
-    def documents(root: Path) -> List[Row]:
-        """Every row document under *root*'s `.agents/owed/`, folded across writers.
-
-        This is how a successor inherits the table: it reads the checkout, not its own state
-        directory, and :func:`fold` settles the ids two bots both observed. It is the
-        inheritance path **whenever a transport is configured**; a checkout-only deployment
-        (no bus at all) has no document to read, and its rows live in the state directory
-        alone -- which is the plane there, and which a successor on the same host inherits.
-        """
+    def _read_documents(root: Path) -> List[Row]:
+        """Every row document under *root*'s `.agents/owed/`, as read (not yet folded)."""
         base = Path(root) / OWED_RELPATH
         if not base.is_dir():
             return []
@@ -705,7 +708,21 @@ class OwedStore:
                 rows.append(Row.from_dict(json.loads(path.read_text(encoding="utf-8"))))
             except Exception:                        # noqa: BLE001 - one bad document, one row
                 logger.warning("owed: unreadable row document %s; skipping it", path)
-        return sorted(fold(rows), key=lambda row: row.id)
+        return rows
+
+    @staticmethod
+    def documents(root: Path) -> List[Row]:
+        """Every row document under *root*'s `.agents/owed/`, folded across writers.
+
+        This is how a successor inherits the table: it reads the checkout, not its own state
+        directory, and :func:`fold` settles the ids two bots both observed. It is the
+        inheritance path **whenever a transport is configured**; a checkout-only deployment
+        (no bus at all) has no document to read, and its rows live in the state directory
+        alone -- which is the plane there, and which a successor on the same host inherits.
+        :meth:`load` reads the same documents, so ``/owed`` and settlement never answer from a
+        narrower view than this.
+        """
+        return sorted(fold(OwedStore._read_documents(root)), key=lambda row: row.id)
 
     def summary(self, now: Optional[float] = None, *, limit: int = 10) -> str:
         """One line for ``/owed``: what is open, or that nothing is."""

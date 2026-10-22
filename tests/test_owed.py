@@ -195,6 +195,49 @@ class TestTheReviewPins(unittest.TestCase):
         self.assertEqual(store.load()[0].writer, "DeepSeek")
 
 
+class TestSuccessorInheritance(unittest.TestCase):
+    """A successor reads the bus documents, not only its own state directory (#173 review)."""
+
+    def test_a_fresh_store_reads_what_the_bus_holds(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "checkout"
+
+            class Bus:
+                ref = "refs/heads/main"
+
+                def commit_and_push(self, message, paths=None):
+                    return None
+
+            writer = ow.OwedStore("Claudebot", state_dir=Path(tmp) / "claudebot",
+                                  transport=Bus(), root=root, clock=lambda: 1000.0)
+            row = writer.save(ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot",
+                                              topic="tg-1", at=1000.0)[0])
+            # The successor: another bot, another state directory, the same checkout.
+            heir = ow.OwedStore("Reasonix", state_dir=Path(tmp) / "reasonix", root=root,
+                                clock=lambda: 1100.0)
+            self.assertEqual([r.id for r in heir.open_rows(now=1100.0)], [row.id])
+            self.assertIn("DeepSeek owes an answer", heir.summary(now=1100.0))
+
+    def test_the_heir_also_sees_its_own_rows(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "checkout"
+            store = ow.OwedStore("Reasonix", state_dir=Path(tmp) / "state", root=root,
+                                 clock=lambda: 1000.0)
+            mine = store.save(ow.handoff_rows(asked=["Codex"], asker="Reasonix",
+                                              topic="tg-2", at=1000.0)[0])
+            self.assertEqual([r.id for r in store.open_rows(now=1000.0)], [mine.id])
+
+    def test_two_untokened_places_are_two_debts(self):
+        first = ow.handoff_rows(asked=["DeepSeek"], asker="C", place="x1a2b3c4",
+                                at=1000.0)[0]
+        second = ow.handoff_rows(asked=["DeepSeek"], asker="C", place="x9f8e7d6",
+                                 at=1000.0)[0]
+        self.assertNotEqual(first.id, second.id)
+        closed = ow.settle([first, second], ow.Fact(kind="reply", item="x1a2b3c4",
+                                                    who="DeepSeek"))
+        self.assertEqual([row.key_extra for row in closed], ["x1a2b3c4"])
+
+
 class TestThePullRequestReview(unittest.TestCase):
     """What the review of PR #173 proved against the code, now pinned as tests."""
 
@@ -350,9 +393,11 @@ class TestClosingOnFacts(unittest.TestCase):
         self.assertEqual([row.debtor for row in closed], ["DeepSeek"])
         self.assertEqual([row.debtor for row in rows if row.is_open], ["Reasonix"])
 
-    def test_the_admin_answering_closes_the_admin_row(self):
-        row = ow.admin_row(question="deploy?", at=1000.0)
-        closed = ow.settle([row], ow.Fact(kind="reply", who="admin"))
+    def test_the_admin_answering_closes_the_admin_row_for_that_place(self):
+        row = ow.admin_row(question="deploy?", topic="tg-1", at=1000.0)
+        # An answer in another topic answers nothing here (#173 review, QA).
+        self.assertEqual(ow.settle([row], ow.Fact(kind="reply", who="admin", item="tg-2")), [])
+        closed = ow.settle([row], ow.Fact(kind="reply", who="admin", item="tg-1"))
         self.assertEqual(len(closed), 1)
 
     def test_no_fact_for_prose_so_saying_done_closes_nothing(self):

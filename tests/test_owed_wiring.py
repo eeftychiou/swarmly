@@ -146,3 +146,34 @@ class TestTheOwedCommand(unittest.TestCase):
             line = channel._owed_command(None)
         self.assertIn("cannot read the table", line)
         self.assertNotIn("owed: nothing", line)
+
+
+class TestTheLeadAndUntokenedPlaces(unittest.TestCase):
+    """#173 review: a hand-off to the coordinator still owes a row, and places without a token
+    must not collapse into one debt."""
+
+    def channel(self):
+        channel = channel_with_table()
+        self.addCleanup(channel._test_table[0].cleanup)
+        return channel
+
+    def test_a_hand_off_to_the_coordinator_opens_a_row(self):
+        channel = self.channel()
+        channel.membership.state.coordinator = "Codex"
+        channel.current_coordinator = lambda *a, **k: "Codex"
+        # The body answers Codex's own hand-off, so it is not mirrored to it -- but the
+        # coordinator is still waited on, which is exactly the debt that had no row.
+        channel._mirror_handoffs("@CodexBot: #173 is ready, merge it.", GROUP, 307, 55,
+                                 asker="Codex")
+        self.assertEqual([row.debtor for row in rows(channel)], ["Codex"])
+
+    def test_two_places_without_a_topic_token_stay_apart(self):
+        channel = self.channel()
+        first = channel._place_key(GROUP, None)
+        second = channel._place_key(GROUP + 1, None)
+        self.assertNotEqual(first, second)
+        self.assertFalse(first.lstrip("x").isdigit())     # a digest, never a chat id
+        channel._mirror_handoffs("@CodexBot: take #173.", GROUP, None, 55)
+        channel._mirror_handoffs("@CodexBot: take #173.", GROUP + 1, None, 56)
+        self.assertEqual(len(rows(channel)), 2)
+

@@ -28,6 +28,7 @@ import contextlib
 import html
 import json
 import contextvars
+import hashlib
 import logging
 import os
 import re
@@ -4902,6 +4903,19 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - book-keeping, not a turn
             return ""
 
+    def _place_key(self, chat_id: int, thread_id: Optional[int]) -> str:
+        """What tells two hand-offs apart: the topic token, or a digest when there is none.
+
+        General and an unbound topic have no token (``context_for`` fails closed), and using ""
+        for both made one peer's hand-offs in two such places a single row (#173 review): a
+        digest keeps them apart without putting a chat id in a row that travels on the bus.
+        """
+        token = self._topic_token(chat_id, thread_id)
+        if token:
+            return token
+        raw = f"{int(chat_id)}:{thread_id}".encode("utf-8")
+        return "x" + hashlib.sha1(raw).hexdigest()[:7]
+
     def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
                             thread_id: Optional[int]) -> None:
         """Record a durable row per peer just handed work (#162, the wiring).
@@ -4915,10 +4929,11 @@ class AgentChannel:
         if not asked or self.bot is None:
             return
         topic = self._topic_token(chat_id, thread_id)
+        place = self._place_key(chat_id, thread_id)
         try:
             store = self.owed_store()
             rows = store.observe(handoff_rows(asked=asked, asker=self.config.identity.alias,
-                                              topic=topic,
+                                              topic=topic, place=place,
                                               opened_by=f"hand-off in {topic or 'a topic'}"))
             for row in rows:
                 store.save(row)
@@ -4935,9 +4950,9 @@ class AgentChannel:
         from swarmly.telegram.owed import Fact, settle
         try:
             store = self.owed_store()
-            closed = settle(store.load(), Fact(kind="reply", item=self._topic_token(chat_id,
-                                                                                  thread_id),
-                                               who=peer))
+            closed = settle(store.load(),
+                            Fact(kind="reply", item=self._place_key(chat_id, thread_id),
+                                 who=peer))
             for row in closed:
                 store.save(row)
         except Exception:                          # noqa: BLE001 - reported, not swallowed
@@ -6891,10 +6906,16 @@ class AgentChannel:
         leads = {name.strip().lower() for name in
                  (self.membership.state.coordinator, self.current_coordinator())
                  if isinstance(name, str) and name.strip()}
+        owed_to_leads: List[str] = []
         for peer in named:
             if peer not in peers and peer.strip().lower() in leads                     and peer.strip().lower() != self.config.identity.alias.strip().lower():
                 self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
                     "at": self._clock(), "message_id": message_id, "nudged": False}
+                owed_to_leads.append(peer)          # waited on, so it is owed a row (#173)
+        if owed_to_leads:
+            # Recorded before the early return: a reply that hands work only to the coordinator
+            # has no mirror copy, and used to open no row at all (#173 review).
+            self._note_owed_handoffs(owed_to_leads, chat_id, thread_id)
         if not peers:
             return
         for peer in peers:
