@@ -24,7 +24,7 @@ TEXT = "SWARM round=5 items=3/9 coord=Claude"
 class FakeBot:
     """The four Telegram calls the dashboard makes, recorded instead of sent."""
 
-    def __init__(self, pinned=None, next_id: int = 500):
+    def __init__(self, pinned=None, next_id: int = 500, shared_pin: bool = False):
         self.sent = []
         self.edits = []
         self.pins = []
@@ -34,6 +34,11 @@ class FakeBot:
         self.send_error = None
         self.edit_error = None
         self.pin_error = None
+        #: Whether the pinned message may be edited as if it were this bot's own. Telegram
+        #: allows a bot to edit only its **own** messages, so the default is to refuse a pin
+        #: this bot never sent -- which is what a real failover hits. A *shared-bot chat* (two
+        #: bots behind one token, or a test of the adoption path in isolation) sets this.
+        self.shared_pin = shared_pin
 
     async def send_message(self, **kwargs):
         if self.send_error:
@@ -45,8 +50,16 @@ class FakeBot:
     async def edit_message_text(self, **kwargs):
         if self.edit_error:
             raise self.edit_error
+        target = kwargs.get("message_id")
+        if not self.shared_pin and target not in self.own_ids():
+            raise RuntimeError("Bad Request: message can't be edited")
         self.edits.append(kwargs)
-        return SimpleNamespace(message_id=kwargs.get("message_id"))
+        return SimpleNamespace(message_id=target)
+
+    def own_ids(self):
+        """The message ids this bot itself sent: the only ones Telegram lets it edit."""
+        return {row["message_id"] for row in self.sent if row.get("message_id")} | \
+            {self.next_id}
 
     async def pin_chat_message(self, **kwargs):
         if self.pin_error:
@@ -132,19 +145,24 @@ class TestLaterRefreshes(unittest.TestCase):
 
 
 class TestFailover(unittest.TestCase):
-    def test_a_new_coordinator_adopts_the_pinned_message(self):
-        """The message id is never on disk: Telegram's pin is the state (#117 failover)."""
+    def test_a_new_coordinator_adopts_the_pinned_message_in_a_shared_bot_chat(self):
+        """Shared-bot chat (one token behind two bots): the pin is editable, so it is adopted.
+
+        A real failover is two *tokens*, and Telegram then refuses the edit -- the retire path
+        in :class:`TestAFailoverRetiresTheOldPin`. This test keeps the adoption path honest for
+        the deployments where the pin genuinely is this bot's to edit.
+        """
         pinned = SimpleNamespace(message_id=777, text=TEXT, message_thread_id=307)
-        bot = FakeBot(pinned=pinned)
+        bot = FakeBot(pinned=pinned, shared_pin=True)
         row = centre(bot)
         result = run(row.refresh())
         self.assertEqual(result.message_id, 777)
         self.assertEqual(bot.sent, [])                              # nothing new was posted
         self.assertEqual(bot.pins, [])                              # and nothing re-pinned
 
-    def test_an_adopted_message_is_edited_when_the_text_moved(self):
+    def test_an_adopted_message_is_edited_when_the_text_moved_in_a_shared_bot_chat(self):
         pinned = SimpleNamespace(message_id=777, text="SWARM round=5 items=1/9", message_thread_id=307)
-        bot = FakeBot(pinned=pinned)
+        bot = FakeBot(pinned=pinned, shared_pin=True)
         result = run(centre(bot).refresh())
         self.assertEqual(result.message_id, 777)
         self.assertEqual(result.status, cc.TAKEN)
