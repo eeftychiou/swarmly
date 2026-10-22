@@ -969,6 +969,10 @@ is shown as **unknown**, never as zero, and a total says how many of its rows re
 ledger survives a restart and is capped (2000 rows, then the oldest are dropped — and the
 output says where its history now starts).
 
+`/usage@<bot> all` lists every bot's usage today: this bot's from its ledger, each peer's from
+the `usage.today` its latest heartbeat carried. The coordinator gets the same lines added to each
+turn's prompt (code, no tokens), so a cost report never needs anyone to look for ledger files.
+
 **Native CLI commands — `/cli` (admin only, no model turn).** Swarmly does not reimplement
 what each CLI already does. `/cli@<bot> <command>` runs the command on that bot's CLI and
 streams the output back into one message that is edited as it goes. It never sends a prompt and

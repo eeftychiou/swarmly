@@ -2674,8 +2674,72 @@ class AgentChannel:
             logger.warning("usage: could not record the turn", exc_info=True)
             return None
 
+    def swarm_usage(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Today's usage per bot (UTC day): this bot's from its own ledger, every peer's from
+        the latest heartbeat it published. Read in code, never a model turn, so the coordinator
+        can report the swarm's cost without searching the disk for ledgers (live, 22 Oct: it ran
+        a whole-disk ``find`` for usage-*.json and lost its reply to it)."""
+        moment = time.time() if now is None else float(now)
+        try:
+            ledger = self.usage_ledger()
+            own = ledger.totals(moment - (moment % 86400.0)) if ledger is not None else {}
+        except Exception:                              # noqa: BLE001 - a row without numbers
+            own = {}
+        rows: List[Dict[str, Any]] = [{"alias": self.config.identity.alias, "age": 0.0,
+                                       "state": "frozen" if self._frozen else "up",
+                                       **_usage_brief(own)}]
+        try:
+            peers = dict(self.presence().peers)
+        except Exception:                              # noqa: BLE001 - this bot only
+            peers = {}
+        for alias in sorted(peers):
+            if not self._is_known_peer(alias):
+                continue
+            peer = peers[alias]
+            snapshot = peer.snapshot if isinstance(peer.snapshot, dict) else {}
+            usage = snapshot.get("usage") if isinstance(snapshot.get("usage"), dict) else {}
+            today = usage.get("today") if isinstance(usage.get("today"), dict) else {}
+            rows.append({"alias": alias, "age": max(0.0, moment - float(peer.last_seen or 0.0)),
+                         "state": str(snapshot.get("state") or ("frozen" if peer.frozen else "up")),
+                         **_usage_brief(today)})
+        return rows
+
+    def swarm_usage_text(self, now: Optional[float] = None) -> str:
+        """``/usage@bot all`` and the coordinator's prompt note: one line per bot."""
+        lines = []
+        for row in self.swarm_usage(now):
+            parts = [f"{row['turns'] or 0} turns"]
+            if row["cost_usd"] is not None:
+                parts.append(f"${float(row['cost_usd']):.2f}")
+            if row["tokens_in"] is not None:
+                parts.append(f"{_usage_tokens(row['tokens_in'])} in")
+            if row["tokens_out"] is not None:
+                parts.append(f"{_usage_tokens(row['tokens_out'])} out")
+            if row["state"] not in ("up", "idle", "busy"):
+                parts.append(row["state"])
+            if row["age"] > 15 * 60:
+                parts.append(f"last heard {int(row['age'] // 60)} min ago")
+            lines.append(f"- {row['alias']}: " + ", ".join(parts))
+        return ("Swarm usage today (UTC), from each bot's own ledger and heartbeat; a number a "
+                "CLI does not report is left out:\n" + "\n".join(lines))
+
+    def _swarm_usage_note(self) -> str:
+        """For the coordinator only: the swarm's usage, so a report needs no search."""
+        try:
+            if not self.is_coordinator():
+                return ""
+            return ("\n\n[" + self.swarm_usage_text() + "\nUse these numbers for any cost "
+                    "report; never search the disk for usage files.]")
+        except Exception:                              # noqa: BLE001 - a turn without the note
+            logger.debug("no swarm usage note this turn", exc_info=True)
+            return ""
+
     def usage_text(self, event: Optional[Any] = None) -> str:
-        """``/usage``: what this bot has spent -- answered from the ledger, in code."""
+        """``/usage``: what this bot has spent -- answered from the ledger, in code.
+        ``/usage@bot all``: every bot's usage today, from the heartbeats."""
+        if event is not None and \
+                [a.lower() for a in command_args(event.text or "")][:1] == ["all"]:
+            return self.swarm_usage_text()
         boot = getattr(self, "_booted_at", None)
         since = None
         if boot is not None:
@@ -4563,6 +4627,7 @@ class AgentChannel:
         if not event.author_is_bot and not is_admin_dm:     # peers can't see a DM
             text += self._waiting_note(event.text)
         text += self._frozen_peers_note()
+        text += self._swarm_usage_note()
         if not event.self_task and asks_for_topic(event.text or ""):
             text += f"\n\n{TOPIC_ASKED_NOTE}"
         incoming = IncomingMessage(
@@ -7086,6 +7151,21 @@ class AgentChannel:
                                               getattr(left, "username", None))
             return
         await self.handle_event(self.event_from_aiogram(message))
+
+
+def _usage_brief(totals: Any) -> Dict[str, Any]:
+    totals = totals if isinstance(totals, dict) else {}
+    return {key: totals.get(key) for key in ("turns", "tokens_in", "tokens_out", "cost_usd")}
+
+
+def _usage_tokens(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    if number >= 1e6:
+        return f"{number / 1e6:.1f}M"
+    return f"{number / 1e3:.0f}k" if number >= 1e3 else f"{int(number)}"
 
 
 class TopicGone(Exception):
