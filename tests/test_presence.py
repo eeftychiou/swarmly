@@ -534,6 +534,74 @@ class TestThePulseCarriesUsage(unittest.TestCase):
         self.assertEqual(CountingAdapter.calls, 0)
 
 
+class TestThePulseTopic(unittest.TestCase):
+    """The swarm opens its own pulse topic: the coordinator does it once, the others follow."""
+
+    class Bot(FakeEditingBot):
+        def __init__(self, thread_id=4242, fails=False):
+            super().__init__()
+            self.created = []
+            self.thread_id = thread_id
+            self.fails = fails
+
+        async def create_forum_topic(self, *, chat_id, name):
+            from types import SimpleNamespace
+            if self.fails:
+                raise RuntimeError("Bad Request: not enough rights to create a topic")
+            self.created.append((chat_id, name))
+            return SimpleNamespace(message_thread_id=self.thread_id)
+
+    def channel(self, bot, *, coordinator, **limits):
+        channel = live_channel(**limits)
+        channel.bot = bot
+        channel.is_coordinator = lambda **_kwargs: coordinator
+        return channel
+
+    def test_the_coordinator_opens_the_topic_once_and_pulses_there(self):
+        from swarmly.telegram.channel import PULSE_TOPIC_NAME
+        bot = self.Bot()
+        channel = self.channel(bot, coordinator=True)
+        self.assertEqual(run(channel._ensure_pulse_topic()), 4242)
+        self.assertEqual(run(channel._ensure_pulse_topic()), 4242)
+        self.assertEqual(bot.created, [(channel.config.identity.home_channel_id,
+                                        PULSE_TOPIC_NAME)])
+
+    def test_a_peer_waits_in_general_and_moves_once_it_has_seen_the_topic(self):
+        from swarmly.telegram.channel import PULSE_TOPIC_NAME
+        bot = self.Bot()
+        channel = self.channel(bot, coordinator=False)
+        self.assertIsNone(run(channel._ensure_pulse_topic()))
+        self.assertEqual(bot.created, [])
+        home = channel.config.identity.home_channel_id
+        channel.topics.remember(home, 4242, PULSE_TOPIC_NAME, current=False)
+        self.assertEqual(run(channel._ensure_pulse_topic()), 4242)
+        self.assertEqual(bot.created, [])
+
+    def test_two_topics_opened_at_once_resolve_to_the_same_one(self):
+        from swarmly.telegram.channel import PULSE_TOPIC_NAME
+        channel = self.channel(self.Bot(), coordinator=False)
+        home = channel.config.identity.home_channel_id
+        channel.topics.remember(home, 900, PULSE_TOPIC_NAME)
+        channel.topics.remember(home, 700, PULSE_TOPIC_NAME)
+        self.assertEqual(channel._pulse_topic(), 700)
+
+    def test_a_failed_open_pulses_in_general_and_waits_before_trying_again(self):
+        bot = self.Bot(fails=True)
+        channel = self.channel(bot, coordinator=True)
+        self.assertIsNone(run(channel._ensure_pulse_topic()))
+        bot.fails = False
+        self.assertIsNone(run(channel._ensure_pulse_topic()))      # no retry storm
+        self.assertEqual(bot.created, [])
+
+    def test_a_configured_topic_or_general_is_never_opened(self):
+        bot = self.Bot()
+        self.assertEqual(run(self.channel(bot, coordinator=True,
+                                          heartbeat_topic_id=77)._ensure_pulse_topic()), 77)
+        self.assertIsNone(run(self.channel(bot, coordinator=True,
+                                           heartbeat_topic_id=-1)._ensure_pulse_topic()))
+        self.assertEqual(bot.created, [])
+
+
 class FakePulseBus:
     """A pulse ref, without a git repo: publish() records, read() returns the others."""
 

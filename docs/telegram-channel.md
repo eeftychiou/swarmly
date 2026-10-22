@@ -599,7 +599,8 @@ it stops a day after the last turn. `0` turns it off.
 **A bot that dies says nothing, so the swarm listens for its pulse.** Every transport writes one
 heartbeat every `limits.heartbeat_minutes` (default 2) carrying its revision, term, role and,
 while a turn is running, `busy_since`. It is a silent Telegram line (`limits.heartbeat_plane:
-telegram`, the default), in `limits.heartbeat_topic_id` (General when 0), and each beat deletes
+telegram`, the default), in the swarm's own "📡 Swarm pulse" topic, which the coordinator opens
+(`limits.heartbeat_topic_id` names another topic, or `-1` for General), and each beat deletes
 the bot's previous one, so there is one current line per bot (`heartbeat_style: edit` edits a
 single message in place instead). `heartbeat_plane: bus` keeps the earlier per-bot git ref, `refs/pulse/<alias>`,
 but a heartbeat is a push and a fetch every beat on GitHub, so it is off by default. The pulse
