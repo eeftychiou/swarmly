@@ -694,3 +694,26 @@ class TestThePulseDoesNotBlockTheTransport(unittest.TestCase):
             return seen
 
         self.assertGreater(run(scenario()), 0)      # the loop ran while the bus was blocked
+
+
+class TestOnlyPeersAreTracked(unittest.TestCase):
+    """Live, 2026-10-22: the pulse topic's "topic created" service message came back as a post
+    by the coordinator's own username (Claude_obot, not its alias Claudebot). The bot tracked
+    itself as a peer and six minutes later announced itself DOWN."""
+
+    def test_the_bots_own_post_under_its_username_is_not_a_peer(self):
+        channel = live_channel()
+        name = channel.config.identity.name
+        run(channel.handle_event(event("", username=name, is_bot=True, message_id=900)))
+        self.assertNotIn(name, channel.presence().peers)
+
+    def test_a_stranger_is_not_tracked(self):
+        channel = live_channel()
+        run(channel.handle_event(event("hello", username="random_bot", is_bot=True,
+                                       author_id=999, message_id=901)))
+        self.assertNotIn("random_bot", channel.presence().peers)
+
+    def test_a_stale_non_peer_entry_is_never_announced_down(self):
+        channel = live_channel()
+        channel.presence().seen("Claude_obot", NOW - 3600)
+        self.assertNotIn("Claude_obot", " ".join(run(channel.check_peer_liveness(now=NOW))))

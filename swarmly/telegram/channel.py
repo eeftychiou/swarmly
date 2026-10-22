@@ -2398,6 +2398,11 @@ class AgentChannel:
         if not alias or alias == "admin" \
                 or alias.lower() == self.config.identity.alias.lower():
             return
+        if self._is_own_post(event) or not self._is_known_peer(alias):
+            # Live: the "topic created" service message of the pulse topic came back as a post
+            # by this bot's own username, which is not its alias, and the bot then reported
+            # itself DOWN six minutes later. Only the swarm's peers are tracked.
+            return
         now = self.presence_clock()
         table = self.presence()
         if envelope.type == MessageType.STATUS and (envelope.intent or "").upper() == "PULSE":
@@ -2446,13 +2451,27 @@ class AgentChannel:
                            exc_info=True)
             return False
 
+    def _is_own_post(self, event: ChannelEvent) -> bool:
+        """Whether *event* was posted by this bot itself (by id or by username)."""
+        me = getattr(self, "_me_id", None)
+        if me is not None and event.author_id == me:
+            return True
+        name = str(self.config.identity.name or "").lstrip("@").lower()
+        return bool(name) and str(event.author_username or "").lstrip("@").lower() == name
+
+    def _is_known_peer(self, alias: str) -> bool:
+        """A configured or admitted peer (admits land in config.peers): presence tracks the
+        swarm, not every author that posts in the group."""
+        wanted = str(alias or "").strip().lower()
+        return wanted in {str(name).strip().lower() for name in self.config.peers}
+
     async def check_peer_liveness(self, *, now: Optional[float] = None) -> List[str]:
         """One pass over peer liveness: a peer gone DOWN is announced once per episode, and a
         return closes it with one line (#82). Returns what it did, so a test can read it."""
         moment = self.presence_clock() if now is None else now
         table = self.presence()
         done: List[str] = []
-        down = table.down_peers(moment)
+        down = [alias for alias in table.down_peers(moment) if self._is_known_peer(alias)]
         if down and self._may_announce_down(moment):
             admin = self.config.identity.maintainer_username
             lead = f"@{str(admin).lstrip('@')} " if admin else ""
@@ -6708,6 +6727,7 @@ class AgentChannel:
         self.dispatcher.edited_message.register(self._on_aiogram_edited)
         self._started_wall = time.time()
         me = await self.bot.get_me()
+        self._me_id = getattr(me, "id", None)
         logger.info("connected as @%s (alias %s) in chat %s",
                     me.username, self.config.identity.alias, self.config.identity.home_channel_id)
         # Issue #70: a dedicated MACHINE receipt line, so the upgrade gate does not
