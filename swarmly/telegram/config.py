@@ -791,7 +791,8 @@ class ChannelLimits:
         for key in ("min_seconds_between_messages", "min_seconds_between_agent_turns",
                     "handoff_nudge_minutes", "cleanup_idle_hours",
                     "ephemeral_notices_minutes", "coordinator_watch_minutes",
-                    "turn_silence_minutes", "turn_silence_kill_minutes"):
+                    "turn_silence_minutes", "turn_silence_kill_minutes",
+                    "stall_minutes"):
             value = getattr(self, key)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):
@@ -800,6 +801,10 @@ class ChannelLimits:
                 raise ConfigError(f"limits.{key} must be a number of {unit}, 0 or more "
                                   f"(got {value!r}).")
         rate = self.max_messages_per_minute     # 0: use max_group_messages_per_minute
+        budget = self.round_wake_budget          # #164: 0 is no cap, like wake_max
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+            raise ConfigError("limits.round_wake_budget must be a whole number of coordinator "
+                              f"wakes per round per day, 0 for no cap (got {budget!r}).")
         if isinstance(rate, bool) or not isinstance(rate, int) or rate < 0:
             raise ConfigError("limits.max_messages_per_minute must be a whole number, 0 for "
                               f"max_group_messages_per_minute (got {rate!r}).")

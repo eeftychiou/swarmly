@@ -5198,7 +5198,7 @@ class AgentChannel:
         wrong bot. An escalation is posted by the coordinator, the swarm's one voice to the
         admin, and held by everyone else.
         """
-        from swarmly.telegram.owed_guard import budget_notice
+        from swarmly.telegram.owed_guard import WakeBudget, budget_notice
         from swarmly.telegram.owed_wake import MAX_WAKES_PER_TICK, mark_woken, plan
         moment = time.time() if now is None else float(now)
         me = str(self.config.identity.alias or "").strip().lower()
@@ -5262,8 +5262,11 @@ class AgentChannel:
                 budget = self.owed_budget()
                 if not budget.allow(round_key, now=moment):
                     done.append(f"{wake.row}: held: the round's wake budget is spent")
-                    if not getattr(self, "_owed_budget_told", False):
-                        self._owed_budget_told = True
+                    # The notice is said once per round per day -- not once per process: a
+                    # boolean left it silent forever after the first day (#191 review).
+                    told = (round_key, WakeBudget.day(moment))
+                    if getattr(self, "_owed_budget_told", None) != told:
+                        self._owed_budget_told = told
                         logger.warning("%s", budget_notice(round_key, budget.cap))
                         self._run_own_task(budget_notice(round_key, budget.cap), key[0], key[1],
                                            self.topics.name(key[0], key[1]))
@@ -5303,12 +5306,33 @@ class AgentChannel:
                           clock=time.time)
 
     def owed_round_key(self) -> str:
-        """The round a budget is counted against: the newest round state's own key, or ""."""
+        """The round a budget is counted against: the one written last, not the last name.
+
+        Round keys are names, not numbers -- ``repo#86``, ``repo#5``, ``repo#10`` -- so the
+        lexically last key is not the newest round, and two rounds at once (a round closing
+        while the next opens) made the budget count against the wrong one (#191 review). The
+        state carries its own ``term``, ``seq`` and ``updated_at`` and the fold keeps the
+        newest of them, so the round with the greatest of those is the one being worked in;
+        the lexically last key is only the answer when no state can be read.
+        """
         try:
-            names = self.round_store().rounds()
+            store = self.round_store()
+            names = store.rounds()
         except Exception:                          # noqa: BLE001 - a budget must not fail
             return ""
-        return sorted(names)[-1] if names else ""
+        newest, stamp = "", None
+        for name in names:
+            try:
+                state = store.load(name)
+            except Exception:                      # noqa: BLE001 - one unreadable round
+                continue
+            if str(getattr(state, "status", "") or "") != "ok":
+                continue
+            mark = (int(getattr(state, "term", 0) or 0), int(getattr(state, "seq", 0) or 0),
+                    str(getattr(state, "updated_at", "") or ""))
+            if stamp is None or mark > stamp:
+                newest, stamp = name, mark
+        return newest or (sorted(names)[-1] if names else "")
 
     def owed_guard_tick(self, *, now: Optional[float] = None) -> List[str]:
         """Walk the stall ladder: remind, then tell the coordinator, then the admin (#164).
