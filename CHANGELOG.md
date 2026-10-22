@@ -14,6 +14,9 @@ All notable changes to this project are documented here. The format follows
   `limits.stall_minutes` climbs a three-rung ladder once per rung — a reminder in code, one
   coordinator turn, then the admin — and a round's coordinator wakes are capped per day by
   `limits.round_wake_budget`, pausing them and telling the admin instead of spending through it.
+  The notice is said once per round per day, not once per process; the budget counts against the
+  round written last (by its own `term`/`seq`/`updated_at`, not the last name); and both settings
+  are validated with the rest of `limits`.
 - Waking on news (`#163`, first slice): a row wakes the bot that owes it only when the value
   observed for it differs from the value that last woke anyone (`Row.woken`, `wakes`), and the
   wake names the delta -- "a result on c166987 on #146: pending to green" -- instead of "check

@@ -121,6 +121,26 @@ class CleanupLimitsLoaderTests(unittest.TestCase):
                 cfg_with_limits({"ephemeral_notices_minutes": bad})
             self.assertIn("limits.ephemeral_notices_minutes", str(caught.exception), bad)
 
+    def test_stall_minutes_is_checked_before_the_ladder_runs(self):
+        """#164/#191: the ladder's two settings were read but never validated."""
+        self.assertEqual(cfg_with_limits({}).limits.stall_minutes, 30.0)
+        self.assertEqual(cfg_with_limits({"stall_minutes": 0}).limits.stall_minutes, 0.0)
+        for bad in ("half an hour", -5, True, None):
+            with self.assertRaises(ConfigError) as caught:
+                cfg_with_limits({"stall_minutes": bad})
+            self.assertIn("limits.stall_minutes", str(caught.exception), bad)
+
+    def test_round_wake_budget_is_checked_and_zero_is_no_cap(self):
+        self.assertEqual(cfg_with_limits({}).limits.round_wake_budget, 20)
+        self.assertEqual(cfg_with_limits({"round_wake_budget": 0})
+                         .limits.round_wake_budget, 0)
+        # 2.5 is not here: the loader's int coercion already floors it to 2 (as it does for
+        # every whole-number limit), so only the values it cannot coerce reach the check.
+        for bad in (-1, "twenty", True, None):
+            with self.assertRaises(ConfigError) as caught:
+                cfg_with_limits({"round_wake_budget": bad})
+            self.assertIn("limits.round_wake_budget", str(caught.exception), bad)
+
 
 class LoadEnvBomTests(unittest.TestCase):
     def test_bom_in_env_does_not_drop_the_first_key(self):

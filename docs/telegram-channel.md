@@ -1286,9 +1286,15 @@ debtor posts the reminder, and only the coordinator the two rungs after it, in c
 folds every bot's documents, so without that check four bots would each post the reminder and
 push the ladder four rungs for one stall (the rule #177 set for wakes, applied to the ladder). **A round's coordinator wakes are
 budgeted** by `limits.round_wake_budget` (default 20 a day, counted in
-`.agents/state/owed-wake-budget.json` (beside the table, never inside it) so a restart does not refill it): reaching it pauses those
-wakes, leaves the table readable in `/owed`, and tells the admin once. The wake budget replaces
-the per-tick cap for coordinators; the tick's own two-turn bound stands.
+`.agents/state/owed-wake-budget.json`, beside the table and never inside it, so a restart does
+not refill it): reaching it pauses those wakes, leaves the table readable in `/owed`, and tells
+the admin **once per round per day** — the notice returns at midnight, because a one-shot flag
+left it silent for good. The count belongs to the round written **last**, not to the last name:
+round keys are names (`repo#86`, `repo#5`, `repo#10`), so the newest is chosen by the state's
+own `term`, `seq` and `updated_at`, and the lexically last key is only the fallback. Both
+settings are validated with the rest of `limits` (`stall_minutes`, `round_wake_budget`, where 0
+means the ladder off and no cap). The wake budget replaces the per-tick cap for coordinators;
+the tick's own two-turn bound stands.
 
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt

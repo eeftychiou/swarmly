@@ -5,6 +5,7 @@ orphan (the coordinator owes the next step), a row that has not moved climbs a t
 ladder once per rung, and a round's coordinator wakes are budgeted for the day.
 """
 
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -228,6 +229,7 @@ class TestTheGuardTick(unittest.TestCase):
         self.assertEqual(channel._test_turns, [])
         self.assertIn("held: turn running", " ".join(done))
         self.assertEqual([r.stalls for r in channel._test_table[1].load()], [0])  # not spent
+
     def test_a_peers_row_is_not_climbed_here(self):
         """#177's rule, again: the table folds every writer's documents, so ownership is checked."""
         channel = self.channel()
@@ -268,3 +270,93 @@ class TestTheGuardTick(unittest.TestCase):
         self.assertEqual(len(first._test_turns) + len(second._test_turns), 1)   # one turn
         self.assertEqual([r.stalls for r in store.load()], [1])                 # one rung
 
+
+class TestTheBudgetBelongsToTheCurrentRound(unittest.TestCase):
+    """A cap counted against the wrong round can pause a round nobody is spending in (#191)."""
+
+    def channel(self, **limits):
+        bus = TemporaryDirectory()
+        self.addCleanup(bus.cleanup)
+        return make_channel(make_config(limits=limits or {"stall_minutes": 30},
+                                       fallback={"gitbus_root": bus.name,
+                                                 "gitbus_ref": ""}))
+
+    def rounds(self, *updates):
+        from swarmly.telegram import rounds as rs
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = rs.RoundStore(None, root=Path(tmp.name), alias="Hermes",
+                             authority=rs.Authority(alias="Hermes"))
+        for update in updates:
+            store.append(rs.RoundUpdate(writer="Hermes", **update))
+        return store
+
+    def test_the_newest_round_wins_not_the_last_name(self):
+        """Round keys are names: sorted(), "repo#5" comes after "repo#10" and is older."""
+        channel = self.channel()
+        channel.round_store = lambda: self.rounds(
+            {"round": "repo#5", "term": 5, "seq": 2},
+            {"round": "repo#10", "term": 10, "seq": 1})
+        self.assertEqual(channel.owed_round_key(), "repo#10")
+
+    def test_no_readable_round_falls_back_to_a_name(self):
+        channel = self.channel()
+        channel.round_store = lambda: self.rounds({"round": "repo#5", "term": 5})
+        self.assertEqual(channel.owed_round_key(), "repo#5")
+        channel.round_store = lambda: self.rounds()
+        self.assertEqual(channel.owed_round_key(), "")
+
+
+class TestTheBudgetNoticeComesBackTomorrow(unittest.TestCase):
+    """A one-shot boolean left the admin told once, ever (#191 review)."""
+
+    def channel(self):
+        from swarmly.telegram import owed_guard as guard
+        bus = TemporaryDirectory()
+        self.addCleanup(bus.cleanup)
+        channel = make_channel(make_config(limits={"stall_minutes": 30, "round_wake_budget": 1},
+                                          fallback={"gitbus_root": bus.name,
+                                                    "gitbus_ref": ""}))
+        channel.bot = object()
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = ow.OwedStore("Hermes", state_dir=Path(directory.name), clock=lambda: 1000.0)
+        channel.owed_store = lambda: store
+        channel._test_table = (directory, store)
+        channel.topics.remember(GROUP, 5122, "round 5")
+        turns = []
+        channel._run_own_task = lambda text, chat, thread, name: turns.append(
+            (text, chat, thread, name))
+        channel._test_turns = turns
+        channel.is_coordinator = lambda **kwargs: True
+        channel.owed_round_key = lambda: "repo#167"
+        budget_file = Path(directory.name) / "owed-wake-budget.json"
+        channel.owed_budget = lambda: guard.WakeBudget(budget_file, cap=1, clock=time.time)
+        return channel
+
+    def stall(self, channel):
+        """Two rows owed here, so the cap (1) is spent on the first tick and hit on the second."""
+        token = channel.topics.context(GROUP, 5122)
+        channel._test_table[1].save_all([
+            row(kind="fix", debtor="Hermes", owes="a new head on #146", item="#146",
+                observed="green", topic=token),
+            row(kind="fix", debtor="Hermes", owes="a new head on #147", item="#147",
+                observed="green", topic=token),
+        ])
+
+    def notices(self, channel, from_index):
+        return [text for text, _c, _t, _n in channel._test_turns[from_index:]
+                if "budget" in text]
+
+    def test_the_notice_returns_after_midnight(self):
+        channel = self.channel()
+        self.stall(channel)
+        channel.owed_wake_tick(now=1000.0)              # spends the day's one wake
+        channel.owed_wake_tick(now=1060.0)              # hits the cap, tells once
+        self.assertEqual(len(self.notices(channel, 0)), 1)
+        seen = len(channel._test_turns)
+        channel.owed_wake_tick(now=1120.0)              # same day, same round: quiet
+        self.assertEqual(self.notices(channel, seen), [])
+        channel.owed_wake_tick(now=1000.0 + 86400)      # tomorrow: allowed, then capped again
+        channel.owed_wake_tick(now=1000.0 + 86460.0)
+        self.assertEqual(len(self.notices(channel, seen)), 1)
