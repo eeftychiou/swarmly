@@ -682,6 +682,13 @@ class ChannelLimits:
     #: How many firings one timer may have before it gives up with a turn that says so. 0
     #: leaves the bound to `until` alone.
     wake_max_attempts: int = 50
+    #: Round 5.5 (#164): how long an owed row may go without a fact changing it before its
+    #: stall ladder starts -- a reminder to the debtor, then one coordinator turn, then the
+    #: admin. 0 turns the ladder off.
+    stall_minutes: float = 30.0
+    #: ... and how many *coordinator* wakes one round may spend in a day. Reaching it pauses
+    #: those wakes and tells the admin, rather than spending through the round. 0 is no cap.
+    round_wake_budget: int = 20
     #: Issue #82: how often each transport publishes a liveness pulse. Liveness rides the
     #: ephemeral Telegram line, not a bus commit -- 6 bots at 2 min is ~180 commits an hour on
     #: the bus, forever, each a push race with real traffic. `heartbeat_minutes * peer_down_after`

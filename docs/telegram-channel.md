@@ -1270,6 +1270,21 @@ ignored wake: a row seeded with a value and never woken (`wakes == 0`) still wak
 claim that contradicts the facts compares heads through `same_head`, so a seven-character SHA
 the forty-character head agrees with is not a contradiction.
 
+**Invariants, deadlines, budget (#164).** Three rules keep the table honest while nobody is
+looking. **An open round item with no live row is an orphan** — nothing owes the next step on
+it — so the sweep opens `the coordinator owes a next step on #N`, carrying the concrete gap
+(`PR #146: CI green, merge verdict, QA pass, not merged`): that is the 09:13 case where no WAKE
+was armed and nothing in the table said the round was stuck. `next_actor()` derives who must act
+next from the item's own facts (a result, then the reviewer, then QA, then the coordinator), and
+a role nobody holds is a flag for the dashboard rather than a guess. **Every row has a
+deadline**: one that no fact has moved for `limits.stall_minutes` (default 30) climbs three
+rungs, each happening once and each logged — a reminder to the debtor in code, then one
+coordinator turn to reassign or escalate, then the admin. **A round's coordinator wakes are
+budgeted** by `limits.round_wake_budget` (default 20 a day, counted in
+`.agents/state/owed-wake-budget.json` (beside the table, never inside it) so a restart does not refill it): reaching it pauses those
+wakes, leaves the table readable in `/owed`, and tells the admin once. The wake budget replaces
+the per-tick cap for coordinators; the tick's own two-turn bound stands.
+
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt
 failures. Each transport deletes **its own** notices from General once they are older than

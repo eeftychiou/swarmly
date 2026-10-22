@@ -147,6 +147,11 @@ def _alias(value: Any) -> str:
     return str(value or "").strip().lstrip("@").strip()
 
 
+def alias_of(value: Any) -> str:
+    """A debtor or waiter name, for callers outside this module (#164)."""
+    return _alias(value)
+
+
 @dataclass
 class Row:
     """One debt. ``id`` is what makes re-observing a fact an update, not a duplicate."""
@@ -172,6 +177,9 @@ class Row:
     woken_at: float = 0.0
     #: Set when a repeat went to the admin instead of the debtor, so it happens once.
     escalated: bool = False
+    #: How far up the stall ladder this row has climbed (#164): 0 nothing, 1 reminded, 2 the
+    #: coordinator was told, 3 the admin was. Each rung happens once, and the ladder stops there.
+    stalls: int = 0
     #: What tells two debts of the same kind, item and debtor apart: the topic a hand-off was
     #: made in, or a digest of the question an admin row is about. Without it, one peer's two
     #: hand-offs in two topics are one row, and a reply in either closes both (#173 review).
@@ -206,6 +214,7 @@ class Row:
             raise OwedError(f"a row wake time must be epoch seconds (got "
                             f"{self.woken_at!r})") from exc
         self.escalated = bool(self.escalated)
+        self.stalls = int(self.stalls or 0)
         self.key_extra = str(self.key_extra or "").strip()
         self.writer = _alias(self.writer)
         self.state = str(self.state or OPEN).strip().lower()
@@ -263,6 +272,7 @@ class Row:
             "topic": self.topic, "key_extra": self.key_extra,
             "woken": self.woken, "wakes": int(self.wakes),
             "woken_at": float(self.woken_at), "escalated": bool(self.escalated),
+            "stalls": int(self.stalls),
             "deadline": self.deadline, "state": self.state,
             "closed_by": self.closed_by, "writer": self.writer,
             "created_at": self.created_at,
@@ -286,7 +296,7 @@ class Row:
             topic=str(data.get("topic") or ""), key_extra=str(data.get("key_extra") or ""),
             woken=str(data.get("woken") or ""), wakes=int(data.get("wakes") or 0),
             woken_at=data.get("woken_at") or 0.0,
-            escalated=bool(data.get("escalated")),
+            escalated=bool(data.get("escalated")), stalls=int(data.get("stalls") or 0),
             deadline=data.get("deadline") or 0.0,
             state=str(data.get("state") or OPEN),
             closed_by=str(data.get("closed_by") or ""),

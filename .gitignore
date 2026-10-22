@@ -31,6 +31,8 @@ config.yaml
 *.local.yaml
 *.replies.sqlite3*
 .agents/state/
+# A lease claim names this bot and its pid: local state, like the state dir, never a commit.
+.agents/leases/
 
 .agents/state-backup-*/
 *.roster.json
