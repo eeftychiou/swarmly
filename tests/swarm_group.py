@@ -460,6 +460,11 @@ class Group:
         channel.presence_clock = self.clock.now
         channel.bus_transport = lambda _root: self.bus.view(alias)   # type: ignore[assignment]
         channel._test_sender = channel._sender
+
+        async def no_subject(subject, *, cwd=None, timeout=30.0):
+            return None                    # never the real repo's PR state (#190 review)
+
+        channel.wake_subject_reader = no_subject
         self._use_group_clock(channel)
         return channel
 

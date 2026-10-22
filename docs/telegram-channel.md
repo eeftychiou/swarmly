@@ -1179,11 +1179,16 @@ a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|lis
 remotes run a command); `-X`/`--method`/`-f`/`--input`/`--output`, shell
 metacharacters and anything not on `PATH` are refused, and the refusal is posted in place of the
 line. Times are absolute, so a restart resumes the schedule instead of re-arming it.
-**One standing check per topic:** arming the same check again in the same topic replaces the
-armed timer (the ack says `replaces <id>`) instead of adding one, and a check that exits 0 with
-the same output the bot last acted on re-arms silently instead of starting a turn, so a standing
-`gh issue view` costs a turn only when the issue changed (live, round 5: ten copies filled the
-cap and each firing posted "nothing changed"). **A due timer waits out a turn.** When a timer
+**One standing check per PR or issue, per topic:** arming another check on the same PR or issue
+(however it is worded: `gh pr view 173`, `gh pr checks 173`, `gh api repos/o/r/pulls/173`) in
+the same topic replaces the armed timer (the ack says `replaces <id>`) instead of adding one. A
+check that exits 0 with the same output the bot last acted on re-arms silently instead of
+starting a turn; durations and timestamps in the output (`2m3s`, `about 1 hour ago`) do not
+count as a change. Before each firing the transport reads the PR or issue itself: a merged or
+closed one ends the timer with no turn, and the turn for an open PR names its head as it is
+now, because a head written into `then=` goes stale. An expiry with nothing new since the last
+firing retires quietly. So a standing `gh issue view` costs a turn only when the issue changed
+(live, round 5 and 22 Oct: copies filled the cap and each firing posted "nothing changed"). **A due timer waits out a turn.** When a timer
 comes due for a topic that already has a turn running, the tick neither claims nor runs it — a
 running turn often settles the same item, and a second turn queued behind it is a paid "nothing
 changed". It stays armed and unclaimed, and is evaluated — expiry included — on the first tick

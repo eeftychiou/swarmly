@@ -113,6 +113,11 @@ def make_channel(config: AgentConfig = None, adapter=None, **kwargs):
                            sender=sender, clock=kwargs.pop("clock", clock),
                            sleeper=kwargs.pop("sleeper", sleeper))
     channel._test_sender = sender
+
+    async def no_subject(subject, *, cwd=None, timeout=30.0):
+        return None                    # never the real repo's PR state (#190 review)
+
+    channel.wake_subject_reader = no_subject
     channel._test_slept = slept
     channel._test_clock = clock_state
     return channel
