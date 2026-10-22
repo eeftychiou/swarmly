@@ -375,8 +375,12 @@ class WakeTimer:
 
     @property
     def standing_key(self) -> Tuple[Tuple[str, ...], int, Optional[int]]:
-        """What makes two timers the same standing check: the argv, in the same topic."""
-        return self.argv, self.chat_id, self.thread_id
+        """What makes two timers the same standing check: the PR or issue the check is about
+        (else its argv), in the same topic. Keyed on the subject, not the text: the
+        coordinator worded one wait on #173 three ways and each became a timer (live, 22 Oct:
+        sixteen WAKEs refused at the cap)."""
+        subject = subject_of(self.argv)
+        return (subject if subject is not None else self.argv), self.chat_id, self.thread_id
 
     @property
     def in_flight(self) -> bool:
@@ -455,16 +459,110 @@ def make_timer(spec: WakeSpec, *, alias: str, chat_id: int, thread_id: Optional[
 class WakeAction:
     """What the transport should do with a fired timer."""
 
-    kind: str                      # fire | rearm | expire | error
+    kind: str                      # fire | rearm | expire | error | retire (no turn)
     timer: WakeTimer
     reason: str = ""
     tail: str = ""
 
 
+#: What changes on every run without anything having happened: elapsed times (``2m3s``,
+#: ``45s``, ``1h2m``), relative times (``about 1 hour ago``) and timestamps. ``gh pr checks``
+#: prints the elapsed time of each check, so its output never matched (live, 22 Oct).
+_VOLATILE = (
+    re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"),
+    re.compile(r"\b(?:about |almost |over |less than )?(?:an?|\d+) "
+               r"(?:second|minute|hour|day|week|month|year)s? ago\b", re.IGNORECASE),
+    re.compile(r"\b(?:\d+h)?(?:\d+m)?\d+(?:\.\d+)?s\b|\b\d+h\d+m\b|\b\d+m\b"),
+)
+
+
 def output_digest(text: str) -> str:
-    """A short digest of a check's whole output, blank lines and trailing spaces ignored."""
-    rows = [row.rstrip() for row in str(text or "").splitlines() if row.strip()]
+    """A short digest of a check's whole output: blank lines, trailing spaces, durations and
+    timestamps ignored, so only a real change in what the check reports counts."""
+    rows = []
+    for row in str(text or "").splitlines():
+        for pattern in _VOLATILE:
+            row = pattern.sub("~", row)
+        if row.strip():
+            rows.append(row.rstrip())
     return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()[:16]
+
+
+_NUMBER = re.compile(r"^#?(\d+)$")
+_API_SUBJECT = re.compile(r"(?:^|/)repos/([^/]+/[^/]+)/(pulls|issues)/(\d+)(?:/|$)")
+
+
+def subject_of(argv: Tuple[str, ...]) -> Optional[Tuple[str, str, str]]:
+    """``("pr", "173", repo)`` or ``("issue", "120", repo)`` when a check is about one PR or
+    issue, else None. ``repo`` is the ``-R/--repo`` value, empty for the checkout's own."""
+    words = list(argv)
+    if len(words) < 3 or words[0] != "gh":
+        return None
+    repo = ""
+    rest: List[str] = []
+    skip = False
+    for index, word in enumerate(words[1:], start=1):
+        if skip:
+            skip = False
+            continue
+        if word in ("-R", "--repo") and index + 1 < len(words):
+            repo, skip = words[index + 1], True
+            continue
+        if word.startswith("--repo="):
+            repo = word.split("=", 1)[1]
+            continue
+        rest.append(word)
+    if rest[:1] == ["api"]:
+        for word in rest[1:]:
+            match = _API_SUBJECT.search(word)
+            if match:
+                kind = "pr" if match.group(2) == "pulls" else "issue"
+                return kind, match.group(3), match.group(1)
+        return None
+    if len(rest) >= 3 and rest[0] in ("pr", "issue") and rest[1] in (
+            "view", "checks", "diff", "status"):
+        for word in rest[2:]:
+            if word.startswith("-"):
+                continue
+            match = _NUMBER.match(word)
+            if match:
+                return rest[0], match.group(1), repo
+            break
+    return None
+
+
+def subject_state(subject: Tuple[str, str, str], *, cwd: Optional[Path],
+                  timeout: float = 30.0) -> Optional[Tuple[str, str]]:
+    """``(state, head)`` of a PR or issue (``("OPEN", "8356114…")``, ``("MERGED", …)``,
+    ``("CLOSED", "")``), or None when it cannot be read. Read-only, one ``gh`` call."""
+    kind, number, repo = subject
+    fields = "state,headRefOid" if kind == "pr" else "state"
+    argv: List[str] = ["gh", kind, "view", number, "--json", fields]
+    if repo:
+        argv += ["--repo", repo]
+    if shutil.which("gh") is None:
+        return None
+    try:
+        process = subprocess.run(argv, cwd=str(cwd) if cwd else None, capture_output=True,
+                                 text=True, timeout=timeout, check=False,
+                                 env=dict(os.environ, GH_PROMPT_DISABLED="1", LC_ALL="C"))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if process.returncode != 0:
+        return None
+    try:
+        data = json.loads(process.stdout or "{}")
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("state"), str):
+        return None
+    return data["state"].upper(), str(data.get("headRefOid") or "")
+
+
+async def subject_state_async(subject: Tuple[str, str, str], *, cwd: Optional[Path],
+                              timeout: float = 30.0) -> Optional[Tuple[str, str]]:
+    """:func:`subject_state`, off the event loop."""
+    return await asyncio.to_thread(subject_state, subject, cwd=cwd, timeout=timeout)
 
 
 def decide(timer: WakeTimer, returncode: Optional[int], *, now: float,
@@ -498,18 +596,19 @@ def decide(timer: WakeTimer, returncode: Optional[int], *, now: float,
         nxt = now + timer.every_seconds
         if nxt > timer.expires_at:
             timer.state = "expired"
+            if unchanged:                         # nothing new to decide on: no turn
+                return WakeAction("retire", timer,
+                                  reason="expired with nothing changed since the last firing")
             return WakeAction("expire", timer,
-                              reason=("the wait expired and the output has not changed since "
-                                      "you last acted on it" if unchanged else
-                                      "the wait expired before the check said ready"))
+                              reason="the wait expired before the check said ready")
         timer.next_at = nxt
         return WakeAction("rearm", timer)
     if verdict == PENDING:                        # pending, but nothing to re-arm on
         timer.state = "expired"
-        return WakeAction("expire", timer,
-                          reason=("the output has not changed since you last acted on it, "
-                                  "and the timer has no every=" if unchanged else
-                                  "still pending, and the timer has no every="))
+        if unchanged:
+            return WakeAction("retire", timer,
+                              reason="nothing changed since the last firing, and no every=")
+        return WakeAction("expire", timer, reason="still pending, and the timer has no every=")
     timer.state = "failed"
     return WakeAction("error", timer, reason=f"the check exited {returncode}")
 

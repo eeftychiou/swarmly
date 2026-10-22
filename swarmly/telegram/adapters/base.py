@@ -103,6 +103,12 @@ _NPM_SHIM_EXE = re.compile(r'"%~?dp0%?\\?([^"%]+?\.exe)"\s+%\*', re.I)
 _ON_WINDOWS = os.name == "nt"
 
 
+#: Windows caps a whole command line at 32,767 characters; past it CreateProcess fails with
+#: WinError 206 and the turn never starts (live, 22 Oct). A prompt that would push the line
+#: over this goes through stdin instead, for an adapter whose CLI reads it there.
+ARGV_PROMPT_LIMIT = 24_000
+
+
 class BatchFileRefused(RuntimeError):
     """A program resolved to a ``.cmd``/``.bat`` that cannot be run safely (review P0-8)."""
 
@@ -270,6 +276,26 @@ def usage_tokens(data: Any) -> Dict[str, int]:
     if out is not None:
         found["tokens_out"] = out
     return found
+
+
+_STRAY_SILENCE = re.compile(r"^\s*(?:@\w+[:,]?\s*)*[*_`]*NO_REPLY[*_`.!]*\s*$", re.IGNORECASE)
+_ONLY_ELAPSED = re.compile(r"^\(\d+s\)$")
+
+
+def drop_stray_silence(text: str) -> str:
+    """A reply without its stray ``NO_REPLY`` lines (#180).
+
+    Antigravity wrote the sentinel above real answers ("NO_REPLY\nNO_REPLY\n@peer: QA is
+    PASS", ten in a row once), and a bare "NO_REPLY" reached General: the sentinel is for
+    the transport, never for the group. A reply that was nothing else comes back empty.
+    """
+    raw = str(text or "")
+    lines = raw.splitlines()
+    kept = [line for line in lines if not _STRAY_SILENCE.match(line)]
+    if len(kept) == len(lines):
+        return raw
+    out = "\n".join(kept).strip()
+    return "" if _ONLY_ELAPSED.match(out) else out
 
 
 def is_silent_reply(text: str) -> bool:
@@ -658,6 +684,9 @@ class SubprocessAdapter(AgentAdapter):
         self._output_at: Dict[str, float] = {}
         self._run_key: contextvars.ContextVar[str] = contextvars.ContextVar(
             "a2a_run_key", default="")
+        #: The prompt this task's CLI reads on stdin, when argv could not carry it (#179).
+        self._stdin_text: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+            "a2a_stdin_text", default=None)
 
     def last_output_at(self, key: Optional[str] = None) -> Optional[float]:
         """``time.monotonic()`` when a running CLI last wrote to stdout or stderr.
@@ -676,6 +705,22 @@ class SubprocessAdapter(AgentAdapter):
     def use_child_registry(self, path: Optional[Path]) -> None:
         """Persist the pids of the CLIs this adapter starts, so a restart can reap orphans."""
         self.children = ChildRegistry(path)
+
+    #: Whether this CLI reads the prompt from stdin when argv carries none (``claude -p``).
+    STDIN_PROMPT = False
+
+    def prompt_off_argv(self, argv: List[str], prompt: str) -> Tuple[List[str], Optional[str]]:
+        """``(argv, stdin_text)``: the prompt moves to stdin when it would make the command
+        line too long for Windows, if this CLI reads it there; otherwise argv is unchanged."""
+        if not self.STDIN_PROMPT or not prompt or prompt not in argv:
+            return argv, None
+        if sum(len(word) + 3 for word in argv) <= ARGV_PROMPT_LIMIT:
+            return argv, None
+        at = len(argv) - 1 - argv[::-1].index(prompt)
+        out = argv[:at] + argv[at + 1:]
+        if out and out[-1] == "--":                 # nothing positional follows it any more
+            out = out[:-1]
+        return out, prompt
 
     # -- command construction ----------------------------------------------------------
     def build_argv(self, prompt: str) -> List[str]:
@@ -713,8 +758,10 @@ class SubprocessAdapter(AgentAdapter):
         # sees EOF at once. Its own process group (POSIX) lets a timeout or /stop end
         # the whole tree, launcher and children included.
         extra: Dict[str, Any] = {} if os.name == "nt" else {"start_new_session": True}
+        stdin = (asyncio.subprocess.PIPE if self._stdin_text.get() is not None
+                 else asyncio.subprocess.DEVNULL)
         return asyncio.create_subprocess_exec(
-            *exec_argv, cwd=cwd, env=env, stdin=asyncio.subprocess.DEVNULL,
+            *exec_argv, cwd=cwd, env=env, stdin=stdin,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **extra)
 
     async def _run(self, argv: Sequence[str]) -> Any:
@@ -763,6 +810,14 @@ class SubprocessAdapter(AgentAdapter):
         the CLI writes nothing. A process without readable pipes -- the runner a test injects
         -- is left to ``communicate()``: its silence is then "since the run started".
         """
+        text = self._stdin_text.get()
+        sink = getattr(process, "stdin", None)
+        if text is not None and sink is not None and hasattr(sink, "write"):
+            sink.write(text.encode("utf-8"))           # the prompt, when argv could not carry it
+            try:
+                await sink.drain()
+            finally:
+                sink.close()
         out, err = getattr(process, "stdout", None), getattr(process, "stderr", None)
         if out is None or err is None or not hasattr(out, "read") or not hasattr(err, "read"):
             return await process.communicate()
@@ -809,6 +864,8 @@ class SubprocessAdapter(AgentAdapter):
         rules = self.system_rules(message)
         if rules:
             argv = self.add_system_rules(argv, rules)
+        argv, stdin_text = self.prompt_off_argv(argv, prompt)
+        self._stdin_text.set(stdin_text)
         started = time.monotonic()
         try:
             process, stdout, stderr = await self._run(argv)

@@ -140,6 +140,8 @@ class ClaudeAdapter(SubprocessAdapter):
     """Drive Claude Code in print mode, one process (and one fresh session) per message."""
 
     TYPE = "claude"
+    #: ``claude -p`` reads the prompt from stdin when none follows on the command line (#179).
+    STDIN_PROMPT = True
 
     @classmethod
     def default_settings(cls, cwd: Optional[str] = None, model: Optional[str] = None,

@@ -269,3 +269,22 @@ class IdentityTests(unittest.TestCase):
             adapter = build_adapter(config(tmp))
             prompt = adapter.build_prompt(topic_message())
         self.assertIn("YOU ARE DeepSeek", prompt)
+
+
+class StraySilenceTests(unittest.TestCase):
+    """#180, live 22 Oct: "NO_REPLY" above real answers, and a bare one in General."""
+
+    def test_stray_sentinels_are_dropped(self):
+        from swarmly.telegram.adapters.base import drop_stray_silence
+        self.assertEqual(drop_stray_silence("NO_REPLY\nNO_REPLY\n@claude_x: QA on #169 is PASS."),
+                         "@claude_x: QA on #169 is PASS.")
+        self.assertEqual(drop_stray_silence("verdict: fix-first.\nNO_REPLY\n\n(355s)"),
+                         "verdict: fix-first.\n\n(355s)")
+        self.assertEqual(drop_stray_silence("NO_REPLY"), "")
+        self.assertEqual(drop_stray_silence("NO_REPLY\n\n(355s)"), "")
+        self.assertEqual(drop_stray_silence("@codex_x NO_REPLY"), "")
+
+    def test_a_mention_of_the_word_stays(self):
+        from swarmly.telegram.adapters.base import drop_stray_silence
+        text = "Reply NO_REPLY when nothing changed."
+        self.assertEqual(drop_stray_silence(text), text)

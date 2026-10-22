@@ -251,3 +251,53 @@ class TestContextSwitchWithMention(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLongPromptGoesThroughStdin(unittest.TestCase):
+    """#179, live 22 Oct: "[WinError 206] The filename or extension is too long" -- the
+    prompt rode the command line and pushed it past Windows' limit."""
+
+    def run_with(self, text):
+        from swarmly.telegram.adapters.base import ARGV_PROMPT_LIMIT
+        seen = {}
+        runner = ScriptedRunner(FakeProcess(result_json()))
+        adapter = ClaudeAdapter("Claude", ClaudeAdapter.default_settings(), runner=runner)
+        inner = runner.__call__
+
+        async def capture(argv, cwd, env, timeout):
+            seen["stdin"] = adapter._stdin_text.get()
+            return await inner(argv, cwd, env, timeout)
+
+        adapter._runner = capture
+        asyncio.run(adapter.respond(message(text)))
+        return runner.calls[0], seen["stdin"], ARGV_PROMPT_LIMIT
+
+    def test_a_long_prompt_leaves_the_command_line(self):
+        argv, stdin, limit = self.run_with("x" * 30_000)
+        self.assertLess(sum(len(word) + 3 for word in argv), limit)
+        self.assertNotEqual(argv[-1], "--")
+        self.assertIn("x" * 30_000, stdin)
+
+    def test_a_short_prompt_stays_on_the_command_line(self):
+        argv, stdin, _ = self.run_with("@claude_bot ping")
+        self.assertIsNone(stdin)
+        self.assertIn("--", argv)
+
+    def test_the_real_runner_writes_it_to_stdin(self):
+        import sys
+        from swarmly.telegram.adapters.base import SubprocessAdapter
+        from swarmly.telegram.config import AdapterSettings
+
+        script = "import sys; d = sys.stdin.read(); print(len(d), d[:3])"
+
+        class Echo(SubprocessAdapter):
+            TYPE = "echo"
+            STDIN_PROMPT = True
+
+            def build_argv(self, prompt):          # no shell quoting, on any platform
+                return [sys.executable, "-c", script, "--", prompt]
+
+        adapter = Echo("Echo", AdapterSettings(type="echo", command="echo", timeout_seconds=30))
+        reply = asyncio.run(adapter.respond(message("abc" + "y" * 30_000)))
+        self.assertTrue(reply.ok, reply.error)
+        self.assertIn("abc", reply.text)

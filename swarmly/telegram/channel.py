@@ -45,8 +45,8 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Se
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
-from swarmly.telegram.adapters.base import (AdapterReply, is_silent_reply, load_state,
-                                           save_state, topic_mode)
+from swarmly.telegram.adapters.base import (AdapterReply, drop_stray_silence, is_silent_reply,
+                                            load_state, save_state, topic_mode)
 from swarmly.telegram.children import reap_orphans
 from swarmly.telegram.cleanup import DELETE_BATCH, Cleanup, GeneralLedger, TopicInfo
 from swarmly.telegram.commands import (
@@ -4646,7 +4646,8 @@ class AgentChannel:
 
     async def _wake_tick(self, *, now: Optional[float] = None) -> List[str]:
         """One pass over the due timers. Returns what it did, so a test can read it."""
-        from swarmly.telegram.wake import WakeAction, decide, run_check_async
+        from swarmly.telegram.wake import (WakeAction, decide, run_check_async, subject_of,
+                                           subject_state_async)
         moment = time.time() if now is None else now
         if self._frozen or getattr(self, "_pause_pending", False):
             # The same gate that holds turns: paused is paused, for checks too (#92 S3).
@@ -4720,14 +4721,39 @@ class AgentChannel:
                 # _busy_since only knows about it once it has begun to run.
                 done.append(f"{timer.id}: held: turn running")
                 continue
+            workdir = self._workdir_for(timer.chat_id, timer.thread_id)
+            subject = subject_of(timer.argv)
+            current = None
+            if subject is not None and mine(timer):
+                # The PR or issue itself, read fresh: a timer whose `then` names a head kept
+                # acting on PRs that had moved on or merged (live, 22 Oct: corrected six times).
+                current = await subject_state_async(subject, cwd=workdir)
+                if current is not None and current[0] in ("MERGED", "CLOSED"):
+                    timer.state = "done"
+                    self._wake_persist(store, timer, done)
+                    done.append(f"{timer.id}: retired: {subject[0]} #{subject[1]} is "
+                                f"{current[0].lower()}")
+                    continue
             if timer.expires_at and moment >= timer.expires_at:
                 late = moment - timer.expires_at
                 timer.state = "expired"
+                if timer.seen_digest and not timer.adopted_from and mine(timer) \
+                        and late < WAKE_STALE_SECONDS:
+                    # Acted on once already: an expiry turn is only worth it if something moved.
+                    result = await run_check_async(
+                        timer.argv, cwd=workdir,
+                        timeout=float(self.config.limits.wake_check_seconds))
+                    if len(result) > 2 and result[2] and result[2] == timer.seen_digest:
+                        self._wake_persist(store, timer, done)
+                        done.append(f"{timer.id}: retired at its until=, nothing changed")
+                        continue
+                    timer.last_exit, timer.last_tail = result[0], result[1]
                 if not timer.adopted_from and mine(timer) and late < WAKE_STALE_SECONDS:
                     self._wake_persist(store, timer, done)
                     self._run_own_task(self._wake_prompt(
                         WakeAction("expire", timer, reason="its until= passed"),
-                        expired=True), timer.chat_id, timer.thread_id, timer.topic or None)
+                        expired=True, current=self._subject_line(subject, current)),
+                        timer.chat_id, timer.thread_id, timer.topic or None)
                     fired_topics.add(topic_key)      # an expiry turn is a turn here too (#171)
                     done.append(f"{timer.id}: expired")
                 else:
@@ -4755,7 +4781,7 @@ class AgentChannel:
                                if claim == "wait" else "claim not confirmed on the bus"))
                 continue
             result = await run_check_async(
-                timer.argv, cwd=self._workdir_for(timer.chat_id, timer.thread_id),
+                timer.argv, cwd=workdir,
                 timeout=float(self.config.limits.wake_check_seconds))
             code, tail = result[0], result[1]
             action = decide(timer, code, now=moment,
@@ -4767,7 +4793,8 @@ class AgentChannel:
                 # Write the turn down before starting it, and count the launch *before* it
                 # starts: a crash after the launch must not replay the turn, so the record
                 # already says this firing was launched.
-                timer.pending = self._wake_prompt(action)
+                timer.pending = self._wake_prompt(
+                    action, current=self._subject_line(subject, current))
                 timer.replays += 1
                 self._wake_persist(store, timer, done)
                 self._run_own_task(timer.pending, timer.chat_id, timer.thread_id,
@@ -4780,7 +4807,8 @@ class AgentChannel:
                 fired_topics.add(topic_key)
                 self._run_own_task(
                     self._wake_prompt(action, failed=action.kind == "error",
-                                      expired=action.kind == "expire"),
+                                      expired=action.kind == "expire",
+                                      current=self._subject_line(subject, current)),
                     timer.chat_id, timer.thread_id, timer.topic or None)
             else:
                 self._wake_persist(store, action.timer, done)
@@ -4802,7 +4830,18 @@ class AgentChannel:
             return ()
 
     @staticmethod
-    def _wake_prompt(action: Any, *, failed: bool = False, expired: bool = False) -> str:
+    def _subject_line(subject: Any, current: Any) -> str:
+        """"PR #173 is open at 8356114", for a wake turn: the head as it is now."""
+        if subject is None or current is None:
+            return ""
+        kind = "PR" if subject[0] == "pr" else "Issue"
+        head = f" at {current[1][:7]}" if current[1] else ""
+        return (f"{kind} #{subject[1]} is {current[0].lower()}{head} now. A head named in "
+                "Then may be stale: act on this one.")
+
+    @staticmethod
+    def _wake_prompt(action: Any, *, failed: bool = False, expired: bool = False,
+                     current: str = "") -> str:
         """The turn a fired timer starts: what to do, and the check's own output."""
         timer = action.timer
         if expired:
@@ -4814,12 +4853,15 @@ class AgentChannel:
         else:
             head = f"WAKE {timer.id} is ready: `{timer.check}` exited 0."
         parts = [head, f"Then: {timer.then}"]
+        if current:
+            parts.append(current)
         if action.reason and not (failed or expired):
             parts.append(action.reason)
         if timer.last_tail:
             parts.append("Last output:\n" + timer.last_tail)
-        parts.append("Act in this turn: do not promise to act later. A WAKE with the same "
-                     "check replaces this one and fires only when its output changes. If "
+        parts.append("Act in this turn: do not promise to act later. A WAKE on the same "
+                     "PR or issue replaces this one, fires only when its output changes, and "
+                     "ends by itself when the PR merges or closes. If "
                      "nothing changed and nobody needs telling, answer NO_REPLY: a post "
                      "saying so costs the topic a message.")
         return "\n\n".join(parts)
@@ -6716,6 +6758,7 @@ class AgentChannel:
         body = self.apply_round_block(body, event).strip()
         if event.self_task:
             body = self._unaddress_self(body)
+        body = drop_stray_silence(body)
         if not body or is_silent_reply(body):
             if body:
                 logger.info("turn for message %s chose to stay silent", event.message_id)
@@ -7943,14 +7986,18 @@ class AgentChannel:
         """
         destination = self.config.identity.home_channel_id if chat_id is None else chat_id
         if not callable(text):
+            text = drop_stray_silence(text)          # the sentinel never reaches the group
+            if not text.strip():
+                return None
             self._watch_ci(text, destination, thread_id)
         topic = (destination, thread_id)
         async with self._send_lock_for(topic):
             if callable(text):
                 await self._wait_for_slot(topic)
                 text = text()
-                if not text:
+                if not text or not drop_stray_silence(text).strip():
                     return None
+                text = drop_stray_silence(text)
                 # The resolved text is what goes out, so it is what may name a PR: a watch
                 # taken from the callable's source would miss the link it renders
                 # (issue #24 review).

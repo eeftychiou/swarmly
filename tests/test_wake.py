@@ -1990,12 +1990,13 @@ class TestOneStandingCheck(unittest.TestCase):
         self.assertEqual(wk.decide(timer, 0, now=1000.0, digest=new).kind, "fire")
         self.assertEqual(timer.seen_digest, new)
 
-    def test_unchanged_until_the_deadline_says_so_when_it_expires(self):
+    def test_unchanged_until_the_deadline_retires_without_a_turn(self):
+        # Live, 22 Oct: an expiry with nothing new still cost a "re-arming" turn (#178).
         same = wk.output_digest("open")
         timer = self.timer(seen_digest=same, expires_at=1100.0)
         action = wk.decide(timer, 0, now=1000.0, digest=same)
-        self.assertEqual(action.kind, "expire")
-        self.assertIn("not changed", action.reason)
+        self.assertEqual(action.kind, "retire")
+        self.assertEqual(timer.state, "expired")
 
     def test_a_re_armed_check_inherits_what_the_fired_one_acted_on(self):
         store = self.store()
@@ -2059,3 +2060,113 @@ class TestOwnBriefIsNotAddressedToItself(unittest.TestCase):
         from swarmly.telegram.channel import AgentChannel
         prompt = AgentChannel._wake_prompt(wk.WakeAction("fire", timer))
         self.assertIn("NO_REPLY", prompt)
+
+
+class TestStaleProofWake(unittest.TestCase):
+    """#178, live 22 Oct: one wait on #173 worded three ways became three timers, `gh pr
+    checks` output never matched because of its timings, and timers kept acting on heads
+    that had moved on or merged."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self):
+        return wk.WakeStore("Claude", state_dir=Path(self.tmp.name), clock=lambda: 1000.0)
+
+    @staticmethod
+    def timer(argv, **kwargs):
+        base = dict(argv=argv, then="merge it", next_at=1000.0, expires_at=9000.0,
+                    every_seconds=300.0, chat_id=-1, thread_id=7, alias="Claude")
+        base.update(kwargs)
+        return wk.WakeTimer(**base)
+
+    def test_the_subject_of_a_check(self):
+        cases = {
+            ("gh", "pr", "view", "173"): ("pr", "173", ""),
+            ("gh", "pr", "view", "173", "--json", "headRefOid,mergeable"): ("pr", "173", ""),
+            ("gh", "pr", "checks", "#169", "--required"): ("pr", "169", ""),
+            ("gh", "issue", "view", "120", "-R", "o/r"): ("issue", "120", "o/r"),
+            ("gh", "api", "repos/o/r/pulls/177/reviews"): ("pr", "177", "o/r"),
+            ("gh", "api", "repos/o/r/issues/167/comments"): ("issue", "167", "o/r"),
+        }
+        for argv, expected in cases.items():
+            self.assertEqual(wk.subject_of(argv), expected, argv)
+        for argv in (("git", "status"), ("gh", "pr", "list"), ("gh", "run", "view", "5")):
+            self.assertIsNone(wk.subject_of(argv), argv)
+
+    def test_three_wordings_of_one_wait_are_one_timer(self):
+        store = self.store()
+        for argv in (("gh", "pr", "view", "173"),
+                     ("gh", "pr", "view", "173", "--json", "headRefOid"),
+                     ("gh", "pr", "checks", "173")):
+            store.add(self.timer(argv), max_timers=2)
+        self.assertEqual(store.live_count, 1)
+
+    def test_timings_and_timestamps_are_not_a_change(self):
+        before = ("lint\tpass\t21s\thttps://x/1\nunittest\tpass\t2m3s\thttps://x/2\n"
+                  "updated 2026-10-22T18:04:11Z, about 1 hour ago")
+        after = ("lint\tpass\t19s\thttps://x/1\nunittest\tpass\t2m41s\thttps://x/2\n"
+                 "updated 2026-10-22T18:09:52Z, 5 minutes ago")
+        moved = before.replace("unittest\tpass", "unittest\tfail")
+        self.assertEqual(wk.output_digest(before), wk.output_digest(after))
+        self.assertNotEqual(wk.output_digest(before), wk.output_digest(moved))
+        self.assertNotEqual(wk.output_digest("head 8356114"), wk.output_digest("head 1149b3b"))
+
+    def tick(self, timer, state, *, output="same", digest_of=None):
+        import asyncio
+        from unittest import mock
+        channel = TestTick.channel(self)
+        started = []
+        channel._run_own_task = lambda text, chat_id, thread_id, name: started.append(text)
+        timer.alias = channel.config.identity.alias
+        channel.wake_store().add(timer, max_timers=10)
+
+        async def check(argv, *, cwd, timeout):
+            return 0, output, wk.output_digest(digest_of or output)
+
+        async def subject(subject, *, cwd, timeout=30.0):
+            return state
+
+        with mock.patch("swarmly.telegram.wake.run_check_async", check), \
+                mock.patch("swarmly.telegram.wake.subject_state_async", subject):
+            done = asyncio.run(channel._wake_tick(now=time.time()))
+        return channel, done, started
+
+    def test_a_merged_pr_ends_its_wake_without_a_turn(self):
+        timer = self.timer(("gh", "pr", "checks", "175"), next_at=1.0,
+                           expires_at=time.time() + 3600)
+        channel, done, started = self.tick(timer, ("MERGED", "eebf80e0"))
+        self.assertEqual(done, [f"{timer.id}: retired: pr #175 is merged"])
+        self.assertEqual(started, [])
+        self.assertEqual(channel.wake_store().live_count, 0)
+
+    def test_the_wake_turn_names_the_head_as_it_is_now(self):
+        timer = self.timer(("gh", "pr", "view", "173"), next_at=1.0,
+                           expires_at=time.time() + 3600, then="review 4f523cb")
+        _, done, started = self.tick(timer, ("OPEN", "8356114abcdef"))
+        self.assertEqual(done, [f"{timer.id}: fire"])
+        self.assertIn("PR #173 is open at 8356114 now", started[0])
+
+    def test_an_expiry_with_nothing_new_retires_quietly(self):
+        timer = self.timer(("gh", "issue", "view", "120"), next_at=1.0,
+                           expires_at=time.time() - 60,
+                           seen_digest=wk.output_digest("state: OPEN"))
+        channel, done, started = self.tick(timer, ("OPEN", ""), output="state: OPEN")
+        self.assertEqual(done, [f"{timer.id}: retired at its until=, nothing changed"])
+        self.assertEqual(started, [])
+
+    def test_an_expiry_with_news_still_gets_its_turn(self):
+        timer = self.timer(("gh", "issue", "view", "120"), next_at=1.0,
+                           expires_at=time.time() - 60,
+                           seen_digest=wk.output_digest("state: OPEN"))
+        _, done, started = self.tick(timer, ("OPEN", ""), output="state: CLOSED")
+        self.assertEqual(done, [f"{timer.id}: expired"])
+        self.assertEqual(len(started), 1)
+
+    def test_an_unreadable_subject_changes_nothing(self):
+        timer = self.timer(("gh", "pr", "checks", "175"), next_at=1.0,
+                           expires_at=time.time() + 3600)
+        _, done, started = self.tick(timer, None)
+        self.assertEqual(done, [f"{timer.id}: fire"])
+        self.assertNotIn("is open at", started[0])
