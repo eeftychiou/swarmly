@@ -315,6 +315,56 @@ class TestTheAdapterReports(unittest.TestCase):
         self.assertEqual((reply.meta["tokens_in"], reply.meta["tokens_out"]), (11, 4))
         self.assertEqual(reply.meta["total_cost_usd"], 0.2)
 
+    def test_claude_input_counts_the_prompt_cache(self):
+        # Live: 192 input tokens for 17 turns that cost $4.60, because the cache was left out.
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        payload = json.dumps({"result": "done", "subtype": "success", "total_cost_usd": 0.3,
+                              "usage": {"input_tokens": 12, "output_tokens": 900,
+                                        "cache_creation_input_tokens": 3000,
+                                        "cache_read_input_tokens": 40000}})
+        reply = ClaudeAdapter("Hermes").parse_output(payload, 1.0)
+        self.assertEqual((reply.meta["tokens_in"], reply.meta["tokens_out"]), (43012, 900))
+
+    def test_codex_output_tokens_land_in_the_meta(self):
+        from swarmly.telegram.adapters.codex import codex_output_tokens
+        out = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "t1"}),
+            json.dumps({"type": "turn.completed",
+                        "usage": {"input_tokens": 5000, "output_tokens": 321}})])
+        self.assertEqual(codex_output_tokens(out), 321)
+        self.assertIsNone(codex_output_tokens("no events"))
+
+    def test_nothing_ran_is_zero_not_unknown(self):
+        ledger = us.Ledger(None, alias="Hermes", clock=lambda: NOW)
+        totals = ledger.totals(NOW)
+        self.assertEqual((totals["tokens_in"], totals["tokens_out"], totals["cost_usd"]),
+                         (0, 0, 0.0))
+
+
+class TestNoBackgroundTasksInATurn(unittest.TestCase):
+    """Live, round 5: a backgrounded `find` kept the turn alive, and Claude's NO_REPLY to its
+    notice replaced the real answer, so the admin's request got silence."""
+
+    def test_the_turn_runs_with_background_tasks_off(self):
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        env = ClaudeAdapter("Hermes").environment({"PATH": "/bin"})
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
+
+    def test_a_no_reply_to_a_task_notice_is_not_silence(self):
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        payload = json.dumps({"result": "NO_REPLY", "subtype": "success",
+                              "origin": {"kind": "task-notification"}})
+        reply = ClaudeAdapter("Hermes").parse_output(payload, 1.0)
+        self.assertFalse(reply.ok)
+        self.assertIn("answer was lost", reply.error)
+
+    def test_a_chosen_no_reply_stays_silent(self):
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        payload = json.dumps({"result": "NO_REPLY", "subtype": "success"})
+        reply = ClaudeAdapter("Hermes").parse_output(payload, 1.0)
+        self.assertTrue(reply.ok)
+        self.assertEqual(reply.text, "NO_REPLY")
+
 
 if __name__ == "__main__":
     unittest.main()

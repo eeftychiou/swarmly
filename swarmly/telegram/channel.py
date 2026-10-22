@@ -34,6 +34,7 @@ import re
 import secrets
 import socket
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import time
 import dataclasses
 from collections import deque
@@ -140,10 +141,29 @@ def _local_revision() -> str:
     """
     rev = _git_head("--short")
     if rev == "unknown":
+        installed = _installed_commit()
+        if installed:
+            return installed[:7]
         # An installed wheel has no checkout: the package version is the revision.
         from swarmly import __version__
         return f"v{__version__}"
     return rev
+
+
+def _installed_commit() -> str:
+    """The commit a ``pip``/``pipx install git+…@<rev>`` was built from, or ``""``.
+
+    Such an install has no checkout to ask, so every build of one version announced the same
+    ``v0.11.0``, and an upgrade looked as if it had not happened (live, CT100). pip records the
+    commit in the distribution's ``direct_url.json`` (PEP 610).
+    """
+    try:
+        from importlib.metadata import distribution
+        text = distribution("swarmly").read_text("direct_url.json") or ""
+        commit = (json.loads(text).get("vcs_info") or {}).get("commit_id") or ""
+    except Exception:                                  # noqa: BLE001 - no record, no commit
+        return ""
+    return commit if re.fullmatch(r"[0-9a-f]{7,40}", str(commit)) else ""
 
 
 def _local_revision_full() -> str:
@@ -155,11 +175,21 @@ def _local_revision_full() -> str:
     human-facing notice carries.
     """
     rev = _git_head()
-    return _local_revision() if rev == "unknown" else rev
+    if rev == "unknown":
+        return _installed_commit() or _local_revision()
+    return rev
 
 
 #: Messages older than this when the transport starts are a backlog, not a conversation.
 _MAX_BACKLOG_SECONDS = 30 * 60
+#: /cleanup's issue and PR lookups: how many run at once, and how long an answer is reused (the
+#: dry run, the ask and the confirm usually come within a few minutes of each other).
+_REF_LOOKUP_WORKERS = 6
+_REF_STATE_CACHE_SECONDS = 300.0
+#: The topic the swarm's heartbeat lives in, opened by the coordinator (limits.heartbeat_topic_id 0).
+PULSE_TOPIC_NAME = "\U0001f4e1 Swarm pulse"
+#: How long a failed attempt to open the pulse topic waits before the next one.
+PULSE_TOPIC_RETRY_SECONDS = 3600.0
 
 #: How often the transport sweeps its own expired notices out of General (#64). A notice is
 #: deleted on the first tick after ``limits.ephemeral_notices_minutes``, so it lingers at
@@ -588,6 +618,8 @@ class AgentChannel:
         # instead of resetting every heartbeat (a paused bot is not "paused since a moment ago"
         # for ever, and a frozen one did not begin freezing when its quota comes back).
         self._state_since: Dict[str, float] = {}
+        self._idle_since: float = self._lease_clock()
+        self._last_reclaimed_term: int = 0
         self._boots = 1
         boots_path = _state_file(config, "boots")
         if boots_path is not None:
@@ -1254,6 +1286,11 @@ class AgentChannel:
                 result += " frozen_peers=" + ",".join(
                     f"{peer}({entry.get('ref') or 'frozen'})"
                     for peer, entry in sorted(frozen_peers.items()))
+            old_releases = self.old_releases()
+            if old_releases:
+                result += " old_releases=" + ",".join(
+                    f"{peer}(running an old release)"
+                    for peer in sorted(old_releases))
             blocker = self.stats.last_error or "none"
             if self._frozen:
                 blocker = f"frozen: {self._freeze_reason()} (/resume@{self.config.identity.name})"
@@ -1717,6 +1754,8 @@ class AgentChannel:
         for chat_id, thread_id, name in self.topics.entries():
             if home is not None and int(chat_id) != int(home):
                 continue
+            if name == PULSE_TOPIC_NAME:
+                continue                           # the swarm's heartbeat, never cleaned up
             refs = list(dict.fromkeys(
                 list(issue_refs(name or "")) + self._refs_of_topic(chat_id, thread_id)))
             topics.append(TopicInfo(
@@ -1764,22 +1803,29 @@ class AgentChannel:
         if not repo or self.config.github is None:
             return {ref: None for ref in refs}
         client = self._github_client()
-        states: Dict[str, Optional[str]] = {}
+        numbers: Dict[str, int] = {}
         for ref in refs:
             try:
-                number = int(str(ref).lstrip("#"))
+                numbers[ref] = int(str(ref).lstrip("#"))
             except (TypeError, ValueError):
                 continue
-            state = None
-            pr = client.pr_view(repo, number)          # a PR first: only it can be merged
-            if pr is not None:
-                state = _ref_state(pr.state)
-            if state is None:
-                issue = client.issue_view(repo, number)
-                if issue is not None:
-                    state = _ref_state(issue.state)
-            states[ref] = state
-        return states
+        cache = self.__dict__.setdefault("_ref_state_cache", {})
+        now = time.time()
+
+        def lookup(number: int) -> Optional[str]:
+            key = (repo, number)
+            hit = cache.get(key)
+            if hit is not None and now - hit[0] < _REF_STATE_CACHE_SECONDS:
+                return hit[1]
+            state = _ref_state(client.ref_state(repo, number))   # one call, issue or PR
+            if state is not None:
+                cache[key] = (now, state)
+            return state
+
+        # A topic links a dozen items: ask about them side by side, not one after another.
+        with ThreadPoolExecutor(max_workers=_REF_LOOKUP_WORKERS) as pool:
+            found = dict(zip(numbers, pool.map(lookup, numbers.values())))
+        return found
 
     async def cleanup_delete_topic(self, chat_id: int, thread_id: int) -> bool:
         """Delete one forum topic with all its messages (any age: that is deleteForumTopic)."""
@@ -2367,6 +2413,11 @@ class AgentChannel:
         if not alias or alias == "admin" \
                 or alias.lower() == self.config.identity.alias.lower():
             return
+        if self._is_own_post(event) or not self._is_known_peer(alias):
+            # Live: the "topic created" service message of the pulse topic came back as a post
+            # by this bot's own username, which is not its alias, and the bot then reported
+            # itself DOWN six minutes later. Only the swarm's peers are tracked.
+            return
         now = self.presence_clock()
         table = self.presence()
         if envelope.type == MessageType.STATUS and (envelope.intent or "").upper() == "PULSE":
@@ -2415,13 +2466,27 @@ class AgentChannel:
                            exc_info=True)
             return False
 
+    def _is_own_post(self, event: ChannelEvent) -> bool:
+        """Whether *event* was posted by this bot itself (by id or by username)."""
+        me = getattr(self, "_me_id", None)
+        if me is not None and event.author_id == me:
+            return True
+        name = str(self.config.identity.name or "").lstrip("@").lower()
+        return bool(name) and str(event.author_username or "").lstrip("@").lower() == name
+
+    def _is_known_peer(self, alias: str) -> bool:
+        """A configured or admitted peer (admits land in config.peers): presence tracks the
+        swarm, not every author that posts in the group."""
+        wanted = str(alias or "").strip().lower()
+        return wanted in {str(name).strip().lower() for name in self.config.peers}
+
     async def check_peer_liveness(self, *, now: Optional[float] = None) -> List[str]:
         """One pass over peer liveness: a peer gone DOWN is announced once per episode, and a
         return closes it with one line (#82). Returns what it did, so a test can read it."""
         moment = self.presence_clock() if now is None else now
         table = self.presence()
         done: List[str] = []
-        down = table.down_peers(moment)
+        down = [alias for alias in table.down_peers(moment) if self._is_known_peer(alias)]
         if down and self._may_announce_down(moment):
             admin = self.config.identity.maintainer_username
             lead = f"@{str(admin).lstrip('@')} " if admin else ""
@@ -2510,18 +2575,25 @@ class AgentChannel:
                     busy: Optional[bool] = None, paused: Optional[bool] = None) -> None:
         """Record when a state began. Called at the transition, never from the snapshot."""
         moment = self.presence_clock()
+        lease_moment = self._lease_clock()
         if frozen is True:
             self._state_since["frozen" if ref == "quota" else "paused"] = moment
+            self._idle_since = float("inf")
         elif frozen is False:
             self._state_since["idle"] = moment
+            self._idle_since = lease_moment
         if busy is True:
             self._state_since["busy"] = moment
+            self._idle_since = float("inf")
         elif busy is False:
             self._state_since["idle"] = moment
+            self._idle_since = lease_moment
         if paused is True:
             self._state_since["paused"] = moment
+            self._idle_since = float("inf")
         elif paused is False:
             self._state_since["idle"] = moment
+            self._idle_since = lease_moment
 
     def status_snapshot(self, now: Optional[float] = None) -> "snapshot_mod.Snapshot":
         """This bot's state right now, as one record: what it is doing and what is waiting.
@@ -2566,7 +2638,8 @@ class AgentChannel:
         wakes: List[Tuple[str, float]] = []
         try:
             wakes = [(timer.id, float(timer.next_at))
-                     for timer in self.wake_store().load() if timer.live][:20]
+                     for timer in self.wake_store().load()
+                     if timer.live and timer.next_at > moment - WAKE_STALE_SECONDS][:20]
         except Exception:                              # noqa: BLE001 - no timer list, no fun
             logger.debug("snapshot: no wake timers this beat", exc_info=True)
 
@@ -2579,11 +2652,18 @@ class AgentChannel:
             logger.debug("snapshot: no lease this beat", exc_info=True)
 
         adapter = self.config.adapter
+        model, effort = adapter.model, adapter.effort
+        try:
+            # The same answer the online notice gives (#99): the CLI's own settings and the
+            # model it last reported fill what the config leaves blank.
+            model, effort = self.running_model_and_effort()
+        except Exception:                              # noqa: BLE001 - the config's names
+            logger.debug("snapshot: no resolved model this beat", exc_info=True)
         return snapshot_mod.Snapshot(
             alias=self.config.identity.alias, state=state, since=since, at=moment,
             every=every, topic=str(topic), turn_elapsed=elapsed, turn_timeout=turn_timeout,
             queue=queue, wakes=tuple(wakes),
-            model=str(adapter.model or ""), effort=str(adapter.effort or ""),
+            model=str(model or ""), effort=str(effort or ""),
             rev=str(self._running_revision or ""),
             uptime=max(0.0, self._clock() - self._booted_at), restarts=max(0, self._boots - 1),
             term=term, lease_ends=lease_ends)
@@ -2619,8 +2699,72 @@ class AgentChannel:
             logger.warning("usage: could not record the turn", exc_info=True)
             return None
 
+    def swarm_usage(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Today's usage per bot (UTC day): this bot's from its own ledger, every peer's from
+        the latest heartbeat it published. Read in code, never a model turn, so the coordinator
+        can report the swarm's cost without searching the disk for ledgers (live, 22 Oct: it ran
+        a whole-disk ``find`` for usage-*.json and lost its reply to it)."""
+        moment = time.time() if now is None else float(now)
+        try:
+            ledger = self.usage_ledger()
+            own = ledger.totals(moment - (moment % 86400.0)) if ledger is not None else {}
+        except Exception:                              # noqa: BLE001 - a row without numbers
+            own = {}
+        rows: List[Dict[str, Any]] = [{"alias": self.config.identity.alias, "age": 0.0,
+                                       "state": "frozen" if self._frozen else "up",
+                                       **_usage_brief(own)}]
+        try:
+            peers = dict(self.presence().peers)
+        except Exception:                              # noqa: BLE001 - this bot only
+            peers = {}
+        for alias in sorted(peers):
+            if not self._is_known_peer(alias):
+                continue
+            peer = peers[alias]
+            snapshot = peer.snapshot if isinstance(peer.snapshot, dict) else {}
+            usage = snapshot.get("usage") if isinstance(snapshot.get("usage"), dict) else {}
+            today = usage.get("today") if isinstance(usage.get("today"), dict) else {}
+            rows.append({"alias": alias, "age": max(0.0, moment - float(peer.last_seen or 0.0)),
+                         "state": str(snapshot.get("state") or ("frozen" if peer.frozen else "up")),
+                         **_usage_brief(today)})
+        return rows
+
+    def swarm_usage_text(self, now: Optional[float] = None) -> str:
+        """``/usage@bot all`` and the coordinator's prompt note: one line per bot."""
+        lines = []
+        for row in self.swarm_usage(now):
+            parts = [f"{row['turns'] or 0} turns"]
+            if row["cost_usd"] is not None:
+                parts.append(f"${float(row['cost_usd']):.2f}")
+            if row["tokens_in"] is not None:
+                parts.append(f"{_usage_tokens(row['tokens_in'])} in")
+            if row["tokens_out"] is not None:
+                parts.append(f"{_usage_tokens(row['tokens_out'])} out")
+            if row["state"] not in ("up", "idle", "busy"):
+                parts.append(row["state"])
+            if row["age"] > 15 * 60:
+                parts.append(f"last heard {int(row['age'] // 60)} min ago")
+            lines.append(f"- {row['alias']}: " + ", ".join(parts))
+        return ("Swarm usage today (UTC), from each bot's own ledger and heartbeat; a number a "
+                "CLI does not report is left out:\n" + "\n".join(lines))
+
+    def _swarm_usage_note(self) -> str:
+        """For the coordinator only: the swarm's usage, so a report needs no search."""
+        try:
+            if not self.is_coordinator():
+                return ""
+            return ("\n\n[" + self.swarm_usage_text() + "\nUse these numbers for any cost "
+                    "report; never search the disk for usage files.]")
+        except Exception:                              # noqa: BLE001 - a turn without the note
+            logger.debug("no swarm usage note this turn", exc_info=True)
+            return ""
+
     def usage_text(self, event: Optional[Any] = None) -> str:
-        """``/usage``: what this bot has spent -- answered from the ledger, in code."""
+        """``/usage``: what this bot has spent -- answered from the ledger, in code.
+        ``/usage@bot all``: every bot's usage today, from the heartbeats."""
+        if event is not None and \
+                [a.lower() for a in command_args(event.text or "")][:1] == ["all"]:
+            return self.swarm_usage_text()
         boot = getattr(self, "_booted_at", None)
         since = None
         if boot is not None:
@@ -2938,6 +3082,39 @@ class AgentChannel:
             await self.refresh_control_center(now=moment)
         return said
 
+    async def _register_command_menu(self) -> str:
+        """Put Swarmly's commands in Telegram's "/" menu, replacing an earlier program's.
+
+        Telegram keeps a bot's menu across programs: a token that once ran another tool keeps
+        offering that tool's commands, and a bot that never set one offers none (live: one of
+        five bots autocompleted, with commands Swarmly does not have). Scoped lists shadow the
+        default one, so they are cleared first. Never fatal: the menu is a convenience.
+        """
+        from aiogram.types import (BotCommand, BotCommandScopeAllGroupChats,
+                                   BotCommandScopeAllPrivateChats)
+        from swarmly.telegram.commands import MENU_COMMANDS
+        bot = self.bot
+        if bot is None or not hasattr(bot, "set_my_commands"):
+            return "no bot"
+        try:
+            for scope in (BotCommandScopeAllPrivateChats(), BotCommandScopeAllGroupChats()):
+                try:
+                    if await bot.get_my_commands(scope=scope):
+                        await bot.delete_my_commands(scope=scope)
+                except Exception:                  # noqa: BLE001 - nothing set there
+                    logger.debug("menu: no %s commands to clear", type(scope).__name__)
+            wanted = [(name, text) for name, text in MENU_COMMANDS]
+            current = [(c.command, c.description) for c in (await bot.get_my_commands() or [])]
+            if current == wanted:
+                return "unchanged"
+            await bot.set_my_commands([BotCommand(command=name, description=text)
+                                       for name, text in wanted])
+            logger.info("menu: registered %d commands with Telegram", len(wanted))
+            return "registered"
+        except Exception:                          # noqa: BLE001 - a menu is not a reason to stop
+            logger.warning("menu: could not register the command menu", exc_info=True)
+            return "failed"
+
     def _pulse_message_path(self) -> Optional[Path]:
         return _state_file(self.config, "pulse-message")
 
@@ -2970,6 +3147,53 @@ class AgentChannel:
         except Exception:                              # noqa: BLE001 - kept in memory only
             logger.warning("heartbeat: cannot save %s", path, exc_info=True)
 
+    def _pulse_topic(self) -> Optional[int]:
+        """The topic the pulse goes to: configured, or the swarm's own pulse topic once known.
+
+        ``limits.heartbeat_topic_id`` above 0 names a topic, -1 means General, and 0 (the
+        default) means the swarm's own "📡 Swarm pulse" topic, learned from the topic map like
+        any other topic name. ``None`` is General.
+        """
+        configured = int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0)
+        if configured > 0:
+            return configured
+        if configured < 0:
+            return None
+        home = int(self.config.identity.home_channel_id or 0)
+        found = [thread for chat, thread, name in self.topics.entries()
+                 if chat == home and name == PULSE_TOPIC_NAME]
+        return min(found) if found else None          # two opened at once: everyone picks one
+
+    async def _ensure_pulse_topic(self) -> Optional[int]:
+        """The pulse topic, opened by the coordinator when the swarm has none yet.
+
+        One bot opens it, so the swarm does not get one per bot: the coordinator. The others
+        pulse in General until they see a message in the new topic (the coordinator's own
+        pulse), which teaches them its name like any topic's, and then move there.
+        """
+        found = self._pulse_topic()
+        if found is not None or int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0):
+            return found
+        home = int(self.config.identity.home_channel_id or 0)
+        create = getattr(self.bot, "create_forum_topic", None) if self.bot is not None else None
+        if not home or create is None or not self.is_coordinator():
+            return None
+        now = time.time()
+        if now - float(self.__dict__.get("_pulse_topic_tried") or 0.0) < PULSE_TOPIC_RETRY_SECONDS:
+            return None
+        self._pulse_topic_tried = now
+        try:
+            topic = await create(chat_id=home, name=PULSE_TOPIC_NAME)
+            thread_id = int(topic.message_thread_id)
+        except Exception as exc:                       # noqa: BLE001 - General meanwhile
+            logger.warning("heartbeat: could not open the %s topic (%s); pulsing in General "
+                           "(turn on Topics and give the bot the right to manage them)",
+                           PULSE_TOPIC_NAME, exc)
+            return None
+        self.topics.remember(home, thread_id, PULSE_TOPIC_NAME, current=True)
+        logger.info("heartbeat: opened the %s topic (%s)", PULSE_TOPIC_NAME, thread_id)
+        return thread_id
+
     async def _publish_pulse_line(self, line: str) -> str:
         """Put the pulse on Telegram, as one current line per bot.
 
@@ -2979,10 +3203,14 @@ class AgentChannel:
         that cannot be edited any more (deleted, /cleanup) is replaced.
         """
         chat = int(self.config.identity.home_channel_id or 0)
-        topic = int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0) or None
+        topic = await self._ensure_pulse_topic()
         ref = self._pulse_message()
+        stale = None
         if ref is not None and (ref[0], ref[1]) != (chat, topic):
-            ref = None                                 # the home or the topic moved
+            # The home or the topic moved: post anew, and take the old line down if it is in
+            # this chat (it is still the last pulse anyone sees there).
+            stale = ref[2] if ref[0] == chat else None
+            ref = None
         style = str(getattr(self.config.limits, "heartbeat_style", "repost") or "repost")
         edit = getattr(self.bot, "edit_message_text", None) if self.bot is not None else None
         if style.strip().lower() != "edit":
@@ -2999,10 +3227,14 @@ class AgentChannel:
                             ref[2], exc)
         sent = await self.send(line, chat_id=chat, thread_id=topic, silent=True,
                                return_message_id=True, allow_when_frozen=True)
+        if topic is not None and (chat, topic) in self._gone_topics:
+            # The pulse topic was deleted (the line went to General instead): forget it, so the
+            # coordinator opens a new one.
+            self.topics.forget(chat, topic)
         message_id = sent if isinstance(sent, int) and not isinstance(sent, bool) else None
         if message_id is None:
             return "posted"
-        old = ref[2] if ref is not None else None
+        old = ref[2] if ref is not None else stale
         self._remember_pulse_message((chat, topic, message_id))
         delete = getattr(self.bot, "delete_message", None) if self.bot is not None else None
         if old is not None and delete is not None:
@@ -3307,7 +3539,7 @@ class AgentChannel:
         has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
         transport = self.bus_transport(root) if has_bus else None
         return LeaseStore(self.config.identity.alias, transport=transport,
-                          root=root, clock=time.time, ttl_seconds=ttl, rank=rank)
+                          root=root, clock=self._lease_clock, ttl_seconds=ttl, rank=rank)
 
     def lease_fence(self, *, now: Optional[float] = None) -> bool:
         """May this bot still act? Freshly read from the bus, once per side effect.
@@ -3378,6 +3610,42 @@ class AgentChannel:
         except Exception:
             return False
         return False
+
+    def is_named_coordinator(self) -> bool:
+        """Whether this bot is the coordinator configured or named by the admin."""
+        alias = self.config.identity.alias.strip().lower()
+        coord = str(getattr(self.membership.state, "coordinator", None) or "").strip().lower()
+        if coord and coord == alias:
+            return True
+        role = str(self.config.identity.role or "").strip().lower()
+        return role == "coordinator"
+
+    def is_idle(self) -> bool:
+        """Whether this bot is currently idle (no turns running or queued, not frozen/paused)."""
+        if self._frozen or self._pause_pending or getattr(self, "_busy_waiting", 0):
+            return False
+        turns = getattr(self, "_turns", None)
+        if turns and any(not t.done() for t in turns):
+            return False
+        return True
+
+    def idle_duration(self, now: Optional[float] = None) -> float:
+        """How long this bot has been UP and idle, in seconds."""
+        if not self.is_idle():
+            return 0.0
+        moment = self._lease_clock() if now is None else now
+        since = getattr(self, "_idle_since", None)
+        if since is None or since == float("inf"):
+            since = self._state_since.get("idle", getattr(self, "_booted_at", moment))
+        return max(0.0, moment - since)
+
+    def old_releases(self) -> tuple[str, ...]:
+        """Aliases of bots detected running old releases with implausible clock claims (#126)."""
+        try:
+            return getattr(self.lease_state(), "old_releases", ()) or self.lease_store().old_releases
+        except Exception:
+            from swarmly.telegram.lease import _OLD_RELEASE_ALIASES
+            return tuple(sorted(_OLD_RELEASE_ALIASES))
 
     def round_authority(self, *, now: Optional[float] = None) -> Any:
         """The alias and term the bus lease names as the coordinator."""
@@ -3709,7 +3977,7 @@ class AgentChannel:
 
     async def _wake_tick(self, *, now: Optional[float] = None) -> List[str]:
         """One pass over the due timers. Returns what it did, so a test can read it."""
-        from swarmly.telegram.wake import decide, run_check_async
+        from swarmly.telegram.wake import WakeAction, decide, run_check_async
         moment = time.time() if now is None else now
         if self._frozen or getattr(self, "_pause_pending", False):
             # The same gate that holds turns: paused is paused, for checks too (#92 S3).
@@ -3725,7 +3993,8 @@ class AgentChannel:
             try:                                     # a dead bot's armed timers are promises
                 for adopted in await asyncio.to_thread(
                         store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),
-                        allow=tuple(self.config.limits.wake_check_allow or ())):
+                        allow=tuple(self.config.limits.wake_check_allow or ()),
+                        skip=self._peers_not_down(moment)):
                     done.append(f"{adopted.id}: adopted from the bus")
             except Exception:                        # noqa: BLE001 - adoption is best effort
                 logger.warning("wake: adoption failed; carrying on", exc_info=True)
@@ -3757,15 +4026,46 @@ class AgentChannel:
             self._wake_persist(store, pending, done)
             done.append(f"{pending.id}: replayed after a restart")
         settle = float(self.config.limits.wake_claim_settle_seconds)
+        alive = {alias.lower() for alias in self._peers_not_down(moment)}
         for timer in store.due(moment):
+            if timer.adopted_from and timer.adopted_from.strip().lower() in alive:
+                # Its owner is up again and keeps its own promise: two holders only ever race.
+                timer.state = "done"
+                store.write(timer)
+                done.append(f"{timer.id}: handed back to {timer.adopted_from}")
+                continue
+            if timer.expires_at and moment >= timer.expires_at:
+                late = moment - timer.expires_at
+                timer.state = "expired"
+                if not timer.adopted_from and mine(timer) and late < WAKE_STALE_SECONDS:
+                    self._wake_persist(store, timer, done)
+                    self._run_own_task(self._wake_prompt(
+                        WakeAction("expire", timer, reason="its until= passed"),
+                        expired=True), timer.chat_id, timer.thread_id, timer.topic or None)
+                    done.append(f"{timer.id}: expired")
+                else:
+                    # Long past its deadline (a restart, a claim that kept losing): a turn now
+                    # would act on a world that has moved on, so it is retired quietly, and
+                    # locally: a bus push per stale copy is noise nobody reads.
+                    store.write(timer)
+                    done.append(f"{timer.id}: retired, expired {int(late // 60)}m ago")
+                continue
             if not mine(timer):
                 done.append(f"{timer.id}: adopted, held while this bot is not the coordinator")
                 continue
             claim = await asyncio.to_thread(store.claim_state, timer, settle_seconds=settle)
+            if claim == "taken":
+                # Another bot holds this firing and acts on it. Keeping our copy armed would
+                # retry the lost claim every tick and count against wake_max forever (live,
+                # round 5: ten such copies refused the WAKE that would have merged a PR).
+                timer.state = "done"
+                store.write(timer)
+                done.append(f"{timer.id}: another bot claimed this firing; copy retired")
+                continue
             if claim != "won":
                 done.append(f"{timer.id}: "
                             + ("claim written, firing after the settle window"
-                               if claim == "wait" else "another bot claimed this firing"))
+                               if claim == "wait" else "claim not confirmed on the bus"))
                 continue
             code, tail = await run_check_async(
                 timer.argv, cwd=self._workdir_for(timer.chat_id, timer.thread_id),
@@ -3794,6 +4094,21 @@ class AgentChannel:
             else:
                 self._wake_persist(store, action.timer, done)
         return done
+
+    def _peers_not_down(self, now: float) -> Tuple[str, ...]:
+        """Peers presence has heard from and that are not DOWN: their timers are theirs to keep.
+
+        Empty when heartbeats are off, because then nobody can tell, and adoption works as before.
+        """
+        try:
+            if self.down_after_seconds() == float("inf"):
+                return ()
+            table = self.presence()
+            return tuple(sorted(alias for alias in table.peers
+                                if not table.is_down(alias, now)))
+        except Exception:                          # noqa: BLE001 - adoption decides alone
+            logger.debug("wake: presence unreadable; adopting as before", exc_info=True)
+            return ()
 
     @staticmethod
     def _wake_prompt(action: Any, *, failed: bool = False, expired: bool = False) -> str:
@@ -3992,6 +4307,40 @@ class AgentChannel:
                     logger.warning("lease: failed to renew lease at term %d", state.term, exc_info=True)
             return state.claim
 
+        # Case 1b (#126): The configured coordinator takes its role back when UP and idle
+        if state.live(moment) and self.is_named_coordinator() and state.holder.strip().lower() != alias:
+            reclaim_window = float(getattr(self.config.limits, "coordinator_reclaim_idle_seconds", 180.0) or 0.0)
+            if self.is_idle() and self.idle_duration(now=moment) >= reclaim_window:
+                next_term = state.term + 1
+                try:
+                    mine = await claim_at(next_term, promoted=True)
+                except Exception as exc:
+                    logger.warning("lease: %s could not reclaim coordinator role at term %d: %s",
+                                   self.config.identity.alias, next_term, exc)
+                    return None
+                settle = float(getattr(self.config.limits, "lease_settle_seconds", 30.0) or 0.0)
+                if settle > 0:
+                    await self._sleep(settle)
+                self._forget_lease_cache()
+                if not await asyncio.to_thread(store.refresh, force=True):
+                    logger.warning("lease: ref refresh failed after settle for reclaim term %d; refusing to act",
+                                   next_term)
+                    return None
+                try:
+                    fresh = await asyncio.to_thread(store.state, now=self._lease_clock())
+                except Exception:
+                    logger.warning("lease: could not re-read the lease after reclaiming term %d",
+                                   next_term, exc_info=True)
+                    return None
+                if not fresh.holds(self.config.identity.alias, self._lease_clock()):
+                    logger.info("lease: %s reclaimed term %d but %s holds it; yielding",
+                                self.config.identity.alias, next_term, fresh.holder or "nobody")
+                    return None
+                logger.info("lease: %s (configured coordinator) reclaimed coordinator role at term %d from %s",
+                            self.config.identity.alias, next_term, state.holder)
+                await self._announce_reclaim(next_term, state.holder, mine)
+                return mine
+
         # A holder that presence marks DOWN has lost the lease now, not when it expires: the
         # lease is renewed rarely (a commit every half hour, not a heartbeat on GitHub), and
         # liveness comes from Telegram.
@@ -4103,6 +4452,20 @@ class AgentChannel:
                 notice=True)
         except Exception:                              # noqa: BLE001 - never fatal
             logger.warning("lease: could not post the takeover notice", exc_info=True)
+
+    async def _announce_reclaim(self, term: int, former: str, claim: Any) -> None:
+        """Announce that the configured coordinator took its role back (#126)."""
+        if getattr(self, "_last_reclaimed_term", 0) == term:
+            return
+        self._last_reclaimed_term = term
+        try:
+            await self.send(
+                f"🔄 coordinator lease: {self.config.identity.alias} (configured coordinator) has reclaimed "
+                f"the coordinator role at term {term} from {former} "
+                f"(expires {time.strftime('%H:%M:%SZ', time.gmtime(claim.expires_at))}).",
+                notice=True)
+        except Exception:                              # noqa: BLE001 - never fatal
+            logger.warning("lease: could not post coordinator reclaim notice", exc_info=True)
 
     async def _lease_tick(self) -> None:
         """Periodic coordinator lease renewal and succession poll."""
@@ -4685,6 +5048,7 @@ class AgentChannel:
         if not event.author_is_bot and not is_admin_dm:     # peers can't see a DM
             text += self._waiting_note(event.text)
         text += self._frozen_peers_note()
+        text += self._swarm_usage_note()
         if not event.self_task and asks_for_topic(event.text or ""):
             text += f"\n\n{TOPIC_ASKED_NOTE}"
         incoming = IncomingMessage(
@@ -5908,7 +6272,9 @@ class AgentChannel:
             return None
         try:
             own = self.config.identity.alias
+            moment = time.time()
             if any(timer.live and (not timer.alias or timer.alias == own)
+                   and timer.next_at > moment - WAKE_STALE_SECONDS
                    for timer in self.wake_store().load()):
                 return None                       # it already promised itself a wake-up
         except Exception:                         # noqa: BLE001 - the watchdog is best effort
@@ -6909,6 +7275,8 @@ class AgentChannel:
         self.dispatcher.edited_message.register(self._on_aiogram_edited)
         self._started_wall = time.time()
         me = await self.bot.get_me()
+        self._me_id = getattr(me, "id", None)
+        await self._register_command_menu()
         logger.info("connected as @%s (alias %s) in chat %s",
                     me.username, self.config.identity.alias, self.config.identity.home_channel_id)
         # Issue #70: a dedicated MACHINE receipt line, so the upgrade gate does not
@@ -7233,6 +7601,21 @@ class AgentChannel:
         await self.handle_event(self.event_from_aiogram(message))
 
 
+def _usage_brief(totals: Any) -> Dict[str, Any]:
+    totals = totals if isinstance(totals, dict) else {}
+    return {key: totals.get(key) for key in ("turns", "tokens_in", "tokens_out", "cost_usd")}
+
+
+def _usage_tokens(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    if number >= 1e6:
+        return f"{number / 1e6:.1f}M"
+    return f"{number / 1e3:.0f}k" if number >= 1e3 else f"{int(number)}"
+
+
 class TopicGone(Exception):
     """The forum topic was closed or deleted; the post goes to General instead."""
 
@@ -7314,6 +7697,10 @@ REASSIGN_NOTE = ("{alias} has not answered your hand-off in this topic for {minu
                  "has not said it is busy, so it may be down. Decide what happens to the work "
                  "now: hand it to another peer whose role fits, or do it yourself, and say so "
                  "here. If it can wait for {alias}, reply exactly NO_REPLY.")
+#: A WAKE timer overdue by more than this is not a live promise: it is not counted as one, and
+#: past its until= it is retired without a turn (live, round 5: ten day-old copies blocked a merge).
+WAKE_STALE_SECONDS = 3600.0
+
 #: The coordinator's watchdog turn (check_coordinator_watch): nothing woke it for a while.
 WATCH_NOTE = ("Coordinator check: you have had no turn for {minutes} minutes and hold no WAKE. "
               "Look at the open tracking issue and every item and PR on it (gh issue view, "

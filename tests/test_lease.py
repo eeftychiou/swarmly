@@ -1087,3 +1087,208 @@ class TestADownHolderLosesTheLease(TestSuccessionOnExpiry):
         limits = make_config().limits
         self.assertGreaterEqual(limits.lease_renew_seconds, 1800)
         self.assertGreaterEqual(limits.takeover_minutes, 60)
+
+
+
+class TestOldClockClaimsRefused(unittest.TestCase):
+    """Issue #126 (item 3): claims stamped with an old host uptime clock, or more than a day
+    in the future, are rejected. The alias is logged once as running an old release, and surfaced
+    in /status and /swarm."""
+
+    def setUp(self):
+        ls.reset_old_release_tracking()
+
+    def test_claim_before_2020_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            entry = Path(tmp) / ".agents" / "leases"
+            entry.mkdir(parents=True)
+            # Old bot stamps with uptime ~3e6 (before 2020)
+            (entry / "000001-Reasonix-aaaa.json").write_text(
+                json.dumps({"term": 1, "alias": "Reasonix", "expires_at": 3_000_000.0}),
+                encoding="utf-8",
+            )
+            now = 1_790_000_000.0  # Year 2026
+            store = ls.LeaseStore("Claude", transport=_Bus(tmp), root=Path(tmp),
+                                  clock=lambda: now)
+            self.assertEqual(store.claims(), [])
+            self.assertIn("Reasonix", store.old_releases)
+            state = store.state()
+            self.assertEqual(state.status, "absent")
+            self.assertIn("Reasonix", state.old_releases)
+
+    def test_old_release_warning_logged_once(self):
+        with TemporaryDirectory() as tmp:
+            entry = Path(tmp) / ".agents" / "leases"
+            entry.mkdir(parents=True)
+            (entry / "000001-Reasonix-aaaa.json").write_text(
+                json.dumps({"term": 1, "alias": "Reasonix", "expires_at": 3_000_000.0}),
+                encoding="utf-8",
+            )
+            now = 1_790_000_000.0
+            store = ls.LeaseStore("Claude", transport=_Bus(tmp), root=Path(tmp),
+                                  clock=lambda: now)
+            with self.assertLogs("swarmly.telegram.lease", level="WARNING") as logs:
+                store.claims()
+                store.claims()
+            matching = [msg for msg in logs.output if "Reasonix is running an old release" in msg]
+            self.assertEqual(len(matching), 1)
+
+    def test_claim_more_than_one_day_in_future_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            entry = Path(tmp) / ".agents" / "leases"
+            entry.mkdir(parents=True)
+            now = 1_790_000_000.0
+            # More than 1 day (86400s) ahead
+            (entry / "000001-Zulu-bbbb.json").write_text(
+                json.dumps({"term": 1, "alias": "Zulu", "expires_at": now + 100_000.0}),
+                encoding="utf-8",
+            )
+            store = ls.LeaseStore("Claude", transport=_Bus(tmp), root=Path(tmp),
+                                  clock=lambda: now)
+            self.assertEqual(store.claims(), [])
+            self.assertIn("Zulu", store.old_releases)
+
+    def test_plausible_claim_is_accepted(self):
+        with TemporaryDirectory() as tmp:
+            entry = Path(tmp) / ".agents" / "leases"
+            entry.mkdir(parents=True)
+            now = 1_790_000_000.0
+            (entry / "000001-Claude-aaaa.json").write_text(
+                json.dumps({"term": 1, "alias": "Claude", "expires_at": now + 3600.0,
+                            "renews_at": now}),
+                encoding="utf-8",
+            )
+            store = ls.LeaseStore("Claude", transport=_Bus(tmp), root=Path(tmp),
+                                  clock=lambda: now)
+            claims = store.claims()
+            self.assertEqual(len(claims), 1)
+            self.assertEqual(claims[0].alias, "Claude")
+            self.assertEqual(store.old_releases, ())
+
+    def test_old_release_claim_at_higher_term_does_not_usurp_valid_coordinator(self):
+        with TemporaryDirectory() as tmp:
+            entry = Path(tmp) / ".agents" / "leases"
+            entry.mkdir(parents=True)
+            now = 1_790_000_000.0
+            # Valid claim at term 1
+            (entry / "000001-Claude-aaaa.json").write_text(
+                json.dumps({"term": 1, "alias": "Claude", "expires_at": now + 3600.0,
+                            "renews_at": now}),
+                encoding="utf-8",
+            )
+            # Old bot with uptime clock rogue claim at term 2
+            (entry / "000002-Reasonix-bbbb.json").write_text(
+                json.dumps({"term": 2, "alias": "Reasonix", "expires_at": 3_000_000.0}),
+                encoding="utf-8",
+            )
+            bus = _Bus(tmp, ranks={"000001-Claude-aaaa.json": 1, "000002-Reasonix-bbbb.json": 2})
+            store = ls.LeaseStore("Claude", transport=bus, root=Path(tmp), clock=lambda: now)
+            state = store.state()
+            self.assertEqual(state.status, "ok")
+            self.assertEqual(state.term, 1)
+            self.assertEqual(state.holder, "Claude")
+            self.assertIn("Reasonix", state.old_releases)
+
+    def test_status_command_reports_old_release(self):
+        from tests.test_telegram_channel import make_channel, make_config
+        channel = make_channel(make_config(agent={"alias": "Claude", "role": "coordinator"}))
+        channel.old_releases = lambda: ("Reasonix",)
+        reply = channel._command_reply("status")
+        self.assertIn("old_releases=", reply)
+        self.assertIn("Reasonix", reply)
+        self.assertIn("running an old release", reply)
+
+    def test_swarm_command_reports_old_release(self):
+        import asyncio
+        from tests.test_telegram_channel import make_channel, make_config
+        channel = make_channel(make_config(agent={"alias": "Claude", "role": "coordinator"},
+                                           peers={"Reasonix": {"username": "reasonix_bot", "role": "developer"}}))
+        channel.old_releases = lambda: ("Reasonix",)
+        text = asyncio.run(channel.membership.status_text())
+        self.assertIn("running an old release", text)
+        self.assertIn("Reasonix", text)
+        self.assertIn("⚠️ Reasonix is running an old release", text)
+
+
+class TestConfiguredCoordinatorTakesItsRoleBack(TestSuccessionOnExpiry):
+    """Issue #126 (item 4): after a failover, when the coordinator named in config or membership
+    has been UP and idle for a few minutes while a successor holds a live lease, it claims the
+    next term itself and announces once."""
+
+    def test_named_coordinator_reclaims_role_after_idle_window(self):
+        import asyncio
+        # Claude is coordinator in config, Codex is reviewer peer.
+        channel, bus, _noted = self.channel(
+            role="coordinator", alias="Claude",
+            peers={"Codex": {"username": "codex_bot", "role": "reviewer"}},
+            settle=0.0)
+        channel.config.limits.coordinator_reclaim_idle_seconds = 180.0
+        now = channel._clock()
+        # Codex took over term 1 with an hour-long live lease
+        holder = ls.LeaseStore("Codex", transport=channel.lease_store().transport, root=bus,
+                               clock=lambda: now, ttl_seconds=3600.0, rank=0)
+        holder.claim(term=1)
+        self.assertEqual(channel.current_coordinator(now=now), "Codex")
+
+        # 1. 60 seconds later (idle duration = 60s < 180s): Claude does not reclaim yet
+        self.assertIsNone(asyncio.run(channel.check_lease(now=now + 60)))
+        self.assertFalse(channel.is_coordinator(now=now + 60))
+        self.assertEqual(channel.current_coordinator(now=now + 60), "Codex")
+
+        # 2. 200 seconds later (idle duration = 200s >= 180s): Claude reclaims term 2
+        claim = asyncio.run(channel.check_lease(now=now + 200))
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.term, 2)
+        self.assertEqual(claim.alias, "Claude")
+        self.assertTrue(channel.is_coordinator(now=now + 200))
+        self.assertEqual(channel.current_coordinator(now=now + 200), "Claude")
+
+        # Announcement posted to channel
+        sent_texts = [item["text"] for item in channel._test_sender.sent]
+        reclaim_notices = [t for t in sent_texts if "reclaimed the coordinator role" in t]
+        self.assertEqual(len(reclaim_notices), 1)
+        self.assertIn("Claude (configured coordinator) has reclaimed the coordinator role at term 2 from Codex",
+                      reclaim_notices[0])
+
+        # 3. Subsequent check_lease at now + 210: already holds term 2, no duplicate announcement
+        claim2 = asyncio.run(channel.check_lease(now=now + 210))
+        self.assertIsNotNone(claim2)
+        self.assertEqual(claim2.term, 2)
+        reclaim_notices2 = [t for t in [item["text"] for item in channel._test_sender.sent]
+                            if "reclaimed the coordinator role" in t]
+        self.assertEqual(len(reclaim_notices2), 1)
+
+    def test_named_coordinator_does_not_reclaim_while_busy(self):
+        import asyncio
+        channel, bus, _noted = self.channel(
+            role="coordinator", alias="Claude",
+            peers={"Codex": {"username": "codex_bot", "role": "reviewer"}},
+            settle=0.0)
+        channel.config.limits.coordinator_reclaim_idle_seconds = 180.0
+        now = channel._clock()
+        holder = ls.LeaseStore("Codex", transport=channel.lease_store().transport, root=bus,
+                               clock=lambda: now, ttl_seconds=3600.0, rank=0)
+        holder.claim(term=1)
+
+        # Mark channel as busy with a running turn / busy_waiting
+        channel._busy_waiting = 1
+        claim = asyncio.run(channel.check_lease(now=now + 300))
+        self.assertIsNone(claim)
+        self.assertEqual(channel.current_coordinator(now=now + 300), "Codex")
+
+    def test_successor_does_not_reclaim_from_another_bot(self):
+        import asyncio
+        # Hermes is qa-tester (not named coordinator)
+        channel, bus, _noted = self.channel(
+            role="qa-tester", alias="Hermes",
+            peers={"Claude": {"username": "claude_bot", "role": "coordinator"}},
+            settle=0.0)
+        channel.config.limits.coordinator_reclaim_idle_seconds = 180.0
+        now = channel._clock()
+        holder = ls.LeaseStore("Claude", transport=channel.lease_store().transport, root=bus,
+                               clock=lambda: now, ttl_seconds=3600.0, rank=3)
+        holder.claim(term=1)
+        # Even after 300 seconds idle, Hermes does NOT take the role over a live lease
+        claim = asyncio.run(channel.check_lease(now=now + 300))
+        self.assertIsNone(claim)
+        self.assertFalse(channel.is_coordinator(now=now + 300))

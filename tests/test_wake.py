@@ -612,15 +612,18 @@ class TestClaimIsNotFailOpen(unittest.TestCase):
         store = wk.WakeStore(channel.config.identity.alias,
                              state_dir=Path(tmp.name) / "state", transport=None,
                              root=Path(tmp.name), clock=time.time)
-        store.claim_state = lambda timer, settle_seconds=0: "lost"   # another bot won it
+        store.claim_state = lambda timer, settle_seconds=0: "taken"  # another bot won it
         channel.wake_store = lambda: store
         channel.lease_fence = lambda now=None: True
         store.add(wk.WakeTimer(argv=("git", "status"), then="go", next_at=1.0,
                                expires_at=time.time() + 3600, every_seconds=0, chat_id=-1,
                                alias=channel.config.identity.alias), max_timers=10)
         done = asyncio.run(channel._wake_tick(now=time.time()))
-        self.assertEqual(done, [f"{store.load()[0].id}: another bot claimed this firing"])
+        self.assertEqual(done, [f"{store.load()[0].id}: another bot claimed this firing; "
+                                "copy retired"])
         self.assertEqual(started, [])
+        # Retired, not retried: the copy no longer counts against wake_max (live, round 5).
+        self.assertFalse(store.load()[0].live)
 
 
 class TestQuotedText(unittest.TestCase):
@@ -759,6 +762,108 @@ class TestAdoption(unittest.TestCase):
                                 transport=_BusTransport(tmp), root=Path(tmp),
                                 clock=lambda: 1000.0)
             self.assertEqual(heir.adopt(max_timers=10), [])
+
+
+class TestStaleCopiesDoNotPileUp(unittest.TestCase):
+    """Live, round 5: ten armed copies of other bots' timers, days overdue, filled wake_max and
+    refused the WAKE that would have merged a green PR. The watchdog took them for promises."""
+
+    def timer(self, alias="antigravity", ident="abc12345"):
+        return wk.WakeTimer(argv=("gh", "pr", "checks", "75"), then="merge it",
+                            next_at=1000.0, expires_at=2000.0, every_seconds=300.0,
+                            chat_id=-7, thread_id=12, topic="Round 4", alias=alias, id=ident)
+
+    def test_an_adopted_copy_says_whose_it_was_and_leaves_the_cap_alone(self):
+        with TemporaryDirectory() as tmp:
+            dead = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            dead.add(self.timer(), max_timers=10)
+            heir = wk.WakeStore("claudebot", state_dir=Path(tmp) / "heir",
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            [taken] = heir.adopt(max_timers=10)
+            self.assertEqual(taken.adopted_from, "antigravity")
+            self.assertEqual(wk.WakeTimer.from_dict(taken.to_dict()).adopted_from, "antigravity")
+            # The heir's own cap is one: the adopted copy does not take that slot.
+            self.assertTrue(heir.add(self.timer(alias="claudebot", ident="own00001"),
+                                     max_timers=1) is not None)
+
+    def test_a_peer_that_is_up_keeps_its_own_timer(self):
+        with TemporaryDirectory() as tmp:
+            owner = wk.WakeStore("antigravity", state_dir=Path(tmp),
+                                 transport=_BusTransport(tmp), root=Path(tmp),
+                                 clock=lambda: 1000.0)
+            owner.add(self.timer(), max_timers=10)
+            heir = wk.WakeStore("claudebot", state_dir=Path(tmp) / "heir",
+                                transport=_BusTransport(tmp), root=Path(tmp),
+                                clock=lambda: 1000.0)
+            self.assertEqual(heir.adopt(max_timers=10, skip=("Antigravity",)), [])
+            self.assertEqual(len(heir.adopt(max_timers=10)), 1)   # DOWN, or nobody can tell
+
+    def tick_channel(self):
+        import asyncio  # noqa: F401 - used by the callers
+        from tests.test_telegram_channel import make_channel, make_config
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config(agent={"role": "developer"},
+                             fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
+                             limits={"wake_tick_seconds": 0})
+        channel = make_channel(config)
+        started = []
+        channel._run_own_task = lambda *args, **kwargs: started.append(args)
+        store = wk.WakeStore(channel.config.identity.alias,
+                             state_dir=Path(tmp.name) / "state", transport=None,
+                             root=Path(tmp.name), clock=time.time)
+        channel.wake_store = lambda: store
+        channel.lease_fence = lambda now=None: True
+        return channel, store, started
+
+    def test_a_timer_long_past_its_until_is_retired_without_a_turn(self):
+        import asyncio
+        channel, store, started = self.tick_channel()
+        now = time.time()
+        store.write(wk.WakeTimer(argv=("gh", "issue", "view", "120"), then="go",
+                                 next_at=now - 86400, expires_at=now - 80000, every_seconds=300,
+                                 chat_id=-1, alias=channel.config.identity.alias, id="old00001"))
+        done = asyncio.run(channel._wake_tick(now=now))
+        self.assertTrue(done[0].startswith("old00001: retired, expired"), done)
+        self.assertEqual(started, [])
+        self.assertEqual(store.live_count, 0)
+
+    def test_a_timer_just_past_its_until_still_gets_its_expiry_turn(self):
+        import asyncio
+        channel, store, started = self.tick_channel()
+        now = time.time()
+        store.write(wk.WakeTimer(argv=("gh", "pr", "checks", "146"), then="merge it",
+                                 next_at=now - 60, expires_at=now - 30, every_seconds=300,
+                                 chat_id=-1, alias=channel.config.identity.alias, id="new00001"))
+        done = asyncio.run(channel._wake_tick(now=now))
+        self.assertEqual(done, ["new00001: expired"])
+        self.assertEqual(len(started), 1)
+        self.assertIn("WAKE new00001 expired", started[0][0])
+
+    def test_an_adopted_copy_goes_back_when_its_owner_is_up(self):
+        import asyncio
+        channel, store, started = self.tick_channel()
+        now = time.time()
+        channel._peers_not_down = lambda moment: ("Codex",)
+        store.write(wk.WakeTimer(argv=("gh", "pr", "checks", "90"), then="go",
+                                 next_at=now - 60, expires_at=now + 3600, every_seconds=300,
+                                 chat_id=-1, alias=channel.config.identity.alias, id="cdx00001",
+                                 adopted_from="Codex"))
+        done = asyncio.run(channel._wake_tick(now=now))
+        self.assertEqual(done, ["cdx00001: handed back to Codex"])
+        self.assertEqual(started, [])
+        self.assertEqual(store.live_count, 0)
+
+    def test_the_watchdog_and_the_pulse_ignore_a_stale_timer(self):
+        channel, store, _started = self.tick_channel()
+        now = time.time()
+        store.write(wk.WakeTimer(argv=("gh", "issue", "view", "120"), then="go",
+                                 next_at=now - 86400, expires_at=now + 86400, every_seconds=300,
+                                 chat_id=-1, alias=channel.config.identity.alias, id="old00002"))
+        self.assertEqual(channel.status_snapshot(now).wakes, ())
 
 
 class TestCrashWindow(unittest.TestCase):
@@ -951,9 +1056,9 @@ class TestSettleWindow(unittest.TestCase):
             higher = wk.WakeStore("zulu", state_dir=Path(tmp), transport=_BusTransport(tmp),
                                   root=Path(tmp), clock=lambda: now["t"])
             self.assertEqual(lower.claim_state(self.timer(), settle_seconds=30), "wait")
-            self.assertEqual(higher.claim_state(self.timer(), settle_seconds=30), "lost")
+            self.assertEqual(higher.claim_state(self.timer(), settle_seconds=30), "taken")
             now["t"] += 60
-            self.assertEqual(higher.claim_state(self.timer(), settle_seconds=30), "lost")
+            self.assertEqual(higher.claim_state(self.timer(), settle_seconds=30), "taken")
             self.assertEqual(lower.claim_state(self.timer(), settle_seconds=30), "won")
 
     def test_without_a_settle_window_a_single_bot_fires_immediately(self):
@@ -1021,7 +1126,7 @@ class TestOverlappingPushRace(unittest.TestCase):
             # The lower alias only writes now; the firing is already claimed by an older one.
             later = wk.WakeStore("alpha", state_dir=Path(tmp), transport=_BusTransport(tmp),
                                  root=Path(tmp), clock=lambda: now["t"])
-            self.assertEqual(later.claim_state(self.timer(), settle_seconds=30), "lost")
+            self.assertEqual(later.claim_state(self.timer(), settle_seconds=30), "taken")
 
 
 class TestPublicationSurfaces(unittest.TestCase):
@@ -1112,13 +1217,13 @@ class TestDelayedPush(unittest.TestCase):
             self.assertEqual(beta.claim_state(self.timer(), settle_seconds=30), "wait")
             # alpha's push has not landed, so the bus does not confirm its own claim: it must
             # not fire, and it will not start firing later either.
-            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "lost")
+            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "taken")
             now["t"] += 31
             self.assertEqual(beta.claim_state(self.timer(), settle_seconds=30), "won")
             # alpha's claim finally lands: it finds beta's claim and loses.
             held["alpha"] = False
             now["t"] += 120
-            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "lost")
+            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "taken")
 
     def test_the_window_is_measured_from_the_confirmation(self):
         with TemporaryDirectory() as tmp:
@@ -1217,7 +1322,7 @@ class TestInFlightClaim(unittest.TestCase):
                                 root=Path(tmp), clock=lambda: now["t"])
             self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "wait")
             # alpha's push took 40s and landed; zulu, starting after it, finds the claim.
-            self.assertEqual(zulu.claim_state(self.timer("zulu"), settle_seconds=30), "lost")
+            self.assertEqual(zulu.claim_state(self.timer("zulu"), settle_seconds=30), "taken")
             now["t"] += 40
             self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=30), "won")
 
@@ -1239,7 +1344,7 @@ class TestInFlightClaim(unittest.TestCase):
                                  clock=lambda: now["t"])
             # zulu's push returned earlier even though alpha's alias is lower.
             self.assertEqual(zulu.claim_state(self.timer("zulu"), settle_seconds=0), "won")
-            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=0), "lost")
+            self.assertEqual(alpha.claim_state(self.timer(), settle_seconds=0), "taken")
 
     def test_a_claim_on_the_ref_without_a_confirmed_stamp_is_not_a_claim(self):
         with TemporaryDirectory() as tmp:
@@ -1335,7 +1440,7 @@ class TestBusHistoryOrdersClaims(unittest.TestCase):
                                 transport=self.bus(tmp, seen), root=Path(tmp),
                                 clock=lambda: now["t"])
             self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=0), "won")
-            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "taken")
 
     def test_a_slow_confirmation_push_cannot_win_by_its_earlier_write(self):
         with TemporaryDirectory() as tmp:
@@ -1354,7 +1459,7 @@ class TestBusHistoryOrdersClaims(unittest.TestCase):
             # beta settled and fired (the window is behind it); alpha's claim lands later.
             self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=0), "won")
             now["t"] += 40
-            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "taken")
 
 
 class TestPushLandsAfterAPeerFired(unittest.TestCase):
@@ -1392,7 +1497,7 @@ class TestPushLandsAfterAPeerFired(unittest.TestCase):
                                       clock=lambda: now["t"])
             now["t"] = 1100.0
             # Its own claim has been on the bus since 1040 (settled), and beta's is earlier: lost.
-            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=30), "lost")
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=30), "taken")
             # and beta, already fired, does not fire a second time either: its own record says
             # done, so nothing on the claim path can make it fire again.
             fired = self.timer("beta")
@@ -1504,7 +1609,7 @@ class TestDelayedWriterPush(unittest.TestCase):
             self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=30), "won")
             # alpha's claim finally lands -- behind the one that already fired: it loses.
             alpha_bus.release()
-            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "lost")
+            self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "taken")
 
     def test_two_writers_are_ordered_by_the_bus_not_by_their_own_stamps(self):
         with TemporaryDirectory() as tmp:
@@ -1518,7 +1623,7 @@ class TestDelayedWriterPush(unittest.TestCase):
                                 clock=lambda: now["t"])
             # Both write at the same clock value: only arrival order differs.
             self.assertEqual(alpha.claim_state(self.timer("alpha"), settle_seconds=0), "won")
-            self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=0), "lost")
+            self.assertEqual(beta.claim_state(self.timer("beta"), settle_seconds=0), "taken")
 
 
 class TestUnrankedClaimsFailClosed(unittest.TestCase):

@@ -510,7 +510,9 @@ class TestThePulseCarriesUsage(unittest.TestCase):
         # The next beat counts only what came after this one.
         later = channel.own_pulse(NOW + 120).status
         self.assertEqual(later["usage"]["beat"]["turns"], 0)
-        self.assertIsNone(later["usage"]["beat"]["tokens_in"])
+        # No turn, so nothing spent: zeros, not nulls (live: the pulse read as all nulls).
+        self.assertEqual((later["usage"]["beat"]["tokens_in"], later["usage"]["beat"]["cost_usd"]),
+                         (0, 0.0))
 
     def test_a_beat_never_runs_a_model_turn(self):
         class CountingAdapter:
@@ -532,6 +534,74 @@ class TestThePulseCarriesUsage(unittest.TestCase):
         run(channel._on_aiogram_edited(message))
         hear(channel, pulse_text("Codex", NOW), message_id=10)
         self.assertEqual(CountingAdapter.calls, 0)
+
+
+class TestThePulseTopic(unittest.TestCase):
+    """The swarm opens its own pulse topic: the coordinator does it once, the others follow."""
+
+    class Bot(FakeEditingBot):
+        def __init__(self, thread_id=4242, fails=False):
+            super().__init__()
+            self.created = []
+            self.thread_id = thread_id
+            self.fails = fails
+
+        async def create_forum_topic(self, *, chat_id, name):
+            from types import SimpleNamespace
+            if self.fails:
+                raise RuntimeError("Bad Request: not enough rights to create a topic")
+            self.created.append((chat_id, name))
+            return SimpleNamespace(message_thread_id=self.thread_id)
+
+    def channel(self, bot, *, coordinator, **limits):
+        channel = live_channel(**limits)
+        channel.bot = bot
+        channel.is_coordinator = lambda **_kwargs: coordinator
+        return channel
+
+    def test_the_coordinator_opens_the_topic_once_and_pulses_there(self):
+        from swarmly.telegram.channel import PULSE_TOPIC_NAME
+        bot = self.Bot()
+        channel = self.channel(bot, coordinator=True)
+        self.assertEqual(run(channel._ensure_pulse_topic()), 4242)
+        self.assertEqual(run(channel._ensure_pulse_topic()), 4242)
+        self.assertEqual(bot.created, [(channel.config.identity.home_channel_id,
+                                        PULSE_TOPIC_NAME)])
+
+    def test_a_peer_waits_in_general_and_moves_once_it_has_seen_the_topic(self):
+        from swarmly.telegram.channel import PULSE_TOPIC_NAME
+        bot = self.Bot()
+        channel = self.channel(bot, coordinator=False)
+        self.assertIsNone(run(channel._ensure_pulse_topic()))
+        self.assertEqual(bot.created, [])
+        home = channel.config.identity.home_channel_id
+        channel.topics.remember(home, 4242, PULSE_TOPIC_NAME, current=False)
+        self.assertEqual(run(channel._ensure_pulse_topic()), 4242)
+        self.assertEqual(bot.created, [])
+
+    def test_two_topics_opened_at_once_resolve_to_the_same_one(self):
+        from swarmly.telegram.channel import PULSE_TOPIC_NAME
+        channel = self.channel(self.Bot(), coordinator=False)
+        home = channel.config.identity.home_channel_id
+        channel.topics.remember(home, 900, PULSE_TOPIC_NAME)
+        channel.topics.remember(home, 700, PULSE_TOPIC_NAME)
+        self.assertEqual(channel._pulse_topic(), 700)
+
+    def test_a_failed_open_pulses_in_general_and_waits_before_trying_again(self):
+        bot = self.Bot(fails=True)
+        channel = self.channel(bot, coordinator=True)
+        self.assertIsNone(run(channel._ensure_pulse_topic()))
+        bot.fails = False
+        self.assertIsNone(run(channel._ensure_pulse_topic()))      # no retry storm
+        self.assertEqual(bot.created, [])
+
+    def test_a_configured_topic_or_general_is_never_opened(self):
+        bot = self.Bot()
+        self.assertEqual(run(self.channel(bot, coordinator=True,
+                                          heartbeat_topic_id=77)._ensure_pulse_topic()), 77)
+        self.assertIsNone(run(self.channel(bot, coordinator=True,
+                                           heartbeat_topic_id=-1)._ensure_pulse_topic()))
+        self.assertEqual(bot.created, [])
 
 
 class FakePulseBus:
@@ -626,3 +696,72 @@ class TestThePulseDoesNotBlockTheTransport(unittest.TestCase):
             return seen
 
         self.assertGreater(run(scenario()), 0)      # the loop ran while the bus was blocked
+
+
+class TestOnlyPeersAreTracked(unittest.TestCase):
+    """Live, 2026-10-22: the pulse topic's "topic created" service message came back as a post
+    by the coordinator's own username (Claude_obot, not its alias Claudebot). The bot tracked
+    itself as a peer and six minutes later announced itself DOWN."""
+
+    def test_the_bots_own_post_under_its_username_is_not_a_peer(self):
+        channel = live_channel()
+        name = channel.config.identity.name
+        run(channel.handle_event(event("", username=name, is_bot=True, message_id=900)))
+        self.assertNotIn(name, channel.presence().peers)
+
+    def test_a_stranger_is_not_tracked(self):
+        channel = live_channel()
+        run(channel.handle_event(event("hello", username="random_bot", is_bot=True,
+                                       author_id=999, message_id=901)))
+        self.assertNotIn("random_bot", channel.presence().peers)
+
+    def test_a_stale_non_peer_entry_is_never_announced_down(self):
+        channel = live_channel()
+        channel.presence().seen("Claude_obot", NOW - 3600)
+        self.assertNotIn("Claude_obot", " ".join(run(channel.check_peer_liveness(now=NOW))))
+
+
+class TestSwarmUsageForTheCoordinator(unittest.TestCase):
+    """Live, 22 Oct: asked for the cost per bot, the coordinator ran a whole-disk find for
+    usage files, which ran on in the background and swallowed its reply. The swarm's usage
+    comes from each peer's heartbeat instead, read in code, never a model turn."""
+
+    def channel_with_codex_usage(self):
+        channel = live_channel()
+        channel.presence().note(pr.Pulse(alias="Codex", at=NOW, status={
+            "state": "idle", "usage": {"today": {"turns": 6, "tokens_in": 3030593,
+                                                 "tokens_out": None, "cost_usd": None}}}),
+            seen_at=NOW)
+        return channel
+
+    def test_peers_usage_comes_from_their_heartbeats(self):
+        text = self.channel_with_codex_usage().swarm_usage_text(now=NOW)
+        self.assertIn("- Codex: 6 turns, 3.0M in", text)
+        self.assertIn("- Hermes: 0 turns", text)
+
+    def test_usage_all_answers_in_code(self):
+        channel = self.channel_with_codex_usage()
+        reply = run(channel.handle_event(event("/usage@HermesBot all", author_id=ADMIN_ID,
+                                               username="alice", is_bot=False, message_id=31)))
+        self.assertIn("Swarm usage today", reply or channel._test_sender.last)
+
+    def test_only_the_coordinator_gets_the_note(self):
+        channel = self.channel_with_codex_usage()
+        channel.is_coordinator = lambda now=None: False
+        self.assertEqual(channel._swarm_usage_note(), "")
+        channel.is_coordinator = lambda now=None: True
+        note = channel._swarm_usage_note()
+        self.assertIn("Codex: 6 turns", note)
+        self.assertIn("never search the disk", note)
+
+    def test_a_non_peer_is_left_out(self):
+        channel = self.channel_with_codex_usage()
+        channel.presence().note(pr.Pulse(alias="Claude_obot", at=NOW), seen_at=NOW)
+        self.assertNotIn("Claude_obot", channel.swarm_usage_text(now=NOW))
+
+
+class TestTheWorkspaceRule(unittest.TestCase):
+    def test_every_turn_is_told_to_stay_in_its_workspace(self):
+        from swarmly.telegram.adapters.base import _tail_rules
+        self.assertTrue(any("STAY IN YOUR WORKSPACE" in rule and "find /" in rule
+                            for rule in _tail_rules()))

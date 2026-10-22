@@ -325,6 +325,9 @@ class CodexAdapter(SubprocessAdapter):
         used = codex_input_tokens(out)
         if used is not None:
             meta["input_tokens"] = used
+        wrote = codex_output_tokens(out)
+        if wrote is not None:
+            meta["output_tokens"] = wrote               # the ledger had input only (#125)
         if error and not text:
             return AdapterReply(ok=False, error=f"{self.alias} failed: {error}",
                                 duration_seconds=duration, meta=meta)
@@ -439,6 +442,25 @@ def codex_input_tokens(out: str) -> Optional[int]:
                 and isinstance(usage.get("input_tokens"), int):
             used = usage["input_tokens"]
     return used
+
+
+def codex_output_tokens(out: str) -> Optional[int]:
+    """Output tokens from the last ``turn.completed`` event, counted the same way as input."""
+    wrote = None
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{") or "turn.completed" not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        usage = event.get("usage") if isinstance(event, dict) else None
+        if event.get("type") == "turn.completed" and isinstance(usage, dict) \
+                and isinstance(usage.get("output_tokens"), int) \
+                and not isinstance(usage.get("output_tokens"), bool):
+            wrote = usage["output_tokens"]
+    return wrote
 
 
 def _readable(detail) -> Optional[str]:

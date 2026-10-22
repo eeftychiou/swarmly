@@ -2306,3 +2306,112 @@ from tests import envguard  # noqa: E402 - last on purpose: the wrapper stays tw
 
 def load_tests(loader, tests, pattern):
     return envguard.guard(loader, tests, pattern)
+
+
+class TestInstalledRevision(unittest.TestCase):
+    """A pip/pipx install from git announces its commit, not just the version (live, CT100)."""
+
+    def test_the_commit_pip_recorded_is_the_revision(self):
+        import json as json_mod
+        from unittest import mock
+        from swarmly.telegram import channel as channel_mod
+        record = json_mod.dumps({"url": "https://github.com/eeftychiou/swarmly",
+                                 "vcs_info": {"vcs": "git", "commit_id": "e0982f5" + "0" * 33}})
+        dist = mock.Mock()
+        dist.read_text.return_value = record
+        with mock.patch.object(channel_mod, "_git_head", return_value="unknown"), \
+                mock.patch("importlib.metadata.distribution", return_value=dist):
+            self.assertEqual(channel_mod._local_revision(), "e0982f5")
+            self.assertEqual(channel_mod._local_revision_full(), "e0982f5" + "0" * 33)
+
+    def test_no_record_falls_back_to_the_version(self):
+        from unittest import mock
+        from swarmly import __version__
+        from swarmly.telegram import channel as channel_mod
+        dist = mock.Mock()
+        dist.read_text.return_value = None
+        with mock.patch.object(channel_mod, "_git_head", return_value="unknown"), \
+                mock.patch("importlib.metadata.distribution", return_value=dist):
+            self.assertEqual(channel_mod._local_revision(), f"v{__version__}")
+
+
+class TestCleanupLookups(unittest.TestCase):
+    """/cleanup asks GitHub once per number, side by side, and reuses a recent answer."""
+
+    def test_one_lookup_per_number_in_parallel_and_cached(self):
+        import threading
+        import time as time_mod
+        channel = make_channel(make_config(github={"poll_minutes": 0}))
+        channel._cleanup_repo = lambda *_args: "o/r"
+        calls = []
+        lock = threading.Lock()
+
+        class Client:
+            def ref_state(self, repo, number):
+                with lock:
+                    calls.append(number)
+                time_mod.sleep(0.2)
+                return "closed" if number % 2 else "merged"
+
+        channel._gh_client = Client()
+        refs = [f"#{n}" for n in range(1, 13)]
+        started = time_mod.monotonic()
+        states = channel._ref_states(refs, GROUP, 7)
+        took = time_mod.monotonic() - started
+        self.assertEqual(sorted(calls), list(range(1, 13)))       # one call each, no fallback
+        self.assertLess(took, 1.5)                                 # not 12 x 0.2 s in a row
+        self.assertEqual(states["#1"], "closed")
+        self.assertEqual(states["#2"], "merged")
+        channel._ref_states(refs, GROUP, 7)
+        self.assertEqual(len(calls), 12)                           # the second ask is cached
+
+
+class TestTheCommandMenu(unittest.TestCase):
+    """Live: only the bot whose token once ran another tool autocompleted, with that tool's
+    commands. Every transport now registers Swarmly's own menu on start."""
+
+    class MenuBot:
+        def __init__(self, default=(), scoped=()):
+            from types import SimpleNamespace
+            self.default = [SimpleNamespace(command=c, description=d) for c, d in default]
+            self.scoped = [SimpleNamespace(command=c, description="x") for c in scoped]
+            self.set_calls, self.deleted = [], []
+
+        async def get_my_commands(self, scope=None):
+            return self.scoped if scope is not None else self.default
+
+        async def delete_my_commands(self, scope=None):
+            self.deleted.append(type(scope).__name__)
+            self.scoped = []
+
+        async def set_my_commands(self, commands, scope=None):
+            self.set_calls.append([c.command for c in commands])
+
+    def test_a_stale_menu_is_replaced_with_swarmlys_own(self):
+        from swarmly.telegram.commands import MENU_COMMANDS
+        channel = make_channel()
+        channel.bot = self.MenuBot(default=[("memory", "Show main memory")], scoped=["cron"])
+        self.assertEqual(run(channel._register_command_menu()), "registered")
+        self.assertEqual(channel.bot.set_calls, [[name for name, _ in MENU_COMMANDS]])
+        self.assertTrue(channel.bot.deleted)                # the scoped list that shadowed it
+        self.assertNotIn("memory", channel.bot.set_calls[0])
+
+    def test_an_unchanged_menu_is_left_alone(self):
+        from swarmly.telegram.commands import MENU_COMMANDS
+        channel = make_channel()
+        channel.bot = self.MenuBot(default=MENU_COMMANDS)
+        self.assertEqual(run(channel._register_command_menu()), "unchanged")
+        self.assertEqual(channel.bot.set_calls, [])
+
+    def test_every_menu_command_is_one_the_bot_handles(self):
+        import re
+        from swarmly.telegram.commands import MENU_COMMANDS
+        source = Path(__file__).resolve().parents[1].joinpath(
+            "swarmly", "telegram", "channel.py").read_text(encoding="utf-8")
+        source += Path(__file__).resolve().parents[1].joinpath(
+            "swarmly", "telegram", "membership.py").read_text(encoding="utf-8")
+        for name, text in MENU_COMMANDS:
+            self.assertTrue(re.fullmatch(r"[a-z0-9_]{1,32}", name), name)
+            self.assertLessEqual(len(text), 256)
+            if name != "cli":                      # /cli is parsed by native.parse_request
+                self.assertIn(f'"{name}"', source, name)

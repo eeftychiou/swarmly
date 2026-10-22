@@ -888,13 +888,22 @@ class Membership:
                 lines.append(presence_line())
             except Exception:                       # noqa: BLE001 - /swarm must answer
                 logger.warning("membership: no presence line for /swarm", exc_info=True)
+        old_releases: tuple[str, ...] = ()
+        if hasattr(self.ch, "old_releases"):
+            try:
+                old_releases = self.ch.old_releases()
+            except Exception:
+                pass
         for alias, role in sorted(self.team().items()):
             if alias == self.alias:
                 state = "online (me)"
             else:
                 seen = self.presence.get(alias)
                 state = "unknown" if seen is None else ("online" if seen["online"] else "offline")
-            lines.append(f"- {alias}: {role or 'no role'}, {state}")
+            extra = " (running an old release)" if alias in old_releases else ""
+            lines.append(f"- {alias}: {role or 'no role'}, {state}{extra}")
+        for alias in sorted(old_releases):
+            lines.append(f"⚠️ {alias} is running an old release")
         count = await self.member_count()
         if count is not None:
             known = len(self.cfg.peers) + 1 + 1 + len(self.cfg.identity.allowed_users)

@@ -599,7 +599,8 @@ it stops a day after the last turn. `0` turns it off.
 **A bot that dies says nothing, so the swarm listens for its pulse.** Every transport writes one
 heartbeat every `limits.heartbeat_minutes` (default 2) carrying its revision, term, role and,
 while a turn is running, `busy_since`. It is a silent Telegram line (`limits.heartbeat_plane:
-telegram`, the default), in `limits.heartbeat_topic_id` (General when 0), and each beat deletes
+telegram`, the default), in the swarm's own "📡 Swarm pulse" topic, which the coordinator opens
+(`limits.heartbeat_topic_id` names another topic, or `-1` for General), and each beat deletes
 the bot's previous one, so there is one current line per bot (`heartbeat_style: edit` edits a
 single message in place instead). `heartbeat_plane: bus` keeps the earlier per-bot git ref, `refs/pulse/<alias>`,
 but a heartbeat is a push and a fetch every beat on GitHub, so it is off by default. The pulse
@@ -967,6 +968,10 @@ runtime's own records expose them, and the last few turns. A number the runtime 
 is shown as **unknown**, never as zero, and a total says how many of its rows reported one. The
 ledger survives a restart and is capped (2000 rows, then the oldest are dropped — and the
 output says where its history now starts).
+
+`/usage@<bot> all` lists every bot's usage today: this bot's from its ledger, each peer's from
+the `usage.today` its latest heartbeat carried. The coordinator gets the same lines added to each
+turn's prompt (code, no tokens), so a cost report never needs anyone to look for ledger files.
 
 **The command centre — a pinned dashboard (issue #117).** The coordinator keeps one message
 pinned in a control topic (or the admin's DM) and edits it in place on every heartbeat, so the
