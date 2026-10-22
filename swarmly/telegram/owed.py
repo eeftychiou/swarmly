@@ -163,6 +163,15 @@ class Row:
     deadline: float = 0.0           # absolute; 0 means "no deadline"
     state: str = OPEN
     closed_by: str = ""             # the fact that closed it
+    #: The observation that last woke somebody about this row (#163): a wake needs news, so
+    #: the row carries what it already told someone, and how often it has.
+    woken: str = ""
+    wakes: int = 0
+    #: When the last wake went out, so a wake that nobody acted on can be told from one whose
+    #: turn is still running (#163 review: an ignored wake never escalated).
+    woken_at: float = 0.0
+    #: Set when a repeat went to the admin instead of the debtor, so it happens once.
+    escalated: bool = False
     #: What tells two debts of the same kind, item and debtor apart: the topic a hand-off was
     #: made in, or a digest of the question an admin row is about. Without it, one peer's two
     #: hand-offs in two topics are one row, and a reply in either closes both (#173 review).
@@ -189,6 +198,14 @@ class Row:
             # The head is in the id on purpose: a verdict on older code must close nothing,
             # so a debt that is *about* a head cannot exist without naming it.
             raise OwedError(f"a {self.kind} row must name the head it is bound to")
+        self.woken = str(self.woken or "").strip()
+        self.wakes = int(self.wakes or 0)
+        try:
+            self.woken_at = float(self.woken_at or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise OwedError(f"a row wake time must be epoch seconds (got "
+                            f"{self.woken_at!r})") from exc
+        self.escalated = bool(self.escalated)
         self.key_extra = str(self.key_extra or "").strip()
         self.writer = _alias(self.writer)
         self.state = str(self.state or OPEN).strip().lower()
@@ -244,6 +261,8 @@ class Row:
             "debtor": self.debtor, "owes": self.owes, "waiting_on": self.waiting_on,
             "opened_by": self.opened_by, "observed": self.observed, "head": self.head,
             "topic": self.topic, "key_extra": self.key_extra,
+            "woken": self.woken, "wakes": int(self.wakes),
+            "woken_at": float(self.woken_at), "escalated": bool(self.escalated),
             "deadline": self.deadline, "state": self.state,
             "closed_by": self.closed_by, "writer": self.writer,
             "created_at": self.created_at,
@@ -265,6 +284,9 @@ class Row:
             opened_by=str(data.get("opened_by") or ""),
             observed=str(data.get("observed") or ""), head=str(data.get("head") or ""),
             topic=str(data.get("topic") or ""), key_extra=str(data.get("key_extra") or ""),
+            woken=str(data.get("woken") or ""), wakes=int(data.get("wakes") or 0),
+            woken_at=data.get("woken_at") or 0.0,
+            escalated=bool(data.get("escalated")),
             deadline=data.get("deadline") or 0.0,
             state=str(data.get("state") or OPEN),
             closed_by=str(data.get("closed_by") or ""),

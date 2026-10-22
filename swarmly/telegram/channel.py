@@ -3744,6 +3744,12 @@ class AgentChannel:
             self.owed_sweep(now=moment)
         except Exception:                          # noqa: BLE001 - a beat must not fail on it
             logger.warning("owed: sweep failed this beat", exc_info=True)
+        # Round 5.5 (#163): and a row whose fact changed wakes its debtor, once, right after
+        # the sweep -- so the beat that learns of a change is the beat that acts on it.
+        try:
+            self.owed_wake_tick(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("owed: wake failed this beat", exc_info=True)
         # The pinned dashboard rides the beat, and only its holder edits it: every bot
         # refreshing one message would fight over it (#117).
         if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
@@ -4951,6 +4957,20 @@ class AgentChannel:
             add(alias, role)
         return roles
 
+    def owed_bots(self) -> Set[str]:
+        """The debtors a wake can actually reach: this bot, and the peers it is configured with.
+
+        A wake starts a turn, so it needs a chat handler behind it. ``CI`` owes a result and
+        ``admin`` owes an answer, and neither is one (#163 review): the roster decides, never
+        the round state, and a debtor off it keeps its row without getting a turn.
+        """
+        bots = {str(getattr(self.config.identity, "alias", "") or "").strip()}
+        for table in ("peers", "peer_roles"):
+            for alias in (getattr(self.config, table, None) or {}):
+                bots.add(str(alias or "").strip())
+        bots.discard("")
+        return bots
+
     def owed_sweep(self, *, now: Optional[float] = None) -> List[str]:
         """Open and close the rows the round state answers -- every source but a hand-off.
 
@@ -5072,6 +5092,110 @@ class AgentChannel:
             done.append(f"open {row.id}")
         if done:
             logger.info("owed: %s", "; ".join(done[:8]))
+        return done
+
+    # -- waking on news (issue #163, item 4's second half) -------------------------------
+
+    def _place_target(self, token: str) -> Optional[Tuple[int, Optional[int]]]:
+        """The discussion a row's ``tg-`` token stands for, or the General topic for none.
+
+        A row carries a token, never a chat id, so it is resolved back through the topics this
+        transport knows -- its own view, the only one it can act in. A row with no token (a
+        debt the round state opened, and General itself) wakes in the home group's General: the
+        swarm's own room, which is where a debt nobody's topic owns belongs.
+        """
+        token = str(token or "").strip()
+        if token:
+            for chat_id, thread_id, _name in self.topics.entries():
+                if self.topics.context(chat_id, thread_id) == token:
+                    return (int(chat_id), thread_id)
+            return None                     # a token this bot cannot place: wake nowhere
+        home = self.config.identity.home_channel_id
+        return (int(home), None) if home else None
+
+    @staticmethod
+    def _owed_wake_note(wake: Any) -> str:
+        """The brief a wake turn starts with: the news, in one line, and what it asks for."""
+        from swarmly.telegram.owed_wake import MAX_WAKES
+        if wake.escalated:
+            return (f"Owed-row escalation: {wake.text}. Nobody acted on it and it is still "
+                    f"open; tell the admin in one short line. This is the last notice for "
+                    f"this row.")
+        return (f"Owed-row wake: {wake.text}. Act on it, or say in one line why you cannot. Do "
+                f"not answer with a status line. (Row {wake.row}; after {MAX_WAKES} wake-ups "
+                f"with no news the admin is told instead, and the row stops asking.)")
+
+    def owed_wake_tick(self, *, now: Optional[float] = None) -> List[str]:
+        """Start one turn for each row whose fact has changed, and none for the rest (#163).
+
+        The decision is :func:`swarmly.telegram.owed_wake.plan`, a pure function over the
+        table. This is the half that knows *where*: a row's discussion is resolved to a chat
+        and thread, a topic with a turn already running is held (a wake queued behind a turn
+        often settles the same debt, #160), and what woke whom is written to the row before
+        the next tick, so a restart cannot wake the same bot about the same observation twice.
+        A wake nobody acts on is nudged once, then escalated to the admin in General, once.
+        A bot starts turns only for the debts **it** owes: the table folds every writer's
+        documents, so a peer's row is here too, and waking it here would spend the news on the
+        wrong bot. An escalation is posted by the coordinator, the swarm's one voice to the
+        admin, and held by everyone else.
+        """
+        from swarmly.telegram.owed_wake import MAX_WAKES_PER_TICK, mark_woken, plan
+        moment = time.time() if now is None else float(now)
+        try:
+            store = self.owed_store()
+            rows = store.open_rows(now=moment)
+        except Exception:                          # noqa: BLE001 - a tick must survive
+            logger.warning("owed wake: the table could not be read", exc_info=True)
+            return []
+        # The roster, not the table: a row whose debtor is CI or the admin is observed here and
+        # woken nowhere -- there is no turn behind those names. An escalation goes to General,
+        # the place the admin is addressed in, not to the discussion the debt lives in.
+        wakes = plan(rows, now=moment, bots=self.owed_bots(), admin_topic="")
+        if not wakes:
+            return []
+        done: List[str] = []
+        acted: List[Any] = []
+        fired: Set[Any] = set()
+        me = str(getattr(self.config.identity, "alias", "") or "").strip().lower()
+        for wake in wakes:
+            # Every bot's table folds every writer's documents, so a peer's debt is on this
+            # table too. Waking it here would start *my* turn about *their* debt and then write
+            # `woken` on the shared row before the debtor ever saw it -- the news spent on the
+            # wrong bot (#163 review). A bot wakes only what it owes, and the admin hears it
+            # from one voice: the coordinator's.
+            if wake.escalated:
+                if not self.is_coordinator(now=moment):
+                    done.append(f"{wake.row}: held: the escalation is the coordinator's to post")
+                    continue
+            elif str(wake.debtor or "").strip().lower() != me:
+                done.append(f"{wake.row}: held: owed by {wake.debtor}, not me")
+                continue
+            if len(acted) >= MAX_WAKES_PER_TICK:
+                done.append(f"{wake.row}: held: the tick's wake budget is spent")
+                continue
+            target = self._place_target(wake.topic)
+            if target is None:
+                done.append(f"{wake.row}: held: no discussion to wake in")
+                continue
+            key = (int(target[0]), target[1])
+            if key in self._busy_since or key in fired:
+                # A turn is already running here, or one already started in this pass: the
+                # debt stays armed and is looked at again on the next tick.
+                done.append(f"{wake.row}: held: turn running")
+                continue
+            self._run_own_task(self._owed_wake_note(wake), key[0], key[1],
+                               self.topics.name(key[0], key[1]))
+            fired.add(key)
+            acted.append(wake)
+            done.append(f"{wake.row}: woke {wake.debtor}")
+        if acted:
+            try:
+                store.save_all(mark_woken(rows, acted, now=moment))
+            except Exception:                      # noqa: BLE001 - the turn is already running
+                logger.warning("owed wake: could not record what woke; it may repeat",
+                               exc_info=True)
+        if done:
+            logger.info("owed wake: %s", "; ".join(done[:8]))
         return done
 
     def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
