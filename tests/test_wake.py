@@ -472,6 +472,136 @@ class TestTick(unittest.TestCase):
         self.assertTrue(asyncio.run(channel._wake_tick(now=time.time()))[0].startswith("paused"))
 
 
+class TestHeldWhileBusy(unittest.TestCase):
+    """Round 5.5 item 1 (#160): a due WAKE waits out a turn already running in its topic.
+
+    Replays of the 22 Oct incidents this covers. The coordinator's standing
+    ``gh issue view 120`` check came due while a turn was running in that topic, so a second
+    turn queued behind it and paid a full model turn to say "nothing changed"; a turn hung on
+    a background ``find`` over the whole disk did the same for fifteen minutes. Neither the
+    check nor the turn may start while the topic is busy: the timer stays armed, unclaimed,
+    and is evaluated -- expiry included -- on the first tick after the turn ends.
+    """
+
+    def channel(self):
+        """A lone bot whose store, check and claim can all be watched from the test."""
+        from unittest import mock
+        from tests.test_telegram_channel import make_channel, make_config
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config(agent={"role": "developer"},
+                             fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
+                             limits={"wake_tick_seconds": 0})
+        channel = make_channel(config)
+        channel.lease_fence = lambda now=None: True        # the lease is not what these test
+        store = wk.WakeStore(channel.config.identity.alias,
+                             state_dir=Path(tmp.name) / "state", transport=None,
+                             root=Path(tmp.name), clock=time.time)
+        channel.wake_store = lambda: store
+        started: list = []
+        checks: list = []
+        claims: list = []
+        channel._run_own_task = lambda text, chat_id, thread_id, name: started.append(text)
+        real_claim = store.claim_state
+        store.claim_state = lambda timer, settle_seconds=0.0: (
+            claims.append(timer.id) or real_claim(timer, settle_seconds=settle_seconds))
+
+        async def check(argv, *, cwd, timeout):
+            checks.append(argv)
+            return 0, "state: OPEN\n[ ] #167", wk.output_digest("state: OPEN\n[ ] #167")
+
+        patcher = mock.patch("swarmly.telegram.wake.run_check_async", check)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return channel, store, started, checks, claims
+
+    def timer(self, channel, **fields):
+        """The 22 Oct standing check: ``gh issue view 120``, always true, every 5 minutes."""
+        fields.setdefault("argv", ("gh", "issue", "view", "120"))
+        fields.setdefault("then", "check whether the round moved")
+        fields.setdefault("next_at", 1.0)
+        fields.setdefault("expires_at", time.time() + 3600)
+        fields.setdefault("every_seconds", 300)
+        fields.setdefault("chat_id", -1)
+        fields.setdefault("alias", channel.config.identity.alias)
+        return wk.WakeTimer(**fields)
+
+    def test_a_standing_check_due_behind_a_running_turn_is_held(self):
+        import asyncio
+        channel, store, started, checks, claims = self.channel()
+        timer = self.timer(channel, thread_id=307)
+        store.add(timer, max_timers=10)
+        channel._busy_since[(-1, 307)] = channel._clock()   # the coordinator's own turn
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(done, [f"{timer.id}: held: turn running"])
+        self.assertEqual(checks, [])          # no check ran
+        self.assertEqual(started, [])         # no second turn queued behind the first
+        self.assertEqual(claims, [])          # the firing was not claimed on the bus
+        self.assertEqual(store.live_count, 1)  # still armed, still owed
+        self.assertEqual(store.load()[0].state, "armed")
+
+    def test_the_held_check_fires_on_the_first_tick_after_the_turn_ends(self):
+        import asyncio
+        channel, store, started, checks, claims = self.channel()
+        timer = self.timer(channel, thread_id=307)
+        store.add(timer, max_timers=10)
+        channel._busy_since[(-1, 307)] = channel._clock()
+        asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(claims, [])
+        channel._busy_since.pop((-1, 307))     # the turn ended
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(done, [f"{timer.id}: fire"])
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(len(started), 1)
+        self.assertIn("check whether the round moved", started[0])
+        self.assertEqual(store.live_count, 0)
+
+    def test_a_check_due_behind_a_turn_running_for_fifteen_minutes_is_still_held(self):
+        """The 22 Oct hang: a turn stuck on a whole-disk ``find`` for 15 minutes."""
+        import asyncio
+        channel, store, started, checks, _claims = self.channel()
+        timer = self.timer(channel, thread_id=307)
+        store.add(timer, max_timers=10)
+        channel._busy_since[(-1, 307)] = channel._clock() - 900
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(done, [f"{timer.id}: held: turn running"])
+        self.assertEqual((started, checks), ([], []))
+
+    def test_a_check_due_in_a_topic_that_is_not_busy_still_fires(self):
+        import asyncio
+        channel, store, started, _checks, claims = self.channel()
+        busy_topic = self.timer(channel, id="busy0001", thread_id=307)
+        free_topic = self.timer(channel, id="free0001", thread_id=308)
+        store.add(busy_topic, max_timers=10)
+        store.add(free_topic, max_timers=10)
+        channel._busy_since[(-1, 307)] = channel._clock()
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(done, ["busy0001: held: turn running", "free0001: fire"])
+        self.assertEqual(claims, ["free0001"])
+        self.assertEqual(len(started), 1)
+        by_id = {row.id: row for row in store.load()}
+        self.assertEqual(by_id["free0001"].state, "done")
+        self.assertEqual(by_id["busy0001"].state, "armed")   # held, not retired
+
+    def test_a_held_check_past_its_until_expires_once_the_turn_ends(self):
+        import asyncio
+        channel, store, started, checks, _claims = self.channel()
+        now = time.time()
+        timer = self.timer(channel, thread_id=307, expires_at=now - 30)
+        store.add(timer, max_timers=10)
+        channel._busy_since[(-1, 307)] = channel._clock()
+        done = asyncio.run(channel._wake_tick(now=now))
+        self.assertEqual(done, [f"{timer.id}: held: turn running"])
+        self.assertEqual((started, checks), ([], []))
+        self.assertEqual(store.live_count, 1)  # held, not silently dropped
+        channel._busy_since.pop((-1, 307))
+        done = asyncio.run(channel._wake_tick(now=now + 20))
+        self.assertEqual(done, [f"{timer.id}: expired"])
+        self.assertEqual(len(started), 1)
+        self.assertIn(f"WAKE {timer.id} expired", started[0])
+        self.assertEqual(store.live_count, 0)
+
+
 class TestAttachedFlagBypass(unittest.TestCase):
     """Blocker 1: an attached flag value must not smuggle a write past the allowlist."""
 

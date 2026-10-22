@@ -1162,7 +1162,11 @@ line. Times are absolute, so a restart resumes the schedule instead of re-arming
 armed timer (the ack says `replaces <id>`) instead of adding one, and a check that exits 0 with
 the same output the bot last acted on re-arms silently instead of starting a turn, so a standing
 `gh issue view` costs a turn only when the issue changed (live, round 5: ten copies filled the
-cap and each firing posted "nothing changed"). Limits:
+cap and each firing posted "nothing changed"). **A due timer waits out a turn.** When a timer
+comes due for a topic that already has a turn running, the tick neither claims nor runs it — a
+running turn often settles the same item, and a second turn queued behind it is a paid "nothing
+changed". It stays armed and unclaimed, and is evaluated — expiry included — on the first tick
+after that topic's turn ends; the tick reports `held: turn running`. Limits:
 
 | `limits.` | default | what it bounds |
 |---|---|---|
