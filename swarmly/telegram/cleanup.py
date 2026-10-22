@@ -36,6 +36,7 @@ choices, pending hand-offs, the name cache) and posts one machine
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets as _secrets
 import time
@@ -333,7 +334,7 @@ class Cleanup:
         home = int(home)
 
         if not words:
-            return self.dry_run(home)
+            return self.dry_run(home, topics=await self._topics_off_loop())
         if words[0] == "confirm":
             return await self._confirm(words[1:], home)
         if words == ["general"]:
@@ -349,10 +350,11 @@ class Cleanup:
 
     # -- the dry run ---------------------------------------------------------------------
 
-    def dry_run(self, chat_id: int, now: Optional[float] = None) -> str:
+    def dry_run(self, chat_id: int, now: Optional[float] = None,
+                topics: Optional[List[TopicInfo]] = None) -> str:
         """Every known topic with its state, and the General messages it could delete."""
         moment = float(now if now is not None else self._clock())
-        topics = self._topics()
+        topics = self._topics() if topics is None else topics
         self.last_topics = topics
         lines = [f"🧹 {self._me()} cleanup (dry run: nothing is deleted)", ""]
         if topics:
@@ -390,7 +392,8 @@ class Cleanup:
 
     async def _ask_done(self, chat_id: int) -> str:
         moment = self._clock()
-        targets = [topic for topic in self._topics() if self._is_done(topic, moment)]
+        targets = [topic for topic in await self._topics_off_loop()
+                   if self._is_done(topic, moment)]
         if not targets:
             return (f"{self._me()}: no topic has a closed or merged item and has been idle "
                     f"{self.idle_hours:g}h. Nothing to delete.")
@@ -399,7 +402,7 @@ class Cleanup:
 
     async def _ask_all(self, chat_id: int) -> str:
         moment = self._clock()
-        targets = [topic for topic in self._topics()
+        targets = [topic for topic in await self._topics_off_loop()
                    if topic.thread_id not in self.keep]
         if not targets:
             return f"{self._me()}: no topic to delete (only General and the kept ones)."
@@ -411,7 +414,8 @@ class Cleanup:
             thread_id = int(word.lstrip("#"))
         except ValueError:
             return f"{self._me()}: /cleanup topic takes a topic id (a number)."
-        topic = next((t for t in self._topics() if t.thread_id == thread_id), None)
+        topic = next((t for t in await self._topics_off_loop() if t.thread_id == thread_id),
+                     None)
         return self._ask("topics", chat_id, thread_ids=[thread_id],
                          listing=[self._describe(topic, self._clock()) if topic
                                   else f"{thread_id} · unknown to this transport"])
@@ -508,6 +512,11 @@ class Cleanup:
                 "48h stay yours to remove by hand.")
 
     # -- helpers -------------------------------------------------------------------------
+
+    async def _topics_off_loop(self) -> List[TopicInfo]:
+        """The topics, gathered in a worker thread: their states are GitHub lookups, and the bot
+        must keep handling messages while they run (live: a dry run held it for 52 s)."""
+        return await asyncio.to_thread(self._topics)
 
     def _topics(self) -> List[TopicInfo]:
         topics = list(self.host.cleanup_topics() or [])

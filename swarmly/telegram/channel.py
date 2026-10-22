@@ -34,6 +34,7 @@ import re
 import secrets
 import socket
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import time
 import dataclasses
 from collections import deque
@@ -177,6 +178,10 @@ def _local_revision_full() -> str:
 
 #: Messages older than this when the transport starts are a backlog, not a conversation.
 _MAX_BACKLOG_SECONDS = 30 * 60
+#: /cleanup's issue and PR lookups: how many run at once, and how long an answer is reused (the
+#: dry run, the ask and the confirm usually come within a few minutes of each other).
+_REF_LOOKUP_WORKERS = 6
+_REF_STATE_CACHE_SECONDS = 300.0
 #: The topic the swarm's heartbeat lives in, opened by the coordinator (limits.heartbeat_topic_id 0).
 PULSE_TOPIC_NAME = "\U0001f4e1 Swarm pulse"
 #: How long a failed attempt to open the pulse topic waits before the next one.
@@ -1783,22 +1788,29 @@ class AgentChannel:
         if not repo or self.config.github is None:
             return {ref: None for ref in refs}
         client = self._github_client()
-        states: Dict[str, Optional[str]] = {}
+        numbers: Dict[str, int] = {}
         for ref in refs:
             try:
-                number = int(str(ref).lstrip("#"))
+                numbers[ref] = int(str(ref).lstrip("#"))
             except (TypeError, ValueError):
                 continue
-            state = None
-            pr = client.pr_view(repo, number)          # a PR first: only it can be merged
-            if pr is not None:
-                state = _ref_state(pr.state)
-            if state is None:
-                issue = client.issue_view(repo, number)
-                if issue is not None:
-                    state = _ref_state(issue.state)
-            states[ref] = state
-        return states
+        cache = self.__dict__.setdefault("_ref_state_cache", {})
+        now = time.time()
+
+        def lookup(number: int) -> Optional[str]:
+            key = (repo, number)
+            hit = cache.get(key)
+            if hit is not None and now - hit[0] < _REF_STATE_CACHE_SECONDS:
+                return hit[1]
+            state = _ref_state(client.ref_state(repo, number))   # one call, issue or PR
+            if state is not None:
+                cache[key] = (now, state)
+            return state
+
+        # A topic links a dozen items: ask about them side by side, not one after another.
+        with ThreadPoolExecutor(max_workers=_REF_LOOKUP_WORKERS) as pool:
+            found = dict(zip(numbers, pool.map(lookup, numbers.values())))
+        return found
 
     async def cleanup_delete_topic(self, chat_id: int, thread_id: int) -> bool:
         """Delete one forum topic with all its messages (any age: that is deleteForumTopic)."""

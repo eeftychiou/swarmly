@@ -150,6 +150,27 @@ class DryRunTests(CleanupCase):
         self.assertIn("topics done -- 1 topic(s)", text)
 
 
+class OffTheLoopTests(CleanupCase):
+    """Live: the topic states are GitHub lookups, and a dry run held the bot for 52 s."""
+
+    def test_the_topics_are_gathered_in_a_worker_thread(self):
+        import threading
+        host = FakeHost([topic(5)])
+        threads = []
+        original = host.cleanup_topics
+
+        def gathered():
+            threads.append(threading.current_thread() is threading.main_thread())
+            return original()
+
+        host.cleanup_topics = gathered
+        cleanup = self.cleanup(host)
+        for words in ((), ("topics", "done"), ("topics", "all"), ("topic", "5")):
+            self.ask(cleanup, *words)
+        self.assertTrue(threads)
+        self.assertNotIn(True, threads)
+
+
 class RefusalTests(CleanupCase):
     def test_a_non_admin_gets_a_refusal_and_nothing_else(self):
         host = FakeHost([topic(42, "#37", refs=["#37"], states={"#37": "merged"})])
