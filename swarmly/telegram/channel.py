@@ -3026,7 +3026,7 @@ class AgentChannel:
     #: post the local one: one press is one line on the bus (review, #133).
     CONTROL_BROADCASTS = ("swarm.pause_all",)
 
-    def _control_event(self, command: str) -> ChannelEvent:
+    def _control_event(self, command: str, argument: str = "") -> ChannelEvent:
         """A synthetic event for a report control: the admin, typing a bare command.
 
         The report answers through the *same* functions the typed commands use (``/model``,
@@ -3036,11 +3036,73 @@ class AgentChannel:
         would be the wrong shape for a control that is not asked twice.
         """
         settings = getattr(self.config, "control", None)
-        return ChannelEvent(text=f"/{command}",
+        return ChannelEvent(text=f"/{command}" + (f" {argument}" if argument else ""),
                             chat_id=self.config.identity.home_channel_id or 0,
                             author_id=self.config.identity.admin_user_id,
                             author_username=self.config.identity.name,
                             thread_id=getattr(settings, "topic_id", None))
+
+    def control_choices(self, action: str) -> List[Tuple[str, str]]:
+        """The live choices a picker offers, read in code and costing no turn (#153).
+
+        Model names come from the list the CLI already reported (``/model``'s own cache), the
+        effort levels from the config's own set, and the timers from what this bot holds. An
+        unreadable list is an empty one, and the press then says there is nothing to pick.
+        """
+        adapter = self.config.adapter
+        if action == "bot.model":
+            names = cached_models(adapter.type) or []
+            return [(name, name) for name in names][:12]
+        if action == "bot.effort":
+            return [(level, level) for level in EFFORT_LEVELS]
+        if action == "bot.wake":
+            now = time.time()
+            timers = [timer for timer in self.wake_store().load() if timer.live]
+            return [(f"{timer.id} in {max(0, int(timer.next_at - now)) // 60}m", timer.id)
+                    for timer in sorted(timers, key=lambda row: row.next_at)][:10]
+        return []
+
+    async def _offer_picker(self, action: str) -> str:
+        """Send the picker for *action*: a small message of its own, one button per value.
+
+        The keyboard cannot live on the dashboard -- every heartbeat edits that message with
+        the plain keyboard, which would wipe a picker mid-press -- and it must not cost a model
+        turn, so the choices come from code and the value rides each button's callback data.
+        """
+        found = control_mod.control(action)
+        label = found.label if found else action
+        choices = self.control_choices(action)
+        if not choices:
+            raise ControlRefused(f"{label}: there is nothing to pick from just now")
+        bot = getattr(self, "bot", None)
+        if bot is None:
+            raise ControlRefused(f"{label}: this transport cannot post the picker")
+        rows = control_mod.picker(action, choices)
+        try:
+            from aiogram.types import InlineKeyboardMarkup
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        except Exception:                      # noqa: BLE001 - no aiogram: the plain shape
+            markup = {"inline_keyboard": rows}
+        await bot.send_message(chat_id=self.config.identity.home_channel_id,
+                               text=control_mod.picker_text(action,
+                                                            self.config.identity.alias),
+                               disable_web_page_preview=True, reply_markup=markup)
+        return f"{label}: {len(choices)} choice(s) offered"
+
+    async def _apply_pick(self, action: str, value: str) -> str:
+        """Set what a picker chose -- through the same function the typed command runs.
+
+        ``/model <name>``, ``/reasoning <level>`` and ``/wakes cancel <id>`` are the transport's
+        own answers, so a picked value behaves exactly like a typed one: same validation, same
+        limits, same words back.
+        """
+        if action == "bot.model":
+            return self._model_command(self._control_event("model", value))
+        if action == "bot.effort":
+            return self._reasoning_command(self._control_event("reasoning", value))
+        if action == "bot.wake":
+            return self._wakes_command(self._control_event("wakes", f"cancel {value}"))
+        raise ControlRefused(f"{action}: this build cannot apply a picked value")
 
     def control_report(self, action: str) -> Optional[str]:
         """What a report control answers, in code and costing no turn (None for the others)."""
@@ -3114,7 +3176,8 @@ class AgentChannel:
             decision = self.control_policy().decide(press, actor=str(press.user_id))
             if decision.verdict == press_mod.RUN:
                 answer = await self._run_control(decision.action, decision.target,
-                                                 presser=str(press.user_id))
+                                                 presser=str(press.user_id),
+                                                 value=decision.value)
                 if answer:
                     decision.text = answer
             if decision.log and decision.action not in self.CONTROL_BROADCASTS:
@@ -3135,12 +3198,17 @@ class AgentChannel:
             Envelope(type=MessageType.NOTE, to="*", intent="CONTROL", ref=self._alias_ref()),
             line), silent=True, notice=True, allow_when_frozen=True)
 
-    async def _run_control(self, action: str, target: str, *, presser: str = "") -> Optional[str]:
+    async def _run_control(self, action: str, target: str, *, presser: str = "",
+                           value: str = "") -> Optional[str]:
         """Carry out one wired control, here and -- for a swarm-wide one -- everywhere else.
 
         Returns the words to answer the presser with when the control is one that *reports*
         (None otherwise, and the policy's own line is the answer).
         """
+        if value:
+            return await self._apply_pick(action, value)
+        if control_mod.is_picker(action):
+            return await self._offer_picker(action)
         report = self.control_report(action)
         if report is not None:
             return report

@@ -13,8 +13,10 @@ import asyncio
 import unittest
 from unittest import mock
 
+from swarmly.telegram import channel as channel_mod
 from swarmly.telegram import control as ct
 from swarmly.telegram import control_press as cp
+from tests.test_control_center import FakeBot
 from tests.test_telegram_channel import (ADMIN_ID, event, make_channel, make_config,
                                         run)
 
@@ -23,6 +25,13 @@ NOW = 1_800_000_000.0
 #: The bot that posted a CONTROL note in these tests. A press lands on the transport that
 #: holds the dashboard, so a note is only obeyed when a bot of the swarm sent it (#133).
 SENDER = "Codex"
+
+
+def buttons_of(markup):
+    """``[(text, callback_data)]`` per row, for either aiogram's markup or the plain dict."""
+    rows = markup["inline_keyboard"] if isinstance(markup, dict) else markup.inline_keyboard
+    return [[((b["text"], b["callback_data"]) if isinstance(b, dict)
+              else (b.text, b.callback_data)) for b in row] for row in rows]
 
 
 def apply(channel, text, sender=SENDER):
@@ -461,23 +470,32 @@ class TestTheReportControls(unittest.TestCase):
         channel.control_round = lambda: None
         return channel
 
-    def test_a_press_on_model_reports_the_model_and_how_to_change_it(self):
+    def test_a_press_on_model_offers_the_models_and_changes_nothing(self):
         channel = self.channel()
-        text = run(channel.handle_control_press(press("ctl:bot.model")))
-        self.assertIn("claude-sonnet-4", text)
-        self.assertIn("/model@HermesBot", text)
-        self.assertEqual(channel._models, {})                 # nothing was switched
+        channel.bot = FakeBot()
+        with mock.patch.object(channel_mod, "cached_models",
+                               return_value=["claude-sonnet-4", "claude-opus-4"]):
+            text = run(channel.handle_control_press(press("ctl:bot.model")))
+        self.assertIn("2 choice(s)", text)
+        buttons = buttons_of(channel.bot.sent[0]["reply_markup"])[0]
+        self.assertEqual([label for label, _ in buttons],
+                         ["claude-sonnet-4", "claude-opus-4"])
+        self.assertEqual(buttons[0][1], "ctl:bot.model::claude-sonnet-4")
+        self.assertEqual(channel._models, {})                 # offering is not setting
 
-    def test_a_press_on_effort_reports_the_effort_and_how_to_change_it(self):
+    def test_a_press_on_effort_offers_the_levels(self):
         channel = self.channel(effort="high")
-        text = run(channel.handle_control_press(press("ctl:bot.effort")))
-        self.assertIn("reasons at high", text)
-        self.assertIn("/reasoning@HermesBot", text)
+        channel.bot = FakeBot()
+        run(channel.handle_control_press(press("ctl:bot.effort")))
+        values = [data.rsplit(":", 1)[-1]
+                  for _, data in buttons_of(channel.bot.sent[0]["reply_markup"])[0]]
+        self.assertEqual(values, ["low", "medium", "high"])
         self.assertEqual(channel._efforts, {})                # nothing was changed
 
-    def test_a_press_on_wake_lists_the_timers(self):
+    def test_a_picker_with_nothing_to_offer_says_so(self):
         channel = self.channel()
-        self.assertIn("wakes", run(channel.handle_control_press(press("ctl:bot.wake"))))
+        self.assertIn("nothing to pick",
+                      run(channel.handle_control_press(press("ctl:bot.wake"))))
 
     def test_a_press_on_cli_lists_the_allowlist_and_runs_nothing(self):
         from swarmly.telegram import native as native_cli
@@ -510,6 +528,96 @@ class TestTheReportControls(unittest.TestCase):
         line = ("CONTROL bot.model target=Hermes by=%d at=2027-01-15T08:00:00Z state=done"
                 % ADMIN_ID)
         self.assertIn("is a report, not a control", apply(channel, line))
+
+
+class TestTheValueCarryingKeyboard(unittest.TestCase):
+    """One mechanism for every picked value, inside Telegram's callback budget (#153).
+
+    The value rides the button's callback data rather than a conversation state, so it needs
+    no disk, survives a restart, and cannot drift from what the button said.
+    """
+
+    def channel(self, **adapter):
+        config = make_config(control={"chat_id": -1001234567890, "topic_id": 307},
+                             adapter=dict({"type": "claude", "model": "claude-sonnet-4"},
+                                          **adapter))
+        channel = make_channel(config)
+        channel.presence_clock = lambda: NOW
+        channel.control_round = lambda: None
+        return channel
+
+    # -- the wire format ---------------------------------------------------------------
+    def test_a_value_written_last_and_read_back(self):
+        data = cp.callback_data("bot.model", "", "claude-opus-4")
+        self.assertEqual(cp.parse(data), cp.Command("bot.model", "", value="claude-opus-4"))
+
+    def test_a_plain_button_keeps_the_data_it_always_had(self):
+        self.assertEqual(cp.callback_data("bot.pause"), "ctl:bot.pause")
+        self.assertEqual(cp.parse("ctl:bot.pause"), cp.Command("bot.pause"))
+        self.assertEqual(cp.parse("ctl:bot.pause:Codex"), cp.Command("bot.pause", "Codex"))
+
+    def test_the_twelve_longest_values_still_fit_telegrams_budget(self):
+        for action in ct.PICKERS:
+            for value in ("x" * cp.MAX_VALUE_CHARS, "claude-3-5-sonnet-latest"):
+                data = cp.callback_data(action, "", value[:cp.MAX_VALUE_CHARS])
+                self.assertFalse(cp.too_long(data), data)
+                self.assertLessEqual(len(data.encode()), cp.MAX_CALLBACK_BYTES)
+
+    def test_the_picker_keyboard_carries_values_and_no_identifier(self):
+        rows = ct.picker("bot.model", [("opus", "claude-opus-4"), ("sonnet", "claude-sonnet-4")])
+        self.assertEqual([row["callback_data"] for row in rows[0]],
+                         ["ctl:bot.model::claude-opus-4", "ctl:bot.model::claude-sonnet-4"])
+
+    # -- the press policy --------------------------------------------------------------
+    def test_a_picked_value_always_asks_twice_even_for_a_report_control(self):
+        row = policy(available=("bot.model",))
+        first = row.decide(press("ctl:bot.model::claude-opus-4"))
+        self.assertEqual(first.verdict, cp.CONFIRM)
+        self.assertEqual(first.value, "claude-opus-4")
+        self.assertEqual(first.log, "")                       # nothing has happened yet
+        done = row.decide(press("ctl:confirm:" + row.pending()[0].code))
+        self.assertEqual(done.verdict, cp.RUN)
+        self.assertEqual(done.value, "claude-opus-4")
+        self.assertIn("CONTROL bot.model", done.log)          # and it is on the record
+
+    def test_a_stranger_cannot_pick_a_value_either(self):
+        decision = policy(available=("bot.model",)).decide(
+            press("ctl:bot.model::claude-opus-4", user=42))
+        self.assertEqual(decision.reason, cp.NOT_ADMIN)
+
+    def test_an_expired_code_does_not_apply_the_value(self):
+        row = policy(available=("bot.model",))
+        row.decide(press("ctl:bot.model::claude-opus-4"))
+        code = row.pending()[0].code
+        late = row.decide(press("ctl:confirm:" + code, at=NOW + cp.CONFIRM_SECONDS + 1))
+        self.assertEqual(late.verdict, cp.REFUSED)
+        self.assertEqual(late.value, "")
+
+    # -- the transport -----------------------------------------------------------------
+    def test_a_picked_model_is_set_by_the_same_code_the_typed_command_runs(self):
+        channel = self.channel()
+        asked = run(channel.handle_control_press(press("ctl:bot.model::claude-opus-4")))
+        self.assertIn("claude-opus-4", asked)
+        self.assertEqual(channel._models, {})                 # the first tap changed nothing
+        code = channel.control_policy().pending()[0].code
+        done = run(channel.handle_control_press(press("ctl:confirm:" + code)))
+        self.assertIn("claude-opus-4", done)
+        self.assertTrue(channel._models)                      # now it is set
+        self.assertIn("claude-opus-4", str(next(iter(channel._models.values()))))
+
+    def test_a_picked_effort_is_set_the_same_way(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.effort::xhigh")))
+        code = channel.control_policy().pending()[0].code
+        run(channel.handle_control_press(press("ctl:confirm:" + code)))
+        self.assertEqual(list(channel._efforts.values()), ["xhigh"])
+
+    def test_a_picked_value_costs_no_model_turn(self):
+        channel = self.channel()
+        channel.adapter.respond = lambda message: self.fail("a picker asked for a turn")
+        run(channel.handle_control_press(press("ctl:bot.effort::high")))
+        code = channel.control_policy().pending()[0].code
+        run(channel.handle_control_press(press("ctl:confirm:" + code)))
 
 
 class TestAStaleDashboardAnswersNothing(unittest.TestCase):

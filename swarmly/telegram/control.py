@@ -134,6 +134,41 @@ def keyboard(actions: Iterable[str]) -> List[List[Dict[str, str]]]:
     return [buttons[index:index + PER_ROW] for index in range(0, len(buttons), PER_ROW)]
 
 
+#: The controls that take a **picked value**: pressing one with no value offers the choices,
+#: pressing one with a value sets it after the second tap (#153). The list is short on purpose
+#: -- a control joins it when its choices can actually be read in code, with no model turn.
+PICKERS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.wake")
+
+
+def is_picker(action: str) -> bool:
+    """Whether a control takes a value from a list rather than being a plain button."""
+    return str(action) in PICKERS
+
+
+def picker(action: str, choices: Iterable[Tuple[str, str]],
+           target: str = "") -> List[List[Dict[str, str]]]:
+    """The keyboard that carries a picked value: one button per choice, three to a row.
+
+    The value rides the button's own callback data (``ctl:<action>:<target>:<value>``), not a
+    conversation state, so a press made after a restart still means what it said, and nothing
+    is kept on disk. ``choices`` are ``(label, value)`` pairs read from a live list.
+    """
+    from swarmly.telegram.control_press import MAX_VALUE_CHARS, callback_data
+    buttons = []
+    for label, value in choices:
+        value = str(value)[:MAX_VALUE_CHARS]
+        buttons.append({"text": str(label), "callback_data": callback_data(action, target, value)})
+    return [buttons[index:index + PER_ROW] for index in range(0, len(buttons), PER_ROW)]
+
+
+def picker_text(action: str, alias: str = "") -> str:
+    """What a picker asks, in words -- a fixed line, so asking costs no model turn."""
+    found = control(action)
+    label = found.label if found else action
+    who = f" for {alias}" if alias else ""
+    return f"{label}{who}: pick one below. Nothing changes until you tap again to confirm."
+
+
 def available(*prefixes: str) -> List[Control]:
     """The controls under one message: by prefix (``bot`` for per-bot, ``swarm``, ``item``)."""
     wanted = tuple(prefixes) or ("bot", "swarm", "item")
