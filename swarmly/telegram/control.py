@@ -137,7 +137,8 @@ def keyboard(actions: Iterable[str]) -> List[List[Dict[str, str]]]:
 #: The controls that take a **picked value**: pressing one with no value offers the choices,
 #: pressing one with a value sets it after the second tap (#153). The list is short on purpose
 #: -- a control joins it when its choices can actually be read in code, with no model turn.
-PICKERS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.wake", "swarm.role")
+PICKERS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.wake", "swarm.role",
+                            "swarm.lease")
 
 
 def is_picker(action: str) -> bool:
@@ -187,6 +188,10 @@ def picker_text(action: str, alias: str = "", target: str = "") -> str:
         # The one thing a timer pick can do is cancel it: say so, rather than "WAKE" over a
         # list of ids that reads as arming one (review, #153).
         return f"{label}{f' for {alias}' if alias else ''}: pick the timer to cancel below."
+    if action == "swarm.lease":
+        # The hand-over names the *new* holder; nothing is given away until it is confirmed.
+        return (f"{label}: which bot should coordinate? Nothing moves until you tap again "
+                "to confirm.")
     who = f" for {alias}" if alias else ""
     return f"{label}{who}: pick one below. Nothing changes until you tap again to confirm."
 

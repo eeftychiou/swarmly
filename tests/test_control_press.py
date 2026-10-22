@@ -269,8 +269,10 @@ class TestAnotherBotsControl(unittest.TestCase):
 
     def test_a_note_for_a_control_this_build_lacks_is_refused(self):
         channel = self.channel()
+        # `swarm.admit` is in the table and not yet wired, so it is the one this build lacks.
+        self.assertNotIn("swarm.admit", channel.control_actions())
         self.assertIn("not a control here",
-                      apply(channel, self.note("swarm.lease", "Hermes")))
+                      apply(channel, self.note("swarm.admit", "Hermes")))
 
     def test_the_note_arrives_through_the_machine_path_and_is_applied(self):
         """End to end: a peer posts `NOTE intent=CONTROL`; this bot holds without a turn."""
@@ -821,6 +823,171 @@ class TestTheSecondTapIsDeliverable(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("value=claude-opus-4", notes[0])
         self.assertIn("by=%d" % ADMIN_ID, notes[0])
+
+
+class TestTheLeaseControls(unittest.TestCase):
+    """Hand lease and Fail back: the dashboard finally has an operation to call (#154).
+
+    The lease is two writes by two bots -- a claim is signed by whoever writes it -- so this
+    half of the press is the bot that *holds* it: yield, and one note naming the successor.
+    The other bot's half rides that note, and is pinned in ``tests/test_lease.py`` against a
+    real store. A recording store here keeps these to the wiring.
+    """
+
+    ADMIN = ADMIN_ID
+
+    class Store:
+        """A lease store that records instead of pushing: the wiring is what is under test."""
+
+        def __init__(self, term=4, holder="Hermes"):
+            self.term, self.holder = term, holder
+            self.yielded = []
+            self.claimed = []
+
+        def state(self, *, now=None):
+            from swarmly.telegram.lease import LeaseState
+            return LeaseState(status="ok", term=self.term, holder=self.holder,
+                              expires_at=1e12)
+
+        def yield_lease(self, *, reason="", now=None):
+            self.yielded.append(reason)
+            self.holder = ""
+
+        def claim(self, *, term=None, now=None, promoted=False):
+            from swarmly.telegram.lease import LeaseClaim
+            self.claimed.append((term, promoted))
+            self.term = int(term or self.term)
+            self.holder = "Hermes"
+            return LeaseClaim(term=self.term, alias="Hermes", expires_at=1e12)
+
+    def channel(self, *, term=4, holder="Hermes", leader="auto", fence=None, named="",
+                role=None):
+        config = make_config(control={"chat_id": -1009876543210, "topic_id": 307},
+                             bus={"transport": "folder", "repo": "/nonexistent-bus"})
+        if role is not None:
+            config = make_config(agent={"role": role},
+                                 control={"chat_id": -1009876543210, "topic_id": 307},
+                                 bus={"transport": "folder", "repo": "/nonexistent-bus"})
+        channel = make_channel(config)
+        channel.bot = FakeBot()
+        channel.presence_clock = lambda: NOW
+        channel.control_round = lambda: None
+        channel.store = self.Store(term=term, holder=holder)
+        channel.lease_store = lambda: channel.store
+        channel.lease_fence = lambda now=None: bool(holder == "Hermes"
+                                                    if fence is None else fence)
+        channel.current_coordinator = lambda now=None: (
+            (channel.store.holder or None) if leader == "auto" else (leader or None))
+        channel.membership.state.coordinator = named
+        return channel
+
+    def notes(self, channel):
+        return [entry["text"] for entry in channel._test_sender.sent
+                if "CONTROL swarm.lease" in entry["text"]]
+
+    def confirm(self, channel, data):
+        """Press, then press the confirm button the answer carries (#153)."""
+        asked = run(channel.handle_control_press(press(data)))
+        code = channel.control_policy().pending()[0].code
+        return asked, run(channel.handle_control_press(press("ctl:confirm:" + code)))
+
+    # -- offered, and only where it works ------------------------------------------------
+    def test_both_buttons_are_offered_now_that_both_work(self):
+        channel = self.channel()
+        self.assertIn("swarm.lease", channel.control_actions())
+        self.assertIn("swarm.failback", channel.control_actions())
+
+    def test_the_lease_pick_offers_the_other_bots_only(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:swarm.lease")))
+        labels = [pair[0] for line in buttons_of(channel.bot.sent[0]["reply_markup"])
+                  for pair in line]
+        self.assertEqual(labels, ["Antigravity", "Codex"])     # not Hermes itself
+        self.assertEqual(channel.store.yielded, [])            # offering moves nothing
+
+    # -- the hand-over ------------------------------------------------------------------
+    def test_a_hand_over_asks_twice_then_steps_down_and_names_the_successor(self):
+        channel = self.channel()
+        asked = run(channel.handle_control_press(press("ctl:swarm.lease::Codex")))
+        self.assertIn("Tap again", asked)
+        self.assertEqual(channel.store.yielded, [])            # the first tap changes nothing
+        code = channel.control_policy().pending()[0].code
+        run(channel.handle_control_press(press("ctl:confirm:" + code)))
+
+        self.assertEqual(len(channel.store.yielded), 1)
+        self.assertIn("Codex", channel.store.yielded[0])
+        notes = self.notes(channel)
+        self.assertEqual(len(notes), 1)                        # one press, one line on the bus
+        self.assertIn("target=Codex", notes[0])
+        self.assertIn("value=take", notes[0])
+        self.assertIn("by=%d" % self.ADMIN, notes[0])
+
+    def test_a_bot_that_does_not_hold_the_lease_cannot_hand_it_on(self):
+        # Still the coordinator as far as the press gate is concerned, but its lease lapsed:
+        # the fence is what says so, and that is the rule a hand-over must obey.
+        channel = self.channel(holder="Codex", leader="Hermes", fence=False)
+        _, answer = self.confirm(channel, "ctl:swarm.lease::Antigravity")
+        self.assertIn("does not hold the lease", answer)
+        self.assertEqual(channel.store.yielded, [])
+
+    def test_a_hand_over_to_a_stranger_is_refused(self):
+        channel = self.channel()
+        _, answer = self.confirm(channel, "ctl:swarm.lease::Nobody")
+        self.assertIn("not a bot of this swarm", answer)
+        self.assertEqual(channel.store.yielded, [])
+
+    def test_the_target_takes_the_next_term_from_the_note(self):
+        # The giver writes the note and then yields, so by the time this bot reads it the
+        # giver is no longer the live leader -- only the bot the lease still records may be
+        # obeyed for this one action (#154).
+        channel = self.channel(term=4, holder="Claude", leader="")
+        line = ("CONTROL swarm.lease target=Hermes by=%d at=2027-01-15T08:00:00Z "
+                "state=done value=take" % self.ADMIN)
+        self.assertEqual(apply(channel, line, sender="Claude"), "applied: swarm.lease")
+        self.assertEqual(channel.store.claimed, [(5, True)])   # the next term, promoted
+
+    def test_a_hand_over_for_another_bot_is_not_applied_here(self):
+        channel = self.channel(holder="Claude", leader="")
+        line = ("CONTROL swarm.lease target=Codex by=%d at=2027-01-15T08:00:00Z "
+                "state=done value=take" % self.ADMIN)
+        self.assertIn("not mine", apply(channel, line, sender="Claude"))
+        self.assertEqual(channel.store.claimed, [])
+
+    def test_the_new_holder_takes_the_pinned_dashboard(self):
+        channel = self.channel(term=4)
+        run(channel._take_handed_lease(presser=str(self.ADMIN)))
+        self.assertTrue(channel.bot.sent)
+        self.assertTrue(str(channel.bot.sent[-1]["text"]).startswith(ct.MARKER))
+        self.assertEqual(channel.store.claimed, [(5, True)])
+
+    # -- fail-back ----------------------------------------------------------------------
+    def test_fail_back_hands_the_role_to_the_coordinator_the_admin_named(self):
+        channel = self.channel(named="Codex")
+        asked, done = self.confirm(channel, "ctl:swarm.failback")
+        self.assertIn("Tap again", asked)
+        self.assertIn("Codex", str(done))
+        self.assertEqual(len(channel.store.yielded), 1)
+        notes = self.notes(channel)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("target=Codex", notes[0])
+
+    def test_fail_back_with_no_named_coordinator_says_so(self):
+        channel = self.channel(named="")
+        _, answer = self.confirm(channel, "ctl:swarm.failback")
+        self.assertIn("no coordinator is named", answer)
+        self.assertEqual(channel.store.yielded, [])
+
+    def test_the_named_coordinator_takes_the_next_term_back(self):
+        # The lease lapsed, so nothing coordinates: the named coordinator claims N+1 itself.
+        channel = self.channel(holder="Codex", leader="", fence=False, role="coordinator")
+        _, answer = self.confirm(channel, "ctl:swarm.failback")
+        self.assertIn("took term 5 back", answer)
+        self.assertEqual(channel.store.claimed, [(5, True)])
+
+    def test_a_coordinator_that_already_holds_it_does_not_fail_back(self):
+        channel = self.channel(named="Hermes", role="coordinator")
+        _, answer = self.confirm(channel, "ctl:swarm.failback")
+        self.assertIn("already holds the lease", answer)
 
 
 class TestAStaleDashboardAnswersNothing(unittest.TestCase):
