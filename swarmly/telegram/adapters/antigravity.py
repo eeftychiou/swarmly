@@ -715,6 +715,7 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
         return rules_digest(channel_rules(getattr(message, "mentions", None),
                                           getattr(message, "maintainer_username", None),
                                           role=self.role_text,
+                                          me=self.alias,
                                           reply_chars=getattr(message, "reply_chars", None)))
 
     async def _respond_in_topic(self, message: IncomingMessage,
@@ -805,6 +806,7 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
             discussion=discussion_line(message),
             project=project_line(message),
             role=self.role_text,
+            me=self.alias,
             card=turn_card(message),
             reply_chars=getattr(message, "reply_chars", None),
         )
@@ -1050,6 +1052,7 @@ class AntigravityThreadAdapter(AntigravityContextMixin, AgentAdapter):
             discussion=discussion_line(message),
             project=project_line(message),
             role=self.role_text,
+            me=self.alias,
             card=turn_card(message),
             reply_chars=getattr(message, "reply_chars", None),
         )
