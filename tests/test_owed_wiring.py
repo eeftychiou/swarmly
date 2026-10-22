@@ -223,3 +223,94 @@ class TestTheLeadAndUntokenedPlaces(unittest.TestCase):
         channel._mirror_handoffs("@CodexBot: take #173.", GROUP + 1, None, 56)
         self.assertEqual(len(rows(channel)), 2)
 
+
+class FakeRounds:
+    """A round store with states a test writes, standing in for the bus fold."""
+
+    def __init__(self, states):
+        self.states = states
+
+    def rounds(self):
+        return list(self.states)
+
+    def load(self, key):
+        return self.states[key]
+
+
+def round_state(items, *, status="ok", order=None):
+    from swarmly.telegram.rounds import RoundState
+    return RoundState(round="repo#167", status=status, order=list(order or items),
+                      items=items, source="ref")
+
+
+class TestTheRoundStateSweep(unittest.TestCase):
+    """#162's other sources: the round state's own facts open and close the rows."""
+
+    def channel(self):
+        channel = channel_with_table()
+        self.addCleanup(channel._test_table[0].cleanup)
+        channel.owed_roles = lambda: {"review": "Reasonix", "qa": "Antigravity",
+                                      "developer": "DeepSeek", "coordinator": "Claudebot"}
+        return channel
+
+    def sweep(self, channel, items, **state):
+        channel.round_store = lambda: FakeRounds({"repo#167": round_state(items, **state)})
+        return channel.owed_sweep(now=1000.0)
+
+    def item(self, **fields):
+        base = {"pr": 173, "head": "5b90b50", "owner": "DeepSeek", "ci": "pending"}
+        base.update(fields)
+        return base
+
+    def test_a_new_head_opens_ci_and_both_verdicts(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item()})
+        ids = sorted(row.id for row in rows(channel))
+        self.assertEqual(ids, ["ci:#173@5b90b50:CI", "progress:#173:DeepSeek",
+                               "verdict:#173@5b90b50:Antigravity",
+                               "verdict:#173@5b90b50:Reasonix"])
+
+    def test_a_fix_first_verdict_makes_the_developer_owe_a_head(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(review={"verdict": "fix-first",
+                                                      "sha": "5b90b50"})})
+        self.assertIn("fix:#173@5b90b50:DeepSeek", [row.id for row in rows(channel)])
+
+    def test_green_merge_and_pass_on_one_head_make_the_coordinator_owe_the_merge(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(
+            ci="green", review={"verdict": "merge", "sha": "5b90b50"},
+            qa={"verdict": "pass", "sha": "5b90b50"})})
+        self.assertIn("merge:#173@5b90b50:Claudebot", [row.id for row in rows(channel)])
+
+    def test_green_without_a_pass_owes_no_merge(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(ci="green",
+                                             review={"verdict": "merge", "sha": "5b90b50"})})
+        self.assertNotIn("merge:#173@5b90b50:Claudebot", [row.id for row in rows(channel)])
+
+    def test_an_item_waiting_on_the_admin_opens_an_admin_row(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(waits_on="admin")})
+        self.assertIn("admin", [row.kind for row in rows(channel)])
+
+    def test_a_merged_item_closes_what_it_owed(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item()})
+        self.assertTrue(rows(channel))
+        self.sweep(channel, {"173": self.item(state="merged")})
+        self.assertEqual([row for row in rows(channel) if row.is_open], [])
+
+    def test_an_unreadable_round_opens_nothing(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item()}, status="unreadable")
+        self.assertEqual(rows(channel), [])
+
+    def test_roles_come_from_the_roster(self):
+        channel = self.channel()
+        channel.owed_roles = lambda: {}
+        self.sweep(channel, {"173": self.item()})
+        # No reviewer or QA in the roster: the CI row is the only one the facts support.
+        self.assertEqual(sorted(row.id for row in rows(channel)),
+                         ["ci:#173@5b90b50:CI", "progress:#173:DeepSeek"])
+

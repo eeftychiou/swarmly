@@ -3739,6 +3739,11 @@ class AgentChannel:
         # Round 5.5 (#161): a turn whose CLI has gone silent past the kill limit is stopped
         # here, through the /stop path. Liveness only -- this never starts a turn.
         await self.check_stuck_turns(now=moment)
+        # Round 5.5 (#162): the round state's own facts open and close rows each beat.
+        try:
+            self.owed_sweep(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("owed: sweep failed this beat", exc_info=True)
         # The pinned dashboard rides the beat, and only its holder edits it: every bot
         # refreshing one message would fight over it (#117).
         if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
@@ -4924,6 +4929,107 @@ class AgentChannel:
             return str(ref.get("topic") or ref.get("ref") or ref.get("channel") or "") or "x"
         except Exception:                          # noqa: BLE001 - book-keeping, not a turn
             return "x"
+
+    def owed_roles(self) -> Dict[str, str]:
+        """Who owes a verdict, and who owes the merge: the roster, never the round state.
+
+        ``agent.role`` for this bot and ``peers[*].role`` for the rest (``config.peer_roles``),
+        the same roster ``/role`` prints. A role nobody was given simply opens no row: a debt
+        with no holder is a line to post, not a row to wake.
+        """
+        roles: Dict[str, str] = {}
+        names = {"reviewer": "review", "qa-tester": "qa", "qa": "qa",
+                 "developer": "developer", "coordinator": "coordinator"}
+
+        def add(alias: Any, role: Any) -> None:
+            key = names.get(str(role or "").strip().lower())
+            if key and alias and key not in roles:
+                roles[key] = str(alias).strip()
+
+        add(self.config.identity.alias, self.config.identity.role)
+        for alias, role in (getattr(self.config, "peer_roles", {}) or {}).items():
+            add(alias, role)
+        return roles
+
+    def owed_sweep(self, *, now: Optional[float] = None) -> List[str]:
+        """Open and close the rows the round state answers -- every source but a hand-off.
+
+        A round's items already carry the facts this needs: the PR and its head, the owner, the
+        CI state and the two verdicts, each bound to the head it was given on. So the table is
+        filled from the state the transport folds, not from a model's line, and a fact the
+        state does not carry (no head, no CI field, no verdict) opens nothing at all. A round
+        that cannot be read opens nothing: fail closed, never "nothing is owed".
+        """
+        from swarmly.telegram.owed import (Fact, admin_row, fix_rows, head_rows, merge_row,
+                                           progress_rows, settle)
+        moment = time.time() if now is None else float(now)
+        roles = self.owed_roles()
+        store = self.owed_store()
+        try:
+            rounds = self.round_store()
+            keys = rounds.rounds()
+        except Exception:                          # noqa: BLE001 - a sweep is best effort
+            logger.warning("owed: no round state to sweep", exc_info=True)
+            return []
+        rows = store.load()
+        closed: List[Row] = []
+        fresh: List[Row] = []
+        for key in keys:
+            try:
+                state = rounds.load(key)
+            except Exception:                      # noqa: BLE001 - one round, one failure
+                logger.warning("owed: could not read round %s", key, exc_info=True)
+                continue
+            if state.status != "ok":
+                continue                           # absent or unreadable: open nothing
+            for item_key in (state.order or list(state.items)):
+                item = state.item(item_key)
+                if not item:
+                    continue
+                label = f"#{item_key}"
+                head = str(item.get("head") or "").strip().lower()
+                if str(item.get("state") or "").strip().lower() in ("merged", "closed", "done"):
+                    closed.extend(settle(rows, Fact(kind="merge", item=label, head=head)))
+                    continue
+                verdicts: Dict[str, str] = {}
+                for kind in ("review", "qa"):
+                    verdict = state.verdict(item_key, kind, head=head or None)
+                    if verdict is not None:
+                        verdicts[kind] = verdict.verdict
+                if item.get("pr") and head:
+                    # A new head answers the old head's verdicts and opens the new head's debts.
+                    closed.extend(settle(rows, Fact(kind="head", item=label, head=head)))
+                    fresh.extend(head_rows(item=label, head=head, roles=roles, at=moment,
+                                           opened_by=f"head {head} on {label}"))
+                    fresh.extend(fix_rows(item=label, head=head,
+                                          developer=roles.get("developer", ""),
+                                          verdicts=verdicts, at=moment))
+                    if str(item.get("ci") or "").strip().lower() in ("green", "pass", "passed",
+                                                                     "ok"):
+                        merge = merge_row(item=label, head=head,
+                                          coordinator=roles.get("coordinator", ""),
+                                          ci_green=True, verdicts=verdicts, at=moment)
+                        if merge is not None:
+                            fresh.append(merge)
+                fresh.extend(progress_rows(items=[{**item, "key": item_key}], at=moment))
+                if str(item.get("waits_on") or "").strip().lower() in ("admin", "owner", "human"):
+                    fresh.append(admin_row(
+                        question=str(item.get("note") or f"waiting on the admin on {label}"),
+                        item=label, at=moment))
+        done: List[str] = []
+        if closed or fresh:
+            try:
+                store.save_all([*closed, *fresh])
+            except Exception:                      # noqa: BLE001 - the sweep is best effort
+                logger.warning("owed: could not write the swept rows", exc_info=True)
+                return done
+        for row in closed:
+            done.append(f"closed {row.id}")
+        for row in fresh:
+            done.append(f"open {row.id}")
+        if done:
+            logger.info("owed: %s", "; ".join(done[:8]))
+        return done
 
     def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
                             thread_id: Optional[int]) -> None:

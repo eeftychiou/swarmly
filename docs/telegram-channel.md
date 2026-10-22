@@ -1423,3 +1423,4 @@ python -m unittest discover -s tests -t .        # no network, no aiogram needed
 The routing, loop-safety, pacing, escaping and adapter command construction are all exercised
 with an injected sender and a fake subprocess runner, so the suite makes no API calls and
 spawns no agent processes. aiogram-specific paths are covered behind `skipUnless`.
+
