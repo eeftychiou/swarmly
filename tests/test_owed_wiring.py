@@ -262,6 +262,21 @@ class TestTheRoundStateSweep(unittest.TestCase):
         base.update(fields)
         return base
 
+    def test_a_quiet_beat_reports_nothing(self):
+        """#175 review: `done` said "open …" on every beat, whatever actually landed."""
+        channel = self.channel()
+        first = self.sweep(channel, {"173": self.item()})
+        self.assertTrue(first)                               # the first sweep opens rows
+        self.assertEqual(self.sweep(channel, {"173": self.item()}), [])   # the second, nothing
+        # A row opened and answered in the same pass is reported as closed, not as opened.
+        done = self.sweep(channel, {"173": self.item(ci="green", head="aaaaaaa",
+                                                     review={"verdict": "merge",
+                                                             "sha": "aaaaaaa"},
+                                                     qa={"verdict": "pass", "sha": "aaaaaaa"})})
+        self.assertIn("closed ci:#173@aaaaaaa:CI", done)
+        self.assertNotIn("open ci:#173@aaaaaaa:CI", done)
+        self.assertNotIn("open verdict:#173@aaaaaaa:Reasonix", done)
+
     def test_a_new_head_opens_ci_and_both_verdicts(self):
         channel = self.channel()
         self.sweep(channel, {"173": self.item()})

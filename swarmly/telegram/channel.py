@@ -5065,6 +5065,10 @@ class AgentChannel:
         for row in closed:
             done.append(f"closed {row.id}")
         for row in fresh:
+            if row.id in seen:
+                continue                       # already owed: this beat found nothing new
+            if not row.is_open:
+                continue                       # opened and answered in the same pass
             done.append(f"open {row.id}")
         if done:
             logger.info("owed: %s", "; ".join(done[:8]))
