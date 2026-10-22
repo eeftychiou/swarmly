@@ -2879,16 +2879,30 @@ class AgentChannel:
             logger.warning("control centre: peer usage is not readable", exc_info=True)
         return usage
 
-    def apply_control_note(self, text: str) -> str:
+    def apply_control_note(self, text: str, *, sender: str = "") -> str:
         """Apply a ``CONTROL`` note addressed to this bot. Returns what it did, for a test.
 
-        A note is only obeyed when it names this bot and the Telegram user it carries is this
-        bot's admin: the id is the whole authorisation, so prose that merely looks like a note
-        (or a stranger's) is a refusal, not a pause.
+        Three checks, in this order, and none of them trusts the note's own words:
+
+        1. **Who sent it.** A press lands on the transport that holds the dashboard, and that
+           is the coordinator: only its notes are obeyed while a lease is readable, and only
+           a known peer's when it is not. Without this, ``by=`` -- which is free text -- would
+           let any bot on the bus write an admin's id and stop the swarm. A note from this bot
+           itself, or from nobody, is never a peer's press.
+        2. **Who it names.** This bot, ``self``, or ``*`` for a swarm-wide control.
+        3. **Which admin pressed.** The id must be *this* bot's admin, so a peer repeats the
+           authorisation against its own config instead of trusting whoever passed it on.
+
+        What is left is forgery at the bus identity level (a bot impersonating the
+        coordinator), which is the transport's authentication problem, not this one's.
         """
         note = press_mod.parse_note(text)
         if note is None:
             return "not a control note"
+        if not self._note_sender_may_command(sender):
+            logger.warning("control note for %s refused: %r does not hold the dashboard",
+                           self.config.identity.alias, sender)
+            return f"refused: {sender or 'an unknown bot'} does not hold the dashboard"
         target = note.target.strip().lower()
         if target not in ("", "self", "*", self.config.identity.alias.lower()):
             return f"for {note.target}: not mine"
@@ -2905,12 +2919,36 @@ class AgentChannel:
         try:
             # Synchronous on purpose: this runs inside the machine-note path, which must not
             # need an event loop of its own to hold a bot.
-            self._run_control_now(note.action)
+            done = self._run_control_now(note.action)
         except Exception:                      # noqa: BLE001 - a note must not break routing
             logger.warning("control note: %s failed", note.action, exc_info=True)
             return f"failed: {note.action}"
+        if not done:
+            # It passed every check and still could not be carried out: say so, loudly.
+            logger.warning("control note: %s arrived but this bot cannot carry it out",
+                           note.action)
+            return f"failed: {note.action} is not carried out here"
         logger.info("control: %s applied from a peer note (by=%s)", note.action, note.by)
         return f"applied: {note.action}"
+
+    def _note_sender_may_command(self, sender: str) -> bool:
+        """Whether a bot that sent a CONTROL note may command this one.
+
+        The coordinator holds the dashboard, so its notes are the ones that count; while no
+        lease is readable, any *known* peer of this swarm is accepted, because a swarm that
+        cannot read its lease still has to be stoppable. A note from this bot itself, from an
+        empty sender, or from a stranger is refused either way.
+        """
+        who = str(sender or "").strip().lower()
+        me = str(self.config.identity.alias or "").strip().lower()
+        if not who or who == me:
+            return False
+        leader = str(self.current_coordinator() or "").strip().lower()
+        if leader:
+            return who == leader
+        peers = {str(alias).strip().lower() for alias in
+                 (getattr(self.config, "peers", None) or {})}
+        return who in peers
 
     def _is_my_admin(self, user_id: Any) -> bool:
         """Whether a note's id is this bot's admin. A malformed id authorises nothing."""
@@ -2919,8 +2957,14 @@ class AgentChannel:
         except (TypeError, ValueError):
             return False
 
-    def _run_control_now(self, action: str) -> None:
-        """The synchronous half of :meth:`_run_control`: the controls that only set state."""
+    def _run_control_now(self, action: str) -> bool:
+        """The synchronous half of :meth:`_run_control`: the controls that only set state.
+
+        Returns whether it actually carried the action out. That matters more than it looks:
+        a note this bot cannot carry out must say **failed**, never ``applied`` -- the peer
+        that broadcast it, and the admin reading the log, would otherwise be told that a
+        swarm-wide pause happened on a bot that never froze (review, #133).
+        """
         if action == "bot.pause":
             self._set_frozen(True, "pause")
         elif action == "bot.resume":
@@ -2931,6 +2975,13 @@ class AgentChannel:
             self.request_restart()
         elif action == "bot.stop_turn":
             self._stop_every_turn()
+        elif action == "swarm.pause_all":
+            # The broadcast half: the presser holds itself, and every peer that receives
+            # ``target=*`` holds itself here.
+            self._set_frozen(True, "pause")
+        else:
+            return False
+        return True
 
     def _stop_every_turn(self) -> str:
         """Stop this bot's turns and queued messages: what ``/stop all`` does, from a button.
@@ -2969,6 +3020,10 @@ class AgentChannel:
     #: :mod:`swarmly.telegram.control`: they change nothing, so they need no second tap and
     #: leave no note, and a peer's note may not ask for one -- a report answers a person.
     CONTROL_REPORTS = control_mod.reports()
+
+    #: The controls that broadcast their own ``target=*`` note, so the press must not also
+    #: post the local one: one press is one line on the bus (review, #133).
+    CONTROL_BROADCASTS = ("swarm.pause_all",)
 
     def _control_event(self, command: str) -> ChannelEvent:
         """A synthetic event for a report control: the admin, typing a bare command.
@@ -3039,7 +3094,9 @@ class AgentChannel:
                                                  presser=str(press.user_id))
                 if answer:
                     decision.text = answer
-            if decision.log:
+            if decision.log and decision.action not in self.CONTROL_BROADCASTS:
+                # A swarm-wide control posts its own ``target=*`` note (which already names
+                # the pressing bot); a second, local note would double every press on the bus.
                 await self._post_control_note(decision.log)
             self._control_answer = decision.text
             return decision.text
@@ -3403,7 +3460,7 @@ class AgentChannel:
             # Issue #117: a control pressed on another bot's dashboard, for this one. The admin
             # check is repeated here: the note only ever carries the presser's Telegram id. The
             # envelope's own header is not part of the line, so the body is what is parsed.
-            self.apply_control_note(parse_message(event.text)[1])
+            self.apply_control_note(parse_message(event.text)[1], sender=alias)
         if (envelope.type == MessageType.NOTE
                 and (envelope.intent or "").upper() == "TOPIC_GONE" and envelope.ref):
             # Issue #63: one bot ran /cleanup and deleted a topic; every peer forgets it here,

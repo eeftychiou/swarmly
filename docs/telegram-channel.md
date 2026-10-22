@@ -1038,10 +1038,15 @@ A swarm-wide control — pause everything — holds the bot that owns the messag
 
 That note is also how a control reaches **another** bot: the transport that holds the message
 carries out a press for itself, and for any other bot the same `CONTROL` line *is* the
-dispatch. The target applies it when the note names it and the Telegram id it carries is its
-own admin's, so a press behaves the same whether the button was under the target's own line or
-under somebody else's. A note that names another bot, carries a stranger's id or asks for a
-control that build does not have is refused and only logged.
+dispatch. Three checks decide it, and none of them trusts the note's own words: **who sent
+it** (only the bot holding the dashboard — the coordinator — commands the others, or any known
+peer while no lease is readable; `by=` is free text, so without this any bot could write an
+admin's id and stop the swarm), **who it names** (the target, or `*` for a swarm-wide
+control), and **which admin pressed** (the id must be *this* bot's admin, so a peer repeats the
+authorisation against its own config). A note that fails any of them is refused and only
+logged — and a note this bot cannot actually carry out answers `failed:`, never `applied:`.
+One press is one line on the bus: a swarm-wide control posts its own `target=*` note, and the
+pressing bot does not add a second, local one.
 
 Deploy, upgrade, merging a PR and editing configs or secrets are not on the keyboard at all.
 

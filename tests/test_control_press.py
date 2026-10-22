@@ -20,6 +20,15 @@ from tests.test_telegram_channel import (ADMIN_ID, event, make_channel, make_con
 
 NOW = 1_800_000_000.0
 
+#: The bot that posted a CONTROL note in these tests. A press lands on the transport that
+#: holds the dashboard, so a note is only obeyed when a bot of the swarm sent it (#133).
+SENDER = "Codex"
+
+
+def apply(channel, text, sender=SENDER):
+    """Apply a peer's note the way the machine-note path does: with its sender named."""
+    return channel.apply_control_note(text, sender=sender)
+
 
 def policy(available=("bot.pause", "bot.resume", "bot.stop_turn"), admin=ADMIN_ID):
     return cp.PressPolicy(admin_id=admin, clock=lambda: NOW,
@@ -228,31 +237,31 @@ class TestAnotherBotsControl(unittest.TestCase):
 
     def test_this_bot_applies_a_note_addressed_to_it(self):
         channel = self.channel()
-        self.assertEqual(channel.apply_control_note(self.note("bot.pause", "Hermes")),
+        self.assertEqual(apply(channel, self.note("bot.pause", "Hermes")),
                          "applied: bot.pause")
         self.assertTrue(channel._frozen)
 
     def test_a_note_for_another_bot_is_ignored(self):
         channel = self.channel()
-        self.assertIn("not mine", channel.apply_control_note(self.note("bot.pause", "Codex")))
+        self.assertIn("not mine", apply(channel, self.note("bot.pause", "Codex")))
         self.assertFalse(channel._frozen)
 
     def test_a_note_from_a_stranger_is_refused(self):
         channel = self.channel()
         self.assertIn("not the admin",
-                      channel.apply_control_note(self.note("bot.pause", "Hermes", by=42)))
+                      apply(channel, self.note("bot.pause", "Hermes", by=42)))
         self.assertFalse(channel._frozen)
 
     def test_a_note_with_a_malformed_id_authorises_nothing(self):
         channel = self.channel()
         line = "CONTROL bot.pause target=Hermes by=nobody at=2027-01-15T08:00:00Z state=done"
-        self.assertIn("not the admin", channel.apply_control_note(line))
+        self.assertIn("not the admin", apply(channel, line))
         self.assertFalse(channel._frozen)
 
     def test_a_note_for_a_control_this_build_lacks_is_refused(self):
         channel = self.channel()
         self.assertIn("not a control here",
-                      channel.apply_control_note(self.note("swarm.lease", "Hermes")))
+                      apply(channel, self.note("swarm.lease", "Hermes")))
 
     def test_the_note_arrives_through_the_machine_path_and_is_applied(self):
         """End to end: a peer posts `NOTE intent=CONTROL`; this bot holds without a turn."""
@@ -262,8 +271,19 @@ class TestAnotherBotsControl(unittest.TestCase):
         payload = format_message(
             Envelope(type=MessageType.NOTE, to="*", intent="CONTROL", ref="HERMES"),
             self.note("bot.pause", "Hermes"))
-        run(channel.handle_event(event(payload, author_id=303, username="ClaudeBot")))
+        run(channel.handle_event(event(payload, author_id=303, username="CodexBot")))
         self.assertTrue(channel._frozen)
+
+    def test_a_note_from_a_bot_outside_the_swarm_is_refused(self):
+        """The header's author is checked too: `by=` is free text anyone could write."""
+        from swarmly.telegram.wire import Envelope, MessageType, format_message
+        channel = self.channel()
+        channel.presence_clock = lambda: NOW
+        payload = format_message(
+            Envelope(type=MessageType.NOTE, to="*", intent="CONTROL", ref="HERMES"),
+            self.note("bot.pause", "Hermes"))
+        run(channel.handle_event(event(payload, author_id=303, username="SomebodyElseBot")))
+        self.assertFalse(channel._frozen)
 
     def test_freeze_holds_the_bot_until_it_is_resumed(self):
         channel = self.channel()
@@ -326,7 +346,7 @@ class TestStoppingEverything(unittest.TestCase):
     def test_another_bot_applies_a_stop_note(self):
         channel = self.channel()
         line = "CONTROL bot.stop_turn target=Hermes by=%d at=2027-01-15T08:00:00Z state=done" % ADMIN_ID
-        self.assertEqual(channel.apply_control_note(line), "applied: bot.stop_turn")
+        self.assertEqual(apply(channel, line), "applied: bot.stop_turn")
         self.assertEqual(channel._stop_generation, 1)
 
 
@@ -357,13 +377,13 @@ class TestSwarmWideAndNudge(unittest.TestCase):
     def test_another_bot_applies_a_broadcast(self):
         channel = self.channel()
         line = "CONTROL bot.pause target=* by=%d at=2027-01-15T08:00:00Z state=done" % ADMIN_ID
-        self.assertEqual(channel.apply_control_note(line), "applied: bot.pause")
+        self.assertEqual(apply(channel, line), "applied: bot.pause")
         self.assertTrue(channel._frozen)
 
     def test_a_broadcast_from_a_stranger_still_authorises_nothing(self):
         channel = self.channel()
         line = "CONTROL bot.pause target=* by=42 at=2027-01-15T08:00:00Z state=done"
-        self.assertIn("not the admin", channel.apply_control_note(line))
+        self.assertIn("not the admin", apply(channel, line))
         self.assertFalse(channel._frozen)
 
     def test_a_nudge_names_the_owner_and_the_item(self):
@@ -383,6 +403,45 @@ class TestSwarmWideAndNudge(unittest.TestCase):
     def test_a_nudge_for_an_item_the_round_does_not_have_says_so(self):
         channel = self.channel({})
         self.assertIn("no owner", run(channel.handle_control_press(press("ctl:item.nudge:999"))))
+
+
+class TestAPeerAppliesWhatItCanAndSaysWhatItCannot(unittest.TestCase):
+    """The review's blocker on #133: a note that changed nothing must never read `applied`.
+
+    `swarm.pause_all` had no branch in `_run_control_now`, so a peer answered
+    ``applied: swarm.pause_all`` and stayed unfrozen -- a swarm-wide stop that stopped one bot
+    and logged success on the rest.
+    """
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        return channel
+
+    def note(self, action: str, target: str = "*", by: int = ADMIN_ID) -> str:
+        return cp.PressPolicy.log_line(action, target, str(by), NOW, done=True)
+
+    def test_a_broadcast_pause_actually_holds_the_peer(self):
+        channel = self.channel()
+        self.assertEqual(apply(channel, self.note("swarm.pause_all")),
+                         "applied: swarm.pause_all")
+        self.assertTrue(channel._frozen)                      # the blocker: it used to stay up
+        self.assertEqual(channel._freeze_ref, "pause")
+
+    def test_a_control_this_bot_cannot_carry_out_says_failed(self):
+        channel = self.channel()
+        # `swarm.sync` is wired on the press path but there is nothing to apply from a note.
+        self.assertIn("failed:", apply(channel, self.note("swarm.sync", "Hermes")))
+
+    def test_one_press_posts_one_control_note(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:swarm.pause_all")))
+        code = channel.control_policy().pending()[0].code
+        run(channel.handle_control_press(press("ctl:confirm:" + code)))
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "intent=CONTROL" in entry["text"]]
+        self.assertEqual(len(notes), 1)                       # the broadcast, not a second copy
+        self.assertIn("target=*", notes[0])
 
 
 class TestTheReportControls(unittest.TestCase):
@@ -450,7 +509,7 @@ class TestTheReportControls(unittest.TestCase):
         channel = self.channel()
         line = ("CONTROL bot.model target=Hermes by=%d at=2027-01-15T08:00:00Z state=done"
                 % ADMIN_ID)
-        self.assertIn("is a report, not a control", channel.apply_control_note(line))
+        self.assertIn("is a report, not a control", apply(channel, line))
 
 
 class TestTheSwarmControls(unittest.TestCase):
