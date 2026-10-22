@@ -29,6 +29,52 @@ def rows(channel):
     return channel._test_table[1].load()
 
 
+class TestOnePushPerEvent(unittest.TestCase):
+    """The wiring must not put one bus commit on the wire per row (#173 review)."""
+
+    def channel(self):
+        pushed = []
+
+        class Bus:
+            ref = "refs/heads/main"
+
+            def commit_and_push(self, message, paths=None):
+                pushed.append(list(paths or []))
+
+        channel = make_channel(make_config())
+        channel.bot = object()
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = ow.OwedStore("Hermes", state_dir=Path(directory.name), transport=Bus(),
+                             root=Path(directory.name), clock=lambda: 1000.0)
+        channel.owed_store = lambda: store
+        channel._test_table = (directory, store)
+        channel._test_pushed = pushed
+        return channel
+
+    def test_a_reply_to_two_peers_is_one_push(self):
+        channel = self.channel()
+        channel._mirror_handoffs("@CodexBot: review #173.\n- @AntigravityBot: QA it.",
+                                 GROUP, 307, 55)
+        self.assertEqual(len(rows(channel)), 2)
+        self.assertEqual(len(channel._test_pushed), 1)        # one commit, both documents
+        self.assertEqual(len(channel._test_pushed[0]), 2)
+
+    def test_a_reply_that_closes_two_rows_is_one_push(self):
+        channel = self.channel()
+        store = channel._test_table[1]
+        place = channel._place_key(GROUP, 307)
+        store.save_all([*ow.handoff_rows(asked=["Codex"], item="#173", asker="Hermes",
+                                         topic=place, place=place, at=1000.0),
+                        *ow.handoff_rows(asked=["Codex"], item="#174", asker="Hermes",
+                                         topic=place, place=place, at=1000.0)])
+        channel._test_pushed.clear()
+        channel._close_owed_handoff("Codex", GROUP, 307)
+        self.assertEqual(len(channel._test_pushed), 1)        # one commit for both closes
+        self.assertEqual(len(channel._test_pushed[0]), 2)
+        self.assertEqual([row for row in rows(channel) if row.is_open], [])
+
+
 class TestAHandOffOpensARow(unittest.TestCase):
 
     def channel(self):

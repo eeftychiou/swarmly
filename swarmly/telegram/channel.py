@@ -4942,8 +4942,7 @@ class AgentChannel:
             rows = store.observe(handoff_rows(asked=asked, asker=self.config.identity.alias,
                                               topic=topic, place=place,
                                               opened_by=f"hand-off in {topic or 'a topic'}"))
-            for row in rows:
-                store.save(row)
+            store.save_all(rows)               # one push for the whole reply, not one per peer
         except Exception:                          # noqa: BLE001 - reported, not swallowed
             logger.warning("owed: could not record the hand-off to %s",
                            ", ".join(asked), exc_info=True)
@@ -4960,8 +4959,7 @@ class AgentChannel:
             closed = settle(store.load(),
                             Fact(kind="reply", item=self._place_key(chat_id, thread_id),
                                  who=peer))
-            for row in closed:
-                store.save(row)
+            store.save_all(closed)             # one push for the close, not one per row
         except Exception:                          # noqa: BLE001 - reported, not swallowed
             logger.warning("owed: could not close the hand-off to %s", peer, exc_info=True)
 

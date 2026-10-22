@@ -420,6 +420,26 @@ class TestTheStore(unittest.TestCase):
                             root=Path(tmp.name) if root is None else root,
                             clock=lambda: 1000.0)
 
+    def test_three_rows_go_up_in_one_commit(self):
+        """Should-fix: one commit+push per row meant three pushes for one three-peer reply."""
+        pushed = []
+
+        class Bus:
+            ref = "refs/heads/main"
+
+            def commit_and_push(self, message, paths=None):
+                pushed.append((message, list(paths or [])))
+
+        store = self.store(transport=Bus())
+        rows = ow.handoff_rows(asked=["Reasonix", "Antigravity", "Codex"], asker="Claudebot",
+                               topic="tg-3556", at=1000.0)
+        store.save_all(rows)
+        self.assertEqual(len(pushed), 1)                     # one push, not three
+        self.assertEqual(len(pushed[0][1]), 3)               # carrying all three documents
+        self.assertIn("+2 more", pushed[0][0])
+        self.assertEqual(len(store.open_rows()), 3)
+        self.assertEqual(len(ow.OwedStore.documents(store.root)), 3)
+
     def test_a_row_survives_a_restart(self):
         store = self.store()
         row = ow.handoff_rows(asked=["Reasonix"], asker="Claudebot", at=1000.0)[0]
