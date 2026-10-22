@@ -7,6 +7,7 @@ managers never signal an unowned PID or an external process.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import unittest
@@ -29,11 +30,17 @@ class TestProcessSignalingSafety(unittest.TestCase):
             registry = ChildRegistry(registry_path)
 
             # Child recorded with start time 't_child_original', spawned by dead transport 9999
-            registry.save([
-                Child(pid=12345, transport_pid=9999,
-                      transport_identity="t_transport", identity="t_child_original",
-                      command="python -m echo")
-            ])
+            registry.save(
+                [
+                    Child(
+                        pid=12345,
+                        transport_pid=9999,
+                        transport_identity="t_transport",
+                        identity="t_child_original",
+                        command="python -m echo",
+                    )
+                ]
+            )
 
             signaled: list[int] = []
 
@@ -49,19 +56,31 @@ class TestProcessSignalingSafety(unittest.TestCase):
                 kill=mock_kill,
             )
 
-            self.assertEqual(reaped, [], "Reaped list must be empty when identity does not match")
-            self.assertEqual(signaled, [], "Must never signal an unowned PID with mismatched identity")
+            self.assertEqual(
+                reaped, [], "Reaped list must be empty when identity does not match"
+            )
+            self.assertEqual(
+                signaled,
+                [],
+                "Must never signal an unowned PID with mismatched identity",
+            )
 
     def test_reap_orphans_refuses_when_parent_transport_is_live(self) -> None:
         """Children belonging to a live transport must never be signaled."""
         with TemporaryDirectory() as tmp:
             registry_path = Path(tmp) / "children.json"
             registry = ChildRegistry(registry_path)
-            registry.save([
-                Child(pid=54321, transport_pid=1111,
-                      transport_identity="parent_live", identity="child_live",
-                      command="python -m echo")
-            ])
+            registry.save(
+                [
+                    Child(
+                        pid=54321,
+                        transport_pid=1111,
+                        transport_identity="parent_live",
+                        identity="child_live",
+                        command="python -m echo",
+                    )
+                ]
+            )
 
             signaled: list[int] = []
 
@@ -73,7 +92,9 @@ class TestProcessSignalingSafety(unittest.TestCase):
             )
 
             self.assertEqual(reaped, [])
-            self.assertEqual(signaled, [], "Must never signal child of a live transport")
+            self.assertEqual(
+                signaled, [], "Must never signal child of a live transport"
+            )
 
     def test_wake_kill_group_only_targets_its_own_process_object(self) -> None:
         """_kill_group in wake.py only signals the PID belonging to the process it spawned."""
@@ -88,7 +109,10 @@ class TestProcessSignalingSafety(unittest.TestCase):
                 self.assertIn("taskkill", args[0].lower())
                 self.assertIn(str(fake_proc.pid), args)
         else:
-            with patch("os.killpg", create=True) as mock_killpg, patch("os.getpgid", return_value=98765):
+            with (
+                patch("os.killpg", create=True) as mock_killpg,
+                patch("os.getpgid", return_value=98765),
+            ):
                 _kill_group(fake_proc)
                 mock_killpg.assert_called_once_with(98765, signal.SIGKILL)
 
