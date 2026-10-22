@@ -555,6 +555,9 @@ class AgentChannel:
         self._topics_reported: Set[Tuple[int, Optional[int]]] = set()   # sent REPORT_BACK
         self._report_asked: Set[Tuple[int, Optional[int]]] = set()      # REPORT_NOTE sent
         self._self_tasks: Set[asyncio.Task] = set()
+        #: How a WAKE firing reads its PR or issue (#178); None means `gh`. Tests stub it, so
+        #: a host with `gh` signed in does not read the real repo's state (#190 review).
+        self.wake_subject_reader: Optional[Callable[..., Any]] = None
         # #29: sender+chat+topic -> the parts of a split reply already here, and their timers.
         self._split_pending: Dict[Tuple[Any, ...], _PendingSplit] = {}
         self._split_tasks: Set[asyncio.Task] = set()
@@ -4727,7 +4730,8 @@ class AgentChannel:
             if subject is not None and mine(timer):
                 # The PR or issue itself, read fresh: a timer whose `then` names a head kept
                 # acting on PRs that had moved on or merged (live, 22 Oct: corrected six times).
-                current = await subject_state_async(subject, cwd=workdir)
+                reader = self.wake_subject_reader or subject_state_async
+                current = await reader(subject, cwd=workdir)
                 if current is not None and current[0] in ("MERGED", "CLOSED"):
                     timer.state = "done"
                     self._wake_persist(store, timer, done)

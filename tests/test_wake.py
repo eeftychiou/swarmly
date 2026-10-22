@@ -2128,8 +2128,8 @@ class TestStaleProofWake(unittest.TestCase):
         async def subject(subject, *, cwd, timeout=30.0):
             return state
 
-        with mock.patch("swarmly.telegram.wake.run_check_async", check), \
-                mock.patch("swarmly.telegram.wake.subject_state_async", subject):
+        channel.wake_subject_reader = subject
+        with mock.patch("swarmly.telegram.wake.run_check_async", check):
             done = asyncio.run(channel._wake_tick(now=time.time()))
         return channel, done, started
 
