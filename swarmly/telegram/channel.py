@@ -3308,6 +3308,10 @@ class AgentChannel:
                 # A dashboard from an earlier coordinator can outlive its failover (Telegram
                 # will not let this bot unpin everything), and its buttons would otherwise
                 # answer "done" from a bot that no longer coordinates (review, #133).
+                if decision.code:
+                    # The policy minted a second-tap code before this refusal: no button will
+                    # carry it, so drop it rather than leave a dead code pending (#159).
+                    self.control_policy().drop(decision.code)
                 answer = f"{stale} coordinates now: press the dashboard in its message."
                 self._control_answer = answer
                 return answer

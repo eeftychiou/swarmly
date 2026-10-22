@@ -301,6 +301,16 @@ class PressPolicy:
             if pending.expires < moment:
                 self._pending.pop(code, None)
 
+    def drop(self, code: str) -> bool:
+        """Forget a code the policy minted but nobody will be offered (#159).
+
+        ``decide`` mints the second-tap code on its way to a ``CONFIRM`` verdict; a caller
+        that then refuses the press (a dashboard from an earlier coordinator) holds a code
+        no button carries and no admin can use. Left in ``_pending`` it would sit there for
+        its whole window, so it is dropped instead. Says whether there was one.
+        """
+        return self._pending.pop(str(code).lower(), None) is not None
+
     def pending(self) -> List[_Pending]:
         return list(self._pending.values())
 

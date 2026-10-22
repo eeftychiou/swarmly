@@ -110,6 +110,20 @@ class TestTheSecondTap(unittest.TestCase):
         self.assertEqual(decision.verdict, cp.RUN)
         self.assertEqual(policy().pending(), [])
 
+    def test_a_dropped_code_can_no_longer_confirm_anything(self):
+        """A code minted for a press that is then refused is not left usable (#159)."""
+        row = policy()
+        minted = row.decide(press("ctl:bot.stop_turn")).code
+        self.assertTrue(row.drop(minted))
+        self.assertEqual(row.pending(), [])
+        late = row.decide(press("ctl:confirm:" + minted))
+        self.assertEqual(late.verdict, cp.REFUSED)
+        self.assertEqual(late.reason, cp.EXPIRED)
+
+    def test_dropping_a_code_nobody_minted_says_so(self):
+        self.assertFalse(policy().drop("ffff"))
+        self.assertFalse(policy().drop(""))
+
 
 class TestWhatThisBuildCanDo(unittest.TestCase):
     def test_an_unwired_control_is_refused_not_silently_ignored(self):
@@ -1033,7 +1047,14 @@ class TestARefusedBroadcastStaysOutOfTheChat(unittest.TestCase):
                       apply(channel, self.broadcast("swarm.admit"), sender="Claude"))
         self.assertEqual(channel._test_sender.sent, [])
 
-    def test_a_broadcast_from_a_stranger_is_refused_quietly(self):
+    def test_a_broadcast_from_a_sender_without_the_dashboard_changes_nothing(self):
+        """A neighbour of the refused broadcast, not one of its proofs (review, #159).
+
+        What item one proves is the two tests above -- a broadcast this bot could not carry
+        out, and one on a control it does not know, both logged and neither posted. This one
+        is about the earlier question of *who* may command at all: a sender without the
+        dashboard is turned away before any control is carried out.
+        """
         channel = self.channel()
         with self.assertLogs("swarmly.telegram", level="WARNING") as logged:
             self.assertIn("does not hold the dashboard",
@@ -1114,6 +1135,14 @@ class TestAStaleDashboardAnswersNothing(unittest.TestCase):
         self.assertFalse(channel._frozen)                          # and it did nothing
         self.assertEqual([entry for entry in channel._test_sender.sent
                           if "intent=CONTROL" in entry["text"]], [])
+
+    def test_a_stale_press_leaves_no_second_tap_code_behind(self):
+        """The policy mints a code on the way to CONFIRM; a refused press must drop it (#159)."""
+        channel = self.channel()
+        answer = run(channel.handle_control_press(press("ctl:bot.stop_turn")))
+        self.assertIn("coordinates now", answer)
+        self.assertEqual(channel.control_policy().pending(), [])
+        self.assertFalse(channel._frozen)                          # and it did nothing
 
     def test_the_coordinator_itself_still_answers(self):
         channel = self.channel(leader="Hermes")
