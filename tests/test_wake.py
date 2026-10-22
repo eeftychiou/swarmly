@@ -602,6 +602,77 @@ class TestHeldWhileBusy(unittest.TestCase):
         self.assertEqual(store.live_count, 0)
 
 
+class TestOneTickOneTurn(unittest.TestCase):
+    """#171: two WAKEs due in one topic in the same tick start one turn, not two.
+
+    #160 holds a due timer for a topic that has a turn *running*, and `_busy_since` only knows
+    about a turn once it has begun. Two timers due in the same pass would therefore both fire
+    before the first one's turn registered: the same paid "nothing changed", one tick apart.
+    """
+
+    channel = TestHeldWhileBusy.channel
+    timer = TestHeldWhileBusy.timer
+
+    def test_two_checks_due_in_one_topic_start_one_turn(self):
+        import asyncio
+        channel, store, started, checks, claims = self.channel()
+        first = self.timer(channel, id="first001", thread_id=307,
+                           argv=("gh", "pr", "checks", "169"))
+        second = self.timer(channel, id="second01", thread_id=307, next_at=2.0,
+                            argv=("gh", "issue", "view", "167"))
+        store.add(first, max_timers=10)
+        store.add(second, max_timers=10)
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(done, ["first001: fire", "second01: held: turn running"])
+        self.assertEqual(checks, [("gh", "pr", "checks", "169")])   # one check ran
+        self.assertEqual(len(started), 1)                           # one turn started
+        self.assertEqual(claims, ["first001"])
+        by_id = {row.id: row for row in store.load()}
+        self.assertEqual(by_id["first001"].state, "done")
+        self.assertEqual(by_id["second01"].state, "armed")           # still owed, not lost
+
+    def test_the_held_second_check_fires_on_the_next_tick(self):
+        import asyncio
+        channel, store, started, checks, _claims = self.channel()
+        first = self.timer(channel, id="first001", thread_id=307)
+        second = self.timer(channel, id="second01", thread_id=307, next_at=2.0,
+                            argv=("gh", "issue", "view", "167"))
+        store.add(first, max_timers=10)
+        store.add(second, max_timers=10)
+        asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(len(started), 1)
+        done = asyncio.run(channel._wake_tick(now=time.time()))     # the turn has ended
+        self.assertEqual(done, ["second01: fire"])
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(len(started), 2)
+        self.assertEqual(store.live_count, 0)
+
+    def test_two_checks_due_in_different_topics_still_both_fire(self):
+        import asyncio
+        channel, store, started, checks, _claims = self.channel()
+        store.add(self.timer(channel, id="topic307", thread_id=307), max_timers=10)
+        store.add(self.timer(channel, id="topic308", thread_id=308, next_at=2.0), max_timers=10)
+        done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(done, ["topic307: fire", "topic308: fire"])
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(len(started), 2)
+
+    def test_an_expiry_turn_holds_the_topics_other_timer_too(self):
+        import asyncio
+        channel, store, started, checks, _claims = self.channel()
+        now = time.time()
+        expiring = self.timer(channel, id="expiring", thread_id=307, expires_at=now - 30)
+        later = self.timer(channel, id="later001", thread_id=307, next_at=2.0,
+                           argv=("gh", "issue", "view", "167"))
+        store.add(expiring, max_timers=10)
+        store.add(later, max_timers=10)
+        done = asyncio.run(channel._wake_tick(now=now))
+        self.assertEqual(done, ["expiring: expired", "later001: held: turn running"])
+        self.assertEqual(checks, [])                 # no check for the held one
+        self.assertEqual(len(started), 1)            # the expiry turn only
+        self.assertEqual(store.live_count, 1)
+
+
 class TestAttachedFlagBypass(unittest.TestCase):
     """Blocker 1: an attached flag value must not smuggle a write past the allowlist."""
 

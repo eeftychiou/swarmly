@@ -4593,6 +4593,11 @@ class AgentChannel:
         def mine(timer: Any) -> bool:
             return coordinator or not timer.alias or timer.alias == own
 
+        # Round 5.5 (#171): topics that started a turn during *this* pass. _busy_since is only
+        # set when the turn actually starts (a task later in the loop), so two timers for one
+        # topic due in the same tick would otherwise both fire and queue a turn behind a turn.
+        fired_topics: set = set()
+
         for pending in store.pending_firings():
             if not mine(pending):
                 done.append(f"{pending.id}: adopted, held while this bot is not the coordinator")
@@ -4613,6 +4618,7 @@ class AgentChannel:
             pending.replays += 1
             pending.state, pending.pending = "done", ""
             self._wake_persist(store, pending, done)
+            fired_topics.add((pending.chat_id, pending.thread_id))
             done.append(f"{pending.id}: replayed after a restart")
         settle = float(self.config.limits.wake_claim_settle_seconds)
         alive = {alias.lower() for alias in self._peers_not_down(moment)}
@@ -4623,13 +4629,15 @@ class AgentChannel:
                 store.write(timer)
                 done.append(f"{timer.id}: handed back to {timer.adopted_from}")
                 continue
-            if mine(timer) and (timer.chat_id, timer.thread_id) in self._busy_since:
+            topic_key = (timer.chat_id, timer.thread_id)
+            if mine(timer) and (topic_key in self._busy_since or topic_key in fired_topics):
                 # A turn already running in this topic very often settles the same item, so a
                 # second turn queued behind it is a paid "nothing changed" (round 5, 22 Oct:
                 # the standing check woke the coordinator behind its own running turn). The
                 # timer stays armed and unclaimed, and is evaluated -- expiry included -- on
                 # the first tick after that topic's turn ends: nothing is lost, nothing is
-                # extended.
+                # extended. That includes a turn started earlier in this same pass (#171):
+                # _busy_since only knows about it once it has begun to run.
                 done.append(f"{timer.id}: held: turn running")
                 continue
             if timer.expires_at and moment >= timer.expires_at:
@@ -4640,6 +4648,7 @@ class AgentChannel:
                     self._run_own_task(self._wake_prompt(
                         WakeAction("expire", timer, reason="its until= passed"),
                         expired=True), timer.chat_id, timer.thread_id, timer.topic or None)
+                    fired_topics.add(topic_key)      # an expiry turn is a turn here too (#171)
                     done.append(f"{timer.id}: expired")
                 else:
                     # Long past its deadline (a restart, a claim that kept losing): a turn now
@@ -4683,10 +4692,12 @@ class AgentChannel:
                 self._wake_persist(store, timer, done)
                 self._run_own_task(timer.pending, timer.chat_id, timer.thread_id,
                                    timer.topic or None)
+                fired_topics.add(topic_key)
                 timer.state, timer.pending = "done", ""
                 self._wake_persist(store, timer, done)
             elif action.kind in ("error", "expire"):
                 self._wake_persist(store, action.timer, done)
+                fired_topics.add(topic_key)
                 self._run_own_task(
                     self._wake_prompt(action, failed=action.kind == "error",
                                       expired=action.kind == "expire"),
