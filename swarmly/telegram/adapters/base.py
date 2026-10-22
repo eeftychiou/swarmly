@@ -643,6 +643,23 @@ class SubprocessAdapter(AgentAdapter):
         # Issue #68: the pids of the CLIs this adapter runs. With no path nothing is kept,
         # so a transport that was never given a state file cannot reap what it left behind.
         self.children = ChildRegistry(None)
+        # Round 5.5 (#161): when the CLI of the running turn last wrote anything, on the
+        # monotonic clock. None until a run starts, so a caller can tell "no turn" from
+        # "silent since it started".
+        self._last_output_at: Optional[float] = None
+
+    def last_output_at(self) -> Optional[float]:
+        """``time.monotonic()`` when the running CLI last wrote to stdout or stderr.
+
+        The transport reads this to say `stuck (silent Nm)` about a turn that is running but
+        making no progress; an adapter that cannot see its CLI's output (it runs in a thread
+        with pipes read at the end) simply leaves this at the start of the run.
+        """
+        return self._last_output_at
+
+    def _note_output(self) -> None:
+        """Record that the CLI said something just now."""
+        self._last_output_at = time.monotonic()
 
     def use_child_registry(self, path: Optional[Path]) -> None:
         """Persist the pids of the CLIs this adapter starts, so a restart can reap orphans."""
@@ -699,8 +716,9 @@ class SubprocessAdapter(AgentAdapter):
         except Exception:                                    # noqa: BLE001 - never blocks a turn
             logger.warning("%s: could not record the CLI pid %s", self.alias,
                            getattr(process, "pid", None), exc_info=True)
+        self._note_output()                                  # the run started: not silent yet
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(),
+            stdout, stderr = await asyncio.wait_for(self._communicate(process),
                                                     timeout=float(self.settings.timeout_seconds))
         except BaseException as exc:
             # A timeout or a /stop cancels the wait, not the program: end it too, or it keeps
@@ -723,6 +741,32 @@ class SubprocessAdapter(AgentAdapter):
             logger.debug("%s: stderr tail:\n%s", self.alias, _tail(err))
         self._forget_child(process)
         return process, stdout, stderr
+
+    async def _communicate(self, process: Any) -> Tuple[bytes, bytes]:
+        """Read both pipes as they arrive, recording when the CLI last said anything.
+
+        ``communicate()`` hands everything back at the end, so a turn that printed for twenty
+        minutes looked silent for twenty minutes and could only be judged by the hard timeout
+        (#161). Reading chunk by chunk keeps the silence clock honest and costs nothing when
+        the CLI writes nothing. A process without readable pipes -- the runner a test injects
+        -- is left to ``communicate()``: its silence is then "since the run started".
+        """
+        out, err = getattr(process, "stdout", None), getattr(process, "stderr", None)
+        if out is None or err is None or not hasattr(out, "read") or not hasattr(err, "read"):
+            return await process.communicate()
+        buffers = (bytearray(), bytearray())
+
+        async def pump(stream: Any, sink: bytearray) -> None:
+            while True:
+                chunk = await stream.read(65536)
+                if not chunk:                            # EOF: the CLI closed its side
+                    return
+                sink.extend(chunk)
+                self._note_output()
+
+        await asyncio.gather(pump(out, buffers[0]), pump(err, buffers[1]))
+        await process.wait()
+        return bytes(buffers[0]), bytes(buffers[1])
 
     def _forget_child(self, process: Any) -> None:
         """The CLI exited: drop its pid from the registry (#68)."""
