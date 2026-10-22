@@ -683,7 +683,8 @@ class ChannelLimits:
     #: notification or new line appears. "bus": the old per-bot git ref on the bus repository,
     #: a push and a fetch every beat (a heartbeat does not belong on GitHub, so off by default).
     heartbeat_plane: str = "telegram"
-    #: The forum topic the status message lives in; 0 is General.
+    #: The forum topic the pulse lives in. 0 (the default): the swarm's own "📡 Swarm pulse"
+    #: topic, which the coordinator opens when there is none; -1: General; above 0: that topic.
     heartbeat_topic_id: int = 0
     #: On the Telegram plane: "repost" posts each beat as a new silent line and deletes the
     #: previous one, so peers receive an ordinary message; "edit" edits one message in place,

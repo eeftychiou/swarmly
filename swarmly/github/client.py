@@ -208,6 +208,26 @@ class GitHubClient:
             logger.warning("gh execution failed: %s", exc)
             return 1, "", str(exc)
 
+    def ref_state(self, repo: str, number: int) -> Optional[str]:
+        """``open``, ``closed`` or ``merged`` for an issue *or* a PR, in one call; None if unknown.
+
+        GitHub's issues endpoint answers for both, and a PR carries ``pull_request.merged_at``.
+        /cleanup asked ``pr view`` first and fell back to ``issue view``: two calls for every
+        issue, one after another, and a dry run took most of a minute (live, 2026-10-22).
+        """
+        code, out, err = self._run(
+            ["api", f"repos/{repo}/issues/{int(number)}",
+             "--jq", '[.state, (.pull_request.merged_at // "")] | @tsv'], timeout=20.0)
+        if code != 0:
+            logger.warning("ref_state(%s, %s) failed (code %d): %s", repo, number, code,
+                           err.strip())
+            return None
+        state, _, merged = out.strip().partition("\t")
+        state = state.strip().lower()
+        if merged.strip():
+            return "merged"
+        return state if state in ("open", "closed") else None
+
     def issue_view(self, repo: str, number: int) -> Optional[Issue]:
         """Get details of an issue."""
         fields = "number,title,body,author,state,labels,assignees,comments"

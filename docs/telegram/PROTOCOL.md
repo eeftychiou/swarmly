@@ -566,8 +566,11 @@ A participant conforms to v1.1 if it:
 ## Peer liveness: pulse and DOWN (issue #82)
 
 Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2). By default
-(`limits.heartbeat_plane: telegram`) it is a silent `STATUS to=* intent=PULSE` line in the topic
-`limits.heartbeat_topic_id` (General when 0), and **each beat deletes the bot's previous pulse**
+(`limits.heartbeat_plane: telegram`) it is a silent `STATUS to=* intent=PULSE` line in the
+swarm's own **"📡 Swarm pulse"** topic. The coordinator opens that topic when the swarm has none
+(it needs Topics on and the right to manage them); the other bots pulse in General until they
+see a message in it, then move there, and `/cleanup` never offers it.
+`limits.heartbeat_topic_id` names another topic instead, or `-1` for General. Either way **each beat deletes the bot's previous pulse**
 (`limits.heartbeat_style: repost`), so the topic always holds one current line per bot. With
 `heartbeat_style: edit` the bot edits one status message in place instead, and peers receive the
 edit as an `edited_message` update; only a pulse counts in an edited message, and an edit never

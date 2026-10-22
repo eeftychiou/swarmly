@@ -47,6 +47,17 @@ class TestGitHubClient(unittest.TestCase):
             self.assertEqual(issue.comments[0].body, "Looking into this")
             self.assertEqual(issue.comments[0].created_at, "2026-10-10T12:00:00Z")
 
+    def test_ref_state_is_one_call_for_an_issue_or_a_pr(self):
+        cases = [("open\t\n", "open"), ("closed\t\n", "closed"),
+                 ("closed\t2026-10-21T20:17:48Z\n", "merged"), ("weird\t\n", None)]
+        for out, want in cases:
+            with patch.object(self.client, "_run", return_value=(0, out, "")) as mock_run:
+                self.assertEqual(self.client.ref_state("o/r", 63), want)
+                mock_run.assert_called_once()
+                self.assertIn("repos/o/r/issues/63", mock_run.call_args[0][0])
+        with patch.object(self.client, "_run", return_value=(1, "", "HTTP 404")):
+            self.assertIsNone(self.client.ref_state("o/r", 63))
+
     def test_client_pr_view_parses_json(self):
         fake_data = {
             "number": 174,

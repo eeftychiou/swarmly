@@ -34,6 +34,7 @@ import re
 import secrets
 import socket
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import time
 import dataclasses
 from collections import deque
@@ -136,10 +137,29 @@ def _local_revision() -> str:
     """
     rev = _git_head("--short")
     if rev == "unknown":
+        installed = _installed_commit()
+        if installed:
+            return installed[:7]
         # An installed wheel has no checkout: the package version is the revision.
         from swarmly import __version__
         return f"v{__version__}"
     return rev
+
+
+def _installed_commit() -> str:
+    """The commit a ``pip``/``pipx install git+…@<rev>`` was built from, or ``""``.
+
+    Such an install has no checkout to ask, so every build of one version announced the same
+    ``v0.11.0``, and an upgrade looked as if it had not happened (live, CT100). pip records the
+    commit in the distribution's ``direct_url.json`` (PEP 610).
+    """
+    try:
+        from importlib.metadata import distribution
+        text = distribution("swarmly").read_text("direct_url.json") or ""
+        commit = (json.loads(text).get("vcs_info") or {}).get("commit_id") or ""
+    except Exception:                                  # noqa: BLE001 - no record, no commit
+        return ""
+    return commit if re.fullmatch(r"[0-9a-f]{7,40}", str(commit)) else ""
 
 
 def _local_revision_full() -> str:
@@ -151,11 +171,21 @@ def _local_revision_full() -> str:
     human-facing notice carries.
     """
     rev = _git_head()
-    return _local_revision() if rev == "unknown" else rev
+    if rev == "unknown":
+        return _installed_commit() or _local_revision()
+    return rev
 
 
 #: Messages older than this when the transport starts are a backlog, not a conversation.
 _MAX_BACKLOG_SECONDS = 30 * 60
+#: /cleanup's issue and PR lookups: how many run at once, and how long an answer is reused (the
+#: dry run, the ask and the confirm usually come within a few minutes of each other).
+_REF_LOOKUP_WORKERS = 6
+_REF_STATE_CACHE_SECONDS = 300.0
+#: The topic the swarm's heartbeat lives in, opened by the coordinator (limits.heartbeat_topic_id 0).
+PULSE_TOPIC_NAME = "\U0001f4e1 Swarm pulse"
+#: How long a failed attempt to open the pulse topic waits before the next one.
+PULSE_TOPIC_RETRY_SECONDS = 3600.0
 
 #: How often the transport sweeps its own expired notices out of General (#64). A notice is
 #: deleted on the first tick after ``limits.ephemeral_notices_minutes``, so it lingers at
@@ -1709,6 +1739,8 @@ class AgentChannel:
         for chat_id, thread_id, name in self.topics.entries():
             if home is not None and int(chat_id) != int(home):
                 continue
+            if name == PULSE_TOPIC_NAME:
+                continue                           # the swarm's heartbeat, never cleaned up
             refs = list(dict.fromkeys(
                 list(issue_refs(name or "")) + self._refs_of_topic(chat_id, thread_id)))
             topics.append(TopicInfo(
@@ -1756,22 +1788,29 @@ class AgentChannel:
         if not repo or self.config.github is None:
             return {ref: None for ref in refs}
         client = self._github_client()
-        states: Dict[str, Optional[str]] = {}
+        numbers: Dict[str, int] = {}
         for ref in refs:
             try:
-                number = int(str(ref).lstrip("#"))
+                numbers[ref] = int(str(ref).lstrip("#"))
             except (TypeError, ValueError):
                 continue
-            state = None
-            pr = client.pr_view(repo, number)          # a PR first: only it can be merged
-            if pr is not None:
-                state = _ref_state(pr.state)
-            if state is None:
-                issue = client.issue_view(repo, number)
-                if issue is not None:
-                    state = _ref_state(issue.state)
-            states[ref] = state
-        return states
+        cache = self.__dict__.setdefault("_ref_state_cache", {})
+        now = time.time()
+
+        def lookup(number: int) -> Optional[str]:
+            key = (repo, number)
+            hit = cache.get(key)
+            if hit is not None and now - hit[0] < _REF_STATE_CACHE_SECONDS:
+                return hit[1]
+            state = _ref_state(client.ref_state(repo, number))   # one call, issue or PR
+            if state is not None:
+                cache[key] = (now, state)
+            return state
+
+        # A topic links a dozen items: ask about them side by side, not one after another.
+        with ThreadPoolExecutor(max_workers=_REF_LOOKUP_WORKERS) as pool:
+            found = dict(zip(numbers, pool.map(lookup, numbers.values())))
+        return found
 
     async def cleanup_delete_topic(self, chat_id: int, thread_id: int) -> bool:
         """Delete one forum topic with all its messages (any age: that is deleteForumTopic)."""
@@ -2687,6 +2726,53 @@ class AgentChannel:
         except Exception:                              # noqa: BLE001 - kept in memory only
             logger.warning("heartbeat: cannot save %s", path, exc_info=True)
 
+    def _pulse_topic(self) -> Optional[int]:
+        """The topic the pulse goes to: configured, or the swarm's own pulse topic once known.
+
+        ``limits.heartbeat_topic_id`` above 0 names a topic, -1 means General, and 0 (the
+        default) means the swarm's own "📡 Swarm pulse" topic, learned from the topic map like
+        any other topic name. ``None`` is General.
+        """
+        configured = int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0)
+        if configured > 0:
+            return configured
+        if configured < 0:
+            return None
+        home = int(self.config.identity.home_channel_id or 0)
+        found = [thread for chat, thread, name in self.topics.entries()
+                 if chat == home and name == PULSE_TOPIC_NAME]
+        return min(found) if found else None          # two opened at once: everyone picks one
+
+    async def _ensure_pulse_topic(self) -> Optional[int]:
+        """The pulse topic, opened by the coordinator when the swarm has none yet.
+
+        One bot opens it, so the swarm does not get one per bot: the coordinator. The others
+        pulse in General until they see a message in the new topic (the coordinator's own
+        pulse), which teaches them its name like any topic's, and then move there.
+        """
+        found = self._pulse_topic()
+        if found is not None or int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0):
+            return found
+        home = int(self.config.identity.home_channel_id or 0)
+        create = getattr(self.bot, "create_forum_topic", None) if self.bot is not None else None
+        if not home or create is None or not self.is_coordinator():
+            return None
+        now = time.time()
+        if now - float(self.__dict__.get("_pulse_topic_tried") or 0.0) < PULSE_TOPIC_RETRY_SECONDS:
+            return None
+        self._pulse_topic_tried = now
+        try:
+            topic = await create(chat_id=home, name=PULSE_TOPIC_NAME)
+            thread_id = int(topic.message_thread_id)
+        except Exception as exc:                       # noqa: BLE001 - General meanwhile
+            logger.warning("heartbeat: could not open the %s topic (%s); pulsing in General "
+                           "(turn on Topics and give the bot the right to manage them)",
+                           PULSE_TOPIC_NAME, exc)
+            return None
+        self.topics.remember(home, thread_id, PULSE_TOPIC_NAME, current=True)
+        logger.info("heartbeat: opened the %s topic (%s)", PULSE_TOPIC_NAME, thread_id)
+        return thread_id
+
     async def _publish_pulse_line(self, line: str) -> str:
         """Put the pulse on Telegram, as one current line per bot.
 
@@ -2696,10 +2782,14 @@ class AgentChannel:
         that cannot be edited any more (deleted, /cleanup) is replaced.
         """
         chat = int(self.config.identity.home_channel_id or 0)
-        topic = int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0) or None
+        topic = await self._ensure_pulse_topic()
         ref = self._pulse_message()
+        stale = None
         if ref is not None and (ref[0], ref[1]) != (chat, topic):
-            ref = None                                 # the home or the topic moved
+            # The home or the topic moved: post anew, and take the old line down if it is in
+            # this chat (it is still the last pulse anyone sees there).
+            stale = ref[2] if ref[0] == chat else None
+            ref = None
         style = str(getattr(self.config.limits, "heartbeat_style", "repost") or "repost")
         edit = getattr(self.bot, "edit_message_text", None) if self.bot is not None else None
         if style.strip().lower() != "edit":
@@ -2716,10 +2806,14 @@ class AgentChannel:
                             ref[2], exc)
         sent = await self.send(line, chat_id=chat, thread_id=topic, silent=True,
                                return_message_id=True, allow_when_frozen=True)
+        if topic is not None and (chat, topic) in self._gone_topics:
+            # The pulse topic was deleted (the line went to General instead): forget it, so the
+            # coordinator opens a new one.
+            self.topics.forget(chat, topic)
         message_id = sent if isinstance(sent, int) and not isinstance(sent, bool) else None
         if message_id is None:
             return "posted"
-        old = ref[2] if ref is not None else None
+        old = ref[2] if ref is not None else stale
         self._remember_pulse_message((chat, topic, message_id))
         delete = getattr(self.bot, "delete_message", None) if self.bot is not None else None
         if old is not None and delete is not None:
