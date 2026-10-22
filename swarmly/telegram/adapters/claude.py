@@ -60,6 +60,7 @@ from swarmly.telegram.adapters.base import (
     format_channel_prompt,
     is_silent_reply,
     load_state,
+    looks_like_event_stream,
     usage_tokens,
     project_line,
     rules_digest,
@@ -97,26 +98,41 @@ def rules_file(alias: str, rules: str) -> Path:
 
 
 def parse_claude_json(out: str) -> Optional[dict]:
-    """The ``--output-format json`` result object, or ``None`` when stdout is not JSON
-    (for example a custom command without ``--output-format json``)."""
+    """The result object a run printed, or ``None`` when stdout carries none.
+
+    ``--output-format json`` prints one object; ``--output-format stream-json`` prints one
+    per line, ending with the ``result`` event (round 5.5, #161: a streaming run is what lets
+    the transport see progress, so its output has to be read here too). In both shapes the
+    reply is the ``result`` object and nothing else: a stream that stopped before it has no
+    answer, which is said plainly instead of posting half a turn as if it were complete.
+    """
     text = (out or "").strip()
-    if not text.startswith("{"):
+    if not text:
         return None
+    found: List[dict] = []
     try:
-        data = json.loads(text)
+        whole = json.loads(text)
+        if isinstance(whole, dict):
+            found.append(whole)
     except ValueError:
-        # Some wrappers print a line before the JSON; take the last JSON line.
-        for line in reversed(text.splitlines()):
+        for line in text.splitlines():
             line = line.strip()
-            if line.startswith("{"):
-                try:
-                    data = json.loads(line)
-                    break
-                except ValueError:
-                    continue
-        else:
-            return None
-    return data if isinstance(data, dict) else None
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                found.append(event)
+    if not found:
+        return None
+    for data in reversed(found):
+        if data.get("type") == "result":
+            return data
+    if any(str(data.get("type") or "") for data in found):
+        return None                          # a truncated stream: progress, but no answer
+    return found[-1]                         # a wrapper's stray object, as before
 
 
 class ClaudeAdapter(SubprocessAdapter):
@@ -197,6 +213,13 @@ class ClaudeAdapter(SubprocessAdapter):
     def parse_output(self, out: str, duration: float) -> AdapterReply:
         data = parse_claude_json(out)
         if data is None:
+            if looks_like_event_stream(out):
+                # A stream-json run that ended before its result event: progress lines are
+                # not an answer, and posting them as prose would put machine noise in the topic.
+                return AdapterReply(
+                    ok=False, duration_seconds=duration,
+                    error=f"{self.alias} streamed no result (the run ended before its "
+                          "result event)")
             return super().parse_output(out, duration)
         meta = {key: data[key] for key in ("session_id", "total_cost_usd", "num_turns")
                 if key in data}

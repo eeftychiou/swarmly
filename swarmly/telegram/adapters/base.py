@@ -939,3 +939,28 @@ def _decode(raw: Optional[bytes]) -> str:
     if not raw:
         return ""
     return raw.decode("utf-8", errors="replace")
+
+
+def looks_like_event_stream(text: str) -> bool:
+    """Whether *text* is a CLI's JSON event stream (``--output-format stream-json``).
+
+    Such a run prints one object per line, each with a ``type``. Asking this is how a caller
+    tells "the CLI streamed events and no result event arrived" from "the CLI printed plain
+    text": the first is a broken turn, the second is a reply, and posting the events as prose
+    would put machine noise in the topic (round 5.5, #161).
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if len(lines) < 1:
+        return False
+    typed = 0
+    for line in lines[:50]:
+        if not line.startswith("{"):
+            return False
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return False
+        if not isinstance(event, dict) or not event.get("type"):
+            return False
+        typed += 1
+    return typed > 0 and len(lines) > 1

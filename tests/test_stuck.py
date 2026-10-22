@@ -232,3 +232,63 @@ class TestTheKillPath(unittest.TestCase):
 
 if __name__ == "__main__":                       # pragma: no cover
     unittest.main()
+
+
+class TestStreamingOutput(unittest.TestCase):
+    """A `--output-format stream-json` run is progress the transport can see (and parse).
+
+    The pump in `_communicate` reports bytes as they arrive; this is the other half: the
+    reply comes from the `result` event, and a stream that ended before it is a broken turn,
+    never a partial answer posted as prose.
+    """
+
+    def stream(self, *events):
+        import json
+        return "\n".join(json.dumps(event) for event in events) + "\n"
+
+    def events(self, result="the answer", **extra):
+        first = {"type": "system", "subtype": "init", "session_id": "s-1"}
+        said = {"type": "assistant", "message": {"content": [{"type": "text",
+                                                              "text": "working"}]}}
+        last = {"type": "result", "subtype": "success", "is_error": False, "result": result,
+                "session_id": "s-1", "total_cost_usd": 0.02}
+        last.update(extra)
+        return [first, said, last]
+
+    def test_the_reply_is_the_result_event_not_an_earlier_one(self):
+        from swarmly.telegram.adapters.claude import parse_claude_json
+        data = parse_claude_json(self.stream(*self.events()))
+        self.assertEqual(data["type"], "result")
+        self.assertEqual(data["result"], "the answer")
+
+    def test_a_truncated_stream_is_a_failed_turn_not_a_partial_reply(self):
+        from swarmly.telegram.adapters.base import AdapterSettings
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        adapter = ClaudeAdapter("Claude", AdapterSettings(type="claude"))
+        head = self.events()[:2]                      # no result event: the run stopped
+        reply = adapter.parse_output(self.stream(*head), 1.0)
+        self.assertFalse(reply.ok)
+        self.assertIn("streamed no result", reply.error)
+        self.assertNotIn('"type"', reply.text or "")   # no event lines posted as prose
+
+    def test_a_finished_stream_is_the_usual_reply(self):
+        from swarmly.telegram.adapters.base import AdapterSettings
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        adapter = ClaudeAdapter("Claude", AdapterSettings(type="claude"))
+        reply = adapter.parse_output(self.stream(*self.events()), 1.0)
+        self.assertTrue(reply.ok, reply.error)
+        self.assertEqual(reply.text.strip(), "the answer")
+        self.assertEqual(reply.meta.get("total_cost_usd"), 0.02)
+
+    def test_a_single_json_object_still_reads_as_before(self):
+        from swarmly.telegram.adapters.claude import parse_claude_json
+        import json
+        data = parse_claude_json(json.dumps({"result": "hi", "session_id": "s-2"}))
+        self.assertEqual(data["result"], "hi")        # a wrapper's object: no `type`,
+        self.assertFalse(json.dumps(data) == "")     # still a reply, as it always was
+
+    def test_plain_text_is_not_mistaken_for_a_stream(self):
+        from swarmly.telegram.adapters.base import looks_like_event_stream
+        self.assertFalse(looks_like_event_stream("just a reply\nsecond line\n"))
+        self.assertFalse(looks_like_event_stream(""))
+        self.assertTrue(looks_like_event_stream('{"type":"system"}\n{"type":"result"}\n'))

@@ -969,6 +969,12 @@ end (nothing to stream) reports "silent since the turn started" and nothing more
 through the `/stop` path, its CLI tree with it, and the topic is told once. This is liveness
 only: it never starts a turn and never touches a `WAKE`.
 
+A run the bot's own command starts with `--output-format stream-json` (Claude, Reasonix) is
+progress the transport can see as it happens. Such a run prints one JSON object per line and
+ends with a `result` event; the adapters take **that** event as the reply, and a stream that
+ended before it is reported as a broken turn (`streamed no result`) rather than posting the
+progress lines into the topic as prose.
+
 
 **What a bot has spent — `/usage` (no model turn).** Every model turn appends one row to a
 per-bot ledger (`usage-<alias>.json`, beside the transport's other state): when it started and
