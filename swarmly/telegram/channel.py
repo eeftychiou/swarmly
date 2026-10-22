@@ -3014,7 +3014,7 @@ class AgentChannel:
         """
         return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart", "bot.stop_turn",
                 "bot.model", "bot.effort", "bot.wake", "bot.cli",
-                "swarm.pause_all", "swarm.sync", "swarm.cleanup",
+                "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
                 "item.nudge")
 
     #: The controls that only *report*, read off the one table in
@@ -3026,7 +3026,7 @@ class AgentChannel:
     #: post the local one: one press is one line on the bus (review, #133).
     CONTROL_BROADCASTS = ("swarm.pause_all",)
 
-    def _control_event(self, command: str) -> ChannelEvent:
+    def _control_event(self, command: str, argument: str = "") -> ChannelEvent:
         """A synthetic event for a report control: the admin, typing a bare command.
 
         The report answers through the *same* functions the typed commands use (``/model``,
@@ -3036,11 +3036,148 @@ class AgentChannel:
         would be the wrong shape for a control that is not asked twice.
         """
         settings = getattr(self.config, "control", None)
-        return ChannelEvent(text=f"/{command}",
+        return ChannelEvent(text=f"/{command}" + (f" {argument}" if argument else ""),
                             chat_id=self.config.identity.home_channel_id or 0,
                             author_id=self.config.identity.admin_user_id,
                             author_username=self.config.identity.name,
                             thread_id=getattr(settings, "topic_id", None))
+
+    def control_choices(self, action: str, target: str = "") -> List[Tuple[str, str]]:
+        """The live choices a picker offers, read in code and costing no turn (#153).
+
+        Model names come from the list the CLI already reported (``/model``'s own cache), the
+        effort levels from the config's own set, and the timers from what this bot holds. An
+        unreadable list is an empty one, and the press then says there is nothing to pick.
+        """
+        adapter = self.config.adapter
+        if action == "bot.model":
+            names = cached_models(adapter.type) or []
+            return [(name, name) for name in names][:12]
+        if action == "bot.effort":
+            return [(level, level) for level in EFFORT_LEVELS]
+        if action == "swarm.role":
+            from swarmly.telegram.roles import known_roles, role_dirs
+            if not target:
+                # Step one: which bot. Its own alias included, because a bot may hand its own
+                # role on (the coordinator's job is a role like any other).
+                names = sorted({str(alias) for alias in
+                                (getattr(self.config, "peers", None) or {})}
+                               | {self.config.identity.alias})
+                return [(name, name) for name in names][:12]
+            # The project's own role files too, not only the built-ins: a swarm that defined
+            # its roles in the bus repository must be able to pick them (review, #153).
+            names = sorted(known_roles(role_dirs(self.config.bus.repo)))
+            return [(name, name) for name in names][:12]
+        if action == "bot.wake":
+            now = time.time()
+            timers = [timer for timer in self.wake_store().load() if timer.live]
+            return [(f"cancel {timer.id} "
+                     f"({max(0, int(timer.next_at - now)) // 60}m)", timer.id)
+                    for timer in sorted(timers, key=lambda row: row.next_at)][:10]
+        return []
+
+    async def _offer_picker(self, action: str, target: str = "") -> str:
+        """Send the picker for *action*: a small message of its own, one button per value.
+
+        The keyboard cannot live on the dashboard -- every heartbeat edits that message with
+        the plain keyboard, which would wipe a picker mid-press -- and it must not cost a model
+        turn, so the choices come from code and the value rides each button's callback data.
+        """
+        found = control_mod.control(action)
+        label = found.label if found else action
+        choices = self.control_choices(action, target)
+        if not choices:
+            raise ControlRefused(f"{label}: there is nothing to pick from just now")
+        bot = getattr(self, "bot", None)
+        if bot is None:
+            raise ControlRefused(f"{label}: this transport cannot post the picker")
+        # A role pick asks for the *bot* first, and that choice belongs in the target slot;
+        # every other picker's single choice is the value itself.
+        rows = control_mod.picker(action, choices, target=target,
+                                  as_target=bool(action == "swarm.role" and not target))
+        try:
+            from aiogram.types import InlineKeyboardMarkup
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        except Exception:                      # noqa: BLE001 - no aiogram: the plain shape
+            markup = {"inline_keyboard": rows}
+        chat_id, thread_id = self._control_chat()
+        if not chat_id:
+            raise ControlRefused(f"{label}: this bot has nowhere to post the picker")
+        await bot.send_message(**self._control_post(
+            chat_id, thread_id,
+            text=control_mod.picker_text(action, self.config.identity.alias, target),
+            disable_web_page_preview=True, reply_markup=markup))
+        return f"{label}: {len(choices)} choice(s) offered"
+
+    def _control_chat(self) -> Tuple[int, Optional[int]]:
+        """Where the dashboard lives: ``control.chat_id``/``control.topic_id``, else home.
+
+        A picker or a confirmation sent to the home channel while the dashboard is pinned in a
+        control topic lands in the wrong conversation -- the presser is reading the other one
+        (review, #153).
+        """
+        settings = getattr(self.config, "control", None)
+        chat_id = (getattr(settings, "chat_id", None)
+                   or self.config.identity.home_channel_id)
+        thread_id = getattr(settings, "topic_id", None)
+        return int(chat_id or 0), thread_id
+
+    @staticmethod
+    def _control_post(chat_id: int, thread_id: Optional[int], **kwargs: Any) -> Dict[str, Any]:
+        """``send_message`` keyword arguments for a control message, topic included when set."""
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+        return {"chat_id": chat_id, **kwargs}
+
+    async def _offer_confirm(self, decision: Any) -> None:
+        """Post the second tap as a button carrying the code the policy just minted (#153).
+
+        Every "tap again" the policy says is only true if the minted code can be sent back;
+        without a button the presser's only option is to press the first one again, which mints
+        a *new* code and confirms nothing (review, #153). A failure here is logged and never
+        raised: the words still name the code, and the typed form is accepted too.
+        """
+        code = str(getattr(decision, "code", "") or "")
+        bot = getattr(self, "bot", None)
+        chat_id, thread_id = self._control_chat()
+        if not code or bot is None or not chat_id:
+            return
+        rows = control_mod.confirm_keyboard(decision.action, code,
+                                            getattr(decision, "value", ""))
+        try:
+            from aiogram.types import InlineKeyboardMarkup
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        except Exception:                      # noqa: BLE001 - no aiogram: the plain shape
+            markup = {"inline_keyboard": rows}
+        try:
+            await bot.send_message(**self._control_post(
+                chat_id, thread_id, text=decision.text, disable_web_page_preview=True,
+                reply_markup=markup))
+        except Exception:                      # noqa: BLE001 - the answer still stands
+            logger.warning("control centre: could not post the confirm button", exc_info=True)
+
+    async def _apply_pick(self, action: str, value: str, target: str = "") -> str:
+        """Set what a picker chose -- through the same function the typed command runs.
+
+        ``/model <name>``, ``/reasoning <level>`` and ``/wakes cancel <id>`` are the transport's
+        own answers, so a picked value behaves exactly like a typed one: same validation, same
+        limits, same words back.
+        """
+        if action == "bot.model":
+            return self._model_command(self._control_event("model", value))
+        if action == "bot.effort":
+            return self._reasoning_command(self._control_event("reasoning", value))
+        if action == "bot.wake":
+            return self._wakes_command(self._control_event("wakes", f"cancel {value}"))
+        if action == "swarm.role":
+            who = str(target or "").strip()
+            if not who:
+                raise ControlRefused("swarm.role needs a bot: pick one, then a role")
+            assigned = await self.membership.assign(who, value)
+            if not assigned:
+                raise ControlRefused(f"{who}: that role was refused")
+            return f"{who} is now {value}"
+        raise ControlRefused(f"{action}: this build cannot apply a picked value")
 
     def control_report(self, action: str) -> Optional[str]:
         """What a report control answers, in code and costing no turn (None for the others)."""
@@ -3114,9 +3251,14 @@ class AgentChannel:
             decision = self.control_policy().decide(press, actor=str(press.user_id))
             if decision.verdict == press_mod.RUN:
                 answer = await self._run_control(decision.action, decision.target,
-                                                 presser=str(press.user_id))
+                                                 presser=str(press.user_id),
+                                                 value=decision.value)
                 if answer:
                     decision.text = answer
+            if decision.verdict == press_mod.CONFIRM:
+                # The policy minted a code; without a button for it the second tap is not
+                # deliverable, and nothing that stops or changes can be carried out (#153).
+                await self._offer_confirm(decision)
             if decision.log and decision.action not in self.CONTROL_BROADCASTS:
                 # A swarm-wide control posts its own ``target=*`` note (which already names
                 # the pressing bot); a second, local note would double every press on the bus.
@@ -3129,18 +3271,50 @@ class AgentChannel:
             logger.warning("control centre: the press failed", exc_info=True)
             return "the press failed; the log has the reason"
 
+    async def _handle_control_text(self, event: ChannelEvent) -> Optional[str]:
+        """A control typed into the chat: the press handler, fed by text instead of a callback.
+
+        Admin only, and only for this module's own prefix: everyone else's message is left
+        alone, unadvertised, and the press policy repeats the check anyway -- a typed code is
+        no more trusted than a pressed one, only another way of delivering it.
+        """
+        text = (event.text or "").strip()
+        if not text.startswith(press_mod.PREFIX):
+            return None
+        if any(ch.isspace() for ch in text):
+            # A control is one token. A sentence that merely *starts* with the prefix is
+            # somebody talking about the controls, and it must not be read as one.
+            return None
+        if not self.config.is_admin(event.author_id):
+            self.stats.ignored += 1
+            return None
+        try:
+            user_id = int(event.author_id or 0)
+        except (TypeError, ValueError):
+            return None
+        press = press_mod.Press(user_id=user_id, data=text, at=time.time())
+        return await self.handle_control_press(press)
+
     async def _post_control_note(self, line: str) -> None:
         """Put a CONTROL line on the durable plane: how a press reaches the other bots."""
         await self.send(format_message(
             Envelope(type=MessageType.NOTE, to="*", intent="CONTROL", ref=self._alias_ref()),
             line), silent=True, notice=True, allow_when_frozen=True)
 
-    async def _run_control(self, action: str, target: str, *, presser: str = "") -> Optional[str]:
+    async def _run_control(self, action: str, target: str, *, presser: str = "",
+                           value: str = "") -> Optional[str]:
         """Carry out one wired control, here and -- for a swarm-wide one -- everywhere else.
 
         Returns the words to answer the presser with when the control is one that *reports*
         (None otherwise, and the policy's own line is the answer).
         """
+        if value:
+            return await self._apply_pick(action, value, target)
+        if action == "swarm.role" and target:
+            # Step two of the role pick: the bot is chosen, now ask which role.
+            return await self._offer_picker(action, target)
+        if control_mod.is_picker(action):
+            return await self._offer_picker(action)
         report = self.control_report(action)
         if report is not None:
             return report
@@ -5028,6 +5202,16 @@ class AgentChannel:
                 await self.send(self._resumed_notice("the admin resumed it"),
                                 allow_when_frozen=True, notice=True)
             return sent
+
+        # A typed control (`ctl:confirm:ab12`) means exactly what the button means. The words
+        # under a pick or a confirm offer it, and handed to the adapter it is only prose -- so
+        # the second tap never happened and nothing that stops could be confirmed (#153).
+        control_text = await self._handle_control_text(event)
+        if control_text is not None:
+            self.stats.handled += 1
+            return await self.send(control_text, reply_to_message_id=event.message_id,
+                                   chat_id=event.chat_id, thread_id=event.thread_id,
+                                   allow_when_frozen=True)
 
         if self._frozen:
             await self._lift_expired_freeze()

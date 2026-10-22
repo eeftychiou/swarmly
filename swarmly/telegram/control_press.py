@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from swarmly.telegram.control import control as lookup
+from swarmly.telegram.control import control as lookup, is_picker
 
 #: The callback-data prefix. Every button this module handles starts with it, so a callback
 #: from anything else on the bot's keyboard is ignored rather than parsed.
@@ -88,17 +88,33 @@ def parse_note(text: str) -> Optional[Note]:
     return Note(action=words[1], target=fields["target"], by=fields["by"])
 
 
+#: Telegram's limit on one button's callback data, in bytes. A picker carries a value in that
+#: budget: ``ctl`` (3) + the action (17 at most today) + a target + a value must fit.
+MAX_CALLBACK_BYTES = 64
+
+#: The most a picked value may be, so a long model name cannot push the callback over the
+#: limit and make Telegram reject the whole keyboard.
+MAX_VALUE_CHARS = 32
+
+
 @dataclass(frozen=True)
 class Command:
-    """What a button's callback data says: the action, its target, and a code when confirming."""
+    """What a button's callback data says: the action, its target, a picked value, a code."""
 
     action: str
     target: str = ""
     code: str = ""
+    #: The value a picker chose -- a model, an effort, a timer id, ``<alias>:<role>``. Empty
+    #: for the buttons that need no value, so every existing callback stays valid (#153).
+    value: str = ""
 
 
 def parse(data: str) -> Optional[Command]:
-    """``ctl:<action>[:<target>]`` or ``ctl:confirm:<code>``. None when it is not ours."""
+    """``ctl:<action>[:<target>[:<value>]]`` or ``ctl:confirm:<code>``.
+
+    The value is the third field, and it is always last, so the two-field form the dashboard
+    already sends keeps its meaning (#153). None when the data is not ours.
+    """
     if not isinstance(data, str) or not data.startswith(PREFIX):
         return None
     body = data[len(PREFIX):]
@@ -110,7 +126,13 @@ def parse(data: str) -> Optional[Command]:
         return Command(action="confirm", code=rest.strip())
     if not head:
         return None
-    return Command(action=head, target=rest.strip())
+    target, _, value = rest.partition(":")
+    return Command(action=head, target=target.strip(), value=value.strip())
+
+
+def too_long(data: str) -> bool:
+    """Whether a callback data would be refused by Telegram (over :data:`MAX_CALLBACK_BYTES`)."""
+    return len(str(data).encode("utf-8")) > MAX_CALLBACK_BYTES
 
 
 def every_bot(action: str, actor: str, moment: Optional[float] = None) -> str:
@@ -124,8 +146,25 @@ def every_bot(action: str, actor: str, moment: Optional[float] = None) -> str:
                                 time.time() if moment is None else moment, done=True)
 
 
-def callback_data(action: str, target: str = "") -> str:
-    """The callback data for one control, so the keyboard and the parser cannot drift."""
+def confirm_data(code: str) -> str:
+    """The callback data of the *second* tap: the minted code, in the form ``parse`` reads.
+
+    A confirmation is only ever deliverable if something can send ``ctl:confirm:<code>`` back,
+    so the keyboard that offers it and the parser that accepts it share this one function
+    (review, #153).
+    """
+    return f"{PREFIX}confirm:{str(code).strip().lower()}"
+
+
+def callback_data(action: str, target: str = "", value: str = "") -> str:
+    """The callback data for one control, so the keyboard and the parser cannot drift.
+
+    A value is written only when there is one, and the target is written when either the
+    target or the value is set (``ctl:bot.model::claude-sonnet-4``), so a plain button keeps
+    the exact data it had before pickers existed (#153).
+    """
+    if value:
+        return f"{PREFIX}{action}:{target}:{value}"
     return f"{PREFIX}{action}" + (f":{target}" if target else "")
 
 
@@ -142,6 +181,11 @@ class Decision:
     target: str = ""
     #: The line to put on the durable plane when something actually happens.
     log: str = ""
+    #: The value the press picked (a model, an effort, a timer): empty for plain controls.
+    value: str = ""
+    #: The one-use code a ``CONFIRM`` verdict just minted, so the second tap can be offered as
+    #: a button instead of only described in the words (#153 review).
+    code: str = ""
 
 
 @dataclass
@@ -151,6 +195,9 @@ class _Pending:
     code: str
     expires: float
     actor: str = ""
+    #: The value the press picked, carried through the second tap so the confirmed action runs
+    #: with exactly what the first tap chose (#153).
+    value: str = ""
 
 
 @dataclass
@@ -186,6 +233,20 @@ class PressPolicy:
             return Decision(REFUSED, command=command, reason=UNKNOWN,
                             text=f"There is no control {command.action!r} here.",
                             action=command.action)
+        if command.value:
+            # A picked value *changes* something (a model, an effort, a role), so it always
+            # asks for the second tap, whatever the bare control's own rule is (#153).
+            code = self._mint(command, moment, actor)
+            return Decision(CONFIRM, command=command, action=command.action,
+                            target=command.target, value=command.value, code=code,
+                            text=(f"Tap again to set {found.label} to `{command.value}`. "
+                                  f"Or answer `{PREFIX}confirm:{code}` within "
+                                  f"{self.confirm_seconds / 60:g} minute(s)."))
+        if not command.value and is_picker(command.action):
+            # Step one of a pick -- offering the list -- changes nothing, so it is not
+            # confirmed even when the action itself is one that changes something (#153).
+            return Decision(RUN, command=command, action=command.action,
+                            target=command.target, text=f"{found.label}: pick one below.")
         if not found.confirm:
             # A report changes nothing, so it leaves no CONTROL note: the durable line is for
             # "who stopped what", and a read-only press would only add noise to the bus.
@@ -196,7 +257,7 @@ class PressPolicy:
         code = self._mint(command, moment, actor)
         note = f" — {found.note}" if found.note else ""
         return Decision(CONFIRM, command=command, action=command.action,
-                        target=command.target,
+                        target=command.target, code=code,
                         text=(f"Tap again to confirm {found.label}{note}. "
                               f"Or answer `{PREFIX}confirm:{code}` within "
                               f"{self.confirm_seconds / 60:g} minute(s)."))
@@ -214,10 +275,11 @@ class PressPolicy:
                             text="Only the admin who asked can confirm that.")
         found = lookup(pending.action)
         label = found.label if found else pending.action
+        said = (f"{label} set to {pending.value}." if pending.value else f"{label} done.")
         return Decision(RUN, command=command, action=pending.action, target=pending.target,
-                        text=f"{label} done.",
+                        value=pending.value, text=said,
                         log=self.log_line(pending.action, pending.target, pending.actor,
-                                          moment, done=True))
+                                          moment, done=True, value=pending.value))
 
     # -- pieces ------------------------------------------------------------------------
     def _is_admin(self, user_id: Any) -> bool:
@@ -231,7 +293,7 @@ class PressPolicy:
         code = self.code().lower()
         self._pending[code] = _Pending(action=command.action, target=command.target, code=code,
                                        expires=moment + self.confirm_seconds,
-                                       actor=str(actor or ""))
+                                       actor=str(actor or ""), value=command.value)
         return code
 
     def _expire(self, moment: float) -> None:
@@ -244,13 +306,17 @@ class PressPolicy:
 
     @staticmethod
     def log_line(action: str, target: str, actor: str, moment: float, *,
-                 done: bool = False) -> str:
-        """``CONTROL bot.pause target=Codex by=4242 at=2026-10-21T20:00:00Z``.
+                 done: bool = False, value: str = "") -> str:
+        """``CONTROL bot.pause target=Codex by=4242 at=2026-10-21T20:00:00Z state=done``.
 
         Who, what and when, on one line: the transport posts it as a NOTE, so it is on the
-        durable plane and every peer can see who stopped what.
+        durable plane and every peer can see who stopped what. A picked value is part of
+        *what*: ``CONTROL bot.model target=self value=claude-opus-4 by=...`` -- without it the
+        record says a model changed and not which one (review, #153).
         """
         when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))
         state = "done" if done else "asked"
-        return (f"CONTROL {action} target={target or 'self'} by={actor or 'unknown'} "
+        picked = "".join(str(value).split())[:MAX_VALUE_CHARS] if value else ""
+        return (f"CONTROL {action} target={target or 'self'}"
+                f"{' value=' + picked if picked else ''} by={actor or 'unknown'} "
                 f"at={when} state={state}")

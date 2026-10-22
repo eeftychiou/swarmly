@@ -134,6 +134,79 @@ def keyboard(actions: Iterable[str]) -> List[List[Dict[str, str]]]:
     return [buttons[index:index + PER_ROW] for index in range(0, len(buttons), PER_ROW)]
 
 
+#: The controls that take a **picked value**: pressing one with no value offers the choices,
+#: pressing one with a value sets it after the second tap (#153). The list is short on purpose
+#: -- a control joins it when its choices can actually be read in code, with no model turn.
+PICKERS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.wake", "swarm.role")
+
+
+def is_picker(action: str) -> bool:
+    """Whether a control takes a value from a list rather than being a plain button."""
+    return str(action) in PICKERS
+
+
+def picker(action: str, choices: Iterable[Tuple[str, str]],
+           target: str = "", as_target: bool = False) -> List[List[Dict[str, str]]]:
+    """The keyboard that carries a picked value: one button per choice, three to a row.
+
+    The value rides the button's own callback data (``ctl:<action>:<target>:<value>``), not a
+    conversation state, so a press made after a restart still means what it said, and nothing
+    is kept on disk. ``choices`` are ``(label, value)`` pairs read from a live list.
+    """
+    from swarmly.telegram.control_press import MAX_VALUE_CHARS, callback_data
+    buttons = []
+    for label, value in choices:
+        value = str(value)[:MAX_VALUE_CHARS]
+        # ``as_target`` is for the controls that need *two* values (reassign a role: which bot,
+        # then which role): the first choice goes in the target slot, and the second press
+        # fills the value next to it, so the whole pick still arrives in one callback (#153).
+        buttons.append({"text": str(label),
+                        "callback_data": (callback_data(action, value)
+                                          if as_target else
+                                          callback_data(action, target, value))})
+    return [buttons[index:index + PER_ROW] for index in range(0, len(buttons), PER_ROW)]
+
+
+def picker_text(action: str, alias: str = "", target: str = "") -> str:
+    """What a picker asks, in words -- a fixed line, so asking costs no model turn.
+
+    It names the bot the press will *change*: the target of a two-value pick when there is one,
+    and otherwise this bot. The role pick's first step changes nobody yet, so it must not name
+    itself there -- a list of bots under "Reassign role for Hermes" reads as if Hermes were
+    already chosen (review, #153).
+    """
+    found = control(action)
+    label = found.label if found else action
+    target = str(target or "").strip()
+    if target:
+        return (f"{label} for {target}: pick one below. "
+                "Nothing changes until you tap again to confirm.")
+    if action == "swarm.role":
+        return f"{label}: which bot? pick one below, then its role."
+    if action == "bot.wake":
+        # The one thing a timer pick can do is cancel it: say so, rather than "WAKE" over a
+        # list of ids that reads as arming one (review, #153).
+        return f"{label}{f' for {alias}' if alias else ''}: pick the timer to cancel below."
+    who = f" for {alias}" if alias else ""
+    return f"{label}{who}: pick one below. Nothing changes until you tap again to confirm."
+
+
+def confirm_keyboard(action: str, code: str, value: str = "") -> List[List[Dict[str, str]]]:
+    """The second tap, as a button: the only thing that can send ``ctl:confirm:<code>`` back.
+
+    A confirmation the presser cannot deliver is not a confirmation. The words under a pick
+    say "tap again", so the tap has to exist as a button whose data carries the minted code --
+    pressing the *first* button again only mints a new one (review, #153).
+    """
+    from swarmly.telegram.control_press import confirm_data
+    found = control(action)
+    label = found.label if found else action
+    said = f"Confirm {label}"
+    if value:
+        said += f" → {str(value)[:24]}"
+    return [[{"text": said[:48], "callback_data": confirm_data(code)}]]
+
+
 def available(*prefixes: str) -> List[Control]:
     """The controls under one message: by prefix (``bot`` for per-bot, ``swarm``, ``item``)."""
     wanted = tuple(prefixes) or ("bot", "swarm", "item")

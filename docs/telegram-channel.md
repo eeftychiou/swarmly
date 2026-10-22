@@ -1032,11 +1032,15 @@ the `/stop all` form, because the dashboard speaks for the whole bot rather than
 - **The admin only.** The presser's Telegram user id is checked before the action is even
   looked up, so a stranger is refused and learns nothing about what the buttons do.
 - **Anything that stops or changes something asks twice.** The first tap mints a one-use code
-  and says what the second tap will do; only `ctl:confirm:<code>` runs it, and the code dies
-  when it is used or after 2 minutes.
+  and answers with a **Confirm button that carries it** — `ctl:confirm:<code>` — which is the
+  only thing that runs the action; the code dies when it is used or after 2 minutes. The same
+  answer offers the code as text, and typing `ctl:confirm:<code>` in the chat means exactly
+  what the button means: it goes through the press handler, never to the model as prose.
 - **Every action leaves a record.** A run posts one `NOTE intent=CONTROL` line —
   `CONTROL bot.restart target=self by=<user id> at=<UTC> state=done` — so the durable plane
-  says who stopped what and when.
+  says who stopped what and when. A press that picked a value names it in the same line
+  (`CONTROL bot.model target=self value=claude-opus-4 by=…`): a record that says a model
+  changed and not which one is not a record.
 
 A swarm-wide control — pause everything — holds the bot that owns the message and broadcasts
 `target=*`, so every peer applies it: one press stops the swarm, and each bot keeps its own
@@ -1053,6 +1057,26 @@ authorisation against its own config). A note that fails any of them is refused 
 logged — and a note this bot cannot actually carry out answers `failed:`, never `applied:`.
 One press is one line on the bus: a swarm-wide control posts its own `target=*` note, and the
 pressing bot does not add a second, local one.
+
+**A control that needs a value carries it on the button (#153).** Model, effort and WAKE are
+pickers: pressing one sends a short list — the models `/model` already knows, the effort
+levels, the timers this bot holds — as a message of its own (the dashboard's keyboard is
+rewritten on every beat, so a picker cannot live there), and the chosen value rides that
+button's own callback data, `ctl:<action>:<target>:<value>`. Nothing is kept on disk, so a
+press that arrives after a restart still means what the button said, and the value is capped
+so the data always fits Telegram's 64 bytes. A picked value *always* asks for the second tap,
+whatever the bare control's rule is, and it is applied by the same function the typed command
+runs — `/model <name>`, `/reasoning <level>`, `/wakes cancel <id>` — so a picked value has the
+same validation and the same words back as a typed one. A control joins the pickers only when
+its choices can be read in code: listing them costs no model turn. Reassigning a role needs
+**two** values, so it picks twice: the bot goes in the target slot (`ctl:swarm.role:Codex`) and
+the role fills the value next to it (`ctl:swarm.role:Codex:qa-tester`), which keeps one callback
+carrying the whole choice. Offering a list is not confirmed — it changes nothing; the second tap
+arrives with the finished pick. The picker is posted where the dashboard lives
+(`control.chat_id`/`control.topic_id`, else the home channel) and it names the bot the press will
+*change*, so the role pick's first step asks which bot rather than claiming one is already chosen.
+The role list includes the project's own role files (`<bus repo>/.agents/roles`), and the WAKE
+picker says what it does — it cancels a timer, so its buttons read `cancel <id>`.
 
 Deploy, upgrade, merging a PR and editing configs or secrets are not on the keyboard at all.
 
