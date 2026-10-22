@@ -3056,7 +3056,7 @@ class AgentChannel:
         if action == "bot.effort":
             return [(level, level) for level in EFFORT_LEVELS]
         if action == "swarm.role":
-            from swarmly.telegram.roles import known_roles
+            from swarmly.telegram.roles import known_roles, role_dirs
             if not target:
                 # Step one: which bot. Its own alias included, because a bot may hand its own
                 # role on (the coordinator's job is a role like any other).
@@ -3064,11 +3064,15 @@ class AgentChannel:
                                 (getattr(self.config, "peers", None) or {})}
                                | {self.config.identity.alias})
                 return [(name, name) for name in names][:12]
-            return [(name, name) for name in sorted(known_roles())][:12]
+            # The project's own role files too, not only the built-ins: a swarm that defined
+            # its roles in the bus repository must be able to pick them (review, #153).
+            names = sorted(known_roles(role_dirs(self.config.bus.repo)))
+            return [(name, name) for name in names][:12]
         if action == "bot.wake":
             now = time.time()
             timers = [timer for timer in self.wake_store().load() if timer.live]
-            return [(f"{timer.id} in {max(0, int(timer.next_at - now)) // 60}m", timer.id)
+            return [(f"cancel {timer.id} "
+                     f"({max(0, int(timer.next_at - now)) // 60}m)", timer.id)
                     for timer in sorted(timers, key=lambda row: row.next_at)][:10]
         return []
 
@@ -3096,11 +3100,61 @@ class AgentChannel:
             markup = InlineKeyboardMarkup(inline_keyboard=rows)
         except Exception:                      # noqa: BLE001 - no aiogram: the plain shape
             markup = {"inline_keyboard": rows}
-        await bot.send_message(chat_id=self.config.identity.home_channel_id,
-                               text=control_mod.picker_text(action,
-                                                            self.config.identity.alias),
-                               disable_web_page_preview=True, reply_markup=markup)
+        chat_id, thread_id = self._control_chat()
+        if not chat_id:
+            raise ControlRefused(f"{label}: this bot has nowhere to post the picker")
+        await bot.send_message(**self._control_post(
+            chat_id, thread_id,
+            text=control_mod.picker_text(action, self.config.identity.alias, target),
+            disable_web_page_preview=True, reply_markup=markup))
         return f"{label}: {len(choices)} choice(s) offered"
+
+    def _control_chat(self) -> Tuple[int, Optional[int]]:
+        """Where the dashboard lives: ``control.chat_id``/``control.topic_id``, else home.
+
+        A picker or a confirmation sent to the home channel while the dashboard is pinned in a
+        control topic lands in the wrong conversation -- the presser is reading the other one
+        (review, #153).
+        """
+        settings = getattr(self.config, "control", None)
+        chat_id = (getattr(settings, "chat_id", None)
+                   or self.config.identity.home_channel_id)
+        thread_id = getattr(settings, "topic_id", None)
+        return int(chat_id or 0), thread_id
+
+    @staticmethod
+    def _control_post(chat_id: int, thread_id: Optional[int], **kwargs: Any) -> Dict[str, Any]:
+        """``send_message`` keyword arguments for a control message, topic included when set."""
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+        return {"chat_id": chat_id, **kwargs}
+
+    async def _offer_confirm(self, decision: Any) -> None:
+        """Post the second tap as a button carrying the code the policy just minted (#153).
+
+        Every "tap again" the policy says is only true if the minted code can be sent back;
+        without a button the presser's only option is to press the first one again, which mints
+        a *new* code and confirms nothing (review, #153). A failure here is logged and never
+        raised: the words still name the code, and the typed form is accepted too.
+        """
+        code = str(getattr(decision, "code", "") or "")
+        bot = getattr(self, "bot", None)
+        chat_id, thread_id = self._control_chat()
+        if not code or bot is None or not chat_id:
+            return
+        rows = control_mod.confirm_keyboard(decision.action, code,
+                                            getattr(decision, "value", ""))
+        try:
+            from aiogram.types import InlineKeyboardMarkup
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        except Exception:                      # noqa: BLE001 - no aiogram: the plain shape
+            markup = {"inline_keyboard": rows}
+        try:
+            await bot.send_message(**self._control_post(
+                chat_id, thread_id, text=decision.text, disable_web_page_preview=True,
+                reply_markup=markup))
+        except Exception:                      # noqa: BLE001 - the answer still stands
+            logger.warning("control centre: could not post the confirm button", exc_info=True)
 
     async def _apply_pick(self, action: str, value: str, target: str = "") -> str:
         """Set what a picker chose -- through the same function the typed command runs.
@@ -3201,6 +3255,10 @@ class AgentChannel:
                                                  value=decision.value)
                 if answer:
                     decision.text = answer
+            if decision.verdict == press_mod.CONFIRM:
+                # The policy minted a code; without a button for it the second tap is not
+                # deliverable, and nothing that stops or changes can be carried out (#153).
+                await self._offer_confirm(decision)
             if decision.log and decision.action not in self.CONTROL_BROADCASTS:
                 # A swarm-wide control posts its own ``target=*`` note (which already names
                 # the pressing bot); a second, local note would double every press on the bus.
@@ -3212,6 +3270,30 @@ class AgentChannel:
         except Exception:                      # noqa: BLE001 - a press must not break the bot
             logger.warning("control centre: the press failed", exc_info=True)
             return "the press failed; the log has the reason"
+
+    async def _handle_control_text(self, event: ChannelEvent) -> Optional[str]:
+        """A control typed into the chat: the press handler, fed by text instead of a callback.
+
+        Admin only, and only for this module's own prefix: everyone else's message is left
+        alone, unadvertised, and the press policy repeats the check anyway -- a typed code is
+        no more trusted than a pressed one, only another way of delivering it.
+        """
+        text = (event.text or "").strip()
+        if not text.startswith(press_mod.PREFIX):
+            return None
+        if any(ch.isspace() for ch in text):
+            # A control is one token. A sentence that merely *starts* with the prefix is
+            # somebody talking about the controls, and it must not be read as one.
+            return None
+        if not self.config.is_admin(event.author_id):
+            self.stats.ignored += 1
+            return None
+        try:
+            user_id = int(event.author_id or 0)
+        except (TypeError, ValueError):
+            return None
+        press = press_mod.Press(user_id=user_id, data=text, at=time.time())
+        return await self.handle_control_press(press)
 
     async def _post_control_note(self, line: str) -> None:
         """Put a CONTROL line on the durable plane: how a press reaches the other bots."""
@@ -5120,6 +5202,16 @@ class AgentChannel:
                 await self.send(self._resumed_notice("the admin resumed it"),
                                 allow_when_frozen=True, notice=True)
             return sent
+
+        # A typed control (`ctl:confirm:ab12`) means exactly what the button means. The words
+        # under a pick or a confirm offer it, and handed to the adapter it is only prose -- so
+        # the second tap never happened and nothing that stops could be confirmed (#153).
+        control_text = await self._handle_control_text(event)
+        if control_text is not None:
+            self.stats.handled += 1
+            return await self.send(control_text, reply_to_message_id=event.message_id,
+                                   chat_id=event.chat_id, thread_id=event.thread_id,
+                                   allow_when_frozen=True)
 
         if self._frozen:
             await self._lift_expired_freeze()

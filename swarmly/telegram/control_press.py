@@ -146,6 +146,16 @@ def every_bot(action: str, actor: str, moment: Optional[float] = None) -> str:
                                 time.time() if moment is None else moment, done=True)
 
 
+def confirm_data(code: str) -> str:
+    """The callback data of the *second* tap: the minted code, in the form ``parse`` reads.
+
+    A confirmation is only ever deliverable if something can send ``ctl:confirm:<code>`` back,
+    so the keyboard that offers it and the parser that accepts it share this one function
+    (review, #153).
+    """
+    return f"{PREFIX}confirm:{str(code).strip().lower()}"
+
+
 def callback_data(action: str, target: str = "", value: str = "") -> str:
     """The callback data for one control, so the keyboard and the parser cannot drift.
 
@@ -173,6 +183,9 @@ class Decision:
     log: str = ""
     #: The value the press picked (a model, an effort, a timer): empty for plain controls.
     value: str = ""
+    #: The one-use code a ``CONFIRM`` verdict just minted, so the second tap can be offered as
+    #: a button instead of only described in the words (#153 review).
+    code: str = ""
 
 
 @dataclass
@@ -225,7 +238,7 @@ class PressPolicy:
             # asks for the second tap, whatever the bare control's own rule is (#153).
             code = self._mint(command, moment, actor)
             return Decision(CONFIRM, command=command, action=command.action,
-                            target=command.target, value=command.value,
+                            target=command.target, value=command.value, code=code,
                             text=(f"Tap again to set {found.label} to `{command.value}`. "
                                   f"Or answer `{PREFIX}confirm:{code}` within "
                                   f"{self.confirm_seconds / 60:g} minute(s)."))
@@ -244,7 +257,7 @@ class PressPolicy:
         code = self._mint(command, moment, actor)
         note = f" — {found.note}" if found.note else ""
         return Decision(CONFIRM, command=command, action=command.action,
-                        target=command.target,
+                        target=command.target, code=code,
                         text=(f"Tap again to confirm {found.label}{note}. "
                               f"Or answer `{PREFIX}confirm:{code}` within "
                               f"{self.confirm_seconds / 60:g} minute(s)."))
@@ -266,7 +279,7 @@ class PressPolicy:
         return Decision(RUN, command=command, action=pending.action, target=pending.target,
                         value=pending.value, text=said,
                         log=self.log_line(pending.action, pending.target, pending.actor,
-                                          moment, done=True))
+                                          moment, done=True, value=pending.value))
 
     # -- pieces ------------------------------------------------------------------------
     def _is_admin(self, user_id: Any) -> bool:
@@ -293,13 +306,17 @@ class PressPolicy:
 
     @staticmethod
     def log_line(action: str, target: str, actor: str, moment: float, *,
-                 done: bool = False) -> str:
-        """``CONTROL bot.pause target=Codex by=4242 at=2026-10-21T20:00:00Z``.
+                 done: bool = False, value: str = "") -> str:
+        """``CONTROL bot.pause target=Codex by=4242 at=2026-10-21T20:00:00Z state=done``.
 
         Who, what and when, on one line: the transport posts it as a NOTE, so it is on the
-        durable plane and every peer can see who stopped what.
+        durable plane and every peer can see who stopped what. A picked value is part of
+        *what*: ``CONTROL bot.model target=self value=claude-opus-4 by=...`` -- without it the
+        record says a model changed and not which one (review, #153).
         """
         when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))
         state = "done" if done else "asked"
-        return (f"CONTROL {action} target={target or 'self'} by={actor or 'unknown'} "
+        picked = "".join(str(value).split())[:MAX_VALUE_CHARS] if value else ""
+        return (f"CONTROL {action} target={target or 'self'}"
+                f"{' value=' + picked if picked else ''} by={actor or 'unknown'} "
                 f"at={when} state={state}")

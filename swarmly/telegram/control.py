@@ -167,12 +167,44 @@ def picker(action: str, choices: Iterable[Tuple[str, str]],
     return [buttons[index:index + PER_ROW] for index in range(0, len(buttons), PER_ROW)]
 
 
-def picker_text(action: str, alias: str = "") -> str:
-    """What a picker asks, in words -- a fixed line, so asking costs no model turn."""
+def picker_text(action: str, alias: str = "", target: str = "") -> str:
+    """What a picker asks, in words -- a fixed line, so asking costs no model turn.
+
+    It names the bot the press will *change*: the target of a two-value pick when there is one,
+    and otherwise this bot. The role pick's first step changes nobody yet, so it must not name
+    itself there -- a list of bots under "Reassign role for Hermes" reads as if Hermes were
+    already chosen (review, #153).
+    """
     found = control(action)
     label = found.label if found else action
+    target = str(target or "").strip()
+    if target:
+        return (f"{label} for {target}: pick one below. "
+                "Nothing changes until you tap again to confirm.")
+    if action == "swarm.role":
+        return f"{label}: which bot? pick one below, then its role."
+    if action == "bot.wake":
+        # The one thing a timer pick can do is cancel it: say so, rather than "WAKE" over a
+        # list of ids that reads as arming one (review, #153).
+        return f"{label}{f' for {alias}' if alias else ''}: pick the timer to cancel below."
     who = f" for {alias}" if alias else ""
     return f"{label}{who}: pick one below. Nothing changes until you tap again to confirm."
+
+
+def confirm_keyboard(action: str, code: str, value: str = "") -> List[List[Dict[str, str]]]:
+    """The second tap, as a button: the only thing that can send ``ctl:confirm:<code>`` back.
+
+    A confirmation the presser cannot deliver is not a confirmation. The words under a pick
+    say "tap again", so the tap has to exist as a button whose data carries the minted code --
+    pressing the *first* button again only mints a new one (review, #153).
+    """
+    from swarmly.telegram.control_press import confirm_data
+    found = control(action)
+    label = found.label if found else action
+    said = f"Confirm {label}"
+    if value:
+        said += f" → {str(value)[:24]}"
+    return [[{"text": said[:48], "callback_data": confirm_data(code)}]]
 
 
 def available(*prefixes: str) -> List[Control]:

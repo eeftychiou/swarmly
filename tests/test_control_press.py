@@ -693,6 +693,136 @@ class TestTheRolePick(unittest.TestCase):
                       run(channel.handle_control_press(press("ctl:confirm:" + code))))
 
 
+class TestTheSecondTapIsDeliverable(unittest.TestCase):
+    """The confirmation has to be *sendable*, not just describable (#153 review).
+
+    The old words said "tap again", but pressing the first button again mints a new code and
+    nothing offered ``ctl:confirm:<code>`` as a button, so an action that stops or changes
+    something could never actually run. These pin both halves: the button that carries the
+    minted code, and the typed form the answer also offers.
+    """
+
+    #: A control chat that is not the home channel, so a message sent to the wrong one shows up.
+    CONTROL_CHAT = -1009876543210
+
+    def channel(self, bus=None, **adapter):
+        config = make_config(control={"chat_id": self.CONTROL_CHAT, "topic_id": 307},
+                             adapter=dict({"type": "claude", "model": "claude-sonnet-4"},
+                                          **adapter),
+                             **({"bus": bus} if bus else {}))
+        channel = make_channel(config)
+        channel.bot = FakeBot()
+        channel.presence_clock = lambda: NOW
+        channel.control_round = lambda: None
+        return channel
+
+    def typed(self, channel, text, author=ADMIN_ID, is_bot=False):
+        """The admin typing *text* into the chat: the real routing path, no callback."""
+        return run(channel.handle_event(event(text, author_id=author, is_bot=is_bot,
+                                              username="admin", message_id=9)))
+
+    # -- the button --------------------------------------------------------------------
+    def test_the_first_tap_posts_a_button_that_finishes_it(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.model::claude-opus-4")))
+        code = channel.control_policy().pending()[0].code
+        self.assertEqual(len(channel.bot.sent), 1)
+        button = buttons_of(channel.bot.sent[0]["reply_markup"])[0][0]
+        self.assertEqual(button[1], "ctl:confirm:" + code)
+        self.assertIn("Confirm", button[0])
+        self.assertEqual(channel._models, {})                 # still nothing changed
+        done = run(channel.handle_control_press(press(button[1])))
+        self.assertIn("claude-opus-4", done)
+        self.assertTrue(channel._models)                      # the second tap ran it
+
+    def test_a_stopping_control_offers_the_same_button(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.freeze")))
+        code = channel.control_policy().pending()[0].code
+        button = buttons_of(channel.bot.sent[0]["reply_markup"])[0][0]
+        self.assertEqual(button[1], "ctl:confirm:" + code)
+        self.assertFalse(channel._frozen)                      # one tap holds nothing
+        run(channel.handle_control_press(press(button[1])))
+        self.assertTrue(channel._frozen)                       # the button froze it
+
+    def test_the_button_goes_where_the_dashboard_is(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.model::claude-opus-4")))
+        posted = channel.bot.sent[0]
+        self.assertEqual(posted["chat_id"], self.CONTROL_CHAT)
+        self.assertEqual(posted.get("message_thread_id"), 307)
+
+    def test_the_picker_goes_there_too_and_names_the_bot_it_changes(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:swarm.role:Codex")))
+        posted = channel.bot.sent[0]
+        self.assertEqual(posted["chat_id"], self.CONTROL_CHAT)
+        self.assertEqual(posted.get("message_thread_id"), 307)
+        self.assertIn("for Codex", posted["text"])
+        self.assertNotIn("Hermes:", posted["text"])
+
+    def test_the_role_pick_first_step_names_no_bot(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:swarm.role")))
+        text = channel.bot.sent[0]["text"]
+        self.assertIn("which bot", text)
+        self.assertNotIn("for Hermes", text)
+
+    def test_the_role_pick_reads_the_projects_own_role_files(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as root:
+            roles = Path(root) / ".agents" / "roles"
+            roles.mkdir(parents=True)
+            (roles / "wrangler.md").write_text("A project role that only exists here.",
+                                               encoding="utf-8")
+            channel = self.channel(bus={"repo": root})
+            run(channel.handle_control_press(press("ctl:swarm.role:Codex")))
+        values = [pair[1] for line in buttons_of(channel.bot.sent[0]["reply_markup"])
+                  for pair in line]
+        self.assertIn("ctl:swarm.role:Codex:wrangler", values)
+
+    def test_the_wake_pick_says_it_cancels(self):
+        self.assertIn("cancel", ct.picker_text("bot.wake", "Hermes"))
+
+    # -- the typed form ----------------------------------------------------------------
+    def test_a_typed_code_runs_it_through_the_press_handler(self):
+        channel = self.channel()
+        channel.adapter.respond = lambda message: self.fail("a typed control asked for a turn")
+        run(channel.handle_control_press(press("ctl:bot.model::claude-opus-4")))
+        code = channel.control_policy().pending()[0].code
+        self.assertEqual(channel._models, {})
+        self.typed(channel, "ctl:confirm:" + code)
+        self.assertTrue(channel._models)                      # the typed code was the tap
+
+    def test_a_typed_code_from_a_stranger_does_nothing(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.model::claude-opus-4")))
+        code = channel.control_policy().pending()[0].code
+        self.typed(channel, "ctl:confirm:" + code, author=42)
+        self.assertEqual(channel._models, {})                 # not run, and not answered
+
+    def test_a_sentence_that_merely_starts_with_the_prefix_is_still_prose(self):
+        channel = self.channel()
+        for text in ("ctl is the prefix the controls use",
+                     "ctl:confirm:ab12 never works, I tried it"):
+            self.assertIsNone(run(channel._handle_control_text(
+                event(text, author_id=ADMIN_ID, is_bot=False, username="admin",
+                      message_id=9))), text)
+
+    # -- the record --------------------------------------------------------------------
+    def test_the_control_note_names_the_value_that_was_picked(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.model::claude-opus-4")))
+        code = channel.control_policy().pending()[0].code
+        run(channel.handle_control_press(press("ctl:confirm:" + code)))
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL bot.model" in entry["text"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("value=claude-opus-4", notes[0])
+        self.assertIn("by=%d" % ADMIN_ID, notes[0])
+
+
 class TestAStaleDashboardAnswersNothing(unittest.TestCase):
     """A press on a dashboard whose bot no longer coordinates is refused (review, #133).
 
