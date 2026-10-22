@@ -2929,7 +2929,12 @@ class AgentChannel:
         if isinstance(done, str):
             return done
         if not done:
-            # It passed every check and still could not be carried out: say so, loudly.
+            # It passed every check and still could not be carried out: say so, loudly -- in
+            # the log, and to the caller. Never in the chat: a refused broadcast would
+            # otherwise put one "cannot do that here" line per peer in front of the admin,
+            # which is noise, not news. The presser's own answer already says what happened,
+            # and a peer that could not follow is a thing to read in the log, not to scroll
+            # past (#157).
             logger.warning("control note: %s arrived but this bot cannot carry it out",
                            note.action)
             return f"failed: {note.action} is not carried out here"
@@ -3288,16 +3293,24 @@ class AgentChannel:
         path (and so the bus, when ``bus.repo`` is set), so a control leaves a record of who
         stopped what.
         """
-        stale = self._control_elsewhere()
-        if stale:
-            # A dashboard from an earlier coordinator can outlive its failover (Telegram will
-            # not let this bot unpin everything), and its buttons would otherwise answer
-            # "done" from a bot that no longer coordinates (review, #133).
-            answer = f"{stale} coordinates now: press the dashboard in its message."
-            self._control_answer = answer
-            return answer
         try:
             decision = self.control_policy().decide(press, actor=str(press.user_id))
+            if decision.verdict == press_mod.REFUSED:
+                # Every policy refusal is answered before anything about the lease: "<bot>
+                # coordinates now" is a small disclosure of who leads, and a stranger (or
+                # anybody pressing a keyboard that is not ours) has no business learning it
+                # (#157). The policy already refuses a non-admin before it looks the action up,
+                # so this only moves the answer in front of the lease read.
+                self._control_answer = decision.text
+                return decision.text
+            stale = self._control_elsewhere()
+            if stale:
+                # A dashboard from an earlier coordinator can outlive its failover (Telegram
+                # will not let this bot unpin everything), and its buttons would otherwise
+                # answer "done" from a bot that no longer coordinates (review, #133).
+                answer = f"{stale} coordinates now: press the dashboard in its message."
+                self._control_answer = answer
+                return answer
             if decision.verdict == press_mod.RUN:
                 answer = await self._run_control(decision.action, decision.target,
                                                  presser=str(press.user_id),

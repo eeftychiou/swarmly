@@ -996,6 +996,103 @@ class TestTheLeaseControls(unittest.TestCase):
         self.assertIn("already holds the lease", answer)
 
 
+class TestARefusedBroadcastStaysOutOfTheChat(unittest.TestCase):
+    """A peer that cannot carry out a broadcast says so in the log, never in the chat (#157).
+
+    One press can reach four bots; a line per peer that could not follow would put four
+    messages in front of the admin for one action, and the answer they need is the presser's
+    own. So the refusal is loud where it is useful — the log, and the note's own return value —
+    and silent where it is noise.
+    """
+
+    ADMIN = ADMIN_ID
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890,
+                                                    "topic_id": 307}))
+        channel.presence_clock = lambda: NOW
+        channel.control_round = lambda: None
+        channel.current_coordinator = lambda now=None: "Claude"
+        return channel
+
+    def broadcast(self, action):
+        return (f"CONTROL {action} target=* by={self.ADMIN} at=2027-01-15T08:00:00Z "
+                "state=done")
+
+    def test_a_broadcast_this_bot_cannot_carry_out_is_logged_and_not_posted(self):
+        channel = self.channel()
+        with self.assertLogs("swarmly.telegram", level="WARNING") as logged:
+            said = apply(channel, self.broadcast("swarm.sync"), sender="Claude")
+        self.assertEqual(said, "failed: swarm.sync is not carried out here")
+        self.assertIn("cannot carry it out", "\n".join(logged.output))
+        self.assertEqual(channel._test_sender.sent, [])        # nothing in the chat
+
+    def test_a_broadcast_trading_on_an_unknown_control_is_logged_and_not_posted(self):
+        channel = self.channel()
+        self.assertIn("not a control here",
+                      apply(channel, self.broadcast("swarm.admit"), sender="Claude"))
+        self.assertEqual(channel._test_sender.sent, [])
+
+    def test_a_broadcast_from_a_stranger_is_refused_quietly(self):
+        channel = self.channel()
+        with self.assertLogs("swarmly.telegram", level="WARNING") as logged:
+            self.assertIn("does not hold the dashboard",
+                          apply(channel, self.broadcast("swarm.pause_all"), sender="Nobody"))
+        self.assertIn("does not hold the dashboard", "\n".join(logged.output))
+        self.assertEqual(channel._test_sender.sent, [])
+        self.assertFalse(channel._frozen)                      # and nothing happened either
+
+    def test_a_broadcast_it_can_carry_out_still_works(self):
+        channel = self.channel()
+        self.assertEqual(apply(channel, self.broadcast("swarm.pause_all"), sender="Claude"),
+                         "applied: swarm.pause_all")
+        self.assertTrue(channel._frozen)
+        self.assertEqual(channel._test_sender.sent, [])        # holding is not a chat message
+
+
+class TestTheOrderOfRefusals(unittest.TestCase):
+    """Who may press is answered before who leads (#157).
+
+    "<bot> coordinates now" tells the reader who holds the lease. A stranger must not learn it
+    by pressing a keyboard left over from an earlier coordinator, so the policy's admin check —
+    already first inside the policy — is answered first here too.
+    """
+
+    def channel(self, leader="Claude"):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890,
+                                                    "topic_id": 307}))
+        channel.control_round = lambda: None
+        channel.current_coordinator = lambda now=None: leader
+        return channel
+
+    def test_a_stranger_learns_nothing_about_who_coordinates(self):
+        channel = self.channel()
+        answer = run(channel.handle_control_press(press("ctl:bot.pause", user=42)))
+        self.assertIn("Only the admin", answer)
+        self.assertNotIn("coordinates now", answer)            # who leads is not disclosed
+        self.assertNotIn("Claude", answer)
+        self.assertFalse(channel._frozen)
+
+    def test_a_stranger_on_an_unknown_control_is_refused_as_a_stranger_too(self):
+        """Not as "no such control": that would say which controls exist."""
+        channel = self.channel()
+        answer = run(channel.handle_control_press(press("ctl:bot.nonexistent", user=42)))
+        self.assertIn("Only the admin", answer)
+        self.assertNotIn("nonexistent", answer)
+
+    def test_the_admin_still_hears_that_another_bot_coordinates(self):
+        channel = self.channel(leader="Claude")
+        answer = run(channel.handle_control_press(press("ctl:bot.pause")))
+        self.assertIn("Claude coordinates now", answer)
+        self.assertFalse(channel._frozen)
+
+    def test_a_press_that_is_not_a_control_is_refused_as_such_not_as_the_lease(self):
+        channel = self.channel()
+        answer = run(channel.handle_control_press(press("ctl:", user=42)))
+        self.assertIn("not a control", answer)
+        self.assertNotIn("coordinates now", answer)
+
+
 class TestAStaleDashboardAnswersNothing(unittest.TestCase):
     """A press on a dashboard whose bot no longer coordinates is refused (review, #133).
 
