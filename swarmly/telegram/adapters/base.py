@@ -241,25 +241,32 @@ def usage_tokens(data: Any) -> Dict[str, int]:
     """
     usage = data.get("usage") if isinstance(data, dict) else None
     if not isinstance(usage, dict):
-        return {}
+        if isinstance(data, dict) and any(k in data for k in (
+            "input_tokens", "output_tokens", "prompt_tokens", "completion_tokens",
+            "inputTokens", "outputTokens", "promptTokens", "completionTokens",
+        )):
+            usage = data
+        else:
+            return {}
 
-    def count(source: str) -> Optional[int]:
-        value = usage.get(source)
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-            return value
+    def count(*sources: str) -> Optional[int]:
+        for source in sources:
+            value = usage.get(source)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
         return None
 
     found: Dict[str, int] = {}
-    fresh = count("input_tokens")
+    fresh = count("input_tokens", "inputTokens")
     if fresh is not None:
         found["tokens_in"] = fresh + sum(
-            count(source) or 0 for source in ("cache_creation_input_tokens",
-                                              "cache_read_input_tokens"))
-    elif count("prompt_tokens") is not None:
-        found["tokens_in"] = count("prompt_tokens") or 0
-    out = count("output_tokens")
-    if out is None:
-        out = count("completion_tokens")
+            count(source) or 0 for source in (
+                "cache_creation_input_tokens", "cache_read_input_tokens",
+                "cacheCreationInputTokens", "cacheReadInputTokens",
+            ))
+    elif count("prompt_tokens", "promptTokens") is not None:
+        found["tokens_in"] = count("prompt_tokens", "promptTokens") or 0
+    out = count("output_tokens", "outputTokens", "completion_tokens", "completionTokens")
     if out is not None:
         found["tokens_out"] = out
     return found

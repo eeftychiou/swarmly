@@ -14,7 +14,9 @@ places each CLI documents. It only reads; it never runs a CLI (that would cost a
 * **Claude Code** -- ``ANTHROPIC_MODEL`` and ``CLAUDE_CODE_EFFORT_LEVEL``, then ``model`` and
   ``effortLevel`` in ``.claude/settings.local.json``, ``.claude/settings.json`` (work
   directory) and ``~/.claude/settings.json``.
-* **Antigravity** documents no settings file for either, so nothing is read.
+* **Antigravity** documents no settings file for either, but accepts ANTIGRAVITY_MODEL /
+  AGY_MODEL and ANTIGRAVITY_EFFORT / AGY_EFFORT in the environment, and infers effort from
+  tiered model names (e.g. ``Gemini 3.1 Pro (High)`` or ``gemini-3.8-flash-high``).
 
 Whatever is not found stays None; the channel then falls back to the model the CLI reported on
 its last turn, where the CLI reports one (Claude's ``modelUsage``).
@@ -42,6 +44,7 @@ class CliDefault:
 
 
 def cli_default(adapter_type: str, cwd: Optional[str] = None, *,
+                model: Optional[str] = None,
                 env: Optional[Mapping[str, str]] = None,
                 home: Optional[Path] = None) -> CliDefault:
     """The model and effort ``adapter_type``'s CLI would pick by itself. Never raises."""
@@ -51,9 +54,11 @@ def cli_default(adapter_type: str, cwd: Optional[str] = None, *,
         if adapter_type.startswith("codex"):
             return _codex(env, home)
         if adapter_type == "reasonix":
-            return _reasonix(cwd, env, home)
+            return _reasonix(cwd, env, home, model=model)
         if adapter_type.startswith("claude"):
             return _claude(cwd, env, home)
+        if adapter_type.startswith("antigravity"):
+            return _antigravity(cwd, env, home, model=model)
     except Exception:                                    # noqa: BLE001 - display only
         logger.debug("could not read the %s CLI's defaults", adapter_type, exc_info=True)
     return CliDefault()
@@ -110,24 +115,41 @@ def _reasonix_global(env: Mapping[str, str], home: Path) -> Path:
     return Path(env.get("XDG_CONFIG_HOME") or home / ".config") / "reasonix" / "config.toml"
 
 
-def _reasonix(cwd: Optional[str], env: Mapping[str, str], home: Path) -> CliDefault:
+def _reasonix(cwd: Optional[str], env: Mapping[str, str], home: Path,
+              model: Optional[str] = None) -> CliDefault:
     layers = [_read_toml(_reasonix_global(env, home))]
     if cwd:
         layers.append(_read_toml(Path(cwd) / "reasonix.toml"))
     merged: Dict[str, Any] = {}
     for layer in layers:                                 # the project file wins
         merged.update(layer)
-    model = _text(merged.get("default_model"))
+    target_model = model or _text(merged.get("default_model")) or _text(env.get("REASONIX_MODEL"))
     # model_overrides sits in each [[providers]] entry (or at the top level).
     tables = [merged] + [p for p in merged.get("providers") or [] if isinstance(p, dict)]
     effort = None
     for table in tables:
         overrides = table.get("model_overrides")
-        per_model = overrides.get(model) if model and isinstance(overrides, dict) else None
+        per_model = overrides.get(target_model) if target_model and isinstance(overrides, dict) else None
         if isinstance(per_model, dict) and _text(per_model.get("default_effort")):
             effort = _text(per_model.get("default_effort"))
             break
-    return CliDefault(model=model, effort=effort)
+    effort = effort or _text(env.get("REASONIX_EFFORT"))
+    if target_model and not effort:
+        m = re.search(r"[-_\s]\(?\b(low|medium|high|xhigh|max)\)?$", target_model, re.I)
+        if m:
+            effort = m.group(1).lower()
+    return CliDefault(model=target_model if not model else None, effort=effort)
+
+
+def _antigravity(cwd: Optional[str], env: Mapping[str, str], home: Path,
+                 model: Optional[str] = None) -> CliDefault:
+    target_model = model or _text(env.get("ANTIGRAVITY_MODEL")) or _text(env.get("AGY_MODEL"))
+    effort = _text(env.get("ANTIGRAVITY_EFFORT")) or _text(env.get("AGY_EFFORT"))
+    if target_model and not effort:
+        m = re.search(r"[-_\s]\(?\b(low|medium|high|xhigh|max)\)?$", target_model, re.I)
+        if m:
+            effort = m.group(1).lower()
+    return CliDefault(model=target_model if not model else None, effort=effort)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:

@@ -28,6 +28,11 @@ This document describes the component relationships, data flow, and architectura
   - Durable round state writes require coordinator authority and term fencing (`Authority(alias, source="lease", term)`), preventing split-brain updates and stale overwrites.
 - **Human-in-the-Loop & Override**:
   - A human operator has visibility and control over all agent turns and can intervene in Telegram at any time.
+- **Status Snapshots, Pulse & Usage Accounting (#166)**:
+  - `status_snapshot` captures real-time bot state, active topic, queues, and resolved model/effort without invoking model turns.
+  - Snapshot and pulse align with `online_notice` resolution: adapters supporting reasoning effort (Antigravity, Reasonix, Codex, Claude) default to `"the model default"` when effort is unspecified, or infer effort from tiered model names (e.g., `Gemini 3.1 Pro (High)` -> `high`).
+  - Antigravity runs in plain-text print mode (`agy -p`) without token counters in its SQLite metadata (`gen_metadata`); its usage remains unknown in turn ledgers and pulse by design.
+  - Token parsing in `usage_tokens()` defensively normalizes nested and top-level snake_case and camelCase token payloads across model providers.
 
 ---
 

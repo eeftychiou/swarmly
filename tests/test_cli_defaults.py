@@ -90,6 +90,22 @@ class CliDefaultsTests(unittest.TestCase):
                             env={"ANTHROPIC_MODEL": "haiku", "CLAUDE_CODE_EFFORT_LEVEL": "low"})
         self.assertEqual(found, CliDefault("haiku", "low"))
 
+    def test_antigravity_reads_env_and_infers_effort(self):
+        """Issue #166: Antigravity defaults from env and tiered model names."""
+        found = cli_default("antigravity", env={"ANTIGRAVITY_MODEL": "gemini-3.8-flash-high"}, home=self.home)
+        self.assertEqual(found, CliDefault("gemini-3.8-flash-high", "high"))
+
+        found_engine = cli_default("antigravity", env={"AGY_MODEL": "Gemini 3.1 Pro (Medium)"}, home=self.home)
+        self.assertEqual(found_engine, CliDefault("Gemini 3.1 Pro (Medium)", "medium"))
+
+        found_explicit = cli_default("antigravity", env={"ANTIGRAVITY_MODEL": "gemini-2.5-pro", "ANTIGRAVITY_EFFORT": "low"}, home=self.home)
+        self.assertEqual(found_explicit, CliDefault("gemini-2.5-pro", "low"))
+
+    def test_reasonix_infers_effort_from_model_name(self):
+        """Issue #166: Reasonix infers effort when model name carries effort suffix."""
+        found = cli_default("reasonix", model="deepseek-v4-pro-high", env={}, home=self.home)
+        self.assertEqual(found.effort, "high")
+
     def test_nothing_found_or_a_broken_file_is_none(self):
         self.write(self.home / ".claude" / "settings.json", "{not json")
         self.assertEqual(cli_default("claude", None, env={}, home=self.home), CliDefault())
