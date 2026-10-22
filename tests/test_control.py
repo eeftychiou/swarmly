@@ -204,11 +204,18 @@ class TestTheMessageFits(unittest.TestCase):
 class TestControls(unittest.TestCase):
     def test_anything_that_stops_or_changes_asks_for_a_second_tap(self):
         for action in ("bot.stop_turn", "bot.restart", "bot.freeze", "swarm.pause_all",
-                       "swarm.lease", "swarm.failback", "swarm.role", "swarm.cleanup",
-                       "swarm.admit"):
+                       "swarm.lease", "swarm.failback", "swarm.role", "swarm.admit"):
             self.assertTrue(ct.needs_confirm(action), action)
         for action in ("bot.pause", "bot.resume", "bot.model", "bot.wake", "swarm.sync"):
             self.assertFalse(ct.needs_confirm(action), action)
+
+    def test_a_report_is_never_confirmed_because_it_changes_nothing(self):
+        for action in ("bot.model", "bot.effort", "bot.wake", "bot.cli", "swarm.cleanup"):
+            self.assertIn(action, ct.reports())
+            self.assertFalse(ct.needs_confirm(action), action)
+        # Cleanup's button is the dry run, and it says so: nothing is deleted by a press.
+        self.assertIn("nothing is deleted", ct.control("swarm.cleanup").note)
+        self.assertNotIn("swarm.sync", ct.reports())          # a resync does change the swarm
 
     def test_the_nudge_says_it_costs_a_turn(self):
         self.assertIn("turn", ct.control("item.nudge").note)

@@ -1011,11 +1011,15 @@ stop turn, restart, model, effort, WAKE, freeze and read-only `/cli` per bot; pa
 lease, roles, cleanup, sync and admit for the swarm; and a nudge that costs the owner a turn.
 Only a control the running transport can actually carry out is shown, so a button that exists
 is a button that works (today: pause, resume, freeze, a safe restart and a stop of one bot;
-model, effort, WAKE and read-only `/cli`, which only *report*; pause *everything*; and a nudge
-to an item's owner, which costs that bot a turn). A press on a reporting control answers with
-what the setting is now and the command that changes it — a one-tap button cannot take the
-value a change would need — it changes nothing and leaves no `CONTROL` note, because the
-durable line is for who stopped what, not for who read a setting. **Stop**
+model, effort, WAKE and read-only `/cli`, which only *report*; pause *everything*; a resync of
+the swarm; the cleanup dry run; and a nudge to an item's owner, which costs that bot a turn).
+A press on a reporting control answers with what the setting is now and the command that
+changes it — a one-tap button cannot take the value a change would need — it changes nothing
+and leaves no `CONTROL` note, because the durable line is for who stopped what, not for who
+read a setting. `/sync` is one of the controls that is not confirmed, like pause and resume:
+it changes no bot's state, it asks the peers to say who they are again. The cleanup button is
+the *dry run* — the same code `/cleanup` runs with no argument — so a press can never delete
+anything; the words it answers with name the command that would, with its own code. **Stop**
 cancels the turns in flight, drops the messages queued behind them and kills any `/cli` run —
 the `/stop all` form, because the dashboard speaks for the whole bot rather than one topic. Three rules bound every press:
 

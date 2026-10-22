@@ -252,7 +252,7 @@ class TestAnotherBotsControl(unittest.TestCase):
     def test_a_note_for_a_control_this_build_lacks_is_refused(self):
         channel = self.channel()
         self.assertIn("not a control here",
-                      channel.apply_control_note(self.note("swarm.cleanup", "Hermes")))
+                      channel.apply_control_note(self.note("swarm.lease", "Hermes")))
 
     def test_the_note_arrives_through_the_machine_path_and_is_applied(self):
         """End to end: a peer posts `NOTE intent=CONTROL`; this bot holds without a turn."""
@@ -451,6 +451,35 @@ class TestTheReportControls(unittest.TestCase):
         line = ("CONTROL bot.model target=Hermes by=%d at=2027-01-15T08:00:00Z state=done"
                 % ADMIN_ID)
         self.assertIn("is a report, not a control", channel.apply_control_note(line))
+
+
+class TestTheSwarmControls(unittest.TestCase):
+    """Resync the swarm, and the cleanup dry run: the two that need no value (issue #117)."""
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.presence_clock = lambda: NOW
+        channel.control_round = lambda: None
+        return channel
+
+    def test_a_sync_press_resyncs_at_once(self):
+        # Like pause and resume, a resync is not confirmed: it changes no bot's state, it only
+        # asks the peers to say who they are again.
+        channel = self.channel()
+        self.assertIn("peers", run(channel.handle_control_press(press("ctl:swarm.sync"))))
+        syncs = [entry["text"] for entry in channel._test_sender.sent if "intent=SYNC" in entry["text"]]
+        self.assertEqual(len(syncs), 1)                       # one HELLO, from the press
+
+    def test_a_cleanup_press_is_the_dry_run_and_deletes_nothing(self):
+        channel = self.channel()
+        text = run(channel.handle_control_press(press("ctl:swarm.cleanup")))
+        self.assertIn("dry run", text)
+        self.assertIn("nothing is deleted", text)
+
+    def test_both_are_offered_because_both_work(self):
+        channel = self.channel()
+        self.assertIn("swarm.sync", channel.control_actions())
+        self.assertIn("swarm.cleanup", channel.control_actions())
 
 
 def round_state(items):

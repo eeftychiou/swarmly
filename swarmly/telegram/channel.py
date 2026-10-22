@@ -1217,13 +1217,7 @@ class AgentChannel:
                            command, event.author_username)
             return True
         if command == "sync":
-            self.roster.start_sync()
-            await self.send(format_message(
-                Envelope(type=MessageType.HELLO, to="*", intent="SYNC",
-                         ref=self._alias_ref(), rev=self._running_revision),
-                f"🔄 {self.config.identity.alias} peers: {self.roster.sync_list() or 'none'}"),
-                chat_id=event.chat_id, thread_id=event.thread_id, silent=True,
-                allow_when_frozen=True, notice=True)
+            await self._sync_now(chat_id=event.chat_id, thread_id=event.thread_id)
             return True
         handles = self.roster.handles(event.text or "")
         if command == "remove":
@@ -1238,6 +1232,23 @@ class AgentChannel:
                 chat_id=event.chat_id, thread_id=event.thread_id, silent=True,
                 allow_when_frozen=True, notice=True)
         return True
+
+    async def _sync_now(self, *, chat_id: Optional[int] = None,
+                        thread_id: Optional[int] = None) -> str:
+        """Ask the swarm to re-introduce itself: what ``/sync`` does, and its button too.
+
+        One implementation for both, so a press can never resync a different list than the
+        command would. Returns the line the caller answers with.
+        """
+        self.roster.start_sync()
+        line = (f"🔄 {self.config.identity.alias} peers: "
+                f"{self.roster.sync_list() or 'none'}")
+        await self.send(format_message(
+            Envelope(type=MessageType.HELLO, to="*", intent="SYNC",
+                     ref=self._alias_ref(), rev=self._running_revision), line),
+            chat_id=chat_id, thread_id=thread_id, silent=True,
+            allow_when_frozen=True, notice=True)
+        return line
 
     def _command_reply(self, command: str, event: Optional[ChannelEvent] = None) -> str:
         alias = self.config.identity.alias
@@ -2951,7 +2962,8 @@ class AgentChannel:
         """
         return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart", "bot.stop_turn",
                 "bot.model", "bot.effort", "bot.wake", "bot.cli",
-                "swarm.pause_all", "item.nudge")
+                "swarm.pause_all", "swarm.sync", "swarm.cleanup",
+                "item.nudge")
 
     #: The controls that only *report*, read off the one table in
     #: :mod:`swarmly.telegram.control`: they change nothing, so they need no second tap and
@@ -3052,6 +3064,14 @@ class AgentChannel:
         report = self.control_report(action)
         if report is not None:
             return report
+        if action == "swarm.sync":
+            return await self._sync_now()
+        if action == "swarm.cleanup":
+            # The dry run *is* the control: it deletes nothing, and the words it answers with
+            # name the command that would (with its own confirmation code).
+            return await self.cleanup.handle_args(
+                [], is_admin=True,
+                chat_id=self.config.identity.home_channel_id)
         if action == "swarm.pause_all":
             # Hold this bot, and broadcast the hold: every peer applies the same note, so one
             # press stops the swarm instead of only the bot that owns the message.
