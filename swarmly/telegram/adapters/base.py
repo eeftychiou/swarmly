@@ -643,23 +643,28 @@ class SubprocessAdapter(AgentAdapter):
         # Issue #68: the pids of the CLIs this adapter runs. With no path nothing is kept,
         # so a transport that was never given a state file cannot reap what it left behind.
         self.children = ChildRegistry(None)
-        # Round 5.5 (#161): when the CLI of the running turn last wrote anything, on the
-        # monotonic clock. None until a run starts, so a caller can tell "no turn" from
-        # "silent since it started".
-        self._last_output_at: Optional[float] = None
+        # Round 5.5 (#161): when the CLI of each running turn last wrote anything, keyed by
+        # the discussion that turn belongs to -- one adapter can run a topic's turn and
+        # another's at the same time (limits.max_parallel_turns), and a chatty topic must not
+        # make a hung one look alive. Times are monotonic; a discussion missing from here has
+        # no run this adapter can see, so the caller falls back to "since the turn started".
+        self._output_at: Dict[str, float] = {}
+        self._run_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+            "a2a_run_key", default="")
 
-    def last_output_at(self) -> Optional[float]:
-        """``time.monotonic()`` when the running CLI last wrote to stdout or stderr.
+    def last_output_at(self, key: Optional[str] = None) -> Optional[float]:
+        """``time.monotonic()`` when a running CLI last wrote to stdout or stderr.
 
-        The transport reads this to say `stuck (silent Nm)` about a turn that is running but
-        making no progress; an adapter that cannot see its CLI's output (it runs in a thread
-        with pipes read at the end) simply leaves this at the start of the run.
+        *key* names the discussion (``IncomingMessage.context_id``); without one this answers
+        for the discussion the current task is running a turn for. An adapter that cannot see
+        its CLI's output (it reads the pipes only at the end) simply has nothing here, and the
+        transport then reports "silent since the turn started".
         """
-        return self._last_output_at
+        return self._output_at.get(self._run_key.get() if key is None else str(key))
 
     def _note_output(self) -> None:
-        """Record that the CLI said something just now."""
-        self._last_output_at = time.monotonic()
+        """Record that this task's CLI said something just now."""
+        self._output_at[self._run_key.get()] = time.monotonic()
 
     def use_child_registry(self, path: Optional[Path]) -> None:
         """Persist the pids of the CLIs this adapter starts, so a restart can reap orphans."""
@@ -781,6 +786,9 @@ class SubprocessAdapter(AgentAdapter):
     async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
         if not self.settings.enabled:
             return None
+        # Which discussion this turn is for, so the silence clock of two turns this adapter
+        # runs at once stay apart (#161 review). A task of its own, so it needs no reset.
+        self._run_key.set(str(getattr(message, "context_id", "") or ""))
         prompt = self.build_prompt(message)
         if prompt is None:
             return None

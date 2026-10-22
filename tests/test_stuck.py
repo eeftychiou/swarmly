@@ -132,7 +132,7 @@ class TestTheStuckReport(unittest.TestCase):
 
     def test_a_silent_turn_is_stuck_and_says_for_how_long(self):
         channel = self.busy(live_channel(), 600)
-        channel.adapter.last_output_at = lambda: time.monotonic() - 420
+        channel.adapter.last_output_at = lambda key=None: time.monotonic() - 420
         snap = channel.status_snapshot(NOW)
         self.assertEqual(snap.state, sn.STUCK)
         self.assertAlmostEqual(snap.silent, 420, delta=2)
@@ -140,7 +140,7 @@ class TestTheStuckReport(unittest.TestCase):
 
     def test_output_resuming_clears_stuck(self):
         channel = self.busy(live_channel(), 600)
-        channel.adapter.last_output_at = lambda: time.monotonic()
+        channel.adapter.last_output_at = lambda key=None: time.monotonic()
         snap = channel.status_snapshot(NOW)
         self.assertEqual(snap.state, sn.BUSY)
         self.assertLess(snap.silent, 2)
@@ -152,6 +152,24 @@ class TestTheStuckReport(unittest.TestCase):
         self.assertEqual(snap.state, sn.STUCK)
         self.assertEqual(snap.silent, 900)
         self.assertIn("stuck (silent 15m)", snap.line(NOW))
+
+    def test_the_clock_is_per_discussion_not_per_adapter(self):
+        """Two turns, one adapter: the chatty topic must not mask the hung one (#170 review)."""
+        channel = live_channel()
+        heard = {"tg-307": time.monotonic() - 420, "tg-308": time.monotonic()}
+        channel.adapter.last_output_at = lambda key=None: heard.get(key)
+        self.assertAlmostEqual(channel._silent_seconds((GROUP, 307), 600), 420, delta=2)
+        self.assertLess(channel._silent_seconds((GROUP, 308), 600), 2)
+        # A discussion the adapter has no run for is silent since its turn started.
+        self.assertEqual(channel._silent_seconds((GROUP, 309), 600), 600)
+
+    def test_the_adapter_keeps_one_clock_per_discussion(self):
+        process = CannedProcess()
+        adapter = adapter_with(process)
+        adapter._run_key.set("tg-307")
+        adapter._note_output()
+        self.assertIsNotNone(adapter.last_output_at("tg-307"))
+        self.assertIsNone(adapter.last_output_at("tg-308"))
 
     def test_a_turn_under_the_limit_is_busy(self):
         channel = self.busy(live_channel(), 120)
@@ -170,7 +188,7 @@ class TestTheStuckReport(unittest.TestCase):
 
     def test_the_pulse_carries_it(self):
         channel = self.busy(live_channel(), 600)
-        channel.adapter.last_output_at = lambda: time.monotonic() - 420
+        channel.adapter.last_output_at = lambda key=None: time.monotonic() - 420
         status = channel.own_pulse(NOW).status
         self.assertEqual(status["state"], sn.STUCK)
         self.assertAlmostEqual(status["silent"], 420, delta=2)
@@ -195,7 +213,7 @@ class TestTheKillPath(unittest.TestCase):
 
     def channel(self, kill_minutes, silent_for):
         channel = live_channel(turn_silence_kill_minutes=kill_minutes)
-        channel.adapter.last_output_at = lambda: time.monotonic() - silent_for
+        channel.adapter.last_output_at = lambda key=None: time.monotonic() - silent_for
         return channel
 
     async def kill(self, channel, silent_for=400, stopping=False):
@@ -236,6 +254,19 @@ class TestTheKillPath(unittest.TestCase):
         self.assertEqual(done, [])
         self.assertFalse(cancelled)
         self.assertEqual(channel._test_sender.sent, [])
+
+    def test_the_notice_says_what_is_actually_queued_behind_it(self):
+        """The old line claimed "nothing was queued" without looking (#170 review)."""
+        channel = self.channel(1.0, 400)
+        run(self.kill(channel))
+        self.assertIn("Nothing was queued behind it.", channel._test_sender.last)
+
+    def test_the_notice_counts_the_messages_that_are_still_queued(self):
+        channel = self.channel(1.0, 400)
+        channel._busy_waiting_by[(GROUP, 307)] = 2
+        run(self.kill(channel))
+        self.assertIn("2 message(s) are still queued here.", channel._test_sender.last)
+        self.assertNotIn("Nothing was queued", channel._test_sender.last)
 
     def test_a_turn_already_being_stopped_is_not_stopped_twice(self):
         channel = self.channel(1.0, 400)

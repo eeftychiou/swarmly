@@ -2688,14 +2688,18 @@ class AgentChannel:
     def _silent_seconds(self, key: Any, elapsed: float) -> float:
         """How long the CLI behind a running turn has been silent (#161).
 
-        The adapter that runs the topic's turns knows when it last read a byte from the CLI.
-        An adapter that cannot say (its CLI's pipes are read at the end) leaves the answer at
-        "silent since the turn started", which is all such a run can honestly report.
+        The adapter that runs the topic's turns knows when it last read a byte from the CLI,
+        per discussion: with ``limits.max_parallel_turns`` above 1 one adapter runs turns for
+        several topics at once, and a chatty topic must not make a hung one look alive
+        (#161 review). An adapter that cannot say (its CLI's pipes are read at the end) leaves
+        the answer at "silent since the turn started", which is all such a run can report.
         """
         try:
             chat_id, thread_id = key if isinstance(key, tuple) else (key, None)
-            probe = getattr(self._adapter_for(int(chat_id), thread_id), "last_output_at", None)
-            last = probe() if callable(probe) else None
+            adapter = self._adapter_for(int(chat_id), thread_id)
+            probe = getattr(adapter, "last_output_at", None)
+            context = self.topics.context(int(chat_id), thread_id)
+            last = probe(str(context or "")) if callable(probe) else None
         except Exception:                          # noqa: BLE001 - a snapshot never fails here
             last = None
         if isinstance(last, bool) or not isinstance(last, (int, float)):
@@ -2728,10 +2732,15 @@ class AgentChannel:
             killed.append(f"killed a turn silent for {int(silent // 60)}m")
             logger.warning("stuck: the turn in %s/%s has been silent %ds; killing it",
                            chat_id, thread_id, int(silent))
+            # What is waiting behind it, counted rather than assumed: the topic is told the
+            # truth about its queue, and only the truth (#161 review).
+            queued = int(self._busy_waiting_by.get(key, 0) + self._cooldown_waiting.get(key, 0))
+            behind = (f" {queued} message(s) are still queued here." if queued
+                      else " Nothing was queued behind it.")
             try:
                 await self.send(
                     f"⏱ {self.config.identity.alias}: the turn here had been silent for "
-                    f"{int(silent // 60)}m, so I stopped it. Nothing else was queued behind it.",
+                    f"{int(silent // 60)}m, so I stopped it." + behind,
                     chat_id=chat_id, thread_id=thread_id, silent=True, notice=True)
             except Exception:                      # noqa: BLE001 - the kill already happened
                 logger.warning("stuck: could not tell the topic the turn was killed",
