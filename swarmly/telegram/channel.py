@@ -610,6 +610,8 @@ class AgentChannel:
         # instead of resetting every heartbeat (a paused bot is not "paused since a moment ago"
         # for ever, and a frozen one did not begin freezing when its quota comes back).
         self._state_since: Dict[str, float] = {}
+        self._idle_since: float = self._lease_clock()
+        self._last_reclaimed_term: int = 0
         self._boots = 1
         boots_path = _state_file(config, "boots")
         if boots_path is not None:
@@ -1276,6 +1278,11 @@ class AgentChannel:
                 result += " frozen_peers=" + ",".join(
                     f"{peer}({entry.get('ref') or 'frozen'})"
                     for peer, entry in sorted(frozen_peers.items()))
+            old_releases = self.old_releases()
+            if old_releases:
+                result += " old_releases=" + ",".join(
+                    f"{peer}(running an old release)"
+                    for peer in sorted(old_releases))
             blocker = self.stats.last_error or "none"
             if self._frozen:
                 blocker = f"frozen: {self._freeze_reason()} (/resume@{self.config.identity.name})"
@@ -2557,18 +2564,25 @@ class AgentChannel:
                     busy: Optional[bool] = None, paused: Optional[bool] = None) -> None:
         """Record when a state began. Called at the transition, never from the snapshot."""
         moment = self.presence_clock()
+        lease_moment = self._lease_clock()
         if frozen is True:
             self._state_since["frozen" if ref == "quota" else "paused"] = moment
+            self._idle_since = float("inf")
         elif frozen is False:
             self._state_since["idle"] = moment
+            self._idle_since = lease_moment
         if busy is True:
             self._state_since["busy"] = moment
+            self._idle_since = float("inf")
         elif busy is False:
             self._state_since["idle"] = moment
+            self._idle_since = lease_moment
         if paused is True:
             self._state_since["paused"] = moment
+            self._idle_since = float("inf")
         elif paused is False:
             self._state_since["idle"] = moment
+            self._idle_since = lease_moment
 
     def status_snapshot(self, now: Optional[float] = None) -> "snapshot_mod.Snapshot":
         """This bot's state right now, as one record: what it is doing and what is waiting.
@@ -3235,7 +3249,7 @@ class AgentChannel:
         has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
         transport = self.bus_transport(root) if has_bus else None
         return LeaseStore(self.config.identity.alias, transport=transport,
-                          root=root, clock=time.time, ttl_seconds=ttl, rank=rank)
+                          root=root, clock=self._lease_clock, ttl_seconds=ttl, rank=rank)
 
     def lease_fence(self, *, now: Optional[float] = None) -> bool:
         """May this bot still act? Freshly read from the bus, once per side effect.
@@ -3306,6 +3320,42 @@ class AgentChannel:
         except Exception:
             return False
         return False
+
+    def is_named_coordinator(self) -> bool:
+        """Whether this bot is the coordinator configured or named by the admin."""
+        alias = self.config.identity.alias.strip().lower()
+        coord = str(getattr(self.membership.state, "coordinator", None) or "").strip().lower()
+        if coord and coord == alias:
+            return True
+        role = str(self.config.identity.role or "").strip().lower()
+        return role == "coordinator"
+
+    def is_idle(self) -> bool:
+        """Whether this bot is currently idle (no turns running or queued, not frozen/paused)."""
+        if self._frozen or self._pause_pending or getattr(self, "_busy_waiting", 0):
+            return False
+        turns = getattr(self, "_turns", None)
+        if turns and any(not t.done() for t in turns):
+            return False
+        return True
+
+    def idle_duration(self, now: Optional[float] = None) -> float:
+        """How long this bot has been UP and idle, in seconds."""
+        if not self.is_idle():
+            return 0.0
+        moment = self._lease_clock() if now is None else now
+        since = getattr(self, "_idle_since", None)
+        if since is None or since == float("inf"):
+            since = self._state_since.get("idle", getattr(self, "_booted_at", moment))
+        return max(0.0, moment - since)
+
+    def old_releases(self) -> tuple[str, ...]:
+        """Aliases of bots detected running old releases with implausible clock claims (#126)."""
+        try:
+            return getattr(self.lease_state(), "old_releases", ()) or self.lease_store().old_releases
+        except Exception:
+            from swarmly.telegram.lease import _OLD_RELEASE_ALIASES
+            return tuple(sorted(_OLD_RELEASE_ALIASES))
 
     def round_authority(self, *, now: Optional[float] = None) -> Any:
         """The alias and term the bus lease names as the coordinator."""
@@ -3967,6 +4017,40 @@ class AgentChannel:
                     logger.warning("lease: failed to renew lease at term %d", state.term, exc_info=True)
             return state.claim
 
+        # Case 1b (#126): The configured coordinator takes its role back when UP and idle
+        if state.live(moment) and self.is_named_coordinator() and state.holder.strip().lower() != alias:
+            reclaim_window = float(getattr(self.config.limits, "coordinator_reclaim_idle_seconds", 180.0) or 0.0)
+            if self.is_idle() and self.idle_duration(now=moment) >= reclaim_window:
+                next_term = state.term + 1
+                try:
+                    mine = await claim_at(next_term, promoted=True)
+                except Exception as exc:
+                    logger.warning("lease: %s could not reclaim coordinator role at term %d: %s",
+                                   self.config.identity.alias, next_term, exc)
+                    return None
+                settle = float(getattr(self.config.limits, "lease_settle_seconds", 30.0) or 0.0)
+                if settle > 0:
+                    await self._sleep(settle)
+                self._forget_lease_cache()
+                if not await asyncio.to_thread(store.refresh, force=True):
+                    logger.warning("lease: ref refresh failed after settle for reclaim term %d; refusing to act",
+                                   next_term)
+                    return None
+                try:
+                    fresh = await asyncio.to_thread(store.state, now=self._lease_clock())
+                except Exception:
+                    logger.warning("lease: could not re-read the lease after reclaiming term %d",
+                                   next_term, exc_info=True)
+                    return None
+                if not fresh.holds(self.config.identity.alias, self._lease_clock()):
+                    logger.info("lease: %s reclaimed term %d but %s holds it; yielding",
+                                self.config.identity.alias, next_term, fresh.holder or "nobody")
+                    return None
+                logger.info("lease: %s (configured coordinator) reclaimed coordinator role at term %d from %s",
+                            self.config.identity.alias, next_term, state.holder)
+                await self._announce_reclaim(next_term, state.holder, mine)
+                return mine
+
         # A holder that presence marks DOWN has lost the lease now, not when it expires: the
         # lease is renewed rarely (a commit every half hour, not a heartbeat on GitHub), and
         # liveness comes from Telegram.
@@ -4078,6 +4162,20 @@ class AgentChannel:
                 notice=True)
         except Exception:                              # noqa: BLE001 - never fatal
             logger.warning("lease: could not post the takeover notice", exc_info=True)
+
+    async def _announce_reclaim(self, term: int, former: str, claim: Any) -> None:
+        """Announce that the configured coordinator took its role back (#126)."""
+        if getattr(self, "_last_reclaimed_term", 0) == term:
+            return
+        self._last_reclaimed_term = term
+        try:
+            await self.send(
+                f"🔄 coordinator lease: {self.config.identity.alias} (configured coordinator) has reclaimed "
+                f"the coordinator role at term {term} from {former} "
+                f"(expires {time.strftime('%H:%M:%SZ', time.gmtime(claim.expires_at))}).",
+                notice=True)
+        except Exception:                              # noqa: BLE001 - never fatal
+            logger.warning("lease: could not post coordinator reclaim notice", exc_info=True)
 
     async def _lease_tick(self) -> None:
         """Periodic coordinator lease renewal and succession poll."""

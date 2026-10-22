@@ -34,11 +34,47 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 from swarmly.transports.base import LEASES_RELPATH, is_bus_document
 
 logger = logging.getLogger("swarmly.telegram.lease")
+
+#: Issue #126: Wall-clock sanity bounds for coordinator lease claims.
+MIN_PLAUSIBLE_TIMESTAMP: float = 1577836800.0  # 2020-01-01 00:00:00 UTC
+MAX_FUTURE_DELTA: float = 86400.0              # 1 day in seconds
+
+_OLD_RELEASE_WARNED: Set[str] = set()
+_OLD_RELEASE_ALIASES: Set[str] = set()
+
+
+def reset_old_release_tracking() -> None:
+    """Clear in-memory old release warning logs and alias tracking (for tests)."""
+    _OLD_RELEASE_WARNED.clear()
+    _OLD_RELEASE_ALIASES.clear()
+
+
+def is_plausible_claim(claim: LeaseClaim, now: float) -> bool:
+    """Whether claim timestamps are plausible wall-clock dates (#126)."""
+    if claim.expires_at < 0 or claim.renews_at < 0:
+        return False
+    if now >= MIN_PLAUSIBLE_TIMESTAMP:
+        if claim.expires_at < MIN_PLAUSIBLE_TIMESTAMP:
+            return False
+        if claim.expires_at > now + MAX_FUTURE_DELTA:
+            return False
+        if claim.renews_at > 0:
+            if claim.renews_at < MIN_PLAUSIBLE_TIMESTAMP:
+                return False
+            if claim.renews_at > now + MAX_FUTURE_DELTA:
+                return False
+    else:
+        # In synthetic tests running with mock clocks (< 2020), only check the future window.
+        if claim.expires_at > now + MAX_FUTURE_DELTA:
+            return False
+        if claim.renews_at > 0 and claim.renews_at > now + MAX_FUTURE_DELTA:
+            return False
+    return True
 
 #: One claim per renewal: `<term>-<alias>-<nonce>.json`.
 _CLAIM = re.compile(r"^(?P<term>\d+)-(?P<alias>[A-Za-z0-9_]+)-(?P<nonce>[A-Za-z0-9]+)\.json$")
@@ -116,6 +152,8 @@ class LeaseState(NamedTuple):
     claim: Optional[LeaseClaim] = None
     #: Claims the fold refused (unranked, malformed, or losing a tie), for /status and tests.
     ignored: tuple = ()
+    #: Aliases rejected for implausible clock claims (issue #126).
+    old_releases: tuple = ()
 
     @property
     def usable(self) -> bool:
@@ -191,9 +229,26 @@ class LeaseStore:
         self.clock = clock or time.time
         self.ttl_seconds = float(ttl_seconds)
         self.rank = int(rank)
+        self._old_release_aliases: Set[str] = set()
         #: When the bus ref was last fetched, so a fold does not pay for a fetch each time.
         self._fetched_at: float = -1e9
         self._fetch_interval = 5.0
+
+    @property
+    def old_releases(self) -> tuple[str, ...]:
+        combined = set(self._old_release_aliases) | set(_OLD_RELEASE_ALIASES)
+        return tuple(sorted(combined))
+
+    def _record_old_release(self, alias: str, expires_at: float, renews_at: float) -> None:
+        self._old_release_aliases.add(alias)
+        _OLD_RELEASE_ALIASES.add(alias)
+        if alias not in _OLD_RELEASE_WARNED:
+            _OLD_RELEASE_WARNED.add(alias)
+            logger.warning(
+                "lease: %s is running an old release: invalid claim times "
+                "(expires_at=%.1f, renews_at=%.1f)",
+                alias, expires_at, renews_at,
+            )
 
     # -- reading ---------------------------------------------------------------------
     def refresh(self, *, force: bool = False) -> bool:
@@ -238,7 +293,7 @@ class LeaseStore:
             logger.warning("lease: the local claim directory could not be read", exc_info=True)
             return None
 
-    def claims(self) -> Optional[List[LeaseClaim]]:
+    def claims(self, *, now: Optional[float] = None) -> Optional[List[LeaseClaim]]:
         """Every usable claim, or ``None`` when the bus could not be read."""
         self.refresh()
 
@@ -277,56 +332,69 @@ class LeaseStore:
                  if name.endswith(".json") and "/" not in name and _CLAIM.match(name) is not None]
         if not named:
             return []
-        top_term = max(int(match.group("term")) for match, _name in named)
-        top_names = [name for match, name in named if int(match.group("term")) == top_term]
-
+        stamp = self.clock() if now is None else now
+        terms = sorted({int(match.group("term")) for match, _name in named}, reverse=True)
         claims_list: List[LeaseClaim] = []
-        for name in top_names:
-            if not name.endswith(".json") or "/" in name:
-                continue
-            match = _CLAIM.match(name)
-            if match is None:
-                continue
-            relpath = f"{LEASES_RELPATH}/{name}"
-            cache_key = (str(self.root), relpath)
+        for term in terms:
+            term_names = [name for match, name in named if int(match.group("term")) == term]
+            term_claims: List[LeaseClaim] = []
+            for name in term_names:
+                if not name.endswith(".json") or "/" in name:
+                    continue
+                match = _CLAIM.match(name)
+                if match is None:
+                    continue
+                relpath = f"{LEASES_RELPATH}/{name}"
+                cache_key = (str(self.root), relpath)
 
-            cached = _PARSED_CLAIMS_CACHE.get(cache_key)
-            if cached is not None:
-                claims_list.append(cached[1])
-                continue
+                cached = _PARSED_CLAIMS_CACHE.get(cache_key)
+                if cached is not None:
+                    if is_plausible_claim(cached[1], stamp):
+                        term_claims.append(cached[1])
+                    else:
+                        self._record_old_release(cached[1].alias, cached[1].expires_at, cached[1].renews_at)
+                    continue
 
-            depth = None
-            if depth_of is not None:
+                depth = None
+                if depth_of is not None:
+                    try:
+                        depth = depth_of(relpath)
+                    except Exception:                      # noqa: BLE001 - unplaced: not a claim
+                        logger.warning("lease: %s could not be placed in the bus history; "
+                                       "not counted", name, exc_info=True)
+                        continue
+                    if depth is None:
+                        logger.warning("lease: %s has no place in the bus history; not counted", name)
+                        continue
+
+                text = None
+                if reader is not None:
+                    text = reader(relpath)
+                else:
+                    path = self.root / relpath
+                    text = path.read_text(encoding="utf-8") if path.is_file() else None
+                if not text:
+                    continue
                 try:
-                    depth = depth_of(relpath)
-                except Exception:                      # noqa: BLE001 - unplaced: not a claim
-                    logger.warning("lease: %s could not be placed in the bus history; "
-                                   "not counted", name, exc_info=True)
-                    continue
-                if depth is None:
-                    logger.warning("lease: %s has no place in the bus history; not counted", name)
+                    parsed = LeaseClaim.from_dict(json.loads(text))
+                except (ValueError, TypeError) as exc:
+                    logger.warning("lease: %s is not usable: %s", name, exc)
                     continue
 
-            text = None
-            if reader is not None:
-                text = reader(relpath)
-            else:
-                path = self.root / relpath
-                text = path.read_text(encoding="utf-8") if path.is_file() else None
-            if not text:
-                continue
-            try:
-                parsed = LeaseClaim.from_dict(json.loads(text))
-            except (ValueError, TypeError) as exc:
-                logger.warning("lease: %s is not usable: %s", name, exc)
-                continue
+                if not is_plausible_claim(parsed, stamp):
+                    self._record_old_release(parsed.alias, parsed.expires_at, parsed.renews_at)
+                    continue
 
-            claim = LeaseClaim(term=parsed.term, alias=parsed.alias,
-                               expires_at=parsed.expires_at, renews_at=parsed.renews_at,
-                               rank=parsed.rank, depth=int(depth if depth is not None else -1),
-                               nonce=match.group("nonce"), yielded=parsed.yielded)
-            _PARSED_CLAIMS_CACHE[cache_key] = (depth, claim)
-            claims_list.append(claim)
+                claim = LeaseClaim(term=parsed.term, alias=parsed.alias,
+                                   expires_at=parsed.expires_at, renews_at=parsed.renews_at,
+                                   rank=parsed.rank, depth=int(depth if depth is not None else -1),
+                                   nonce=match.group("nonce"), yielded=parsed.yielded)
+                _PARSED_CLAIMS_CACHE[cache_key] = (depth, claim)
+                term_claims.append(claim)
+
+            if term_claims:
+                claims_list = term_claims
+                break
 
         # B5/B4: Prune superseded renewals in-memory without repetitive git subprocess reads.
         by_key: Dict[Tuple[int, str], List[LeaseClaim]] = {}
@@ -360,10 +428,14 @@ class LeaseStore:
 
     def state(self, *, now: Optional[float] = None) -> LeaseState:
         """The folded lease. ``unreadable`` is never ``absent``: one is a broken bus."""
-        rows = self.claims()
+        rows = self.claims(now=now)
         if rows is None:
-            return LeaseState(status="unreadable", term=0, holder="", expires_at=0.0)
-        return fold_claims(rows)
+            return LeaseState(status="unreadable", term=0, holder="", expires_at=0.0,
+                              old_releases=self.old_releases)
+        st = fold_claims(rows)
+        return LeaseState(status=st.status, term=st.term, holder=st.holder,
+                          expires_at=st.expires_at, claim=st.claim,
+                          ignored=st.ignored, old_releases=self.old_releases)
 
     # -- writing ---------------------------------------------------------------------
     def claim(self, *, term: Optional[int] = None, now: Optional[float] = None,
