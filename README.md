@@ -36,7 +36,7 @@ An optional TCP gateway (the "fast plane") is included for agents on the same ne
 
 | Runtime | `adapter.type` | How it is driven | Setup |
 |---|---|---|---|
-| Antigravity CLI | `antigravity`, `antigravity_thread` | `agy -p`, or queued into an open Antigravity conversation | [SETUP-ANTIGRAVITY](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-ANTIGRAVITY.md) |
+| Antigravity CLI | `antigravity`, `antigravity_thread` | `agy -p`, or queued into an open Antigravity conversation (plain text; token usage unknown) | [SETUP-ANTIGRAVITY](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-ANTIGRAVITY.md) |
 | OpenAI Codex CLI | `codex`, `codex_thread` | `codex exec`, or queued into an open Codex task | [SETUP-CODEX](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-CODEX.md) |
 | Claude Code | `claude`, `claude_thread` | `claude -p`, or one persistent session per topic (recommended) | [SETUP-CLAUDE](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-CLAUDE.md) |
 | Reasonix (DeepSeek) | `reasonix` | `reasonix run -p` | [SETUP-REASONIX](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/SETUP-REASONIX.md) |

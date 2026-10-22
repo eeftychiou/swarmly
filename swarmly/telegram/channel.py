@@ -2675,6 +2675,8 @@ class AgentChannel:
             model, effort = self.running_model_and_effort()
         except Exception:                              # noqa: BLE001 - the config's names
             logger.debug("snapshot: no resolved model this beat", exc_info=True)
+        if not effort and not (adapter.command or effort_problem(adapter.type, "high")):
+            effort = "the model default"
         return snapshot_mod.Snapshot(
             alias=self.config.identity.alias, state=state, since=since, at=moment,
             every=every, topic=str(topic), turn_elapsed=elapsed, turn_timeout=turn_timeout,
@@ -7917,9 +7919,14 @@ class AgentChannel:
             return model, effort
         if not (model and effort):
             env = {**os.environ, **adapter.extra_env}
-            found = cli_default(adapter.type, adapter.cwd, env=env)
+            found = cli_default(adapter.type, adapter.cwd, model=model, env=env)
             model, effort = model or found.model, effort or found.effort
-        return model or self._reported_model, effort
+        model = model or self._reported_model
+        if not effort and model:
+            m = re.search(r"[-_\s]\(?\b(low|medium|high|xhigh|max)\)?$", model, re.I)
+            if m:
+                effort = m.group(1).lower()
+        return model, effort
 
     def _note_reported_model(self, model: Any) -> None:
         """Keep the model the CLI said it ran, so the next online notice can name it."""

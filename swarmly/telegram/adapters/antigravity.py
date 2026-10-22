@@ -12,6 +12,10 @@ Verified surface (Antigravity CLI operator guide, checked 2026-09-16):
 * interactive sessions use ``agy -i`` under a PTY. ``--conversation <id>`` resumes a
   conversation by id; ``-c`` is the short alias for ``--continue`` -- a flag with **no
   value** that continues the most recent conversation (``agy --help``, checked 2026-10-17).
+* token usage: because Antigravity CLI operates in plain-text print mode and its SQLite
+  conversation metadata (``gen_metadata``) carries no token usage counters, Antigravity's
+  token usage is not reported by the CLI and stays unknown in the turn ledger and pulse
+  (issue #166).
 
 Default command::
 

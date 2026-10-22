@@ -180,6 +180,26 @@ class TestOnTheChannel(unittest.TestCase):
             status="ok", term=4, holder="Claudebot", expires_at=NOW + 540.0)
         self.assertEqual(channel.status_snapshot(NOW).term, 0)
 
+    def test_effort_resolution_matches_online_notice(self):
+        """Issue #166: Reasonix and Antigravity fill effort from the same source online_notice uses."""
+        # Antigravity defaults to "the model default" when effort is unset
+        agy_chan = make_channel(make_config(adapter={"type": "antigravity"}))
+        snap = agy_chan.status_snapshot(NOW)
+        self.assertEqual(snap.effort, "the model default")
+
+        # Antigravity with tiered model extracts effort from model name
+        agy_tiered = make_channel(make_config(adapter={"type": "antigravity", "model": "Gemini 3.1 Pro (High)"}))
+        snap_tiered = agy_tiered.status_snapshot(NOW)
+        self.assertEqual(snap_tiered.effort, "high")
+
+        # Reasonix defaults to "the model default" when effort is unset
+        reasonix_chan = make_channel(make_config(adapter={"type": "reasonix", "model": "deepseek-reasoner"}))
+        self.assertEqual(reasonix_chan.status_snapshot(NOW).effort, "the model default")
+
+        # Echo adapter has no effort support, so effort stays blank
+        echo_chan = make_channel(make_config(adapter={"type": "echo"}))
+        self.assertEqual(echo_chan.status_snapshot(NOW).effort, "")
+
     def test_uptime_and_restarts_come_from_the_process(self):
         channel = live_channel()
         channel._booted_at = channel._clock() - 7200

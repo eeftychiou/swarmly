@@ -387,5 +387,65 @@ class TestNoBackgroundTasksInATurn(unittest.TestCase):
         self.assertEqual(reply.text, "NO_REPLY")
 
 
+
+
+class TestUsageTokensParsing(unittest.TestCase):
+    """Issue #166: defensive parsing of token usage across CLI result payloads."""
+
+    def test_nested_claude_usage_with_cache(self):
+        from swarmly.telegram.adapters.base import usage_tokens
+        data = {
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 30,
+            }
+        }
+        self.assertEqual(usage_tokens(data), {"tokens_in": 150, "tokens_out": 50})
+
+    def test_nested_openai_deepseek_usage(self):
+        from swarmly.telegram.adapters.base import usage_tokens
+        data = {
+            "usage": {
+                "prompt_tokens": 200,
+                "completion_tokens": 80,
+            }
+        }
+        self.assertEqual(usage_tokens(data), {"tokens_in": 200, "tokens_out": 80})
+
+    def test_top_level_tokens_without_usage_dict(self):
+        from swarmly.telegram.adapters.base import usage_tokens
+        data = {
+            "prompt_tokens": 350,
+            "completion_tokens": 120,
+            "result": "Success",
+        }
+        self.assertEqual(usage_tokens(data), {"tokens_in": 350, "tokens_out": 120})
+
+    def test_camel_case_tokens_nested_and_flat(self):
+        from swarmly.telegram.adapters.base import usage_tokens
+        nested = {
+            "usage": {
+                "inputTokens": 40,
+                "outputTokens": 15,
+                "cacheReadInputTokens": 10,
+            }
+        }
+        self.assertEqual(usage_tokens(nested), {"tokens_in": 50, "tokens_out": 15})
+
+        flat = {
+            "promptTokens": 90,
+            "completionTokens": 45,
+        }
+        self.assertEqual(usage_tokens(flat), {"tokens_in": 90, "tokens_out": 45})
+
+    def test_antigravity_or_empty_usage_stays_empty(self):
+        from swarmly.telegram.adapters.base import usage_tokens
+        self.assertEqual(usage_tokens({}), {})
+        self.assertEqual(usage_tokens({"result": "plain text output"}), {})
+        self.assertEqual(usage_tokens(None), {})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -396,6 +396,9 @@ the flag to it (see [`SETUP-ANTIGRAVITY.md`](telegram/SETUP-ANTIGRAVITY.md)).
 Print mode is plain text — there is no JSON envelope and no `--max-turns`; the run is bounded
 by `--print-timeout` (default `5m`, raised to `20m` here) and by `timeout_seconds`. `--model`
 picks the engine (`agy models` lists the display strings), `--add-dir` adds context roots.
+Because Antigravity CLI operates in plain-text print mode and its SQLite conversation metadata
+(`gen_metadata`) carries no token usage counters, Antigravity's token usage is not reported
+by the CLI and stays unknown in the turn ledger and pulse.
 
 The adapter optionally tethers to ongoing development conversations via `conversation:` in config
 or a `.active_conversation` pointer file in `cwd`, automatically keeping SQLite state in sync
