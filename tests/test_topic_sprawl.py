@@ -163,3 +163,71 @@ class TestAHandoffIsAnsweredOnce(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWorkFollowsItsTopic(unittest.TestCase):
+    """Live, 22 Oct: round 5.5 items were worked on in the Round 5 topic for hours, because a
+    bot answers where it was asked. A reply about another topic's items goes there."""
+
+    def _channel(self, reply):
+        channel = make_channel(adapter=Scripted(reply))
+        channel.bot = TopicBot()
+        channel._learn_topic_refs(GROUP, 77, "#37 tracking")       # the item's own topic
+        channel._learn_topic_refs(GROUP, 88, "#41 tracking")       # another round's topic
+        channel.sent_where = []
+        send = channel.send
+
+        async def recording(text, **kw):
+            channel.sent_where.append((kw.get("thread_id"), text))
+            return await send(text, **kw)
+        channel.send = recording
+        return channel
+
+    def _sent_in(self, channel, thread_id):
+        return [text for where, text in channel.sent_where if where == thread_id]
+
+    def test_a_reply_about_another_topics_item_moves_there(self):
+        channel = self._channel("@CodexBot QA on #37 passed at abc1234, over to you.")
+        run(channel.handle_event(ask("@HermesBot where is #37?", thread_id=88, message_id=5)))
+        self.assertTrue(any("QA on #37 passed" in t for t in self._sent_in(channel, 77)))
+        here = self._sent_in(channel, 88)
+        self.assertTrue(any(t.startswith("↪ moved this to") for t in here), here)
+        self.assertFalse(any("QA on #37 passed" in t for t in here), here)
+
+    def test_a_reply_naming_this_topics_item_too_stays(self):
+        channel = self._channel("#37 passed QA, and #41 waits on the admin.")
+        run(channel.handle_event(ask("@HermesBot status?", thread_id=88, message_id=5)))
+        self.assertTrue(any("#41 waits" in t for t in self._sent_in(channel, 88)))
+        self.assertEqual(self._sent_in(channel, 77), [])
+
+    def test_a_reply_with_an_unknown_or_no_number_stays(self):
+        for reply in ("#37 and #99 are done.", "All quiet here."):
+            channel = self._channel(reply)
+            run(channel.handle_event(ask("@HermesBot status?", thread_id=88, message_id=5)))
+            self.assertTrue(any(reply in t for t in self._sent_in(channel, 88)), reply)
+            self.assertEqual(self._sent_in(channel, 77), [])
+
+    def test_a_reply_in_the_items_own_topic_stays(self):
+        channel = self._channel("#37 passed QA.")
+        run(channel.handle_event(ask("@HermesBot status?", thread_id=77, message_id=5)))
+        here = self._sent_in(channel, 77)
+        self.assertTrue(any("#37 passed QA." in t for t in here), here)
+        self.assertFalse(any(t.startswith("↪") for t in here), here)
+
+    def test_the_admins_topic_command_moves_an_item_learned_in_the_wrong_topic(self):
+        channel = self._channel("@CodexBot #37 passed QA.")
+        run(channel.handle_event(ask("/topic@HermesBot #37", thread_id=88, message_id=4)))
+        self.assertEqual(channel.topic_for_text("#37"), (GROUP, 88))
+        self.assertTrue(any(t.startswith("📌 #37 live in this topic")
+                            for t in self._sent_in(channel, 88)))
+        run(channel.handle_event(ask("@HermesBot status?", thread_id=77, message_id=5)))
+        self.assertTrue(any("#37 passed QA." in t for t in self._sent_in(channel, 88)))
+
+    def test_only_the_admin_moves_items_and_other_bots_apply_it_silently(self):
+        channel = self._channel("unused")
+        run(channel.handle_event(event("/topic #37", thread_id=88, message_id=4,
+                                       username="CodexBot", is_bot=True)))
+        self.assertEqual(channel.topic_for_text("#37"), (GROUP, 77))
+        run(channel.handle_event(ask("/topic@CodexBot #37", thread_id=88, message_id=5)))
+        self.assertEqual(channel.topic_for_text("#37"), (GROUP, 88))
+        self.assertEqual(self._sent_in(channel, 88), [])
