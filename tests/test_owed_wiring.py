@@ -306,6 +306,42 @@ class TestTheRoundStateSweep(unittest.TestCase):
         self.sweep(channel, {"173": self.item()}, status="unreadable")
         self.assertEqual(rows(channel), [])
 
+    def test_a_verdict_the_state_carries_closes_its_own_row(self):
+        """#173 review: the sweep listed debts the round state had already settled."""
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(review={"verdict": "merge", "sha": "5b90b50",
+                                                      "by": "Reasonix"})})
+        open_now = [row.id for row in rows(channel) if row.is_open]
+        self.assertNotIn("verdict:#173@5b90b50:Reasonix", open_now)
+        self.assertIn("verdict:#173@5b90b50:Antigravity", open_now)   # still owed
+
+    def test_a_green_ci_closes_the_ci_row(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(ci="green")})
+        self.assertNotIn("ci:#173@5b90b50:CI",
+                         [row.id for row in rows(channel) if row.is_open])
+
+    def test_the_whole_settled_head_leaves_only_the_merge(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(
+            ci="green", review={"verdict": "merge", "sha": "5b90b50", "by": "Reasonix"},
+            qa={"verdict": "pass", "sha": "5b90b50", "by": "Antigravity"})})
+        open_now = sorted(row.id for row in rows(channel) if row.is_open)
+        self.assertEqual(open_now, ["merge:#173@5b90b50:Claudebot", "progress:#173:DeepSeek"])
+
+    def test_a_second_sweep_writes_nothing_and_keeps_created_at(self):
+        """#173 review: every beat rewrote and pushed every row."""
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item()})
+        store = channel._test_table[1]
+        writes = []
+        real = store.save_all
+        store.save_all = lambda batch: (writes.append(list(batch)), real(batch))[1]
+        created = {row.id: row.created_at for row in rows(channel)}
+        channel.owed_sweep(now=2000.0)
+        self.assertEqual(writes, [])                       # no beat, no bus commit
+        self.assertEqual({row.id: row.created_at for row in rows(channel)}, created)
+
     def test_roles_come_from_the_roster(self):
         channel = self.channel()
         channel.owed_roles = lambda: {}

@@ -4955,10 +4955,12 @@ class AgentChannel:
         """Open and close the rows the round state answers -- every source but a hand-off.
 
         A round's items already carry the facts this needs: the PR and its head, the owner, the
-        CI state and the two verdicts, each bound to the head it was given on. So the table is
-        filled from the state the transport folds, not from a model's line, and a fact the
-        state does not carry (no head, no CI field, no verdict) opens nothing at all. A round
-        that cannot be read opens nothing: fail closed, never "nothing is owed".
+        CI state and the two verdicts, each bound to the head it was given on. Two rules keep it
+        honest. **A fact that is already there closes as well as opens** -- a verdict the state
+        carries answers its own row, a green CI answers the CI row, a merge answers everything
+        bound to the item -- or ``/owed`` would list debts the swarm has already settled (#173
+        review). And **only a changed row is written**: a beat that rewrote every row pushed a
+        bus commit a minute for nothing, and moved the row's ``created_at`` with it.
         """
         from swarmly.telegram.owed import (Fact, admin_row, fix_rows, head_rows, merge_row,
                                            progress_rows, settle)
@@ -4972,7 +4974,7 @@ class AgentChannel:
             logger.warning("owed: no round state to sweep", exc_info=True)
             return []
         rows = store.load()
-        closed: List[Row] = []
+        facts: List[Any] = []
         fresh: List[Row] = []
         for key in keys:
             try:
@@ -4989,23 +4991,30 @@ class AgentChannel:
                 label = f"#{item_key}"
                 head = str(item.get("head") or "").strip().lower()
                 if str(item.get("state") or "").strip().lower() in ("merged", "closed", "done"):
-                    closed.extend(settle(rows, Fact(kind="merge", item=label, head=head)))
+                    facts.append(Fact(kind="merge", item=label, head=head))
                     continue
                 verdicts: Dict[str, str] = {}
                 for kind in ("review", "qa"):
                     verdict = state.verdict(item_key, kind, head=head or None)
-                    if verdict is not None:
-                        verdicts[kind] = verdict.verdict
+                    if verdict is None:
+                        continue
+                    verdicts[kind] = verdict.verdict
+                    # The state already carries this verdict: the row it answers is closed.
+                    facts.append(Fact(kind="verdict", item=label, head=head,
+                                      who=verdict.by, verdict=verdict.verdict))
+                green = str(item.get("ci") or "").strip().lower() in ("green", "pass", "passed",
+                                                                     "ok")
+                if green:
+                    facts.append(Fact(kind="ci", item=label, head=head, verdict="pass"))
                 if item.get("pr") and head:
                     # A new head answers the old head's verdicts and opens the new head's debts.
-                    closed.extend(settle(rows, Fact(kind="head", item=label, head=head)))
+                    facts.append(Fact(kind="head", item=label, head=head))
                     fresh.extend(head_rows(item=label, head=head, roles=roles, at=moment,
                                            opened_by=f"head {head} on {label}"))
                     fresh.extend(fix_rows(item=label, head=head,
                                           developer=roles.get("developer", ""),
                                           verdicts=verdicts, at=moment))
-                    if str(item.get("ci") or "").strip().lower() in ("green", "pass", "passed",
-                                                                     "ok"):
+                    if green:
                         merge = merge_row(item=label, head=head,
                                           coordinator=roles.get("coordinator", ""),
                                           ci_green=True, verdicts=verdicts, at=moment)
@@ -5016,10 +5025,35 @@ class AgentChannel:
                     fresh.append(admin_row(
                         question=str(item.get("note") or f"waiting on the admin on {label}"),
                         item=label, at=moment))
+        # A snapshot, not the objects themselves: settling mutates the rows in `table`, and a
+        # comparison against the same objects would always say "unchanged".
+        seen = {row.id: row.to_dict() for row in rows}
+        # Keep what a known row has learned (its created_at, its observed value) instead of
+        # overwriting it with a fresh guess.
+        fresh = store.observe(fresh, now=moment)
+        # The table as it will be: what is already open, plus what this sweep opens. The
+        # closing facts are applied to *that*, so a fact the state carries in the same pass as
+        # the row it answers still closes it (#173 review).
+        table = {row.id: row for row in rows}
+        for row in fresh:
+            table.setdefault(row.id, row)
+        closed: List[Row] = []
+        for fact in facts:
+            closed.extend(settle(list(table.values()), fact))
+        # Write only what actually changed: a beat is not a reason for a bus commit.
+        def differs(before: Dict[str, Any], row: Row) -> bool:
+            after = row.to_dict()
+            before = dict(before)
+            before.pop("updated_at", None)
+            after.pop("updated_at", None)
+            return before != after
+
+        writes = [row for row in table.values()
+                  if row.id not in seen or differs(seen[row.id], row)]
         done: List[str] = []
-        if closed or fresh:
+        if writes:
             try:
-                store.save_all([*closed, *fresh])
+                store.save_all(writes)
             except Exception:                      # noqa: BLE001 - the sweep is best effort
                 logger.warning("owed: could not write the swept rows", exc_info=True)
                 return done
