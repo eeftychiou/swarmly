@@ -947,7 +947,7 @@ the coordinator posts the dry run once in General and asks the admin whether to 
 **The status snapshot on every heartbeat (issue #124).** Each beat carries one structured
 record of what the bot is doing, taken in code — no adapter call, no model turn, no tokens:
 state (`idle`, `busy`, `paused`, `frozen` or `stuck`, where `stuck` is a turn that has run past
-`adapter.timeout_seconds`), **when that state began** — recorded at the transition, so it
+`adapter.timeout_seconds` or whose CLI has written nothing for `limits.turn_silence_minutes`), **when that state began** — recorded at the transition, so it
 holds across heartbeats instead of resetting each beat — the discussion it is working in
 (as its `tg-…` token, never a chat id), the turn's elapsed time against its timeout, the queue
 of messages waiting for it, the armed `WAKE` timers with their next fire time, the model and
@@ -956,6 +956,24 @@ coordinator lease. It rides the pulse — on the bot's own git ref, or the `STAT
 line when there is no bus — so a bot that missed a beat can still be rendered, and a snapshot
 that stopped being renewed shows as **stale** (more than two beats old) rather than as current.
 Nothing in the record is a token, key, chat id or local path.
+
+**A turn that is running but silent (issue #161).** No CLI process lives between turns, so the
+transport knows exactly when a bot is busy; what it could not see was whether the running turn
+was making progress, and a hung turn was only found at the hard timeout. Now the adapter behind
+each topic reads its CLI's stdout and stderr chunk by chunk and records the moment the last byte
+arrived, and the snapshot carries that as `silent`. Past `limits.turn_silence_minutes` (default
+5) the state reads `stuck (silent 7m)` — the snapshot's line, the pulse and `/status` — and it
+goes back to `busy` as soon as output resumes. An adapter that reads its CLI's pipes only at the
+end (nothing to stream) reports "silent since the turn started" and nothing more. With
+`limits.turn_silence_kill_minutes` (default 0, off), a turn silent past that limit is stopped
+through the `/stop` path, its CLI tree with it, and the topic is told once. This is liveness
+only: it never starts a turn and never touches a `WAKE`.
+
+A run the bot's own command starts with `--output-format stream-json` (Claude, Reasonix) is
+progress the transport can see as it happens. Such a run prints one JSON object per line and
+ends with a `result` event; the adapters take **that** event as the reply, and a stream that
+ended before it is reported as a broken turn (`streamed no result`) rather than posting the
+progress lines into the topic as prose.
 
 
 **What a bot has spent — `/usage` (no model turn).** Every model turn appends one row to a

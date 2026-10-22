@@ -643,6 +643,28 @@ class SubprocessAdapter(AgentAdapter):
         # Issue #68: the pids of the CLIs this adapter runs. With no path nothing is kept,
         # so a transport that was never given a state file cannot reap what it left behind.
         self.children = ChildRegistry(None)
+        # Round 5.5 (#161): when the CLI of each running turn last wrote anything, keyed by
+        # the discussion that turn belongs to -- one adapter can run a topic's turn and
+        # another's at the same time (limits.max_parallel_turns), and a chatty topic must not
+        # make a hung one look alive. Times are monotonic; a discussion missing from here has
+        # no run this adapter can see, so the caller falls back to "since the turn started".
+        self._output_at: Dict[str, float] = {}
+        self._run_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+            "a2a_run_key", default="")
+
+    def last_output_at(self, key: Optional[str] = None) -> Optional[float]:
+        """``time.monotonic()`` when a running CLI last wrote to stdout or stderr.
+
+        *key* names the discussion (``IncomingMessage.context_id``); without one this answers
+        for the discussion the current task is running a turn for. An adapter that cannot see
+        its CLI's output (it reads the pipes only at the end) simply has nothing here, and the
+        transport then reports "silent since the turn started".
+        """
+        return self._output_at.get(self._run_key.get() if key is None else str(key))
+
+    def _note_output(self) -> None:
+        """Record that this task's CLI said something just now."""
+        self._output_at[self._run_key.get()] = time.monotonic()
 
     def use_child_registry(self, path: Optional[Path]) -> None:
         """Persist the pids of the CLIs this adapter starts, so a restart can reap orphans."""
@@ -699,8 +721,9 @@ class SubprocessAdapter(AgentAdapter):
         except Exception:                                    # noqa: BLE001 - never blocks a turn
             logger.warning("%s: could not record the CLI pid %s", self.alias,
                            getattr(process, "pid", None), exc_info=True)
+        self._note_output()                                  # the run started: not silent yet
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(),
+            stdout, stderr = await asyncio.wait_for(self._communicate(process),
                                                     timeout=float(self.settings.timeout_seconds))
         except BaseException as exc:
             # A timeout or a /stop cancels the wait, not the program: end it too, or it keeps
@@ -724,6 +747,32 @@ class SubprocessAdapter(AgentAdapter):
         self._forget_child(process)
         return process, stdout, stderr
 
+    async def _communicate(self, process: Any) -> Tuple[bytes, bytes]:
+        """Read both pipes as they arrive, recording when the CLI last said anything.
+
+        ``communicate()`` hands everything back at the end, so a turn that printed for twenty
+        minutes looked silent for twenty minutes and could only be judged by the hard timeout
+        (#161). Reading chunk by chunk keeps the silence clock honest and costs nothing when
+        the CLI writes nothing. A process without readable pipes -- the runner a test injects
+        -- is left to ``communicate()``: its silence is then "since the run started".
+        """
+        out, err = getattr(process, "stdout", None), getattr(process, "stderr", None)
+        if out is None or err is None or not hasattr(out, "read") or not hasattr(err, "read"):
+            return await process.communicate()
+        buffers = (bytearray(), bytearray())
+
+        async def pump(stream: Any, sink: bytearray) -> None:
+            while True:
+                chunk = await stream.read(65536)
+                if not chunk:                            # EOF: the CLI closed its side
+                    return
+                sink.extend(chunk)
+                self._note_output()
+
+        await asyncio.gather(pump(out, buffers[0]), pump(err, buffers[1]))
+        await process.wait()
+        return bytes(buffers[0]), bytes(buffers[1])
+
     def _forget_child(self, process: Any) -> None:
         """The CLI exited: drop its pid from the registry (#68)."""
         pid = getattr(process, "pid", None)
@@ -737,6 +786,9 @@ class SubprocessAdapter(AgentAdapter):
     async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
         if not self.settings.enabled:
             return None
+        # Which discussion this turn is for, so the silence clock of two turns this adapter
+        # runs at once stay apart (#161 review). A task of its own, so it needs no reset.
+        self._run_key.set(str(getattr(message, "context_id", "") or ""))
         prompt = self.build_prompt(message)
         if prompt is None:
             return None
@@ -895,3 +947,28 @@ def _decode(raw: Optional[bytes]) -> str:
     if not raw:
         return ""
     return raw.decode("utf-8", errors="replace")
+
+
+def looks_like_event_stream(text: str) -> bool:
+    """Whether *text* is a CLI's JSON event stream (``--output-format stream-json``).
+
+    Such a run prints one object per line, each with a ``type``. Asking this is how a caller
+    tells "the CLI streamed events and no result event arrived" from "the CLI printed plain
+    text": the first is a broken turn, the second is a reply, and posting the events as prose
+    would put machine noise in the topic (round 5.5, #161).
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if len(lines) < 1:
+        return False
+    typed = 0
+    for line in lines[:50]:
+        if not line.startswith("{"):
+            return False
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return False
+        if not isinstance(event, dict) or not event.get("type"):
+            return False
+        typed += 1
+    return typed > 0 and len(lines) > 1

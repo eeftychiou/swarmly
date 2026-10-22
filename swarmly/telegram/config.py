@@ -672,6 +672,13 @@ class ChannelLimits:
     wake_tick_seconds: float = 15.0
     #: A check's own budget; past it the process group is killed and the turn says so.
     wake_check_seconds: float = 120.0
+    #: Round 5.5 (#161): a running turn whose CLI has written nothing for this many minutes is
+    #: reported as `stuck (silent Nm)` by the snapshot and the pulse. Liveness only: 0 turns
+    #: the report off, and nothing here ever starts a turn.
+    turn_silence_minutes: float = 5.0
+    #: ... and once it has been silent this many minutes the turn is killed through the /stop
+    #: path, with one line in its topic. 0 (the default) never kills on silence.
+    turn_silence_kill_minutes: float = 0.0
     #: How many firings one timer may have before it gives up with a turn that says so. 0
     #: leaves the bound to `until` alone.
     wake_max_attempts: int = 50
@@ -776,7 +783,8 @@ class ChannelLimits:
                               f"(got {attachment_mb!r}).")
         for key in ("min_seconds_between_messages", "min_seconds_between_agent_turns",
                     "handoff_nudge_minutes", "cleanup_idle_hours",
-                    "ephemeral_notices_minutes", "coordinator_watch_minutes"):
+                    "ephemeral_notices_minutes", "coordinator_watch_minutes",
+                    "turn_silence_minutes", "turn_silence_kill_minutes"):
             value = getattr(self, key)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):

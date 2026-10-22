@@ -61,6 +61,9 @@ class Snapshot:
     #: The turn in flight: how long it has been running, and when it is considered stuck.
     turn_elapsed: float = 0.0
     turn_timeout: float = 0.0
+    #: Round 5.5 (#161): how long that turn's CLI has been silent. Elapsed when the adapter
+    #: cannot see its output.
+    silent: float = 0.0
     #: Messages waiting for the turn lock.
     queue: int = 0
     #: Armed WAKE timers: ``(id, next fire at)``.
@@ -81,6 +84,7 @@ class Snapshot:
             "alias": self.alias, "state": self.state, "since": self.since, "at": self.at,
             "every": self.every, "topic": self.topic,
             "turn_elapsed": self.turn_elapsed, "turn_timeout": self.turn_timeout,
+            "silent": self.silent,
             "queue": int(self.queue), "wakes": [[str(i), float(at)] for i, at in self.wakes],
             "model": self.model, "effort": self.effort, "rev": self.rev,
             "uptime": self.uptime, "restarts": int(self.restarts),
@@ -110,7 +114,7 @@ class Snapshot:
             since=_num(data.get("since")), at=_num(data.get("at")),
             every=_num(data.get("every")), topic=str(data.get("topic") or "general"),
             turn_elapsed=_num(data.get("turn_elapsed")),
-            turn_timeout=_num(data.get("turn_timeout")),
+            turn_timeout=_num(data.get("turn_timeout")), silent=_num(data.get("silent")),
             queue=int(_num(data.get("queue"))), wakes=tuple(wakes),
             model=str(data.get("model") or ""), effort=str(data.get("effort") or ""),
             rev=str(data.get("rev") or ""), uptime=_num(data.get("uptime")),
@@ -132,7 +136,13 @@ class Snapshot:
     def line(self, now: Optional[float] = None) -> str:
         """One line for a dashboard or /status: state, how long, and what is waiting."""
         moment = time.time() if now is None else float(now)
-        parts = [f"{self.alias}:{self.state}"]
+        head = f"{self.alias}:{self.state}"
+        if self.state == STUCK:
+            # Round 5.5 (#161): "working, but not visibly" now says for how long, so a reader
+            # can tell a long think from a hung CLI without waiting for the hard timeout.
+            head = (f"{self.alias}:stuck (silent {_duration(self.silent)})" if self.silent
+                    else f"{self.alias}:stuck (no output)")
+        parts = [head]
         if self.since and moment >= self.since:
             parts.append(f"for {_duration(moment - self.since)}")
         if self.state == BUSY and self.turn_elapsed:

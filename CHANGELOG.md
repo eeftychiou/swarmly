@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Stuck detection from the CLI's own output (round 5.5 `#161`): the adapter behind each topic
+  reads its CLI's stdout and stderr as they arrive and records when the last byte landed, so a
+  turn that is running but not progressing shows as `stuck (silent Nm)` in the snapshot, the
+  pulse and `/status` — past `limits.turn_silence_minutes` (default 5) — and back to `busy` when
+  output resumes. `limits.turn_silence_kill_minutes` (default 0, off) stops such a turn through
+  the `/stop` path and tells its topic once. Liveness only: it starts no turn and touches no
+  WAKE. A run started with `--output-format stream-json` is read too: the reply is its
+  `result` event, and a stream that ended before that event is a failed turn, not a partial
+  answer posted as prose.
+
 ### Changed
 
 - A WAKE that comes due while its topic already has a turn running is neither claimed nor

@@ -51,6 +51,7 @@ from swarmly.telegram.adapters.base import (
     discussion_line,
     format_channel_prompt,
     load_state,
+    looks_like_event_stream,
     project_line,
     rules_digest,
     save_state,
@@ -269,9 +270,19 @@ class ReasonixAdapter(SubprocessAdapter):
 
     def parse_output(self, out: str, duration: float) -> AdapterReply:
         if self._turn_session.get() is None:
+            if looks_like_event_stream(out):
+                return AdapterReply(
+                    ok=False, duration_seconds=duration,
+                    error=f"{self.alias} streamed no result (the run ended before its "
+                          "result event)")
             return super().parse_output(out, duration)
         data = parse_result_json(out)
         if data is None:
+            if looks_like_event_stream(out):
+                return AdapterReply(
+                    ok=False, duration_seconds=duration,
+                    error=f"{self.alias} streamed no result (the run ended before its "
+                          "result event)")
             return super().parse_output(out, duration)
         meta = {key: data[key] for key in ("session_id", "total_cost_usd", "num_turns")
                 if key in data}

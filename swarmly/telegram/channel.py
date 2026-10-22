@@ -2621,6 +2621,8 @@ class AgentChannel:
         busy = {key: start for key, start in self._busy_since.items()
                 if isinstance(start, (int, float))}
         elapsed = max((self._clock() - start for start in busy.values()), default=0.0)
+        silent = self._silent_seconds(next(iter(busy)), elapsed) if busy else 0.0
+        silence_limit = float(getattr(self.config.limits, "turn_silence_minutes", 0) or 0) * 60
         state, topic = snapshot_mod.IDLE, "general"
         if self._frozen:
             state = (snapshot_mod.FROZEN if self._freeze_ref == "quota"
@@ -2628,8 +2630,11 @@ class AgentChannel:
         elif self._pause_pending or self._paused_topics:
             state = snapshot_mod.PAUSED
         if busy:
-            state = (snapshot_mod.STUCK if turn_timeout and elapsed > turn_timeout
-                     else snapshot_mod.BUSY)
+            # Stuck is "working, but not visibly" (#161): the CLI has written nothing for
+            # limits.turn_silence_minutes, or the turn has run past its own hard timeout.
+            stuck = bool(silence_limit and silent > silence_limit) or bool(
+                turn_timeout and elapsed > turn_timeout)
+            state = snapshot_mod.STUCK if stuck else snapshot_mod.BUSY
         if busy:
             # A turn's start is known exactly from its own clock, so busy/stuck do not need the
             # table: elapsed is measured, not remembered.
@@ -2673,14 +2678,76 @@ class AgentChannel:
         return snapshot_mod.Snapshot(
             alias=self.config.identity.alias, state=state, since=since, at=moment,
             every=every, topic=str(topic), turn_elapsed=elapsed, turn_timeout=turn_timeout,
+            silent=silent,
             queue=queue, wakes=tuple(wakes),
             model=str(model or ""), effort=str(effort or ""),
             rev=str(self._running_revision or ""),
             uptime=max(0.0, self._clock() - self._booted_at), restarts=max(0, self._boots - 1),
             term=term, lease_ends=lease_ends)
 
-    # -- the turn ledger (issue #125) ---------------------------------------------------
+    def _silent_seconds(self, key: Any, elapsed: float) -> float:
+        """How long the CLI behind a running turn has been silent (#161).
 
+        The adapter that runs the topic's turns knows when it last read a byte from the CLI,
+        per discussion: with ``limits.max_parallel_turns`` above 1 one adapter runs turns for
+        several topics at once, and a chatty topic must not make a hung one look alive
+        (#161 review). An adapter that cannot say (its CLI's pipes are read at the end) leaves
+        the answer at "silent since the turn started", which is all such a run can report.
+        """
+        try:
+            chat_id, thread_id = key if isinstance(key, tuple) else (key, None)
+            adapter = self._adapter_for(int(chat_id), thread_id)
+            probe = getattr(adapter, "last_output_at", None)
+            context = self.topics.context(int(chat_id), thread_id)
+            last = probe(str(context or "")) if callable(probe) else None
+        except Exception:                          # noqa: BLE001 - a snapshot never fails here
+            last = None
+        if isinstance(last, bool) or not isinstance(last, (int, float)):
+            return max(0.0, float(elapsed))
+        return max(0.0, min(float(elapsed), time.monotonic() - float(last)))
+
+    async def check_stuck_turns(self, *, now: Optional[float] = None) -> List[str]:
+        """Kill a turn whose CLI has been silent for ``limits.turn_silence_kill_minutes``.
+
+        Liveness only: it starts nothing and never touches a WAKE. The kill goes through the
+        /stop path -- the turn is cancelled and its CLI tree with it -- and the topic is told
+        once, because a bot that drops a turn without a word reads as a bot that died. A turn
+        already being stopped is left alone, so one hang is one notice.
+        """
+        minutes = float(getattr(self.config.limits, "turn_silence_kill_minutes", 0) or 0)
+        if minutes <= 0:
+            return []                              # off by default: report, do not kill
+        killed: List[str] = []
+        for turn in [row for row in self._turns
+                     if not row.done() and row not in self._stopping_turns]:
+            key = self._turn_keys.get(turn)
+            elapsed = self._clock() - float(self._busy_since.get(key, self._clock()))
+            silent = self._silent_seconds(key, elapsed)
+            if silent <= minutes * 60:
+                continue
+            self._stopping_turns.add(turn)
+            turn.cancel()
+            self.stats.stopped += 1
+            chat_id, thread_id = key if isinstance(key, tuple) else (key, None)
+            killed.append(f"killed a turn silent for {int(silent // 60)}m")
+            logger.warning("stuck: the turn in %s/%s has been silent %ds; killing it",
+                           chat_id, thread_id, int(silent))
+            # What is waiting behind it, counted rather than assumed: the topic is told the
+            # truth about its queue, and only the truth (#161 review).
+            queued = int(self._busy_waiting_by.get(key, 0) + self._cooldown_waiting.get(key, 0))
+            behind = (f" {queued} message(s) are still queued here." if queued
+                      else " Nothing was queued behind it.")
+            try:
+                await self.send(
+                    f"⏱ {self.config.identity.alias}: the turn here had been silent for "
+                    f"{int(silent // 60)}m, so I stopped it." + behind,
+                    chat_id=chat_id, thread_id=thread_id, silent=True, notice=True)
+            except Exception:                      # noqa: BLE001 - the kill already happened
+                logger.warning("stuck: could not tell the topic the turn was killed",
+                               exc_info=True)
+        return killed
+
+    # -- the turn ledger (issue #125) ---------------------------------------------------
     def usage_ledger(self) -> Any:
         """This bot's turn ledger: rows on disk, appended once per model turn.
 
@@ -3664,6 +3731,9 @@ class AgentChannel:
             how = await self._publish_pulse_line(line)
             said = f"pulse {how} rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
         await self.check_peer_liveness(now=moment)
+        # Round 5.5 (#161): a turn whose CLI has gone silent past the kill limit is stopped
+        # here, through the /stop path. Liveness only -- this never starts a turn.
+        await self.check_stuck_turns(now=moment)
         # The pinned dashboard rides the beat, and only its holder edits it: every bot
         # refreshing one message would fight over it (#117).
         if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
