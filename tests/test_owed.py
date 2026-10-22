@@ -227,8 +227,9 @@ class TestThePullRequestReview(unittest.TestCase):
         first = ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot", topic="tg-1", at=1000.0)[0]
         second = ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot", topic="tg-2", at=1000.0)[0]
         self.assertNotEqual(first.id, second.id)
-        closed = ow.settle([first, second], ow.Fact(kind="reply", who="DeepSeek"))
-        self.assertEqual(len(closed), 2)                     # a reply answers both, by design
+        # A reply that names no place answers neither: the wiring always names the topic, so
+        # the locationless path is a fallback for rows recorded without one (#173 QA).
+        self.assertEqual(ow.settle([first, second], ow.Fact(kind="reply", who="DeepSeek")), [])
         # A reply in one topic answers that topic's hand-off, not the other one.
         again = [ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot", topic="tg-1",
                                  at=1000.0)[0],
@@ -236,6 +237,56 @@ class TestThePullRequestReview(unittest.TestCase):
                                  at=1000.0)[0]]
         closed = ow.settle(again, ow.Fact(kind="reply", who="DeepSeek", item="tg-1"))
         self.assertEqual([row.topic for row in closed], ["tg-1"])
+
+    def test_a_reply_in_one_topic_closes_no_admin_question_from_another(self):
+        """QA fail: one admin reply closed the open questions of every topic."""
+        rows = [ow.admin_row(question="Do I deploy?", topic="tg-1", at=1000.0),
+                ow.admin_row(question="Which topic carries the report?", topic="tg-2", at=1000.0)]
+        closed = ow.settle(rows, ow.Fact(kind="reply", who="admin", item="tg-1"))
+        self.assertEqual([row.topic for row in closed], ["tg-1"])
+        self.assertEqual(ow.settle(rows, ow.Fact(kind="reply", who="admin")), [])
+
+    def test_a_qa_ok_is_a_pass_and_a_reviewers_ok_is_a_merge(self):
+        """QA fail: `normalize_verdict("ok")` was merge, so a QA "ok" stalled the merge row."""
+        self.assertEqual(ow.normalize_verdict("ok", "qa"), ow.VERDICT_PASS)
+        self.assertEqual(ow.normalize_verdict("ok", "review"), ow.VERDICT_MERGE)
+        row = ow.merge_row(item="#173", head="bc60611", coordinator="Claudebot", ci_green=True,
+                           verdicts={"review": "ok", "qa": "ok"}, at=1000.0)
+        self.assertIsNotNone(row)                            # the merge is owed, not stalled
+        self.assertEqual(ow.fix_rows(item="#173", head="bc60611", developer="DeepSeek",
+                                    verdicts={"qa": "ok"}), [])
+
+    def test_a_missing_head_opens_nothing_instead_of_raising(self):
+        """QA fail: a poll that momentarily has no head raised inside the transport's tick."""
+        self.assertEqual(ow.head_rows(item="#173", head="",
+                                      roles={"review": "Reasonix"}, at=1000.0), [])
+        self.assertEqual(ow.fix_rows(item="#173", head="", developer="DeepSeek",
+                                     verdicts={"review": "fix-first"}), [])
+        self.assertIsNone(ow.merge_row(item="#173", head="", coordinator="Claudebot",
+                                       ci_green=True,
+                                       verdicts={"review": "merge", "qa": "pass"}))
+
+    def test_the_bus_document_is_named_once_not_twice(self):
+        """QA nit: the document name carried the extension twice (`<id>.json.json`)."""
+        pushed = []
+
+        class Bus:
+            ref = "refs/heads/main"
+
+            def commit_and_push(self, message, paths=None):
+                pushed.append(list(paths or []))
+
+        with TemporaryDirectory() as tmp:
+            store = ow.OwedStore("DeepSeek", state_dir=Path(tmp) / "state", transport=Bus(),
+                                 root=Path(tmp) / "checkout", clock=lambda: 1000.0)
+            row = store.save(ow.handoff_rows(asked=["Reasonix"], asker="Claudebot",
+                                             topic="tg-1", at=1000.0)[0])
+            relpath = pushed[0][0]
+            self.assertTrue(relpath.endswith(".json"), relpath)
+            self.assertNotIn(".json.json", relpath)
+            self.assertEqual(relpath.rsplit("/", 1)[0], f"{ow.OWED_RELPATH}/deepseek")
+            self.assertTrue((Path(tmp) / "checkout" / relpath).is_file())
+            self.assertEqual(ow.OwedStore.documents(Path(tmp) / "checkout")[0].id, row.id)
 
     def test_every_question_to_the_admin_is_its_own_row(self):
         """Should-fix: every question collapsed into one `admin:-:admin` row."""

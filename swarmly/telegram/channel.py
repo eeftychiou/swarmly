@@ -40,7 +40,7 @@ import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -1529,7 +1529,7 @@ class AgentChannel:
         if command == "effort":
             command = "reasoning"
         if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes",
-                            "usage"):
+                            "owed", "usage"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1545,6 +1545,8 @@ class AgentChannel:
             return self._round_summary(event)
         if command == "wakes":
             return self._wakes_command(event)
+        if command == "owed":
+            return self._owed_command(event)
         if command == "usage":
             return self.usage_text(event)
         return self._command_reply(command, event)
@@ -4866,6 +4868,81 @@ class AgentChannel:
         newest = max(states, key=lambda state: (state.updated_at, state.seq))
         return newest.summary()
 
+    def _owed_command(self, event: Optional[ChannelEvent]) -> str:
+        """``/owed[@bot]``: the rows this bot holds open -- facts, not a model's word (#162).
+
+        Read-only, like ``/round``: it reports, it changes nothing, and it costs no turn.
+        """
+        try:
+            return self.owed_store().summary()
+        except Exception:                          # noqa: BLE001 - the command must answer
+            logger.warning("owed: the table could not be read", exc_info=True)
+            return "owed: cannot read the table (the log has the reason); this is not 'nothing is owed'"
+
+    def owed_store(self) -> Any:
+        """This bot's expectations table: rows in its state, documents on the bus (#162).
+
+        The state copy is this bot's own, like ``.agents/wakes/<alias>/``; the document under
+        the checkout is the swarm's, and :meth:`OwedStore.documents` is how a successor reads
+        it. A fresh store per call, like ``round_store``: a cached one keeps the ref it first
+        fetched, and ``/owed`` on a bot that has just started must see what the bus holds now.
+        """
+        from swarmly.telegram.owed import OwedStore
+        from swarmly.telegram.wake import wake_dir_for
+        root = self._gitbus_root()
+        has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+        return OwedStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
+                         transport=self.bus_transport(root) if has_bus else None, root=root,
+                         clock=time.time)
+
+    def _topic_token(self, chat_id: int, thread_id: Optional[int]) -> str:
+        """The discussion a debt belongs to, as a ``tg-`` token (never the chat id)."""
+        try:
+            return str(self.topics.context(int(chat_id), thread_id) or "")
+        except Exception:                          # noqa: BLE001 - book-keeping, not a turn
+            return ""
+
+    def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
+                            thread_id: Optional[int]) -> None:
+        """Record a durable row per peer just handed work (#162, the wiring).
+
+        The in-memory ``_pending_handoffs`` is the same debt in a second book and is lost on a
+        restart; these rows are the copy the swarm and a successor coordinator can read. A
+        book-keeping failure is logged and never fails the hand-off itself.
+        """
+        from swarmly.telegram.owed import handoff_rows
+        asked = [peer for peer in peers if peer]
+        if not asked or self.bot is None:
+            return
+        topic = self._topic_token(chat_id, thread_id)
+        try:
+            store = self.owed_store()
+            rows = store.observe(handoff_rows(asked=asked, asker=self.config.identity.alias,
+                                              topic=topic,
+                                              opened_by=f"hand-off in {topic or 'a topic'}"))
+            for row in rows:
+                store.save(row)
+        except Exception:                          # noqa: BLE001 - reported, not swallowed
+            logger.warning("owed: could not record the hand-off to %s",
+                           ", ".join(asked), exc_info=True)
+
+    def _close_owed_handoff(self, peer: str, chat_id: int, thread_id: Optional[int]) -> None:
+        """A peer's reply in a discussion answers the hand-off recorded **there**, not others.
+
+        The topic goes into the fact on purpose: a reply in ``tg-1`` must not close a debt
+        opened in ``tg-2`` (#173 review, QA).
+        """
+        from swarmly.telegram.owed import Fact, settle
+        try:
+            store = self.owed_store()
+            closed = settle(store.load(), Fact(kind="reply", item=self._topic_token(chat_id,
+                                                                                  thread_id),
+                                               who=peer))
+            for row in closed:
+                store.save(row)
+        except Exception:                          # noqa: BLE001 - reported, not swallowed
+            logger.warning("owed: could not close the hand-off to %s", peer, exc_info=True)
+
     def _default_bus_pull(self, root: Path) -> None:
         self.bus_transport(root).refresh()
 
@@ -6823,6 +6900,7 @@ class AgentChannel:
         for peer in peers:
             self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
                 "at": self._clock(), "message_id": message_id, "nudged": False}
+        self._note_owed_handoffs(peers, chat_id, thread_id)
         if not (self.config.bus.repo and getattr(self.config.bus, "mirror_handoffs", True)):
             return
         # Issue #22: the bus carries a topic token, never the chat id. The token resolves
@@ -6924,6 +7002,7 @@ class AgentChannel:
                     self._pending_handoffs[key].update(at=self._clock(), nudged=False)
                 else:
                     self._pending_handoffs.pop(key, None)
+                    self._close_owed_handoff(alias, event.chat_id, event.thread_id)
             elif event.thread_id is not None:
                 self._peer_followed_up(event, prose, alias, str(target).lstrip("@"))
 

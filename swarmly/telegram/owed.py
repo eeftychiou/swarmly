@@ -30,8 +30,10 @@ they are named here rather than left to the wiring:
   the transport -- not a ``ROUND_STATE`` block, which is a model's line and therefore a hint.
   Until that poll runs, these rows do not open; no block will open them.
 * hand-offs: the durable row **is** the source. The channel's in-memory ``_pending_handoffs``
-  is the same debt in a second book, and the wiring makes the nudge read these rows so a nudge
-  cannot fire on a closed row or a row outlive a nudge.
+  is the same debt in a second book -- one that a restart loses -- so the wiring opens a row
+  when a hand-off is made and closes it on the peer's reply **in that discussion**
+  (``_note_owed_handoffs``/``_close_owed_handoff``); the nudge ladder still runs on the
+  in-memory book, and the row is the copy the swarm and a successor can read.
 * admin questions: only observable in a topic this transport polls (there is no DM polling), and
   the row it opens is a reminder, never an action.
 
@@ -44,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,7 +85,7 @@ STATES = (OPEN, CLOSED)
 VERDICT_MERGE, VERDICT_FIX, VERDICT_PASS, VERDICT_FAIL = "merge", "fix-first", "pass", "fail"
 _VERDICT_WORDS = {
     "merge": VERDICT_MERGE, "approved": VERDICT_MERGE, "approve": VERDICT_MERGE,
-    "lgtm": VERDICT_MERGE, "ok": VERDICT_MERGE,
+    "lgtm": VERDICT_MERGE,
     "fix-first": VERDICT_FIX, "fix first": VERDICT_FIX, "fix": VERDICT_FIX,
     "changes requested": VERDICT_FIX, "changes-requested": VERDICT_FIX,
     "rework": VERDICT_FIX, "request changes": VERDICT_FIX,
@@ -90,15 +93,29 @@ _VERDICT_WORDS = {
     "fail": VERDICT_FAIL, "failed": VERDICT_FAIL, "red": VERDICT_FAIL,
 }
 
-_SHA_RE = __import__("re").compile(r"^[0-9a-f]{7,40}$")
+#: The words whose meaning is the *role's*, not the word's: "ok" from QA is a pass (nothing is
+#: owed) and "ok" from the reviewer is its merge verdict. One shared table mapped it to merge,
+#: so a QA "ok" never counted as a pass and stalled the merge row for ever (#173 review, QA).
+_ROLE_WORDS = {
+    "qa": {"ok": VERDICT_PASS, "pass": VERDICT_PASS, "green": VERDICT_PASS,
+           "fail": VERDICT_FAIL, "fail-first": VERDICT_FAIL},
+    "review": {"ok": VERDICT_MERGE, "lgtm": VERDICT_MERGE, "approved": VERDICT_MERGE},
+}
+
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 
-def normalize_verdict(value: Any) -> str:
-    """A verdict, in the one vocabulary the rows are written in ("" when it is not one)."""
+def normalize_verdict(value: Any, kind: str = "") -> str:
+    """A verdict, in the one vocabulary the rows are written in ("" when it is not one).
+
+    *kind* is the role that said it (``review``/``qa``) when the caller knows: a word like
+    "ok" means a pass from QA and a merge from a reviewer, and the role decides it.
+    """
     text = str(value or "").strip().lower()
     if not text:
         return ""
-    return _VERDICT_WORDS.get(text, text)
+    role = _ROLE_WORDS.get(str(kind or "").strip().lower(), {})
+    return role.get(text) or _VERDICT_WORDS.get(text, text)
 
 
 def normalize_head(value: Any) -> str:
@@ -306,6 +323,12 @@ def head_rows(*, item: str, head: str, roles: Mapping[str, str],
     """
     moment = time.time() if at is None else float(at)
     where = f"{item}@{head}" if head else item
+    if not str(head or "").strip():
+        # A head-bound debt cannot exist without its head (#173 review), so a caller that has
+        # no head yet -- an item with a PR but no head, a closed PR, an API hiccup in a tick --
+        # opens nothing rather than raising inside the transport's loop.
+        logger.debug("owed: %s has no head; opening nothing", where or "the item")
+        return []
     rows = [Row(kind="ci", item=item, head=head, debtor=CI, owes=f"a result on {head or item}",
                 opened_by=opened_by or f"head {head} pushed" if head else "item opened",
                 observed="pending", deadline=deadline, created_at=moment, updated_at=moment)]
@@ -331,8 +354,10 @@ def fix_rows(*, item: str, head: str, developer: str, verdicts: Mapping[str, str
     moment = time.time() if at is None else float(at)
     alias = _alias(developer)
     failed = [kind for kind, value in (verdicts or {}).items()
-              if normalize_verdict(value) in (VERDICT_FIX, VERDICT_FAIL)]
-    if not alias or not failed:
+              if normalize_verdict(value, kind) in (VERDICT_FIX, VERDICT_FAIL)]
+    if not alias or not failed or not str(head or "").strip():
+        # A fix row is bound to the head it is about: with no head there is nothing to answer,
+        # and a poll that momentarily lacks one must not raise (#173 review).
         return []
     return [Row(kind="fix", item=item, head=head, debtor=alias,
                 owes=f"a new head on {item}" + (f" after {head}" if head else ""),
@@ -350,9 +375,11 @@ def merge_row(*, item: str, head: str, coordinator: str, ci_green: bool,
     """
     moment = time.time() if at is None else float(at)
     alias = _alias(coordinator)
-    if not alias or not ci_green:
+    if not alias or not ci_green or not str(head or "").strip():
+        # No head, no merge row: "all three on this head" cannot be judged without one, and a
+        # tick that momentarily has no head must not raise (#173 review).
         return None
-    values = {kind: normalize_verdict(value) for kind, value in (verdicts or {}).items()}
+    values = {kind: normalize_verdict(value, kind) for kind, value in (verdicts or {}).items()}
     if values.get("review") != VERDICT_MERGE or values.get("qa") != VERDICT_PASS:
         return None
     return Row(kind="merge", item=item, head=head, debtor=alias,
@@ -469,10 +496,18 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
             return None              # a verdict on older code answers nothing here
         return f"{row.debtor} filed {fact.verdict or 'a verdict'}"
     if fact.kind == "reply":
-        # A reply answers the hand-off where it was made: the item it names, the topic it was
-        # posted in, or -- with neither -- any of that peer's open hand-offs.
-        where = (not item) or same_item or item.lower() == str(row.topic or "").lower()
-        if row.kind == "handoff" and (not who or who.lower() == row.debtor.lower()) and where:
+        # A reply answers the hand-off **where it was made**: the topic it was posted in, or the
+        # item it names. A place it names must match the row's own place -- a bot answering in
+        # tg-1 does not answer a question asked in tg-2 -- and a reply that names no place
+        # answers only rows that name none, so the fallback stays a fallback (#173 review, QA).
+        here = (item or "").lower()
+        if here:
+            same_place = (bool(row.topic) and here == str(row.topic).lower()) or same_item
+        else:
+            same_place = not row.topic and not row.item
+        if not same_place:
+            return None
+        if row.kind == "handoff" and (not who or who.lower() == row.debtor.lower()):
             return f"{row.debtor} answered"
         if row.kind == "admin" and who.lower() == ADMIN.lower():
             return "the admin answered"
@@ -502,8 +537,9 @@ def fold(rows: Iterable[Row]) -> List[Row]:
 
     Two observers of the same debt write the same id in their own directories. The reader's
     rule: **closed beats open** -- a debt answered is answered, whoever noticed first -- and
-    among two opens the newest ``observed`` wins, then the newest write, then the lowest
-    writer, so every reader folds to the same row and a debt is never counted twice.
+    among two rows of the same state the newest ``updated_at`` wins, then the one that has an
+    ``observed`` value, then the highest writer name (so the fold is deterministic rather than
+    dependent on the order the files were read).
     """
     best: Dict[str, Row] = {}
     for row in rows:
@@ -575,7 +611,10 @@ class OwedStore:
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
             return row                  # no bus: this checkout is the plane
-        relpath = f"{OWED_RELPATH}/{self.safe_alias}/{path.name if path else row.id}.json"
+        # The state copy's name already ends in `.json`; the document's name is that name, so
+        # the bus path is `<alias>/<id>.json` and not `<alias>/<id>.json.json` (#173 QA).
+        name = path.name if path is not None else f"{row.id}.json"
+        relpath = f"{OWED_RELPATH}/{self.safe_alias}/{name}"
         if not is_bus_document(relpath):
             raise OwedPushError(f"refusing to write outside {OWED_RELPATH}: {relpath!r}")
         if self.root is None:
@@ -652,7 +691,10 @@ class OwedStore:
         """Every row document under *root*'s `.agents/owed/`, folded across writers.
 
         This is how a successor inherits the table: it reads the checkout, not its own state
-        directory, and :func:`fold` settles the ids two bots both observed.
+        directory, and :func:`fold` settles the ids two bots both observed. It is the
+        inheritance path **whenever a transport is configured**; a checkout-only deployment
+        (no bus at all) has no document to read, and its rows live in the state directory
+        alone -- which is the plane there, and which a successor on the same host inherits.
         """
         base = Path(root) / OWED_RELPATH
         if not base.is_dir():

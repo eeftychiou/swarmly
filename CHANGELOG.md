@@ -18,6 +18,14 @@ All notable changes to this project are documented here. The format follows
   `result` event, and a stream that ended before that event is a failed turn, not a partial
   answer posted as prose.
 
+- The expectations table (#162): facts open and close rows — a hand-off to a peer, a head
+  pushed, a verdict, a merge, an unticked item, a question to the admin — with each row
+  naming the debtor, the item and head it is about, the last value observed and a deadline.
+  Rows live in `.agents/state/owed/` and are mirrored as bus documents under
+  `.agents/owed/<alias>/`, so a successor coordinator inherits what is still open. The
+  transport wires the hand-off source: a reply addressing peers opens a row per peer in that
+  discussion, and the peer's reply there closes it. `/owed` lists the open rows.
+
 ### Changed
 
 - A WAKE that comes due while its topic already has a turn running is neither claimed nor
