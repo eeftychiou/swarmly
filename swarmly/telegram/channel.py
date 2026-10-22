@@ -7308,8 +7308,9 @@ class AgentChannel:
         A bot answers where it was asked, so work that starts in the wrong topic stays there
         however often it is told to move (live, 22 Oct: round 5.5 items were worked on in the
         Round 5 topic for hours). The reply goes where its items live, and the next message
-        follows it. Conservative: every issue or PR the reply names must map to the same other
-        topic; a reply naming one of this topic's items, an unknown number, or none stays."""
+        follows it. Conservative: every issue or PR the reply names that a topic is about must
+        map to the same other topic; a reply naming one of this topic's items, items of two
+        other topics, or only numbers no topic knows, stays."""
         home = self.config.identity.home_channel_id
         if not getattr(self.config.limits, "work_in_topics", False) or home is None \
                 or event.thread_id is None or int(event.chat_id) != int(home) \
@@ -7323,7 +7324,10 @@ class AgentChannel:
         for ref in refs:
             if ref not in self._ref_topics \
                     or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS:
-                return None
+                # A number no topic has talked about yet (an issue filed this hour) neither
+                # holds the reply nor moves it: live, one new #181 kept a post about four
+                # round 5.5 items in Round 5, and the answer followed it there.
+                continue
             targets.add(self._ref_topics[ref])
         if len(targets) != 1:
             return None
@@ -7339,6 +7343,9 @@ class AgentChannel:
         logger.info("moving work from %s to topic %s, which is about the same item",
                     event.thread_id or "General", thread_id)
         await self.send(body, chat_id=chat_id, thread_id=thread_id)
+        # A bot never receives its own posts: the new items the reply names are learned here,
+        # in the topic it went to, as every peer learns them from seeing it there.
+        self._learn_topic_refs(chat_id, thread_id, body)
         self._log_topic(chat_id, thread_id, self.config.identity.alias, body,
                         self.last_first_message_id)
         # The moved reply may be the hand-off that matters (live test: it had no bus copy).
