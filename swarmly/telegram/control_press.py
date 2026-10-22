@@ -187,11 +187,12 @@ class PressPolicy:
                             text=f"There is no control {command.action!r} here.",
                             action=command.action)
         if not found.confirm:
+            # A report changes nothing, so it leaves no CONTROL note: the durable line is for
+            # "who stopped what", and a read-only press would only add noise to the bus.
+            log = "" if found.report else self.log_line(command.action, command.target,
+                                                        actor, moment, done=True)
             return Decision(RUN, command=command, action=command.action,
-                            target=command.target,
-                            text=f"{found.label} done.",
-                            log=self.log_line(command.action, command.target, actor, moment,
-                                              done=True))
+                            target=command.target, text=f"{found.label} done.", log=log)
         code = self._mint(command, moment, actor)
         note = f" — {found.note}" if found.note else ""
         return Decision(CONFIRM, command=command, action=command.action,

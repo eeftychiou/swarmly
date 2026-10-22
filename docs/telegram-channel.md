@@ -1011,7 +1011,11 @@ stop turn, restart, model, effort, WAKE, freeze and read-only `/cli` per bot; pa
 lease, roles, cleanup, sync and admit for the swarm; and a nudge that costs the owner a turn.
 Only a control the running transport can actually carry out is shown, so a button that exists
 is a button that works (today: pause, resume, freeze, a safe restart and a stop of one bot;
-pause *everything*; and a nudge to an item's owner, which costs that bot a turn). **Stop**
+model, effort, WAKE and read-only `/cli`, which only *report*; pause *everything*; and a nudge
+to an item's owner, which costs that bot a turn). A press on a reporting control answers with
+what the setting is now and the command that changes it — a one-tap button cannot take the
+value a change would need — it changes nothing and leaves no `CONTROL` note, because the
+durable line is for who stopped what, not for who read a setting. **Stop**
 cancels the turns in flight, drops the messages queued behind them and kills any `/cli` run —
 the `/stop all` form, because the dashboard speaks for the whole bot rather than one topic. Three rules bound every press:
 

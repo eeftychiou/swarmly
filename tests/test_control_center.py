@@ -262,9 +262,17 @@ class TestWhatEachBotSpent(unittest.TestCase):
         after = dict(channel._pulse_usage(1_800_000_000.0))
         self.assertEqual(before["beat"], after["beat"])
 
-    def test_a_bot_with_no_turns_says_nothing_rather_than_zero(self):
+    def test_a_bot_with_no_turns_spent_nothing_and_a_silent_peer_stays_unknown(self):
         channel = self.channel()
-        self.assertEqual(channel.control_usage().get("Hermes", {}).get("tokens_in"), None)
+        # An empty ledger is a *known* zero, never a silent runtime: main's #147 rule, which
+        # this dashboard inherits by reading ``totals()`` rather than counting rows itself.
+        mine = channel.control_usage()["Hermes"]
+        self.assertEqual((mine["turns"], mine["tokens_in"], mine["tokens_out"]), (0, 0, 0))
+        # A peer that has said nothing is absent from the map, so it renders unknown -- not a
+        # zero it never reported.
+        self.assertNotIn("Codex", channel.control_usage())
+        self.assertEqual(ct.usage_line("Codex", None),
+                         "Codex: usage unknown (no turns recorded)")
 
     def test_a_peers_spend_arrives_on_its_pulse(self):
         from swarmly.telegram.presence import Pulse

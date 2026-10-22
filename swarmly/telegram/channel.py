@@ -2887,6 +2887,10 @@ class AgentChannel:
             return f"refused: {note.by} is not the admin"
         if note.action not in self.control_actions():
             return f"refused: {note.action} is not a control here"
+        if note.action in self.CONTROL_REPORTS:
+            # A report answers the person who pressed it; a peer's note may not ask for one
+            # (there is nothing to apply, and nothing to send back).
+            return f"refused: {note.action} is a report, not a control"
         try:
             # Synchronous on purpose: this runs inside the machine-note path, which must not
             # need an event loop of its own to hold a bot.
@@ -2941,12 +2945,62 @@ class AgentChannel:
     def control_actions(self) -> Tuple[str, ...]:
         """The controls this build can actually carry out, so no button is offered in vain.
 
-        The rest of the table in :mod:`swarmly.telegram.control` -- restart, model, effort,
-        WAKE, the swarm-wide controls -- joins this tuple as each is wired; until then they
-        are neither shown nor run.
+        The rest of the table in :mod:`swarmly.telegram.control` -- the swarm-wide controls
+        (lease, fail back, roles, cleanup, sync, admit) -- joins this tuple as each is wired;
+        until then they are neither shown nor run.
         """
         return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart", "bot.stop_turn",
+                "bot.model", "bot.effort", "bot.wake", "bot.cli",
                 "swarm.pause_all", "item.nudge")
+
+    #: The controls that only *report*, read off the one table in
+    #: :mod:`swarmly.telegram.control`: they change nothing, so they need no second tap and
+    #: leave no note, and a peer's note may not ask for one -- a report answers a person.
+    CONTROL_REPORTS = control_mod.reports()
+
+    def _control_event(self, command: str) -> ChannelEvent:
+        """A synthetic event for a report control: the admin, typing a bare command.
+
+        The report answers through the *same* functions the typed commands use (``/model``,
+        ``/reasoning``, ``/wakes``), so a button and a command can never drift apart. It
+        carries no arguments on purpose: a press says what the setting is and how to change
+        it, it never changes one -- a one-tap button that silently switched a bot's model
+        would be the wrong shape for a control that is not asked twice.
+        """
+        settings = getattr(self.config, "control", None)
+        return ChannelEvent(text=f"/{command}",
+                            chat_id=self.config.identity.home_channel_id or 0,
+                            author_id=self.config.identity.admin_user_id,
+                            author_username=self.config.identity.name,
+                            thread_id=getattr(settings, "topic_id", None))
+
+    def control_report(self, action: str) -> Optional[str]:
+        """What a report control answers, in code and costing no turn (None for the others)."""
+        if action == "bot.model":
+            return self._model_command(self._control_event("model"))
+        if action == "bot.effort":
+            return self._reasoning_command(self._control_event("reasoning"))
+        if action == "bot.wake":
+            return self._wakes_command(None)
+        if action == "bot.cli":
+            return self._cli_report()
+        return None
+
+    def _cli_report(self) -> str:
+        """What ``/cli`` could run here: the runtime's own allowlist, or why there is none.
+
+        Read-only by construction -- it lists, it never runs anything: the first tap of a
+        button must not be able to execute a command nobody typed.
+        """
+        alias = self.config.identity.alias
+        adapter = self.config.adapter
+        why = native_cli.available(adapter.type, command=adapter.command)
+        if why:
+            return f"{alias}: no /cli here — {why}."
+        commands = native_cli.commands_for(adapter.type)
+        return (f"{alias}: /cli passes {', '.join(commands)} to the {adapter.type} CLI "
+                f"(admin only, no turn). Anything that changes something needs /cli! and a "
+                f"confirmation.")
 
     def control_policy(self) -> Any:
         """The press policy: admin-only, a second tap for anything that stops, one log line."""
@@ -2969,8 +3023,10 @@ class AgentChannel:
         try:
             decision = self.control_policy().decide(press, actor=str(press.user_id))
             if decision.verdict == press_mod.RUN:
-                await self._run_control(decision.action, decision.target,
-                                        presser=str(press.user_id))
+                answer = await self._run_control(decision.action, decision.target,
+                                                 presser=str(press.user_id))
+                if answer:
+                    decision.text = answer
             if decision.log:
                 await self._post_control_note(decision.log)
             self._control_answer = decision.text
@@ -2987,8 +3043,15 @@ class AgentChannel:
             Envelope(type=MessageType.NOTE, to="*", intent="CONTROL", ref=self._alias_ref()),
             line), silent=True, notice=True, allow_when_frozen=True)
 
-    async def _run_control(self, action: str, target: str, *, presser: str = "") -> None:
-        """Carry out one wired control, here and -- for a swarm-wide one -- everywhere else."""
+    async def _run_control(self, action: str, target: str, *, presser: str = "") -> Optional[str]:
+        """Carry out one wired control, here and -- for a swarm-wide one -- everywhere else.
+
+        Returns the words to answer the presser with when the control is one that *reports*
+        (None otherwise, and the policy's own line is the answer).
+        """
+        report = self.control_report(action)
+        if report is not None:
+            return report
         if action == "swarm.pause_all":
             # Hold this bot, and broadcast the hold: every peer applies the same note, so one
             # press stops the swarm instead of only the bot that owns the message.

@@ -66,6 +66,9 @@ class Control:
     confirm: bool = False
     #: One short line saying what the press costs or does, shown before a confirm.
     note: str = ""
+    #: A control that only *reports*: it changes nothing, so it is never confirmed and never
+    #: leaves a CONTROL note (there is no "who stopped what" in reading a setting).
+    report: bool = False
 
 
 CONTROLS: Tuple[Control, ...] = (
@@ -75,11 +78,11 @@ CONTROLS: Tuple[Control, ...] = (
     Control("bot.stop_turn", "Stop turn", confirm=True, note="keeps the message for replay"),
     Control("bot.restart", "Restart", confirm=True,
             note="waits for the queue to empty and no reply to be unsent"),
-    Control("bot.model", "Model"),
-    Control("bot.effort", "Effort"),
-    Control("bot.wake", "WAKE"),
+    Control("bot.model", "Model", report=True),
+    Control("bot.effort", "Effort", report=True),
+    Control("bot.wake", "WAKE", report=True),
     Control("bot.freeze", "Freeze", confirm=True),
-    Control("bot.cli", "CLI", note="read-only commands only"),
+    Control("bot.cli", "CLI", note="read-only commands only", report=True),
     # the swarm
     Control("swarm.pause_all", "Pause all", confirm=True),
     Control("swarm.lease", "Hand lease", confirm=True),
@@ -96,6 +99,11 @@ _CONTROLS = {control.action: control for control in CONTROLS}
 
 def control(action: str) -> Optional[Control]:
     return _CONTROLS.get(str(action))
+
+
+def reports() -> Tuple[str, ...]:
+    """The controls that only answer a question: pressing one changes nothing."""
+    return tuple(row.action for row in CONTROLS if row.report)
 
 
 def needs_confirm(action: str) -> bool:

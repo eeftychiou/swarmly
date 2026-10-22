@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest import mock
 
 from swarmly.telegram import control as ct
 from swarmly.telegram import control_press as cp
@@ -382,6 +383,74 @@ class TestSwarmWideAndNudge(unittest.TestCase):
     def test_a_nudge_for_an_item_the_round_does_not_have_says_so(self):
         channel = self.channel({})
         self.assertIn("no owner", run(channel.handle_control_press(press("ctl:item.nudge:999"))))
+
+
+class TestTheReportControls(unittest.TestCase):
+    """Model, effort, WAKE and /cli: a press answers, and changes nothing (issue #117).
+
+    A one-tap button cannot take the value a change would need, so these four *report*: what
+    the setting is now, and the command that changes it. They answer through the same code the
+    typed commands use, so a button never drifts from ``/model``, ``/reasoning`` or ``/wakes``.
+    """
+
+    def channel(self, **adapter):
+        config = make_config(control={"chat_id": -1001234567890, "topic_id": 307},
+                             adapter=dict({"type": "claude", "model": "claude-sonnet-4"},
+                                          **adapter))
+        channel = make_channel(config)
+        channel.presence_clock = lambda: NOW
+        channel.control_round = lambda: None
+        return channel
+
+    def test_a_press_on_model_reports_the_model_and_how_to_change_it(self):
+        channel = self.channel()
+        text = run(channel.handle_control_press(press("ctl:bot.model")))
+        self.assertIn("claude-sonnet-4", text)
+        self.assertIn("/model@HermesBot", text)
+        self.assertEqual(channel._models, {})                 # nothing was switched
+
+    def test_a_press_on_effort_reports_the_effort_and_how_to_change_it(self):
+        channel = self.channel(effort="high")
+        text = run(channel.handle_control_press(press("ctl:bot.effort")))
+        self.assertIn("reasons at high", text)
+        self.assertIn("/reasoning@HermesBot", text)
+        self.assertEqual(channel._efforts, {})                # nothing was changed
+
+    def test_a_press_on_wake_lists_the_timers(self):
+        channel = self.channel()
+        self.assertIn("wakes", run(channel.handle_control_press(press("ctl:bot.wake"))))
+
+    def test_a_press_on_cli_lists_the_allowlist_and_runs_nothing(self):
+        from swarmly.telegram import native as native_cli
+        channel = self.channel()
+        with mock.patch.object(native_cli, "available", return_value=""):
+            text = run(channel.handle_control_press(press("ctl:bot.cli")))
+        self.assertIn("/cli", text)
+        self.assertIn(native_cli.commands_for("claude")[0], text)
+        self.assertIn("/cli!", text)                          # a change is a different word
+
+    def test_a_host_without_a_cli_says_so_instead_of_offering_one(self):
+        channel = self.channel(type="echo")
+        text = run(channel.handle_control_press(press("ctl:bot.cli")))
+        self.assertIn("no /cli here", text)
+
+    def test_a_report_costs_no_turn_and_writes_no_control_note(self):
+        channel = self.channel()
+        channel.adapter.respond = lambda message: self.fail("a report asked for a turn")
+        run(channel.handle_control_press(press("ctl:bot.model")))
+        self.assertEqual([entry for entry in channel._test_sender.sent
+                          if "CONTROL" in entry["text"]], [])
+
+    def test_a_stranger_cannot_read_them_either(self):
+        channel = self.channel()
+        self.assertIn("Only the admin",
+                      run(channel.handle_control_press(press("ctl:bot.model", user=42))))
+
+    def test_a_report_arriving_as_a_peers_note_is_refused(self):
+        channel = self.channel()
+        line = ("CONTROL bot.model target=Hermes by=%d at=2027-01-15T08:00:00Z state=done"
+                % ADMIN_ID)
+        self.assertIn("is a report, not a control", channel.apply_control_note(line))
 
 
 def round_state(items):
