@@ -2900,7 +2900,7 @@ class AgentChannel:
         note = press_mod.parse_note(text)
         if note is None:
             return "not a control note"
-        if not self._note_sender_may_command(sender):
+        if not self._note_sender_may_command(sender, note.action):
             logger.warning("control note for %s refused: %r does not hold the dashboard",
                            self.config.identity.alias, sender)
             return f"refused: {sender or 'an unknown bot'} does not hold the dashboard"
@@ -2919,11 +2919,15 @@ class AgentChannel:
             return f"refused: {note.action} is a report, not a control"
         try:
             # Synchronous on purpose: this runs inside the machine-note path, which must not
-            # need an event loop of its own to hold a bot.
+            # need an event loop of its own to hold a bot. A control that schedules its work
+            # (a hand-over's claim is git work) answers with its own words instead of True,
+            # so this path never reports "applied" for something still in flight (#154).
             done = self._run_control_now(note.action)
         except Exception:                      # noqa: BLE001 - a note must not break routing
             logger.warning("control note: %s failed", note.action, exc_info=True)
             return f"failed: {note.action}"
+        if isinstance(done, str):
+            return done
         if not done:
             # It passed every check and still could not be carried out: say so, loudly.
             logger.warning("control note: %s arrived but this bot cannot carry it out",
@@ -2932,13 +2936,21 @@ class AgentChannel:
         logger.info("control: %s applied from a peer note (by=%s)", note.action, note.by)
         return f"applied: {note.action}"
 
-    def _note_sender_may_command(self, sender: str) -> bool:
+    def _note_sender_may_command(self, sender: str, action: str = "") -> bool:
         """Whether a bot that sent a CONTROL note may command this one.
 
         The coordinator holds the dashboard, so its notes are the ones that count; while no
         lease is readable, any *known* peer of this swarm is accepted, because a swarm that
         cannot read its lease still has to be stoppable. A note from this bot itself, from an
         empty sender, or from a stranger is refused either way.
+
+        **One exception, and only for the hand-over (#154).** The bot that gives the role away
+        writes the note *and then* yields, so by the time a peer reads it the giver is no
+        longer the live coordinator -- the note would always be refused, and the role would
+        never move. A ``swarm.lease`` note is therefore also obeyed from the bot the lease
+        still *records* as the holder at that term: that is exactly the bot allowed to give
+        the role away, and it is nobody else. Every other control keeps the strict rule, so a
+        lapsed holder still acts on nothing (#126).
         """
         who = str(sender or "").strip().lower()
         me = str(self.config.identity.alias or "").strip().lower()
@@ -2946,7 +2958,20 @@ class AgentChannel:
             return False
         leader = str(self.current_coordinator() or "").strip().lower()
         if leader:
-            return who == leader
+            if who == leader:
+                return True
+        if str(action or "") == "swarm.lease":
+            self._forget_lease_cache()         # judged on the lease as it is now, not 5 s ago
+            try:
+                recorded = str(getattr(self.lease_state(), "holder", "") or "").strip().lower()
+            except Exception:                  # noqa: BLE001 - unreadable is not permission
+                recorded = ""
+            if recorded and who == recorded:
+                logger.info("control note: %s posted the hand-over and then yielded; obeying it",
+                            sender)
+                return True
+        if leader:
+            return False
         peers = {str(alias).strip().lower() for alias in
                  (getattr(self.config, "peers", None) or {})}
         return who in peers
@@ -2958,7 +2983,7 @@ class AgentChannel:
         except (TypeError, ValueError):
             return False
 
-    def _run_control_now(self, action: str) -> bool:
+    def _run_control_now(self, action: str) -> Any:
         """The synchronous half of :meth:`_run_control`: the controls that only set state.
 
         Returns whether it actually carried the action out. That matters more than it looks:
@@ -2976,6 +3001,15 @@ class AgentChannel:
             self.request_restart()
         elif action == "bot.stop_turn":
             self._stop_every_turn()
+        elif action == "swarm.lease":
+            # The second half of a hand-over (#154): the holder has already yielded and named
+            # this bot, so it claims the next term -- no loop needed, because the note path
+            # must not wait for one. "accepted", never "applied": the claim is a git write
+            # that has not landed when this returns.
+            if not self._take_lease_soon():
+                return False
+            return (f"accepted: {action} -- {self.config.identity.alias} is claiming the next "
+                    f"term now")
         elif action == "swarm.pause_all":
             # The broadcast half: the presser holds itself, and every peer that receives
             # ``target=*`` holds itself here.
@@ -3015,6 +3049,7 @@ class AgentChannel:
         return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart", "bot.stop_turn",
                 "bot.model", "bot.effort", "bot.wake", "bot.cli",
                 "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
+                "swarm.lease", "swarm.failback",
                 "item.nudge")
 
     #: The controls that only *report*, read off the one table in
@@ -3024,7 +3059,11 @@ class AgentChannel:
 
     #: The controls that broadcast their own ``target=*`` note, so the press must not also
     #: post the local one: one press is one line on the bus (review, #133).
-    CONTROL_BROADCASTS = ("swarm.pause_all",)
+    #: ``swarm.lease``/``swarm.failback`` are here for the same reason ``swarm.pause_all``
+    #: is: they post one note that *names the bot that must act*, which is the record of who
+    #: moved the lease and where to (#154). A second, local note would say the same thing
+    #: twice and name the wrong thing once.
+    CONTROL_BROADCASTS = ("swarm.pause_all", "swarm.lease", "swarm.failback")
 
     def _control_event(self, command: str, argument: str = "") -> ChannelEvent:
         """A synthetic event for a report control: the admin, typing a bare command.
@@ -3055,6 +3094,13 @@ class AgentChannel:
             return [(name, name) for name in names][:12]
         if action == "bot.effort":
             return [(level, level) for level in EFFORT_LEVELS]
+        if action == "swarm.lease":
+            # Who may take the role: every peer and this bot -- minus itself, because a
+            # hand-over to the current holder is not a hand-over (#154).
+            me = str(self.config.identity.alias).strip().lower()
+            names = sorted({str(alias) for alias in (getattr(self.config, "peers", None) or {})}
+                           | {self.config.identity.alias})
+            return [(name, name) for name in names if name.strip().lower() != me][:12]
         if action == "swarm.role":
             from swarmly.telegram.roles import known_roles, role_dirs
             if not target:
@@ -3156,7 +3202,8 @@ class AgentChannel:
         except Exception:                      # noqa: BLE001 - the answer still stands
             logger.warning("control centre: could not post the confirm button", exc_info=True)
 
-    async def _apply_pick(self, action: str, value: str, target: str = "") -> str:
+    async def _apply_pick(self, action: str, value: str, target: str = "",
+                          presser: str = "") -> str:
         """Set what a picker chose -- through the same function the typed command runs.
 
         ``/model <name>``, ``/reasoning <level>`` and ``/wakes cancel <id>`` are the transport's
@@ -3169,6 +3216,8 @@ class AgentChannel:
             return self._reasoning_command(self._control_event("reasoning", value))
         if action == "bot.wake":
             return self._wakes_command(self._control_event("wakes", f"cancel {value}"))
+        if action == "swarm.lease":
+            return await self.hand_over_lease(value, presser=presser)
         if action == "swarm.role":
             who = str(target or "").strip()
             if not who:
@@ -3295,6 +3344,189 @@ class AgentChannel:
         press = press_mod.Press(user_id=user_id, data=text, at=time.time())
         return await self.handle_control_press(press)
 
+    # -- the lease: hand it over, and fail it back (issue #154) ---------------------------
+    def named_coordinator(self) -> str:
+        """The bot the admin named as coordinator: the fail-back target (#154).
+
+        Read from the membership record first (``/role`` writes it), then from a peer whose
+        configured role is ``coordinator``, then from this bot's own role. Empty when the swarm
+        names nobody -- and then a fail-back has no target, which is said, not guessed.
+        """
+        named = str(getattr(self.membership.state, "coordinator", "") or "").strip()
+        if named:
+            return named
+        for alias, role in (getattr(self.config, "peer_roles", None) or {}).items():
+            if str(role).strip().lower() == "coordinator":
+                return str(alias).strip()
+        if str(self.config.identity.role or "").strip().lower() == "coordinator":
+            return str(self.config.identity.alias)
+        return ""
+
+    def known_bot(self, name: str) -> bool:
+        """Whether *name* is a bot of this swarm: a configured peer, or this one."""
+        wanted = str(name or "").strip().lstrip("@").lower()
+        if not wanted:
+            return False
+        if wanted == str(self.config.identity.alias).strip().lower():
+            return True
+        if wanted == str(self.config.identity.name).strip().lstrip("@").lower():
+            return True
+        roster = {str(alias).strip().lstrip("@").lower()
+                  for alias in (getattr(self.config, "peers", None) or {})}
+        # A peer the admin bound to a role is a member even when the transport's peer table
+        # does not list it: `peer_roles` is the swarm's own roster (#154).
+        roster |= {str(alias).strip().lstrip("@").lower()
+                   for alias in (getattr(self.config, "peer_roles", None) or {})}
+        return wanted in roster
+
+    async def hand_over_lease(self, to: str, *, presser: str = "") -> str:
+        """Give the coordinator lease to *to*: this holder steps down, the target claims.
+
+        Two writes, by two bots, which is the whole point: a claim is signed by whoever writes
+        it, so no bot can claim the role *for* another. This half writes the yield -- an expiry
+        in the past at the current term, so nobody waits for the lease to lapse -- and posts one
+        ``CONTROL`` line naming the new holder. The other half is
+        :meth:`_take_handed_lease`, which the target runs when that line reaches it (#154).
+
+        Only the live holder may hand the role on: a bot that has already lost it (a stale
+        dashboard, a failover it slept through) would otherwise appoint a coordinator out of
+        turn, and #126's rule is that a stale holder acts on nothing.
+        """
+        who = str(to or "").strip()
+        me = str(self.config.identity.alias)
+        if not self._has_lease_bus():
+            raise ControlRefused("hand-over: this bot has no bus, so it holds no lease to give")
+        if not who:
+            raise ControlRefused("hand-over: pick the bot that should coordinate")
+        if who.lower() == me.lower():
+            raise ControlRefused(f"hand-over: {me} already holds the lease")
+        if not self.known_bot(who):
+            raise ControlRefused(f"hand-over: {who} is not a bot of this swarm")
+        if not await asyncio.to_thread(self.lease_fence):
+            raise ControlRefused(
+                f"hand-over: {me} does not hold the lease any more, so it cannot give it away")
+        store = self.lease_store()
+        term = int(getattr(await asyncio.to_thread(self.lease_state), "term", 0) or 0)
+        # The note goes first, while this bot is still the coordinator: a peer only obeys a
+        # note from the bot holding the dashboard (#133), and a bot that yields first is not
+        # that bot any more. Ordering cannot go wrong the other way round -- the target claims
+        # term N+1, which outranks the term being given up -- so a note that arrives early is
+        # harmless, and a note that never arrives leaves the lease exactly where it was.
+        await self._post_control_note(press_mod.PressPolicy.log_line(
+            "swarm.lease", who, presser or "0", time.time(), done=True, value="take"))
+        try:
+            async with self._lease_lock():
+                # The term read above, not the current one: the successor may already have
+                # claimed N+1 from the note, and a yield written at N+1 would elect its own
+                # claim and mark the new term dead (#154 review).
+                await asyncio.to_thread(store.yield_lease, reason=f"handed over to {who}",
+                                        term=term)
+        except Exception as exc:                   # noqa: BLE001 - reported to the presser
+            logger.warning("lease: %s could not yield for a hand-over", me, exc_info=True)
+            raise ControlRefused(f"hand-over: the note is out but the yield did not reach the "
+                                 f"bus -- {str(exc)[:160]}")
+        self._forget_lease_cache()
+        logger.warning("lease: %s handed the role to %s at term %d", me, who, term)
+        return (f"lease: handed to {who} -- it claims term {term + 1} and takes the dashboard "
+                f"when the note reaches it")
+
+    async def fail_back_lease(self, *, presser: str = "") -> str:
+        """Give the lease back to the coordinator the admin named (#154).
+
+        Two shapes, because the admin's intent is one: a bot that holds the role hands it to
+        the named coordinator, and the named coordinator that does not hold it takes the next
+        term back. A swarm that names nobody is told so rather than guessing a successor.
+        """
+        named = self.named_coordinator()
+        if not named:
+            raise ControlRefused("fail back: no coordinator is named here (membership or a "
+                                 "peer's role), so there is nobody to fail back to")
+        me = str(self.config.identity.alias)
+        if named.lower() != me.lower():
+            return await self.hand_over_lease(named, presser=presser)
+        if await asyncio.to_thread(self.lease_fence):
+            raise ControlRefused(f"fail back: {me} already holds the lease")
+        term = await self._take_handed_lease(presser=presser)
+        if term is None:
+            raise ControlRefused(f"fail back: {me} could not claim the next term; see the log")
+        return f"lease: {me} took term {term} back as the named coordinator"
+
+    async def _take_handed_lease(self, *, presser: str = "") -> Optional[int]:
+        """The other half of a hand-over: claim the next term, then take the dashboard.
+
+        The claim is ``promoted``: the old holder has yielded, and the admin's press is the
+        authority that makes a claim over a still-live lease legitimate (the same rule #93 B3
+        gave ``/role``). Returns the term claimed, or None when the claim did not land -- a
+        hand-over that fails says so in the channel rather than leaving two bots believing it.
+        """
+        me = str(self.config.identity.alias)
+        if not self._has_lease_bus():
+            logger.info("lease: %s was handed a lease but has no bus; nothing to claim", me)
+            return None
+        store = self.lease_store()
+        self._forget_lease_cache()             # the fold this claim is built on is a fresh one
+        try:
+            async with self._lease_lock():
+                state = await asyncio.to_thread(store.state, now=self._lease_clock())
+                row = await asyncio.to_thread(store.claim, term=int(state.term) + 1,
+                                              promoted=True)
+        except Exception as exc:                   # noqa: BLE001 - said, not swallowed
+            logger.warning("lease: %s could not take the handed-over lease", me, exc_info=True)
+            try:
+                await self.send(f"\u26a0\ufe0f {me}: the lease hand-over did not complete -- "
+                                f"{str(exc)[:200]}",
+                                notice=True, allow_when_frozen=True)
+            except Exception:                      # noqa: BLE001 - the warning is a courtesy
+                logger.warning("lease: could not post the failed hand-over", exc_info=True)
+            return None
+        self._forget_lease_cache()
+        term = int(getattr(row, "term", 0) or 0)
+        logger.warning("lease: %s took term %d on the admin's hand-over from %s",
+                       me, term, getattr(state, "holder", "") or "nobody")
+        await self._post_control_note(press_mod.PressPolicy.log_line(
+            "swarm.lease", me, presser or "0", time.time(), done=True, value="taken"))
+        try:
+            await self.send(
+                f"\U0001f504 coordinator lease: {me} is acting coordinator at term {term} "
+                f"(handed over by {getattr(state, 'holder', '') or 'the swarm'}; expires "
+                f"{time.strftime('%H:%M:%SZ', time.gmtime(float(getattr(row, 'expires_at', 0.0))))}).",
+                notice=True, allow_when_frozen=True)
+        except Exception:                          # noqa: BLE001 - the claim is the point
+            logger.warning("lease: could not post the hand-over notice", exc_info=True)
+        # The dashboard: the new holder pins its own copy and retires the old one (#117).
+        await self.refresh_control_center()
+        return term
+
+    def _take_lease_soon(self) -> bool:
+        """Run :meth:`_take_handed_lease` without an await: the note path cannot wait.
+
+        The peer-note path is synchronous by contract, and the claim is git work that must not
+        run on the event loop (#126), so it is scheduled. Without a loop -- boot, a test -- the
+        claim runs inline, where there is nothing else to block.
+        """
+        if not self._has_lease_bus():
+            # No bus, no lease: a note that arrived over Telegram alone cannot move a role
+            # that only the bus decides. Said as failed, never as applied.
+            logger.info("lease: a hand-over reached %s with no bus; not claimed",
+                        self.config.identity.alias)
+            return False
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                store = self.lease_store()
+                self._forget_lease_cache()
+                state = store.state(now=self._lease_clock())
+                store.claim(term=int(state.term) + 1, promoted=True)
+            except Exception:                      # noqa: BLE001 - reported by the caller
+                logger.warning("lease: could not take the handed-over lease (no loop)",
+                               exc_info=True)
+                return False
+            self._forget_lease_cache()
+            return True
+        self._spawn_lease_task(self._take_handed_lease())
+        return True
+
     async def _post_control_note(self, line: str) -> None:
         """Put a CONTROL line on the durable plane: how a press reaches the other bots."""
         await self.send(format_message(
@@ -3309,7 +3541,9 @@ class AgentChannel:
         (None otherwise, and the policy's own line is the answer).
         """
         if value:
-            return await self._apply_pick(action, value, target)
+            return await self._apply_pick(action, value, target, presser=presser)
+        if action == "swarm.failback":
+            return await self.fail_back_lease(presser=presser)
         if action == "swarm.role" and target:
             # Step two of the role pick: the bot is chosen, now ask which role.
             return await self._offer_picker(action, target)

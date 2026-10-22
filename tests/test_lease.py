@@ -5,6 +5,7 @@ forge or backdate its way into the role, and no authority at all being reported 
 than guessed.
 """
 
+import asyncio
 import json
 import unittest
 from pathlib import Path
@@ -198,8 +199,227 @@ class TestStore(unittest.TestCase):
             self.assertTrue(searcher.state(now=now["t"]).holds("Antigravity", now["t"]))
 
 
+class TestTheHandOver(unittest.IsolatedAsyncioTestCase):
+    """Issue #154: handing the coordinator role on, and failing it back, as an operation.
+
+    The lease is two writes by two bots -- a claim is signed by whoever writes it, so no bot can
+    claim the role *for* another. These pin both halves against a real store, plus the rule that
+    makes the whole thing safe: only the live holder may give the role away, and a yielded term
+    cannot be revived by claiming it again.
+    """
+
+    ADMIN = 1234567890
+
+    def channel(self, root: Path, alias: str, role: str, peer_roles: dict, clock_state: dict):
+        from tests.test_telegram_channel import make_channel, make_config
+        config = make_config(
+            agent={"alias": alias, "role": role},
+            bus={"transport": "folder", "folder": str(root), "repo": str(root)},
+            limits={"takeover_minutes": 10.0, "lease_renew_seconds": 60.0,
+                    "lease_settle_seconds": 0.0},
+        )
+        config.peer_roles = peer_roles
+        channel = make_channel(config, clock=lambda: clock_state["t"])
+        channel.presence_clock = lambda: clock_state["t"]
+        return channel
+
+    def swarm(self, root: Path, clock_state: dict):
+        """Claude coordinates, Hermes and Codex are peers, all reading the same bus."""
+        claude = self.channel(root, "Claude", "coordinator",
+                              {"Hermes": "developer", "Codex": "reviewer"}, clock_state)
+        hermes = self.channel(root, "Hermes", "developer",
+                              {"Claude": "coordinator", "Codex": "reviewer"}, clock_state)
+        codex = self.channel(root, "Codex", "reviewer",
+                             {"Claude": "coordinator", "Hermes": "developer"}, clock_state)
+        return claude, hermes, codex
+
+    # -- the hand-over -----------------------------------------------------------------
+    async def test_a_hand_over_steps_down_and_the_target_takes_the_next_term(self):
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            self.assertEqual(claude.lease_store().state(now=1000.0).holder, "Claude")
+
+            said = await claude.hand_over_lease("Codex", presser="4242")
+            self.assertIn("Codex", said)
+            # The half that gives it away: a yield, and one note naming the new holder.
+            notes = [entry["text"] for entry in claude._test_sender.sent
+                     if "CONTROL swarm.lease" in entry["text"]]
+            self.assertEqual(len(notes), 1)
+            self.assertIn("target=Codex", notes[0])
+            self.assertIn("value=take", notes[0])
+            self.assertIn("by=4242", notes[0])
+            self.assertFalse(claude.lease_store().state(now=1000.0).live(1000.0))
+
+            # The half that takes it: the target claims N+1 and now holds it.
+            term = await codex._take_handed_lease(presser="4242")
+            self.assertEqual(term, 2)
+            state = codex.lease_store().state(now=1000.0)
+            self.assertEqual((state.holder, state.term), ("Codex", 2))
+            self.assertTrue(state.live(1000.0))
+            # The bot that was not named is left alone: one hand-over, one new holder.
+            self.assertEqual(hermes.lease_store().state(now=1000.0).holder, "Codex")
+
+    async def test_the_target_takes_it_from_the_note_alone(self):
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            await claude.hand_over_lease("Codex", presser="4242")
+
+            # No loop here, as on the machine-note path: the claim runs inline.
+            line = (f"CONTROL swarm.lease target=Codex by={self.ADMIN} "
+                    "at=2027-01-15T08:00:00Z state=done value=take")
+            answer = codex.apply_control_note(line, sender="Claude")
+            self.assertIn("accepted: swarm.lease", answer)   # the claim is still in flight
+            self.assertNotIn("applied", answer)
+            # The note path does not wait for git work: the claim runs as a spawned task.
+            await asyncio.gather(*list(getattr(codex, "_lease_tasks", ())))
+            state = codex.lease_store().state(now=1000.0)
+            self.assertEqual((state.holder, state.term), ("Codex", 2))
+
+    async def test_a_bot_that_does_not_hold_the_lease_cannot_give_it_away(self):
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            with self.assertRaises(Exception) as caught:
+                await codex.hand_over_lease("Hermes")
+            self.assertIn("does not hold the lease", str(caught.exception))
+            self.assertEqual(claude.lease_store().state(now=1000.0).holder, "Claude")
+
+    async def test_a_holder_that_has_lapsed_cannot_appoint_someone(self):
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            clock["t"] = 1700.0                       # the lease lapsed 100 s ago
+            with self.assertRaises(Exception) as caught:
+                await claude.hand_over_lease("Codex")
+            self.assertIn("does not hold the lease", str(caught.exception))
+
+    async def test_a_hand_over_to_itself_or_a_stranger_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            for who, why in (("Claude", "already holds the lease"),
+                             ("Nobody", "is not a bot of this swarm")):
+                with self.subTest(who=who), self.assertRaises(Exception) as caught:
+                    await claude.hand_over_lease(who)
+                self.assertIn(why, str(caught.exception))
+            self.assertTrue(claude.lease_store().state(now=1000.0).holds("Claude", 1000.0))
+
+    async def test_a_claim_that_lands_before_the_yield_does_not_kill_the_new_term(self):
+        """The hand-over writes the note first, so the successor can claim N+1 before the
+        holder's yield lands. A yield lifted to *that* term would elect the successor's own
+        claim and read it as yielded -- the new term dead under the old holder's name (#154
+        review). The yield is written at the term it ends, so it lands below and is ignored.
+        """
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)                 # Claude, term 1
+            self.assertEqual(claude.lease_store().state(now=1000.0).term, 1)
+
+            first = await codex._take_handed_lease()              # the successor is quicker
+            self.assertEqual(first, 2)
+
+            # The holder's yield arrives afterwards, ending the term it gave away.
+            claude.lease_store().yield_lease(reason="handed over to Codex", now=1000.0, term=1)
+            state = codex.lease_store().state(now=1000.0)
+            self.assertEqual((state.holder, state.term), ("Codex", 2))
+            self.assertTrue(state.holds("Codex", 1000.0))
+            self.assertFalse(state.holds("Claude", 1000.0))
+
+    async def test_a_yield_defaults_to_the_term_it_ends(self):
+        """Without a term, the yield still ends the *current* one: the old callers keep working."""
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            claude.lease_store().yield_lease(reason="frozen", now=1000.0)
+            self.assertFalse(claude.lease_store().state(now=1000.0).live(1000.0))
+
+    async def test_the_hand_over_yields_the_term_it_read_not_the_current_one(self):
+        """The channel passes the term it read: that is the whole fix, at the call site."""
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            await claude.hand_over_lease("Codex", presser="4242")
+            yielded = [claim for claim in claude.lease_store().claims(now=1000.0) or ()
+                       if claim.yielded and claim.alias == "Claude"]
+            self.assertTrue(yielded)
+            self.assertEqual({claim.term for claim in yielded}, {1})
+
+    async def test_a_yielded_term_cannot_be_revived_by_claiming_it_again(self):
+        """#126's rule, from the other side: a stale holder writes and the fold still says no."""
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            store = claude.lease_store()
+            store.yield_lease(reason="handed over to Codex", now=1000.0)
+            # A stale holder that has not noticed re-claims the term it gave up.
+            store.claim(term=1, now=1000.0)
+            state = store.state(now=1000.0)
+            self.assertFalse(state.live(1000.0))      # the yield stands
+            self.assertEqual(state.holder, "Claude")   # and it is still *its* term, gone
+
+    # -- fail-back ---------------------------------------------------------------------
+    async def test_fail_back_hands_the_role_to_the_coordinator_the_admin_named(self):
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            await claude.hand_over_lease("Hermes")
+            await hermes._take_handed_lease()
+            self.assertEqual(hermes.lease_store().state(now=1000.0).holder, "Hermes")
+
+            said = await hermes.fail_back_lease(presser="4242")
+            self.assertIn("Claude", said)
+            term = await claude._take_handed_lease()
+            self.assertEqual(term, 3)                  # every move bumps the term
+            state = claude.lease_store().state(now=1000.0)
+            self.assertEqual((state.holder, state.term), ("Claude", 3))
+            self.assertTrue(state.live(1000.0))
+
+    async def test_the_named_coordinator_takes_the_next_term_back(self):
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            await claude.hand_over_lease("Hermes")
+            await hermes._take_handed_lease()
+
+            term = await claude.fail_back_lease(presser="4242")
+            self.assertIn("took term 3", term)
+            self.assertEqual(claude.lease_store().state(now=1000.0).holder, "Claude")
+
+    async def test_fail_back_with_no_named_coordinator_says_so(self):
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            peer = self.channel(root, "Hermes", "developer", {"Codex": "reviewer"}, clock)
+            with self.assertRaises(Exception) as caught:
+                await peer.fail_back_lease()
+            self.assertIn("no coordinator is named", str(caught.exception))
+
+    async def test_a_coordinator_that_already_holds_it_does_not_fail_back(self):
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            with self.assertRaises(Exception) as caught:
+                await claude.fail_back_lease()
+            self.assertIn("already holds the lease", str(caught.exception))
+
+
 class TestLeaseSuccession(unittest.IsolatedAsyncioTestCase):
     """Reasonix B1: automatic renewal and takeover on expiry."""
+
+    ADMIN = 1234567890
 
     def channel(self, root: Path, alias: str, role: str, peer_roles: dict, clock_state: dict):
         from tests.test_telegram_channel import make_channel, make_config

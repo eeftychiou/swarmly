@@ -486,15 +486,24 @@ class LeaseStore:
         self.refresh(force=True)      # our own claim has to be visible to the next fold
         return row
 
-    def yield_lease(self, *, reason: str = "", now: Optional[float] = None) -> None:
-        """Give the role up: a claim at the current term with an expiry in the past.
+    def yield_lease(self, *, reason: str = "", now: Optional[float] = None,
+                    term: Optional[int] = None) -> None:
+        """Give the role up: a claim with an expiry in the past, ending *this* term.
 
         A bot that is FROZEN, posted OFFLINE or superseded by ``/role`` writes this, so its
         successor does not have to wait for the lease to lapse by itself.
+
+        ``term`` is the term being given up, and callers that already read it must pass it
+        (#154 review). Defaulting to the *current* term is a race: a hand-over writes the note
+        first and the successor claims N+1 before the yield lands, and a yield lifted to the
+        new term elects that successor's own claim while saying it was yielded -- the lease
+        then reads dead under the old holder's name, and two bots believe they gave it away.
+        Written at the term it ends, the yield is simply below the successor's and is ignored.
         """
         stamp = self.clock() if now is None else now
         current = self.state(now=stamp)
-        row = LeaseClaim(term=max(current.term, 1), alias=self.alias, expires_at=stamp,
+        wanted = current.term if term is None else int(term)
+        row = LeaseClaim(term=max(wanted, 1), alias=self.alias, expires_at=stamp,
                          renews_at=stamp, rank=self.rank, nonce=uuid.uuid4().hex[:8],
                          yielded=True)
         path = self.root / LEASES_RELPATH

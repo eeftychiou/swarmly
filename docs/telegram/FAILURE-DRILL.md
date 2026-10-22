@@ -63,6 +63,42 @@ built on `tests/swarm_group.py`); this file is the human one.
 
 **Expected**: no double merge at any point, one coordinator before and after `/role`.
 
+## 2b. Move the lease deliberately: hand-over and fail-back (#154)
+
+Nothing has to break for this one — it is the drill for an *explicit* move, and it is the same
+operation whether you use the dashboard or `/role`.
+
+**Hand the lease to another bot**
+
+1. In the control topic, press **Hand lease** on the pinned dashboard. It answers with one
+   button per bot (never the current holder), then asks again.
+2. Press the bot that should coordinate, then **Confirm**. That is one press: the holder yields
+   its term and posts `CONTROL swarm.lease target=<new holder> value=take by=<your id>`.
+3. The new holder answers in the channel:
+   `🔄 coordinator lease: <alias> is acting coordinator at term N+1 (handed over by <old>; expires HH:MMZ).`
+   It pins its own dashboard; the previous one is unpinned, never edited.
+4. `/swarm` names the new coordinator, at the new term. Nothing merges for the old one: its
+   yield is in the past, and `lease_fence` refuses it from then on.
+
+**Fail it back**
+
+1. Press **Fail back**. The target is the coordinator the swarm names
+   (`membership.state.coordinator`, else a peer whose role is `coordinator`, else this bot's own
+   role) — not a choice you make at the button, so the role returns to the bot you configured.
+2. If the pressed bot holds the lease it hands it over exactly as above; if the *named*
+   coordinator is the one pressing and the lease has lapsed, it claims the next term itself.
+
+**Expected**
+
+- Exactly one coordinator at every moment: the new claim is term N+1, and a yielded or lapsed
+  term cannot be revived by claiming it again (the fold keeps it dead).
+- One `CONTROL swarm.lease` line per move, naming the new holder, `value=take`, and your user id.
+- One dashboard in the topic: the new holder's. A press on the retired pin answers
+  "<alias> coordinates now" and does nothing.
+- Two refusals you should see if you try: **Hand lease** from a bot whose lease has lapsed
+  answers "does not hold the lease any more", and **Fail back** in a swarm that names no
+  coordinator answers "no coordinator is named here".
+
 ## 3. Two successors at once
 
 Only meaningful with three or more bots. Kill the coordinator and let two peers in the

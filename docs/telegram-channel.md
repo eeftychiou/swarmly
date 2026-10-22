@@ -1017,8 +1017,9 @@ stop turn, restart, model, effort, WAKE, freeze and read-only `/cli` per bot; pa
 lease, roles, cleanup, sync and admit for the swarm; and a nudge that costs the owner a turn.
 Only a control the running transport can actually carry out is shown, so a button that exists
 is a button that works (today: pause, resume, freeze, a safe restart and a stop of one bot;
-model, effort, WAKE and read-only `/cli`, which only *report*; pause *everything*; a resync of
-the swarm; the cleanup dry run; and a nudge to an item's owner, which costs that bot a turn).
+model, effort, WAKE and read-only `/cli`, which only *report*; pause *everything*; hand the
+lease over and fail it back (#154, below); reassign a role; a resync of the swarm; the
+cleanup dry run; and a nudge to an item's owner, which costs that bot a turn).
 A press on a reporting control answers with what the setting is now and the command that
 changes it — a one-tap button cannot take the value a change would need — it changes nothing
 and leaves no `CONTROL` note, because the durable line is for who stopped what, not for who
@@ -1077,6 +1078,33 @@ arrives with the finished pick. The picker is posted where the dashboard lives
 *change*, so the role pick's first step asks which bot rather than claiming one is already chosen.
 The role list includes the project's own role files (`<bus repo>/.agents/roles`), and the WAKE
 picker says what it does — it cancels a timer, so its buttons read `cancel <id>`.
+
+**Hand the lease over, and fail it back (#154).** Holding the coordinator role is automatic
+(#83, #126) — it is renewed on the bus, taken over when it lapses, and reclaimed by the
+configured coordinator when it comes back. What was missing is an *explicit* move, and it is
+two writes by two bots, because a lease claim is signed by whoever writes it: no bot can claim
+the role **for** another.
+
+- **Hand lease** picks a bot, asks twice, then the holder writes a *yield* (an expiry in the
+  past at its own term, so nobody waits for the lease to lapse) and one `CONTROL` line —
+  `CONTROL swarm.lease target=<new holder> value=take by=<user id>` — naming its successor.
+  The successor reads that line, claims **term N+1** as a promoted claim (the admin's press is
+  the authority that makes a claim over a live lease legitimate, the same rule `/role` uses),
+  announces the term, and pins its own dashboard: the old one is retired, never edited, exactly
+  as after a failover.
+- **Fail back** is the same operation aimed at the coordinator the swarm *names*
+  (`membership.state.coordinator`, else a peer whose role is `coordinator`, else this bot's own
+  role). A holder hands the role back; the named coordinator that does not hold it claims the
+  next term itself. A swarm that names nobody is told so rather than guessing a successor.
+- **Every move bumps the term**, so there is never a moment with two live coordinators: the new
+  claim is term N+1 and the old one — yielded, or lapsed — cannot be revived by claiming its
+  own term again. Only the **live holder** may give the role away (`lease_fence`), so a stale
+  dashboard, one that slept through a failover, cannot appoint anybody.
+- One exception to "only the coordinator's notes are obeyed", and only for this action: the
+  giver writes the note *and then* yields, so by the time a peer reads it the giver is no
+  longer the live leader. A `swarm.lease` note is therefore also obeyed from the bot the lease
+  still *records* as the holder at that term — the one bot allowed to give the role away.
+  Every other control keeps the strict rule, so a lapsed holder still acts on nothing.
 
 Deploy, upgrade, merging a PR and editing configs or secrets are not on the keyboard at all.
 
