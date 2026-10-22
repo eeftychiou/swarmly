@@ -5112,7 +5112,8 @@ class AgentChannel:
         # A snapshot, not the objects themselves: settling mutates the rows in `table`, and a
         # comparison against the same objects would always say "unchanged".
         fresh.extend(orphans(open_items, [*rows, *fresh],
-                              coordinator=roles.get("coordinator", ""), at=moment))
+                              coordinator=roles.get("coordinator", ""), roles=roles,
+                              at=moment))
         seen = {row.id: row.to_dict() for row in rows}
         # The table as it will be: what is already open, plus what this sweep opens. The
         # closing facts are applied to *that*, so a fact the state carries in the same pass as
@@ -5317,7 +5318,7 @@ class AgentChannel:
         the row itself -- ``updated_at`` moves only when a fact changed it -- so a beat that
         writes nothing cannot keep a stuck item looking fresh.
         """
-        from swarmly.telegram.owed_guard import STALL_ADMIN, advance, stalls
+        from swarmly.telegram.owed_guard import (STALL_ADMIN, STALL_REMINDER, advance, stalls)
         minutes = float(getattr(self.config.limits, "stall_minutes", 0) or 0)
         moment = time.time() if now is None else float(now)
         try:
@@ -5329,12 +5330,25 @@ class AgentChannel:
         decided = stalls(rows, now=moment, minutes=minutes)
         if not decided:
             return []
+        # Who may deliver a rung. The table folds every writer's documents, so a bot that
+        # neither owes the row nor coordinates would otherwise climb its own copy of the
+        # ladder and advance it for everyone: four bots, one stall, four reminders and four
+        # rungs (#177's rule, and the reason `stalls` is durable).
+        me = str(self.config.identity.alias or "").strip().lower()
+        coordinating = self.is_coordinator()
         done: List[str] = []
         climbed: List[Any] = []
         fired: Set[Any] = set()
         for stall in decided:
             row = next((item for item in rows if item.id == stall.row), None)
             if row is None:
+                continue
+            if stall.step == STALL_REMINDER:
+                if str(stall.debtor or "").strip().lower() != me:
+                    done.append(f"{stall.row}: held: not this bot's rung")
+                    continue
+            elif not coordinating:
+                done.append(f"{stall.row}: held: only the coordinator climbs this rung")
                 continue
             target = self._place_target(row.topic)
             if target is None:

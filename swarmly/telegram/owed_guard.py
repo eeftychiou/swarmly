@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from swarmly.telegram.owed import Row, alias_of
+from swarmly.telegram.owed import ADMIN, CI, Row, alias_of
 
 logger = logging.getLogger("swarmly.telegram.owed_guard")
 
@@ -98,17 +98,22 @@ def next_actor(item: Mapping[str, Any], roles: Mapping[str, str]) -> str:
 
 
 def orphans(items: Iterable[Tuple[str, Mapping[str, Any]]], rows: Sequence[Row], *,
-            coordinator: str, at: Optional[float] = None,
-            deadline: float = 0.0) -> List[Row]:
-    """An open item with no live row: the coordinator owes the next step on it.
+            coordinator: str, roles: Optional[Mapping[str, str]] = None,
+            at: Optional[float] = None, deadline: float = 0.0) -> List[Row]:
+    """An open item with no live row: whoever has to act next owes the next step on it.
 
     This is #146 at 09:13, where no WAKE was armed and nothing in the table said the round was
     stuck. The row carries the concrete :func:`gap`, so its ``observed`` value changes when the
     item moves and the wake is news again.
+
+    The debtor is :func:`next_actor` when that names a bot, and the coordinator otherwise: a
+    reviewer with a merge in their hands is the one to remind, not the coordinator, while an
+    item waiting on CI (``next_actor`` says ``CI``) is the coordinator's -- no bot owes a
+    waiting, and an item nobody can be derived for is the coordinator's to assign.
     """
     moment = time.time() if at is None else float(at)
-    alias = alias_of(coordinator)
-    if not alias:
+    lead = alias_of(coordinator)
+    if not lead:
         return []
     live = {str(row.item or "").strip() for row in rows if row.is_open and row.item}
     out: List[Row] = []
@@ -116,10 +121,16 @@ def orphans(items: Iterable[Tuple[str, Mapping[str, Any]]], rows: Sequence[Row],
         label = f"#{str(key).lstrip('#')}"
         if finished(item) or label in live:
             continue
-        out.append(Row(kind="progress", item=label, debtor=alias,
+        actor = alias_of(next_actor(item, roles or {})) if roles is not None else ""
+        if actor in (CI, ADMIN):
+            actor = ""                  # a fact this transport waits on, or the admin: no bot
+        debtor = actor or lead
+        out.append(Row(kind="progress", item=label, debtor=debtor,
                        owes=f"a next step on {label}", observed=gap(item, key=key),
-                       opened_by="the item is open and nothing owes it", deadline=deadline,
-                       created_at=moment, updated_at=moment))
+                       waiting_on=lead if debtor.lower() != lead.lower() else "",
+                       opened_by=(f"the item is open and {debtor} has the next step"
+                                  if actor else "the item is open and nothing owes it"),
+                       deadline=deadline, created_at=moment, updated_at=moment))
     return out
 
 

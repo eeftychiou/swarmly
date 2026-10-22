@@ -44,6 +44,20 @@ class TestTheOrphanItem(unittest.TestCase):
                          "PR #146: CI green, no merge verdict, no QA pass, not merged")
         self.assertTrue(rows[0].is_open)
 
+    def test_the_orphan_names_the_next_actor_not_always_the_coordinator(self):
+        """`next_actor()` has a caller: a reviewer with a merge in hand is the one to remind."""
+        rows = guard.orphans([("146", item(review={"verdict": "merge"}))], [],
+                             coordinator="Claudebot", roles=ROLES, at=1000.0)
+        self.assertEqual([r.id for r in rows], ["progress:#146:Antigravity"])   # QA is next
+        self.assertEqual(rows[0].waiting_on, "Claudebot")
+        # An item waiting on nothing but CI is the coordinator's: no bot owes a waiting.
+        rows = guard.orphans([("146", item(ci="pending"))], [],
+                             coordinator="Claudebot", roles=ROLES, at=1000.0)
+        self.assertEqual([r.id for r in rows], ["progress:#146:Claudebot"])
+        # No roles at all: the coordinator, as before.
+        rows = guard.orphans([("146", item())], [], coordinator="Claudebot", at=1000.0)
+        self.assertEqual([r.id for r in rows], ["progress:#146:Claudebot"])
+
     def test_an_item_a_live_row_answers_is_no_orphan(self):
         live = row(item="#146", kind="progress", debtor="DeepSeek", owes="progress on #146")
         self.assertEqual(guard.orphans([("146", item())], [live], coordinator="Claudebot"), [])
@@ -57,6 +71,7 @@ class TestTheOrphanItem(unittest.TestCase):
     def test_a_finished_item_opens_nothing(self):
         self.assertEqual(guard.orphans([("146", item(state="merged"))], [],
                                        coordinator="Claudebot"), [])
+
 
     def test_the_gap_names_the_facts_that_do_hold(self):
         done = guard.gap(item(review={"verdict": "merge"}, qa={"verdict": "pass"}))
@@ -193,7 +208,7 @@ class TestTheGuardTick(unittest.TestCase):
     def test_a_stalled_row_gets_its_reminder_then_says_the_coordinator_is_next(self):
         channel = self.channel()
         channel._test_table[1].save_all([
-            row(kind="fix", debtor="DeepSeek", owes="a new head on #146", item="#146",
+            row(kind="fix", debtor="Hermes", owes="a new head on #146", item="#146",
                 updated_at=1000.0, topic=channel.topics.context(GROUP, 5122))])
         self.assertEqual(channel.owed_guard_tick(now=1000.0 + 10 * 60), [])   # not yet
         done = channel.owed_guard_tick(now=1000.0 + 31 * 60)
@@ -206,10 +221,50 @@ class TestTheGuardTick(unittest.TestCase):
     def test_a_busy_topic_holds_the_rung(self):
         channel = self.channel()
         channel._test_table[1].save_all([
-            row(kind="fix", debtor="DeepSeek", owes="a new head on #146", item="#146",
+            row(kind="fix", debtor="Hermes", owes="a new head on #146", item="#146",
                 updated_at=1000.0, topic=channel.topics.context(GROUP, 5122))])
         channel._busy_since[(GROUP, 5122)] = 1000.0 + 30 * 60
         done = channel.owed_guard_tick(now=1000.0 + 31 * 60)
         self.assertEqual(channel._test_turns, [])
         self.assertIn("held: turn running", " ".join(done))
         self.assertEqual([r.stalls for r in channel._test_table[1].load()], [0])  # not spent
+    def test_a_peers_row_is_not_climbed_here(self):
+        """#177's rule, again: the table folds every writer's documents, so ownership is checked."""
+        channel = self.channel()
+        channel._test_table[1].save_all([
+            row(kind="fix", debtor="DeepSeek", owes="a new head on #146", item="#146",
+                updated_at=1000.0, topic=channel.topics.context(GROUP, 5122))])
+        done = channel.owed_guard_tick(now=1000.0 + 31 * 60)
+        self.assertEqual(channel._test_turns, [])                      # no turn for a peer's debt
+        self.assertIn("not this bot's rung", " ".join(done))
+        self.assertEqual([r.stalls for r in channel._test_table[1].load()], [0])  # unspent
+
+    def test_the_coordinator_rung_needs_the_coordinator(self):
+        channel = self.channel()
+        channel._test_table[1].save_all([
+            row(kind="fix", debtor="Hermes", owes="a new head on #146", item="#146",
+                updated_at=1000.0, stalls=1, topic=channel.topics.context(GROUP, 5122))])
+        done = channel.owed_guard_tick(now=1000.0 + 31 * 60)
+        self.assertEqual(channel._test_turns, [])                      # not the coordinator here
+        self.assertIn("only the coordinator climbs this rung", " ".join(done))
+        self.assertEqual([r.stalls for r in channel._test_table[1].load()], [1])
+        # ... and the coordinator delivers it.
+        channel.is_coordinator = lambda **kwargs: True
+        channel.owed_guard_tick(now=1000.0 + 31 * 60)
+        self.assertEqual(len(channel._test_turns), 1)
+        self.assertEqual([r.stalls for r in channel._test_table[1].load()], [2])
+
+    def test_two_bots_on_one_table_climb_one_rung_between_them(self):
+        """Four bots on the beat used to mean four reminders and four rungs for one stall."""
+        first = self.channel()
+        store = first._test_table[1]
+        store.save_all([row(kind="fix", debtor="Hermes", owes="a new head on #146", item="#146",
+                            updated_at=1000.0, topic=first.topics.context(GROUP, 5122))])
+        second = self.channel()
+        second.owed_store = lambda: store                       # the same table, another bot
+        second._test_table = (first._test_table[0], store)
+        first.owed_guard_tick(now=1000.0 + 31 * 60)
+        second.owed_guard_tick(now=1000.0 + 31 * 60)
+        self.assertEqual(len(first._test_turns) + len(second._test_turns), 1)   # one turn
+        self.assertEqual([r.stalls for r in store.load()], [1])                 # one rung
+

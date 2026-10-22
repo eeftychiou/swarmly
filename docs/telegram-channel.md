@@ -1272,14 +1272,19 @@ the forty-character head agrees with is not a contradiction.
 
 **Invariants, deadlines, budget (#164).** Three rules keep the table honest while nobody is
 looking. **An open round item with no live row is an orphan** — nothing owes the next step on
-it — so the sweep opens `the coordinator owes a next step on #N`, carrying the concrete gap
+it — so the sweep opens `the next actor owes a next step on #N`, carrying the concrete gap
 (`PR #146: CI green, merge verdict, QA pass, not merged`): that is the 09:13 case where no WAKE
 was armed and nothing in the table said the round was stuck. `next_actor()` derives who must act
 next from the item's own facts (a result, then the reviewer, then QA, then the coordinator), and
-a role nobody holds is a flag for the dashboard rather than a guess. **Every row has a
+the orphan's debtor is that bot — a reviewer with a merge in hand is the one reminded, while an
+item waiting on nothing but CI goes to the coordinator, and a role nobody holds stays a flag
+rather than a guess. **Every row has a
 deadline**: one that no fact has moved for `limits.stall_minutes` (default 30) climbs three
 rungs, each happening once and each logged — a reminder to the debtor in code, then one
-coordinator turn to reassign or escalate, then the admin. **A round's coordinator wakes are
+coordinator turn to reassign or escalate, then the admin. **Who climbs**: only the row's own
+debtor posts the reminder, and only the coordinator the two rungs after it, in code — the table
+folds every bot's documents, so without that check four bots would each post the reminder and
+push the ladder four rungs for one stall (the rule #177 set for wakes, applied to the ladder). **A round's coordinator wakes are
 budgeted** by `limits.round_wake_budget` (default 20 a day, counted in
 `.agents/state/owed-wake-budget.json` (beside the table, never inside it) so a restart does not refill it): reaching it pauses those
 wakes, leaves the table readable in `/owed`, and tells the admin once. The wake budget replaces
