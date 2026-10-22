@@ -869,6 +869,37 @@ class AgentChannel:
         mentions = re.findall(rf"(?i)@(?:{mine})\b", text)
         return len(delegated.findall(text)) >= len(mentions)
 
+    def _handoff_handles(self) -> List[str]:
+        """Every way a peer may write one of the swarm's bots: alias and @username (#181).
+
+        Both spellings appear in live messages ("@Reasonix: ..." and "@reasonix_dd_bot: ..."),
+        and a split that only knows one of them misses the other's recipient.
+        """
+        handles: List[str] = []
+        for alias, username in (self.config.peers or {}).items():
+            for name in (alias, str(username or "").lstrip("@")):
+                if name and name not in handles:
+                    handles.append(name)
+        return handles
+
+    def _own_handle(self, text: str) -> str:
+        """The handle this message uses for this bot, else this bot's username."""
+        names = [str(name).lstrip("@") for name in
+                 (self.config.identity.username, self.config.identity.name,
+                  self.config.identity.alias) if name]
+        lowered = (text or "").lower()
+        for name in names:
+            if f"@{name.lower()}" in lowered:
+                return name
+        return names[0] if names else ""
+
+    def _own_brief(self, text: str) -> str:
+        """One multi-recipient message, as *this* bot reads it: its own line plus the context."""
+        from swarmly.telegram.handoff_split import own_brief
+        if not text:
+            return text
+        return own_brief(text, self._own_handle(text), self._handoff_handles())
+
     def _routing_text(self, text: Optional[str]) -> str:
         """*text* as routing reads it: without the trailer of handles a transport appended (#28).
 
@@ -1075,7 +1106,12 @@ class AgentChannel:
             # relay rule below still keeps a named bot from taking work meant for another,
             # and a drop there is reported to the sender (``_mention_drop_notice``).
             if self._relayed_through_peer(event):
-                return False, "a peer asks another bot to hand this bot the work"
+                # ...unless the message asks several bots at once (#181): then it is one
+                # hand-off per bot, and the delegation rule does not apply to it. Only a
+                # message that asks *one* bot keeps the old refusal.
+                from swarmly.telegram.handoff_split import is_multi_recipient
+                if not is_multi_recipient(event.text or "", self._handoff_handles()):
+                    return False, "a peer asks another bot to hand this bot the work"
 
         # A stateful adapter explicitly opts in to delivery of every message that
         # contains its Telegram username. This bypasses status/ack and cooldown filtering:
@@ -6031,6 +6067,15 @@ class AgentChannel:
             event = split.event or event
             event.text = split.joined()
             event.reassembled = True
+
+        # #181: a peer message that asks several bots at once is one hand-off per bot. This
+        # bot reads its own line plus the shared context, so it does its share and no more.
+        if event.author_is_bot and event.text:
+            own = self._own_brief(event.text)
+            if own != event.text:
+                logger.info("multi-recipient hand-off: reading %d of %d chars as this bot's "
+                            "share", len(own), len(event.text))
+                event.text = own
 
         # Every message that names its topic teaches the name, addressed to us or not.
         if event.thread_id is not None:

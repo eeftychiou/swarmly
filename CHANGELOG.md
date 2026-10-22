@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A peer's message that asks several bots at once is one hand-off **per bot** (`#181`): each
+  reads the shared context plus its own lines, and none of them refuses with "a peer asks
+  another bot to hand this bot the work" -- the line that dropped a request eight times in
+  round 5. A message that asks one bot, and merely names another as who should get the work,
+  is still that one bot's.
 - An open item whose next actor cannot be derived is **flagged** on its row (`⚑ no next actor: …`
   in `/owed`) instead of looking like one more coordinator debt, and the coordinator is still
   named so the item is not lost (`#194`, the second #164 invariant).
