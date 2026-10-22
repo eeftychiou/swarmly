@@ -341,5 +341,30 @@ class TestTheAdapterReports(unittest.TestCase):
                          (0, 0, 0.0))
 
 
+class TestNoBackgroundTasksInATurn(unittest.TestCase):
+    """Live, round 5: a backgrounded `find` kept the turn alive, and Claude's NO_REPLY to its
+    notice replaced the real answer, so the admin's request got silence."""
+
+    def test_the_turn_runs_with_background_tasks_off(self):
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        env = ClaudeAdapter("Hermes").environment({"PATH": "/bin"})
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
+
+    def test_a_no_reply_to_a_task_notice_is_not_silence(self):
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        payload = json.dumps({"result": "NO_REPLY", "subtype": "success",
+                              "origin": {"kind": "task-notification"}})
+        reply = ClaudeAdapter("Hermes").parse_output(payload, 1.0)
+        self.assertFalse(reply.ok)
+        self.assertIn("answer was lost", reply.error)
+
+    def test_a_chosen_no_reply_stays_silent(self):
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        payload = json.dumps({"result": "NO_REPLY", "subtype": "success"})
+        reply = ClaudeAdapter("Hermes").parse_output(payload, 1.0)
+        self.assertTrue(reply.ok)
+        self.assertEqual(reply.text, "NO_REPLY")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -58,6 +58,7 @@ from swarmly.telegram.adapters.base import (
     channel_rules,
     discussion_line,
     format_channel_prompt,
+    is_silent_reply,
     load_state,
     project_line,
     rules_digest,
@@ -180,6 +181,16 @@ class ClaudeAdapter(SubprocessAdapter):
         at = argv.index("--") if "--" in argv else len(argv) - 1
         return argv[:at] + flags + argv[at:]
 
+    def environment(self, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        env = super().environment(base)
+        # A turn is one headless process whose last answer is its reply. A command Claude Code
+        # moves to the background keeps that process alive, and the notice that it finished
+        # starts one more answer, which replaces the real one (live, round 5: a full report
+        # written at 10:14 was replaced by a NO_REPLY to a `find` that ended at 10:22). Long
+        # commands run inside the turn instead. adapter.extra_env can still set it to 0.
+        env.setdefault("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
+        return env
+
     def parse_output(self, out: str, duration: float) -> AdapterReply:
         data = parse_claude_json(out)
         if data is None:
@@ -218,6 +229,15 @@ class ClaudeAdapter(SubprocessAdapter):
         if not result:
             return AdapterReply(ok=False, error=f"{self.alias} produced an empty result",
                                 duration_seconds=duration, meta=meta)
+        origin = data.get("origin")
+        if is_silent_reply(result) and isinstance(origin, dict) \
+                and origin.get("kind") == "task-notification":
+            # The last answer was to a background task's notice, not to the message: whatever
+            # the turn said before it is gone, so say that rather than stay silent.
+            return AdapterReply(
+                ok=False, duration_seconds=duration, meta=meta,
+                error=f"{self.alias}: the turn ended on a background task's notice, so its "
+                      "answer was lost; ask again for it")
         return AdapterReply(text=self.trim(result), duration_seconds=duration, meta=meta)
 
 
