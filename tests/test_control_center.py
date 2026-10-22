@@ -28,6 +28,7 @@ class FakeBot:
         self.sent = []
         self.edits = []
         self.pins = []
+        self.unpins = []
         self.pinned = pinned
         self.next_id = next_id
         self.send_error = None
@@ -51,6 +52,10 @@ class FakeBot:
         if self.pin_error:
             raise self.pin_error
         self.pins.append(kwargs)
+        return True
+
+    async def unpin_chat_message(self, **kwargs):
+        self.unpins.append(kwargs)
         return True
 
     async def get_chat(self, chat_id):
@@ -159,6 +164,59 @@ class TestFailover(unittest.TestCase):
         result = run(centre(bot).refresh())
         self.assertEqual(result.status, cc.CREATED)
         self.assertNotEqual(result.message_id, 779)
+
+
+MOVED = "SWARM round=5 items=4/9 coord=Claude"
+
+
+class TestAFailoverRetiresTheOldPin(unittest.TestCase):
+    """A bot may edit only its own messages, so a failover cannot adopt the old dashboard.
+
+    Telegram answers "message can't be edited" for another bot's message. Reading that as
+    "gone" (as this code did) pinned a *second* dashboard and left the first one live with its
+    buttons -- presses then landed on a bot that no longer coordinated (review, #133).
+    """
+
+    def pinned(self, author=None, message_id=777):
+        row = SimpleNamespace(message_id=message_id, text=TEXT, message_thread_id=307)
+        if author:
+            row.from_user = SimpleNamespace(username=author)
+        return row
+
+    def test_the_previous_coordinators_dashboard_is_retired_not_adopted(self):
+        bot = FakeBot(pinned=self.pinned(author="ClaudeBot"))
+        row = cc.ControlCenter(bot, chat_id=CHAT, thread_id=307, render=lambda: TEXT,
+                               me_username="HermesBot")
+        result = run(row.refresh())
+        self.assertEqual(bot.unpins[0]["message_id"], 777)          # its keyboard goes with it
+        self.assertEqual(len(bot.sent), 1)                          # exactly one dashboard now
+        self.assertNotEqual(result.message_id, 777)
+        self.assertEqual(bot.pins[0]["message_id"], result.message_id)
+
+    def test_a_restart_adopts_the_pins_own_dashboard_and_posts_nothing(self):
+        bot = FakeBot(pinned=self.pinned(author="HermesBot"))
+        row = cc.ControlCenter(bot, chat_id=CHAT, thread_id=307, render=lambda: TEXT,
+                               me_username="HermesBot")
+        result = run(row.refresh())
+        self.assertEqual(result.message_id, 777)
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(bot.unpins, [])
+
+    def test_a_refused_edit_retires_the_message_instead_of_duplicating_it(self):
+        """The fallback, for when Telegram does not tell us who sent the pin."""
+        bot = FakeBot(pinned=self.pinned(author=None))
+        bot.edit_error = RuntimeError("Bad Request: message can't be edited")
+        result = run(centre(bot, MOVED).refresh())    # a moved dashboard: it tries to edit
+        self.assertEqual(bot.unpins[0]["message_id"], 777)
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(result.status, cc.CREATED)
+
+    def test_a_deleted_message_is_recreated_and_nothing_is_unpinned(self):
+        bot = FakeBot(pinned=self.pinned(author=None))
+        bot.edit_error = RuntimeError("Bad Request: message to edit not found")
+        result = run(centre(bot, MOVED).refresh())
+        self.assertEqual(bot.unpins, [])                            # gone is not "not ours"
+        self.assertEqual(result.status, cc.CREATED)
 
 
 class TestAFailureNeverRaises(unittest.TestCase):

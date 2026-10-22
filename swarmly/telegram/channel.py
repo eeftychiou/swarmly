@@ -2803,7 +2803,8 @@ class AgentChannel:
         chat_id = settings.chat_id or self.config.identity.home_channel_id
         centre = ControlCenter(bot, chat_id=chat_id, thread_id=settings.topic_id,
                                render=self.control_text,
-                               markup=lambda: control_mod.keyboard(self.control_actions()))
+                               markup=lambda: control_mod.keyboard(self.control_actions()),
+                               me_username=self.config.identity.name)
         self._control_center = centre
         return centre
 
@@ -3069,6 +3070,20 @@ class AgentChannel:
                 f"(admin only, no turn). Anything that changes something needs /cli! and a "
                 f"confirmation.")
 
+    def _control_elsewhere(self) -> str:
+        """The bot that coordinates instead of this one, when the lease names another.
+
+        Empty when this bot is the coordinator, or when no lease is readable at all: a swarm
+        that cannot read its lease must still be stoppable from wherever its dashboard is.
+        """
+        try:
+            leader = str(self.current_coordinator() or "").strip()
+        except Exception:                      # noqa: BLE001 - a press must not fail on this
+            return ""
+        if not leader or leader.lower() == str(self.config.identity.alias).strip().lower():
+            return ""
+        return leader
+
     def control_policy(self) -> Any:
         """The press policy: admin-only, a second tap for anything that stops, one log line."""
         existing = getattr(self, "_control_policy", None)
@@ -3087,6 +3102,14 @@ class AgentChannel:
         path (and so the bus, when ``bus.repo`` is set), so a control leaves a record of who
         stopped what.
         """
+        stale = self._control_elsewhere()
+        if stale:
+            # A dashboard from an earlier coordinator can outlive its failover (Telegram will
+            # not let this bot unpin everything), and its buttons would otherwise answer
+            # "done" from a bot that no longer coordinates (review, #133).
+            answer = f"{stale} coordinates now: press the dashboard in its message."
+            self._control_answer = answer
+            return answer
         try:
             decision = self.control_policy().decide(press, actor=str(press.user_id))
             if decision.verdict == press_mod.RUN:

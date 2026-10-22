@@ -8,11 +8,14 @@ testable without aiogram and without the network.
 
 Three decisions shape it.
 
-**The pin is the state.** The message id is not kept in a file: the new coordinator cannot
-read the old one's disk, and a stale file would send a second coordinator to an old message.
-Telegram already remembers, so the coordinator asks the chat for its pinned message and adopts
-it when it is one of ours -- that is what makes a failover take over *the same* message
-instead of pinning a second one.
+**The pin is the state, and a failover retires it rather than adopting it.** The message id
+is not kept in a file: the new coordinator cannot read the old one's disk, and a stale file
+would send a second coordinator to an old message. Telegram already remembers, so the
+coordinator asks the chat for its pinned message and finds the previous dashboard by its
+marker -- but a bot may edit only its **own** messages, so the new coordinator cannot take the
+old one over: it **unpins** the predecessor's message (retiring its keyboard with it) and pins
+its own. The pin is therefore still the state, and there is still exactly one live dashboard;
+it is just a different message than the one it replaced.
 
 **A refresh never breaks the beat.** Every failure -- no right to pin, a message deleted by
 the admin, a flood wait -- is a returned status and a log line, never an exception: the
@@ -67,14 +70,37 @@ def _thread_of(message: Any) -> Optional[int]:
     return getattr(message, "message_thread_id", None)
 
 
+def _sender_username(message: Any) -> str:
+    """The @username of whoever sent a pinned message, when Telegram tells us.
+
+    This is what tells a bot's *own* dashboard (a restart: adopt it and keep editing) from the
+    previous coordinator's (a failover: a bot may not edit another bot's message, so it must
+    retire it). Empty when the field is absent, and then the edit is simply attempted and the
+    refusal is caught.
+    """
+    sender = getattr(message, "from_user", None) or getattr(message, "from", None)
+    return str(getattr(sender, "username", "") or "")
+
+
 def _not_modified(exc: BaseException) -> bool:
     return "not modified" in str(exc).lower()
 
 
 def _gone(exc: BaseException) -> bool:
+    """Whether the message is really gone: the admin deleted it, or it is too old."""
     text = str(exc).lower()
-    return "message to edit not found" in text or "message_id_invalid" in text \
-        or "message can't be edited" in text
+    return "message to edit not found" in text or "message_id_invalid" in text
+
+
+def _not_ours(exc: BaseException) -> bool:
+    """Whether Telegram refused because the message belongs to *another* bot.
+
+    "message can't be edited" is what a failover hits: the dashboard pinned by the previous
+    coordinator is a message this bot may read and may not edit -- Telegram lets a bot edit
+    only its own messages. Reading that as "gone" pins a second dashboard while the old pin
+    and its buttons stay live, so it is its own outcome (review, #133).
+    """
+    return "message can't be edited" in str(exc).lower()
 
 
 class ControlCenter:
@@ -86,8 +112,11 @@ class ControlCenter:
 
     def __init__(self, bot: Any, *, chat_id: int, thread_id: Optional[int] = None,
                  render: Callable[[], str], markup: Optional[Callable[[], Any]] = None,
-                 clock: Optional[Callable[[], float]] = None):
+                 clock: Optional[Callable[[], float]] = None,
+                 me_username: str = ""):
         self.bot = bot
+        #: This bot's own @username, so a pin it did not send is recognised as a failover's.
+        self.me_username = str(me_username or "").lstrip("@").strip()
         self.chat_id = int(chat_id)
         self.thread_id = thread_id
         self._render = render
@@ -137,6 +166,14 @@ class ControlCenter:
             return None
         if self.thread_id is not None and _thread_of(pinned) not in (None, self.thread_id):
             return None                                # another topic's dashboard: not ours
+        author = _sender_username(pinned)
+        if author and self.me_username and author.lstrip("@").lower() != self.me_username.lower():
+            # A failover: this is the previous coordinator's dashboard. A bot may edit only its
+            # own messages, so retire that pin (its keyboard with it) and pin our own.
+            logger.info("control center: the pinned dashboard belongs to @%s; retiring it",
+                        author)
+            await self._unpin(getattr(pinned, "message_id", None))
+            return None
         self.message_id = getattr(pinned, "message_id", None)
         if self.message_id is None:
             return None
@@ -183,6 +220,25 @@ class ControlCenter:
         except Exception as exc:                       # noqa: BLE001 - an unpinned dashboard
             logger.warning("control center: the dashboard did not pin: %s", exc)
 
+    async def _unpin(self, message_id: Optional[int]) -> None:
+        """Retire a message this bot cannot edit: the keyboard under it must go too.
+
+        Best effort on purpose -- a bot that is not a group admin may not unpin at all, and a
+        dashboard that fails to retire its predecessor must still be pinned itself. The press
+        path is the second line of defence: a control pressed on a bot that no longer
+        coordinates is refused, so a surviving stale pin answers nothing.
+        """
+        if message_id is None:
+            return
+        unpin = getattr(self.bot, "unpin_chat_message", None)
+        if unpin is None:
+            return
+        try:
+            await unpin(chat_id=self.chat_id, message_id=message_id)
+            logger.info("control center: retired the previous dashboard (%s)", message_id)
+        except Exception as exc:                       # noqa: BLE001 - the press check covers it
+            logger.warning("control center: could not retire the previous dashboard: %s", exc)
+
     async def _edit(self, text: str, *, taken: bool = False) -> Refreshed:
         assert self.message_id is not None
         try:
@@ -194,6 +250,15 @@ class ControlCenter:
                 self.last_text = text
                 self.status = UNCHANGED
                 return Refreshed(UNCHANGED, self.message_id, str(exc))
+            if _not_ours(exc):
+                # A failover: the dashboard on the pin is the previous coordinator's, and this
+                # bot may not edit it. Retire it -- its buttons would otherwise keep answering
+                # presses on a bot that no longer coordinates -- and pin our own.
+                logger.info("control center: the pinned dashboard is another bot's (%s); "
+                            "retiring it and pinning this bot's", exc)
+                stale, self.message_id = self.message_id, None
+                await self._unpin(stale)
+                return await self._create(text)
             if _gone(exc):
                 # The admin deleted it, or it is too old to edit: send a fresh one and pin it.
                 logger.info("control center: the pinned message is gone (%s); recreating", exc)

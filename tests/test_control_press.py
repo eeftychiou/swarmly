@@ -512,6 +512,39 @@ class TestTheReportControls(unittest.TestCase):
         self.assertIn("is a report, not a control", apply(channel, line))
 
 
+class TestAStaleDashboardAnswersNothing(unittest.TestCase):
+    """A press on a dashboard whose bot no longer coordinates is refused (review, #133).
+
+    A failover retires the old pin, but an unpin can fail (a bot without rights), and the old
+    keyboard then still sits in the chat. Its buttons must not answer "done" from a bot that
+    is not leading any more.
+    """
+
+    def channel(self, leader="Claude"):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        channel.current_coordinator = lambda now=None: leader
+        return channel
+
+    def test_a_press_on_a_bot_that_no_longer_coordinates_is_refused(self):
+        channel = self.channel()
+        answer = run(channel.handle_control_press(press("ctl:bot.pause")))
+        self.assertIn("coordinates now", answer)
+        self.assertFalse(channel._frozen)                          # and it did nothing
+        self.assertEqual([entry for entry in channel._test_sender.sent
+                          if "intent=CONTROL" in entry["text"]], [])
+
+    def test_the_coordinator_itself_still_answers(self):
+        channel = self.channel(leader="Hermes")
+        self.assertIn("Pause", run(channel.handle_control_press(press("ctl:bot.pause"))))
+        self.assertTrue(channel._frozen)
+
+    def test_a_swarm_that_cannot_read_its_lease_still_answers(self):
+        channel = self.channel(leader="")
+        run(channel.handle_control_press(press("ctl:bot.pause")))
+        self.assertTrue(channel._frozen)
+
+
 class TestTheSwarmControls(unittest.TestCase):
     """Resync the swarm, and the cleanup dry run: the two that need no value (issue #117)."""
 

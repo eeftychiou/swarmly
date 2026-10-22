@@ -1001,9 +1001,15 @@ zero it did not report.
 
 Telegram allows 4,096 characters in one message, so the layout drops whole lines in that
 order when it runs out of room — the round board first, the alerts last — and says how many
-it hid. The pin is the state: a new coordinator (a failover, #83) reads the chat's pinned
-message, recognises this one by its `SWARM` marker, and edits **the same message**, so there
-is never a second dashboard. A refresh that cannot be delivered is a log line and a status,
+it hid. The pin is the state, and a failover retires it rather than adopting it: a new
+coordinator (a failover, #83) reads the chat's pinned message and recognises the previous
+dashboard by its `SWARM` marker, but **Telegram lets a bot edit only its own messages**, so it
+cannot take that message over. It unpins the predecessor's message (retiring its keyboard with
+it) and pins its own, so there is still exactly one live dashboard — a different message, not
+a second one. A restart of the same bot adopts its own pin and posts nothing. If the unpin
+fails (a bot without pin rights), the press path is the second line of defence: a control
+pressed on a bot the lease no longer names as coordinator is refused, so a stale pin answers
+"<that bot> coordinates now" instead of "done". A refresh that cannot be delivered is a log line and a status,
 never a failed heartbeat, and an unchanged dashboard sends nothing at all.
 
 The buttons under it come from `CONTROLS` in `swarmly/telegram/control.py` — pause, resume,
