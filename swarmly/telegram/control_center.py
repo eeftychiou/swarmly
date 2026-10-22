@@ -167,11 +167,22 @@ class ControlCenter:
         if self.thread_id is not None and _thread_of(pinned) not in (None, self.thread_id):
             return None                                # another topic's dashboard: not ours
         author = _sender_username(pinned)
+        if self.me_username and not author:
+            # Telegram did not say who sent the pin, so nothing here can tell our own dashboard
+            # (a restart: adopt it) from a predecessor's (a failover: retire it). The edit is
+            # attempted and a refusal retires it -- and this line is what makes a deployment
+            # whose Telegram @username differs from ``identity.name`` visible, because it lands
+            # here on every restart instead of adopting its own message (review, #133).
+            logger.info("control center: the pinned dashboard's author is not reported by "
+                        "Telegram, and this bot is @%s; attempting to edit it, and retiring the "
+                        "pin if Telegram refuses", self.me_username)
         if author and self.me_username and author.lstrip("@").lower() != self.me_username.lower():
             # A failover: this is the previous coordinator's dashboard. A bot may edit only its
             # own messages, so retire that pin (its keyboard with it) and pin our own.
-            logger.info("control center: the pinned dashboard belongs to @%s; retiring it",
-                        author)
+            logger.info("control center: the pinned dashboard belongs to @%s and this bot is "
+                        "@%s, and a bot may edit only its own messages, so the pin is treated as "
+                        "a previous coordinator's: retiring it and pinning our own",
+                        author, self.me_username)
             await self._unpin(getattr(pinned, "message_id", None))
             return None
         self.message_id = getattr(pinned, "message_id", None)

@@ -211,6 +211,30 @@ class TestAFailoverRetiresTheOldPin(unittest.TestCase):
         self.assertNotEqual(result.message_id, 777)
         self.assertEqual(bot.pins[0]["message_id"], result.message_id)
 
+    def test_the_retire_line_names_both_bots_and_the_reason(self):
+        bot = FakeBot(pinned=self.pinned(author="ClaudeBot"))
+        row = cc.ControlCenter(bot, chat_id=CHAT, thread_id=307, render=lambda: TEXT,
+                               me_username="HermesBot")
+        with self.assertLogs(cc.logger, level="INFO") as logged:
+            run(row.refresh())
+        said = "\n".join(logged.output)
+        self.assertIn("@ClaudeBot", said)              # which bot it belongs to
+        self.assertIn("@HermesBot", said)              # and which bot we are
+        self.assertIn("edit only its own messages", said)   # why it is foreign
+        self.assertTrue(bot.unpins)
+
+    def test_a_pin_with_no_author_is_said_to_be_unattributed(self):
+        """A deployment whose @username differs from identity.name lands here every restart."""
+        bot = FakeBot(pinned=self.pinned(author=None))
+        row = cc.ControlCenter(bot, chat_id=CHAT, thread_id=307, render=lambda: TEXT,
+                               me_username="HermesBot")
+        with self.assertLogs(cc.logger, level="INFO") as logged:
+            run(row.refresh())
+        said = "\n".join(logged.output)
+        self.assertIn("author is not reported", said)
+        self.assertIn("@HermesBot", said)
+        self.assertIn("retiring the pin if Telegram refuses", said)
+
     def test_a_restart_adopts_the_pins_own_dashboard_and_posts_nothing(self):
         bot = FakeBot(pinned=self.pinned(author="HermesBot"))
         row = cc.ControlCenter(bot, chat_id=CHAT, thread_id=307, render=lambda: TEXT,

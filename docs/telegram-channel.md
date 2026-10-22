@@ -1031,7 +1031,10 @@ cancels the turns in flight, drops the messages queued behind them and kills any
 the `/stop all` form, because the dashboard speaks for the whole bot rather than one topic. Three rules bound every press:
 
 - **The admin only.** The presser's Telegram user id is checked before the action is even
-  looked up, so a stranger is refused and learns nothing about what the buttons do.
+  looked up, so a stranger is refused and learns nothing about what the buttons do — and that
+  answer comes before the lease check too. A stranger pressing a keyboard left over from an
+  earlier coordinator is told it is the admin's, never "<bot> coordinates now": who leads is
+  not a stranger's to learn (#157).
 - **Anything that stops or changes something asks twice.** The first tap mints a one-use code
   and answers with a **Confirm button that carries it** — `ctl:confirm:<code>` — which is the
   only thing that runs the action; the code dies when it is used or after 2 minutes. The same
@@ -1056,6 +1059,9 @@ admin's id and stop the swarm), **who it names** (the target, or `*` for a swarm
 control), and **which admin pressed** (the id must be *this* bot's admin, so a peer repeats the
 authorisation against its own config). A note that fails any of them is refused and only
 logged — and a note this bot cannot actually carry out answers `failed:`, never `applied:`.
+That refusal is never posted in the chat: one press can reach four bots, and a line per peer
+that could not follow would put four messages in front of the admin for one action, so the
+record is the log and the answer is the presser's own (#157).
 One press is one line on the bus: a swarm-wide control posts its own `target=*` note, and the
 pressing bot does not add a second, local one.
 
