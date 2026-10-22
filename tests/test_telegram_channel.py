@@ -1932,8 +1932,23 @@ class _GatedAdapter(EchoAdapter):
 
 def gated_channel(config=None):
     # The drop/notice tests need the old semantics; queueing is the default now.
+    # The bus root is a temp dir (#190, #164): a channel with none reads *this checkout's*
+    # lease and round state, and a real-world lease timestamp against this fixture's fake
+    # clock is recorded as an "old release" in a process-global set, which then leaks into
+    # `/status` and made the length bound below depend on test order.
+    import tempfile
+    bus = tempfile.TemporaryDirectory()
     channel = make_channel(config if config is not None
-                           else make_config(limits={"busy_behavior": "drop"}))
+                           else make_config(limits={"busy_behavior": "drop"},
+                                           fallback={"gitbus_root": bus.name,
+                                                     "gitbus_ref": ""}))
+    channel._test_bus = bus                       # kept alive for the channel's lifetime
+    # #164 review: `/status` carries `old_releases=`, drawn from a process-global set (#126) that
+    # another suite can fill by folding a lease claim against a fake clock. Clearing it here is
+    # the fix (the status bound below measures the whole line); the temp bus root stops this
+    # fixture from filling it in the first place.
+    from swarmly.telegram.lease import reset_old_release_tracking
+    reset_old_release_tracking()
     adapter = _GatedAdapter("Hermes")
     channel.adapter = adapter
     return channel, adapter
@@ -2076,6 +2091,11 @@ class TestBusyDropVisibility(unittest.TestCase):
         # Not a guarantee — /status is unbounded in general (`stats.last_error` carries `str(exc)`,
         # and `replies.summary()` grows with its row count). It holds here because this fixture has
         # `replies is None` and no error set, so the bound catches only a token explosion.
+        #
+        # The field that *did* drift was `old_releases=`, and it is fixed rather than excluded
+        # (#164 review): it came from a process-global set (#126) that any earlier suite folding
+        # a lease claim against a fake clock could fill, so the fixture clears it and keeps the
+        # plain assertion. A bound that skips the token that drifts is not a bound.
         self.assertLess(len(status), 200)
 
     def test_diag_reports_the_drop_as_its_own_token_inside_seen(self):

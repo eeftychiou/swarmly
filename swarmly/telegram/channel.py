@@ -3780,6 +3780,11 @@ class AgentChannel:
             self.owed_wake_tick(now=moment)
         except Exception:                          # noqa: BLE001 - a beat must not fail on it
             logger.warning("owed: wake failed this beat", exc_info=True)
+        # Round 5.5 (#164): and what is still owed after that climb the stall ladder.
+        try:
+            self.owed_guard_tick(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("owed: the stall ladder failed this beat", exc_info=True)
         # The pinned dashboard rides the beat, and only its holder edits it: every bot
         # refreshing one message would fight over it (#117).
         if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
@@ -5057,6 +5062,7 @@ class AgentChannel:
         """
         from swarmly.telegram.owed import (Fact, Row, admin_row, fix_rows, head_rows, merge_row,
                                            progress_rows, settle)
+        from swarmly.telegram.owed_guard import orphans
         moment = time.time() if now is None else float(now)
         roles = self.owed_roles()
         store = self.owed_store()
@@ -5069,6 +5075,9 @@ class AgentChannel:
         rows = store.load()
         facts: List["Fact"] = []
         fresh: List[Row] = []
+        # Round 5.5 (#164): the items this round still has open, so the orphan invariant can
+        # name the ones no row owes -- #146 at 09:13, where nothing said the round was stuck.
+        open_items: List[Any] = []
         for key in keys:
             try:
                 state = rounds.load(key)
@@ -5122,12 +5131,16 @@ class AgentChannel:
                         if merge is not None:
                             fresh.append(merge)
                 fresh.extend(progress_rows(items=[{**item, "key": item_key}], at=moment))
+                open_items.append((item_key, item))
                 if str(item.get("waits_on") or "").strip().lower() in ("admin", "owner", "human"):
                     fresh.append(admin_row(
                         question=str(item.get("note") or f"waiting on the admin on {label}"),
                         item=label, at=moment))
         # A snapshot, not the objects themselves: settling mutates the rows in `table`, and a
         # comparison against the same objects would always say "unchanged".
+        fresh.extend(orphans(open_items, [*rows, *fresh],
+                              coordinator=roles.get("coordinator", ""), roles=roles,
+                              at=moment))
         seen = {row.id: row.to_dict() for row in rows}
         # The table as it will be: what is already open, plus what this sweep opens. The
         # closing facts are applied to *that*, so a fact the state carries in the same pass as
@@ -5212,8 +5225,16 @@ class AgentChannel:
         wrong bot. An escalation is posted by the coordinator, the swarm's one voice to the
         admin, and held by everyone else.
         """
+        from swarmly.telegram.owed_guard import budget_notice
         from swarmly.telegram.owed_wake import MAX_WAKES_PER_TICK, mark_woken, plan
         moment = time.time() if now is None else float(now)
+        me = str(self.config.identity.alias or "").strip().lower()
+        # Only the coordinator's own wakes are budgeted (#164), and the count belongs to the
+        # round -- both are worked out on the first wake that is ours, not on every tick: the
+        # lease read behind them is a bus fetch, and most ticks wake nobody here.
+        counts_budget: Optional[bool] = None
+        round_key = ""
+        has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
         try:
             store = self.owed_store()
             rows = store.open_rows(now=moment)
@@ -5256,6 +5277,26 @@ class AgentChannel:
                 # debt stays armed and is looked at again on the next tick.
                 done.append(f"{wake.row}: held: turn running")
                 continue
+            if has_bus and wake.debtor.strip().lower() == me:
+                # A round budget needs a round, and a round lives on the bus: without one there
+                # is nothing to count against, and no lease worth reading for it.
+                if counts_budget is None:
+                    counts_budget = self.is_coordinator()
+                    round_key = self.owed_round_key() if counts_budget else ""
+            if counts_budget and wake.debtor.strip().lower() == me:
+                # #164: a round's coordinator wakes are budgeted; a developer's or a reviewer's
+                # are the debt's own. Reaching the cap pauses them and tells the admin once.
+                budget = self.owed_budget()
+                if not budget.allow(round_key, now=moment):
+                    done.append(f"{wake.row}: held: the round's wake budget is spent")
+                    if not getattr(self, "_owed_budget_told", False):
+                        self._owed_budget_told = True
+                        logger.warning("%s", budget_notice(round_key, budget.cap))
+                        self._run_own_task(budget_notice(round_key, budget.cap), key[0], key[1],
+                                           self.topics.name(key[0], key[1]))
+                        fired.add(key)
+                    continue
+                budget.spend(round_key, now=moment)
             self._run_own_task(self._owed_wake_note(wake), key[0], key[1],
                                self.topics.name(key[0], key[1]))
             fired.add(key)
@@ -5269,6 +5310,93 @@ class AgentChannel:
                                exc_info=True)
         if done:
             logger.info("owed wake: %s", "; ".join(done[:8]))
+        return done
+
+    # -- invariants, deadlines and the budget (issue #164) -------------------------------
+
+    def owed_budget(self) -> Any:
+        """The day's coordinator-wake budget for this round (#164).
+
+        One small file beside the table, because the count has to survive a restart: a budget
+        that resets with the process is not a budget.
+        """
+        from swarmly.telegram.owed_guard import WakeBudget
+        from swarmly.telegram.wake import wake_dir_for
+        state = wake_dir_for(self.config)
+        # Beside the table's directory, never inside it: the store reads every `*.json` under
+        # `owed/` as a row, and a counter there is reported as an unreadable row (#164 review).
+        path = None if state is None else Path(state) / "owed-wake-budget.json"
+        return WakeBudget(path, cap=int(getattr(self.config.limits, "round_wake_budget", 0) or 0),
+                          clock=time.time)
+
+    def owed_round_key(self) -> str:
+        """The round a budget is counted against: the newest round state's own key, or ""."""
+        try:
+            names = self.round_store().rounds()
+        except Exception:                          # noqa: BLE001 - a budget must not fail
+            return ""
+        return sorted(names)[-1] if names else ""
+
+    def owed_guard_tick(self, *, now: Optional[float] = None) -> List[str]:
+        """Walk the stall ladder: remind, then tell the coordinator, then the admin (#164).
+
+        One rung per row per tick, each happening once: a reminder to the debtor in code, then
+        one coordinator turn to reassign or escalate, then the admin. "Stalled" is measured on
+        the row itself -- ``updated_at`` moves only when a fact changed it -- so a beat that
+        writes nothing cannot keep a stuck item looking fresh.
+        """
+        from swarmly.telegram.owed_guard import (STALL_ADMIN, STALL_REMINDER, advance, stalls)
+        minutes = float(getattr(self.config.limits, "stall_minutes", 0) or 0)
+        moment = time.time() if now is None else float(now)
+        try:
+            store = self.owed_store()
+            rows = store.open_rows(now=moment)
+        except Exception:                          # noqa: BLE001 - a tick must survive
+            logger.warning("owed guard: the table could not be read", exc_info=True)
+            return []
+        decided = stalls(rows, now=moment, minutes=minutes)
+        if not decided:
+            return []
+        # Who may deliver a rung. The table folds every writer's documents, so a bot that
+        # neither owes the row nor coordinates would otherwise climb its own copy of the
+        # ladder and advance it for everyone: four bots, one stall, four reminders and four
+        # rungs (#177's rule, and the reason `stalls` is durable).
+        me = str(self.config.identity.alias or "").strip().lower()
+        coordinating = self.is_coordinator()
+        done: List[str] = []
+        climbed: List[Any] = []
+        fired: Set[Any] = set()
+        for stall in decided:
+            row = next((item for item in rows if item.id == stall.row), None)
+            if row is None:
+                continue
+            if stall.step == STALL_REMINDER:
+                if str(stall.debtor or "").strip().lower() != me:
+                    done.append(f"{stall.row}: held: not this bot's rung")
+                    continue
+            elif not coordinating:
+                done.append(f"{stall.row}: held: only the coordinator climbs this rung")
+                continue
+            target = self._place_target(row.topic)
+            if target is None:
+                done.append(f"{stall.row}: held: nowhere to say it")
+                continue
+            key = (int(target[0]), target[1])
+            if key in self._busy_since or key in fired:
+                done.append(f"{stall.row}: held: turn running")
+                continue
+            self._run_own_task(stall.text, key[0], key[1], self.topics.name(key[0], key[1]))
+            fired.add(key)
+            climbed.append(stall)
+            done.append(f"{stall.row}: {stall.step}{' (admin)' if stall.step == STALL_ADMIN else ''}")
+        if climbed:
+            try:
+                store.save_all(advance(rows, climbed, now=moment))
+            except Exception:                      # noqa: BLE001 - the turn is already running
+                logger.warning("owed guard: could not record a rung; it may repeat",
+                               exc_info=True)
+        if done:
+            logger.info("owed guard: %s", "; ".join(done[:8]))
         return done
 
     def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
