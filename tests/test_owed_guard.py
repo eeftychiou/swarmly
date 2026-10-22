@@ -59,6 +59,25 @@ class TestTheOrphanItem(unittest.TestCase):
         rows = guard.orphans([("146", item())], [], coordinator="Claudebot", at=1000.0)
         self.assertEqual([r.id for r in rows], ["progress:#146:Claudebot"])
 
+    def test_an_item_with_no_next_actor_is_flagged_not_silently_the_coordinators(self):
+        """#164's second invariant: no derivable actor is a flag on the row, not a quiet debt."""
+        rows = guard.orphans([("146", item())], [], coordinator="Claudebot", roles={}, at=1000.0)
+        self.assertEqual([r.debtor for r in rows], ["Claudebot"])   # still theirs to assign
+        self.assertIn("no next actor", rows[0].flag)
+        self.assertIn("⚑ no next actor", rows[0].line(now=1000.0))  # and `/owed` shows it
+        # A row whose next actor *is* known carries no flag.
+        rows = guard.orphans([("146", item(review={"verdict": "merge"}))], [],
+                             coordinator="Claudebot", roles=ROLES, at=1000.0)
+        self.assertEqual(rows[0].flag, "")
+        self.assertNotIn("⚑", rows[0].line(now=1000.0))
+
+    def test_the_flag_survives_the_round_trip(self):
+        row = guard.orphans([("146", item())], [], coordinator="Claudebot", roles={},
+                            at=1000.0)[0]
+        again = ow.Row.from_dict(row.to_dict())
+        self.assertEqual(again.flag, row.flag)
+        self.assertEqual(again.id, row.id)
+
     def test_an_item_a_live_row_answers_is_no_orphan(self):
         live = row(item="#146", kind="progress", debtor="DeepSeek", owes="progress on #146")
         self.assertEqual(guard.orphans([("146", item())], [live], coordinator="Claudebot"), [])

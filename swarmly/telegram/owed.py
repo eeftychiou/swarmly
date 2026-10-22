@@ -184,6 +184,9 @@ class Row:
     #: made in, or a digest of the question an admin row is about. Without it, one peer's two
     #: hand-offs in two topics are one row, and a reply in either closes both (#173 review).
     key_extra: str = ""
+    #: Something about this row a reader must see rather than infer: today, an open item whose
+    #: next actor cannot be derived (#164's second invariant). Shown in `/owed`, never acted on.
+    flag: str = ""
     #: The bot that wrote this row, like `.agents/wakes/<alias>/` (#162 review): two observers
     #: of the same debt write the same id in different directories, and `fold` reconciles them.
     writer: str = ""
@@ -216,6 +219,7 @@ class Row:
         self.escalated = bool(self.escalated)
         self.stalls = int(self.stalls or 0)
         self.key_extra = str(self.key_extra or "").strip()
+        self.flag = str(self.flag or "").strip()
         self.writer = _alias(self.writer)
         self.state = str(self.state or OPEN).strip().lower()
         if self.state not in STATES:
@@ -258,6 +262,8 @@ class Row:
             text += f" ({self.waiting_on} waiting)"
         if self.observed:
             text += f" [{self.observed}]"
+        if self.flag:
+            text += f" ⚑ {self.flag}"
         if self.deadline:
             moment = time.time() if now is None else float(now)
             left = self.deadline - moment
@@ -269,7 +275,7 @@ class Row:
             "version": self.version, "kind": self.kind, "item": self.item,
             "debtor": self.debtor, "owes": self.owes, "waiting_on": self.waiting_on,
             "opened_by": self.opened_by, "observed": self.observed, "head": self.head,
-            "topic": self.topic, "key_extra": self.key_extra,
+            "topic": self.topic, "key_extra": self.key_extra, "flag": self.flag,
             "woken": self.woken, "wakes": int(self.wakes),
             "woken_at": float(self.woken_at), "escalated": bool(self.escalated),
             "stalls": int(self.stalls),
@@ -294,6 +300,7 @@ class Row:
             opened_by=str(data.get("opened_by") or ""),
             observed=str(data.get("observed") or ""), head=str(data.get("head") or ""),
             topic=str(data.get("topic") or ""), key_extra=str(data.get("key_extra") or ""),
+            flag=str(data.get("flag") or ""),
             woken=str(data.get("woken") or ""), wakes=int(data.get("wakes") or 0),
             woken_at=data.get("woken_at") or 0.0,
             escalated=bool(data.get("escalated")), stalls=int(data.get("stalls") or 0),

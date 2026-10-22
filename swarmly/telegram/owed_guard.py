@@ -125,11 +125,18 @@ def orphans(items: Iterable[Tuple[str, Mapping[str, Any]]], rows: Sequence[Row],
         if actor in (CI, ADMIN):
             actor = ""                  # a fact this transport waits on, or the admin: no bot
         debtor = actor or lead
+        # #164's second invariant: every open item names a next actor, or it is **flagged**.
+        # The row still goes to the coordinator -- an item nobody can be derived for is theirs
+        # to assign -- but it says so, so `/owed` shows a PR nobody is on instead of quietly
+        # looking like one more coordinator debt.
+        flagged = "" if actor or roles is None else (
+            f"no next actor: the roles name nobody for {gap(item, key=key)}")
         out.append(Row(kind="progress", item=label, debtor=debtor,
                        owes=f"a next step on {label}", observed=gap(item, key=key),
                        waiting_on=lead if debtor.lower() != lead.lower() else "",
                        opened_by=(f"the item is open and {debtor} has the next step"
                                   if actor else "the item is open and nothing owes it"),
+                       flag=flagged,
                        deadline=deadline, created_at=moment, updated_at=moment))
     return out
 

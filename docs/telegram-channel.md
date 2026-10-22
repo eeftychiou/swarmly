@@ -1278,7 +1278,8 @@ was armed and nothing in the table said the round was stuck. `next_actor()` deri
 next from the item's own facts (a result, then the reviewer, then QA, then the coordinator), and
 the orphan's debtor is that bot — a reviewer with a merge in hand is the one reminded, while an
 item waiting on nothing but CI goes to the coordinator, and a role nobody holds stays a flag
-rather than a guess. **Every row has a
+rather than a guess: that row is still the coordinator's to assign, but it carries
+`⚑ no next actor: …`, so `/owed` shows a PR nobody is on instead of one more coordinator debt. **Every row has a
 deadline**: one that no fact has moved for `limits.stall_minutes` (default 30) climbs three
 rungs, each happening once and each logged — a reminder to the debtor in code, then one
 coordinator turn to reassign or escalate, then the admin. **Who climbs**: only the row's own
