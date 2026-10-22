@@ -1279,7 +1279,13 @@ next from the item's own facts (a result, then the reviewer, then QA, then the c
 the orphan's debtor is that bot — a reviewer with a merge in hand is the one reminded, while an
 item waiting on nothing but CI goes to the coordinator, and a role nobody holds stays a flag
 rather than a guess: that row is still the coordinator's to assign, but it carries
-`⚑ no next actor: …`, so `/owed` shows a PR nobody is on instead of one more coordinator debt. **Every row has a
+`⚑ no next actor: …`, so `/owed` shows a PR nobody is on instead of one more coordinator debt.
+The flag is computed on the table **as the facts leave it** — a CI row the same pass opens and
+closes is not a live row — and it **clears**: when the roster gains the missing role, or the
+item finds its actor, the sweep retires that row with `closed_by: the item's next actor is
+decided`. The next-actor row carries the sweep's own `key_extra` (`@next`), which is what keeps
+it apart from an owner's progress row and lets the same debt's gap move with the item as QA and
+review land instead of freezing at the day it opened. **Every row has a
 deadline**: one that no fact has moved for `limits.stall_minutes` (default 30) climbs three
 rungs, each happening once and each logged — a reminder to the debtor in code, then one
 coordinator turn to reassign or escalate, then the admin. **Who climbs**: only the row's own

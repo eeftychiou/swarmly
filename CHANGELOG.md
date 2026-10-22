@@ -10,7 +10,10 @@ All notable changes to this project are documented here. The format follows
 
 - An open item whose next actor cannot be derived is **flagged** on its row (`⚑ no next actor: …`
   in `/owed`) instead of looking like one more coordinator debt, and the coordinator is still
-  named so the item is not lost (`#194`, the second #164 invariant).
+  named so the item is not lost (`#194`, the second #164 invariant). The flag is computed on the
+  table as the closing facts leave it, so an item only CI speaks for is flagged rather than
+  looking live; it clears when the item finds its actor; and the same row's gap moves with the
+  item instead of freezing at the day it opened. `/owed` says the item once, not twice.
 - Invariants, deadlines and a wake budget (`#164`): an open round item nothing owes opens a row
   for the coordinator carrying the concrete gap (the #146 case, where no WAKE was armed), every
   open PR names its next actor or is flagged, a row no fact has moved for

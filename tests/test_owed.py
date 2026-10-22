@@ -68,6 +68,14 @@ class TestTheRow(unittest.TestCase):
                          "(Claudebot waiting) [no verdict] 15m left")
         self.assertIn("overdue", self.row(deadline=900.0).line(now=1000.0))
 
+    def test_the_line_says_an_owes_that_names_its_item_once(self):
+        """#195 review: `/owed` read "a next step on #146 on #146" for every flagged item."""
+        row = ow.Row(kind="progress", item="#146", debtor="Claudebot",
+                     owes="a next step on #146", key_extra="next")
+        line = row.line(now=1000.0)
+        self.assertEqual(line, "Claudebot owes a next step on #146")
+        self.assertEqual(line.count("#146"), 1)
+
 
 class TestOpeningRowsFromFacts(unittest.TestCase):
 

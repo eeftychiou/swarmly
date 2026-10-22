@@ -5060,9 +5060,9 @@ class AgentChannel:
         review). And **only a changed row is written**: a beat that rewrote every row pushed a
         bus commit a minute for nothing, and moved the row's ``created_at`` with it.
         """
-        from swarmly.telegram.owed import (Fact, Row, admin_row, fix_rows, head_rows, merge_row,
-                                           progress_rows, settle)
-        from swarmly.telegram.owed_guard import orphans
+        from swarmly.telegram.owed import (CLOSED, Fact, Row, admin_row, fix_rows, head_rows,
+                                           merge_row, progress_rows, settle)
+        from swarmly.telegram.owed_guard import NEXT_ACTOR_KEY, orphans
         moment = time.time() if now is None else float(now)
         roles = self.owed_roles()
         store = self.owed_store()
@@ -5138,19 +5138,63 @@ class AgentChannel:
                         item=label, at=moment))
         # A snapshot, not the objects themselves: settling mutates the rows in `table`, and a
         # comparison against the same objects would always say "unchanged".
-        fresh.extend(orphans(open_items, [*rows, *fresh],
-                              coordinator=roles.get("coordinator", ""), roles=roles,
-                              at=moment))
         seen = {row.id: row.to_dict() for row in rows}
         # The table as it will be: what is already open, plus what this sweep opens. The
         # closing facts are applied to *that*, so a fact the state carries in the same pass as
         # the row it answers still closes it (#173 review).
         table = {row.id: row for row in rows}
+
+        def learn(derived: Row) -> None:
+            """Fold what the facts derive into the row that already holds this debt.
+
+            The same debt seen again keeps what the row learned for itself (its rung count, its
+            wakes, its state) and takes what the facts now say. Without this a row's gap -- and
+            the flag that says nobody can act on it -- stayed at the value it had the day it
+            opened (#195 review). ``updated_at`` moves only when the derived values really
+            changed: a beat that writes nothing must not keep a stalled row looking fresh.
+            """
+            existing = table.get(derived.id)
+            if existing is None:
+                table[derived.id] = derived
+                return
+            if not existing.is_open:
+                return
+            moved = (existing.observed != derived.observed
+                     or existing.flag != derived.flag)
+            existing.observed = derived.observed
+            existing.flag = derived.flag
+            existing.opened_by = derived.opened_by or existing.opened_by
+            if moved:
+                existing.updated_at = moment
+
         for row in fresh:
-            table.setdefault(row.id, row)
+            learn(row)
         closed: List[Row] = []
         for fact in facts:
             closed.extend(settle(list(table.values()), fact))
+        # #164's orphan invariant, on the table **as the facts leave it**: a CI row this very
+        # pass opened and closed was still counting as a live row, so an item nobody owed the
+        # next step on was never flagged (#195 review). The sweep's own next-actor rows are
+        # left out of that count for the same reason: they *are* the "nobody owes it" row, and
+        # counting them as live froze the gap at the day the item opened (#195 review).
+        live_now = [row for row in table.values()
+                    if not (row.kind == "progress" and row.key_extra == NEXT_ACTOR_KEY)]
+        orphaned = orphans(open_items, live_now,
+                           coordinator=roles.get("coordinator", ""), roles=roles, at=moment)
+        fresh.extend(orphaned)
+        keeping = {row.id for row in orphaned}
+        covered = {f"#{str(key).lstrip('#')}" for key, _item in open_items}
+        for row in list(table.values()):
+            if (row.kind == "progress" and row.key_extra == NEXT_ACTOR_KEY and row.is_open
+                    and row.item in covered and row.id not in keeping):
+                # The item found its actor (a new debtor, and a new row), or it gained a live
+                # row: the flag that says "nobody can act on it" is no longer true, and left
+                # open it would keep saying so for ever (#195 review).
+                row.state, row.closed_by = CLOSED, "the item's next actor is decided"
+                row.updated_at = moment
+                closed.append(row)
+        for row in orphaned:
+            learn(row)
         # Write only what actually changed: a beat is not a reason for a bus commit.
         def differs(before: Dict[str, Any], row: Row) -> bool:
             after = row.to_dict()

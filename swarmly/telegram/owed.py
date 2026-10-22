@@ -256,8 +256,14 @@ class Row:
 
     # -- reading it ------------------------------------------------------------------
     def line(self, now: Optional[float] = None) -> str:
-        """One line for ``/owed``: who owes what, on what, and how late it is."""
-        text = f"{self.debtor} owes {self.owes} on {self.subject}"
+        """One line for ``/owed``: who owes what, on what, and how late it is.
+
+        The subject is only added when ``owes`` does not already name it: "owes a next step on
+        #146 on #146" reads as a bug, not as a table (#195 review).
+        """
+        text = f"{self.debtor} owes {self.owes}"
+        if str(self.subject).lower() not in str(self.owes).lower():
+            text += f" on {self.subject}"
         if self.waiting_on:
             text += f" ({self.waiting_on} waiting)"
         if self.observed:

@@ -39,7 +39,7 @@ class TestTheOrphanItem(unittest.TestCase):
 
     def test_an_open_item_with_no_live_row_is_the_coordinators(self):
         rows = guard.orphans([("146", item())], [], coordinator="Claudebot", at=1000.0)
-        self.assertEqual([r.id for r in rows], ["progress:#146:Claudebot"])
+        self.assertEqual([r.id for r in rows], ["progress:#146@next:Claudebot"])
         # The row carries the concrete gap, so an item that moves is news again.
         self.assertEqual(rows[0].observed,
                          "PR #146: CI green, no merge verdict, no QA pass, not merged")
@@ -49,15 +49,15 @@ class TestTheOrphanItem(unittest.TestCase):
         """`next_actor()` has a caller: a reviewer with a merge in hand is the one to remind."""
         rows = guard.orphans([("146", item(review={"verdict": "merge"}))], [],
                              coordinator="Claudebot", roles=ROLES, at=1000.0)
-        self.assertEqual([r.id for r in rows], ["progress:#146:Antigravity"])   # QA is next
+        self.assertEqual([r.id for r in rows], ["progress:#146@next:Antigravity"])   # QA is next
         self.assertEqual(rows[0].waiting_on, "Claudebot")
         # An item waiting on nothing but CI is the coordinator's: no bot owes a waiting.
         rows = guard.orphans([("146", item(ci="pending"))], [],
                              coordinator="Claudebot", roles=ROLES, at=1000.0)
-        self.assertEqual([r.id for r in rows], ["progress:#146:Claudebot"])
+        self.assertEqual([r.id for r in rows], ["progress:#146@next:Claudebot"])
         # No roles at all: the coordinator, as before.
         rows = guard.orphans([("146", item())], [], coordinator="Claudebot", at=1000.0)
-        self.assertEqual([r.id for r in rows], ["progress:#146:Claudebot"])
+        self.assertEqual([r.id for r in rows], ["progress:#146@next:Claudebot"])
 
     def test_an_item_with_no_next_actor_is_flagged_not_silently_the_coordinators(self):
         """#164's second invariant: no derivable actor is a flag on the row, not a quiet debt."""
