@@ -4913,8 +4913,15 @@ class AgentChannel:
         token = self._topic_token(chat_id, thread_id)
         if token:
             return token
-        raw = f"{int(chat_id)}:{thread_id}".encode("utf-8")
-        return "x" + hashlib.sha1(raw).hexdigest()[:7]
+        # No token (General, or a topic that fails closed): the redactor already names such a
+        # place without a chat id, and it is the one place that decides what may go on the bus
+        # (#173 review).
+        try:
+            ref = Redactor.from_config(self.config).topic_ref(
+                int(chat_id), thread_id, getattr(self, "router", None))
+            return str(ref.get("topic") or ref.get("ref") or ref.get("channel") or "") or "x"
+        except Exception:                          # noqa: BLE001 - book-keeping, not a turn
+            return "x"
 
     def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
                             thread_id: Optional[int]) -> None:

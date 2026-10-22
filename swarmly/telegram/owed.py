@@ -607,39 +607,58 @@ class OwedStore:
         observe the same debt each keep their own copy, and :func:`fold` reconciles them for a
         reader instead of one silently overwriting the other.
         """
-        row.writer = row.writer or self.alias
-        row.updated_at = float(self.clock())
-        path = self._file(row)
-        if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(row.to_dict(), sort_keys=True), encoding="utf-8")
-        transport = self.transport
-        if transport is None or not getattr(transport, "ref", None):
-            return row                  # no bus: this checkout is the plane
-        # The state copy's name already ends in `.json`; the document's name is that name, so
-        # the bus path is `<alias>/<id>.json` and not `<alias>/<id>.json.json` (#173 QA).
-        name = path.name if path is not None else f"{row.id}.json"
-        relpath = f"{OWED_RELPATH}/{self.safe_alias}/{name}"
-        if not is_bus_document(relpath):
-            raise OwedPushError(f"refusing to write outside {OWED_RELPATH}: {relpath!r}")
-        if self.root is None:
-            raise OwedPushError("no checkout root to write the bus document into")
-        # The document the bus carries has to be *written* before it can be committed: the
-        # local state copy is this bot's, the document under the checkout is the swarm's, and
-        # a push of a path nothing wrote is a push of nothing (#173 review).
-        document = self.root / relpath
-        try:
-            document.parent.mkdir(parents=True, exist_ok=True)
-            document.write_text(json.dumps(row.to_dict(), sort_keys=True), encoding="utf-8")
-        except OSError as exc:
-            raise OwedPushError(f"the row document could not be written: {exc}") from exc
-        try:
-            if hasattr(transport, "commit_and_push"):
-                transport.commit_and_push(f"owed: {row.id} {row.state} [{self.safe_alias}]",
-                                          paths=[relpath])
-        except Exception as exc:                     # noqa: BLE001 - reported, not swallowed
-            raise OwedPushError(f"the row is local only: {exc}") from exc
+        self.save_all([row])
         return row
+
+    def save_all(self, rows: Sequence[Row]) -> List[Row]:
+        """Write several rows and push them as **one** bus commit (#173 review).
+
+        One push per row meant three pushes for one reply addressed to three peers. Every row
+        is written first -- state copy and bus document -- and then the documents go up
+        together. A refusal is reported after the local copies are on disk, so nothing this
+        bot observed is lost to a bus that would not take it.
+        """
+        batch = list(rows or [])
+        prepared: List[Tuple[Row, str]] = []
+        for row in batch:
+            row.writer = row.writer or self.alias
+            row.updated_at = float(self.clock())
+            path = self._file(row)
+            if path is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(row.to_dict(), sort_keys=True), encoding="utf-8")
+            transport = self.transport
+            if transport is None or not getattr(transport, "ref", None):
+                continue                # no bus: this checkout is the plane
+            # The state copy's name already ends in `.json`; the document's name is that name,
+            # so the bus path is `<alias>/<id>.json` and not `<alias>/<id>.json.json` (#173 QA).
+            name = path.name if path is not None else f"{row.id}.json"
+            relpath = f"{OWED_RELPATH}/{self.safe_alias}/{name}"
+            if not is_bus_document(relpath):
+                raise OwedPushError(f"refusing to write outside {OWED_RELPATH}: {relpath!r}")
+            if self.root is None:
+                raise OwedPushError("no checkout root to write the bus document into")
+            # The document the bus carries has to be *written* before it can be committed: the
+            # local state copy is this bot's, the document under the checkout is the swarm's, and
+            # a push of a path nothing wrote is a push of nothing (#173 review).
+            document = self.root / relpath
+            try:
+                document.parent.mkdir(parents=True, exist_ok=True)
+                document.write_text(json.dumps(row.to_dict(), sort_keys=True), encoding="utf-8")
+            except OSError as exc:
+                raise OwedPushError(f"the row document could not be written: {exc}") from exc
+            prepared.append((row, relpath))
+        if prepared:
+            first, _relpath = prepared[0]
+            more = f" (+{len(prepared) - 1} more)" if len(prepared) > 1 else ""
+            try:
+                if hasattr(self.transport, "commit_and_push"):
+                    self.transport.commit_and_push(
+                        f"owed: {first.id} {first.state} [{self.safe_alias}]{more}",
+                        paths=[relpath for _row, relpath in prepared])
+            except Exception as exc:                     # noqa: BLE001 - reported, not swallowed
+                raise OwedPushError(f"the row is local only: {exc}") from exc
+        return batch
 
     def load(self) -> List[Row]:
         """Every row this bot can read: its own state copy **and** the bus documents.
@@ -660,7 +679,7 @@ class OwedStore:
                     self._unreadable.append(path.name)
                     logger.warning("owed: unreadable row %s; skipping it", path.name)
         if self.root is not None:
-            rows.extend(self._read_documents(self.root))
+            rows.extend(self._read_documents(self.root, self._unreadable))
         return fold(rows)
 
     @property
@@ -697,8 +716,13 @@ class OwedStore:
         return list(rows)
 
     @staticmethod
-    def _read_documents(root: Path) -> List[Row]:
-        """Every row document under *root*'s `.agents/owed/`, as read (not yet folded)."""
+    def _read_documents(root: Path, unreadable: Optional[List[str]] = None) -> List[Row]:
+        """Every row document under *root*'s `.agents/owed/`, as read (not yet folded).
+
+        A document that cannot be read is reported to *unreadable* as well as logged: a table
+        that says "owed: nothing" because one file was corrupt is the failure mode this module
+        exists to avoid (#173 review).
+        """
         base = Path(root) / OWED_RELPATH
         if not base.is_dir():
             return []
@@ -708,6 +732,8 @@ class OwedStore:
                 rows.append(Row.from_dict(json.loads(path.read_text(encoding="utf-8"))))
             except Exception:                        # noqa: BLE001 - one bad document, one row
                 logger.warning("owed: unreadable row document %s; skipping it", path)
+                if unreadable is not None:
+                    unreadable.append(path.name)
         return rows
 
     @staticmethod
