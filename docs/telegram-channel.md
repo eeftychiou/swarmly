@@ -1240,6 +1240,18 @@ open; only a row that actually changed is written, so a beat without news costs 
 than "nothing is owed" when a row file is unreadable. Nothing here reads a bot's prose: a
 question to the admin is observed as a round item waiting on the admin, not as a sentence.
 
+**Waking on news (#163).** A row wakes the bot that owes it only when the value observed for it
+differs from the value that last woke anyone (`Row.woken`), and the wake carries the delta —
+"a result on #146 at c166987: pending to green", not "check again" — so a standing check that
+finds nothing unchanged starts no turn at all. The transport looks at the table once per
+heartbeat, right after the sweep: it resolves the row's `tg-` token back to a chat and thread
+through its own topics (a debt no topic owns wakes in General), **holds** the wake while that
+topic already has a turn running (the rule from #160 — a turn queued behind a turn usually
+settles the same debt), and starts at most two turns a tick until the per-round budget lands
+(#164). What woke whom is written onto the row before the next tick, so a restart cannot wake
+the same bot about the same observation twice; a row that would wake its debtor a third time
+with no news escalates to the admin instead, once.
+
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt
 failures. Each transport deletes **its own** notices from General once they are older than

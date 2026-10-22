@@ -36,6 +36,11 @@ from swarmly.telegram.owed import Row
 #: "a wake needs news", and after this many wakes the news is owed by someone else.
 MAX_WAKES = 2
 
+#: How many turns one tick may start. A table can hold a dozen changed rows at once (a merge
+#: that closes several, a new head that opens three), and waking every debtor in one pass is
+#: the burst #164 exists to bound; until that item lands, one tick stays small.
+MAX_WAKES_PER_TICK = 2
+
 
 @dataclass(frozen=True)
 class Wake:

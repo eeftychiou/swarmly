@@ -12,7 +12,11 @@ All notable changes to this project are documented here. The format follows
   observed for it differs from the value that last woke anyone (`Row.woken`, `wakes`), and the
   wake names the delta -- "a result on #146 at c166987: pending to green" -- instead of "check
   again". A repeat with no news goes to the admin once, and a bot's claim the facts do not
-  support is a notice, never a closed row.
+  support is a notice, never a closed row. The transport half wakes in the discussion the row
+  names (General for a debt no topic owns), **holds** the wake while that topic already has a
+  turn running (a queued wake usually settles the same debt), starts at most two turns a tick,
+  and writes what woke whom onto the row so a restart cannot wake the same bot about the same
+  observation twice.
 - The expectations table's other five sources (`#174`): a sweep on the heartbeat tick opens a
   new head's CI result and both verdicts, the developer's fix row after a fix-first or QA fail,
   the coordinator's merge row once CI, review and QA agree on one head, progress on unticked
