@@ -315,6 +315,23 @@ class TestTheRoundStateSweep(unittest.TestCase):
         self.assertNotIn("verdict:#173@5b90b50:Reasonix", open_now)
         self.assertIn("verdict:#173@5b90b50:Antigravity", open_now)   # still owed
 
+    def test_an_unattributed_verdict_closes_only_its_own_role_row(self):
+        """#175 review: who="" made a carried QA verdict close the reviewer's row too."""
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(qa={"verdict": "pass", "sha": "5b90b50"})})
+        open_now = [row.id for row in rows(channel) if row.is_open]
+        self.assertNotIn("verdict:#173@5b90b50:Antigravity", open_now)   # its own row closed
+        self.assertIn("verdict:#173@5b90b50:Reasonix", open_now)         # the reviewer's stays
+
+    def test_a_verdict_nobody_can_be_attributed_to_closes_nothing(self):
+        channel = self.channel()
+        channel.owed_roles = lambda: {}
+        self.sweep(channel, {"173": self.item(qa={"verdict": "pass", "sha": "5b90b50"})})
+        # With nobody to attribute it to, no verdict row exists to close; the facts that do
+        # name a debtor still open theirs.
+        self.assertEqual(sorted(row.id for row in rows(channel) if row.is_open),
+                         ["ci:#173@5b90b50:CI", "progress:#173:DeepSeek"])
+
     def test_a_green_ci_closes_the_ci_row(self):
         channel = self.channel()
         self.sweep(channel, {"173": self.item(ci="green")})

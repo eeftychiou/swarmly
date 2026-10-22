@@ -4974,7 +4974,7 @@ class AgentChannel:
             logger.warning("owed: no round state to sweep", exc_info=True)
             return []
         rows = store.load()
-        facts: List[Any] = []
+        facts: List["Fact"] = []
         fresh: List[Row] = []
         for key in keys:
             try:
@@ -5000,8 +5000,14 @@ class AgentChannel:
                         continue
                     verdicts[kind] = verdict.verdict
                     # The state already carries this verdict: the row it answers is closed.
-                    facts.append(Fact(kind="verdict", item=label, head=head,
-                                      who=verdict.by, verdict=verdict.verdict))
+                    # An unattributed verdict must answer one row, not every verdict row on
+                    # that head: the role's owner stands in for it, and with neither the
+                    # verdict answers nothing rather than closing a debt nobody settled
+                    # (#175 review).
+                    who = verdict.by or roles.get(kind, "")
+                    if who:
+                        facts.append(Fact(kind="verdict", item=label, head=head, who=who,
+                                          verdict=verdict.verdict))
                 green = str(item.get("ci") or "").strip().lower() in ("green", "pass", "passed",
                                                                      "ok")
                 if green:
@@ -5028,9 +5034,6 @@ class AgentChannel:
         # A snapshot, not the objects themselves: settling mutates the rows in `table`, and a
         # comparison against the same objects would always say "unchanged".
         seen = {row.id: row.to_dict() for row in rows}
-        # Keep what a known row has learned (its created_at, its observed value) instead of
-        # overwriting it with a fresh guess.
-        fresh = store.observe(fresh, now=moment)
         # The table as it will be: what is already open, plus what this sweep opens. The
         # closing facts are applied to *that*, so a fact the state carries in the same pass as
         # the row it answers still closes it (#173 review).
