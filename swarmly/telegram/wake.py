@@ -350,6 +350,9 @@ class WakeTimer:
     replays: int = 0
     #: armed | firing (turn written, not yet started) | done | expired | failed | cancelled
     state: str = "armed"
+    #: The bot this copy was adopted from, empty for the bot's own timer. An adopted copy is
+    #: a stand-in for a dead peer's promise, not one of this bot's own.
+    adopted_from: str = ""
 
     def __post_init__(self) -> None:
         self.argv = tuple(self.argv)
@@ -379,7 +382,7 @@ class WakeTimer:
             "thread_id": self.thread_id, "topic": self.topic, "created_at": self.created_at,
             "attempts": self.attempts, "fires": self.fires, "last_exit": self.last_exit,
             "last_tail": self.last_tail, "pending": self.pending, "replays": self.replays,
-            "state": self.state,
+            "state": self.state, "adopted_from": self.adopted_from,
         }
 
     @classmethod
@@ -414,6 +417,7 @@ class WakeTimer:
             pending=str(data.get("pending") or ""),
             replays=int(data.get("replays") or 0),
             state=str(data.get("state") or "armed"),
+            adopted_from=str(data.get("adopted_from") or ""),
         )
 
     def ack(self, *, now: float) -> str:
@@ -607,7 +611,9 @@ class WakeStore:
         os.replace(tmp, path)
 
     def add(self, timer: WakeTimer, *, max_timers: int) -> bool:
-        live = [row for row in self.load() if row.live]
+        # The cap is on this bot's own promises: copies it holds for dead peers must not crowd
+        # out the WAKE it needs to keep its own word (live, round 5: ten stale copies refused it).
+        live = [row for row in self.load() if row.live and not row.adopted_from]
         if len(live) >= max_timers:
             raise WakeError(f"{len(live)} timers are already armed (limits.wake_max={max_timers})")
         self.write(timer)
@@ -674,8 +680,8 @@ class WakeStore:
                     f"the timer state is local only: {exc}") from exc
         return True
 
-    def adopt(self, *, max_timers: int, allow: Iterable[str] = ()
-              ) -> List[WakeTimer]:
+    def adopt(self, *, max_timers: int, allow: Iterable[str] = (),
+              skip: Iterable[str] = ()) -> List[WakeTimer]:
         """Take over armed timers this checkout does not have, from the bus state records.
 
         A state record carries the whole timer, so a successor can rebuild a dead bot's
@@ -686,6 +692,7 @@ class WakeStore:
         ``adopt`` blocker).
         """
         allowed_binaries = {str(word) for word in allow}
+        alive = {str(name).strip().lower() for name in skip}
         transport = self.transport
         if transport is None or not getattr(transport, "ref", None):
             return []
@@ -705,7 +712,7 @@ class WakeStore:
             if not base.endswith("-state.json"):
                 continue
             owner = name.split("/", 1)[0]
-            if owner == self.safe_alias:
+            if owner == self.safe_alias or owner.lower() in alive:
                 continue
             try:
                 payload = json.loads(transport.read_at_ref(f"{WAKE_RELPATH}/{name}") or "{}")
@@ -719,8 +726,9 @@ class WakeStore:
         taken: List[WakeTimer] = []
         for timer_id in sorted(newest):
             timer = newest[timer_id][1]
-            if not timer.live or timer_id in mine or timer.alias == self.alias:
-                continue
+            if not timer.live or timer_id in mine or timer.alias == self.alias \
+                    or timer.alias.strip().lower() in alive:
+                continue                      # finished, ours, or its owner is still up
             try:
                 checked = validate_check(timer.check)
             except WakeError as exc:
@@ -733,6 +741,7 @@ class WakeStore:
             timer.argv = checked
             if len(taken) + self.live_count >= max_timers:
                 break
+            timer.adopted_from = timer.adopted_from or timer.alias or owner
             timer.alias = self.alias          # this bot now holds the promise
             self.write(timer)
             taken.append(timer)
@@ -839,8 +848,9 @@ class WakeStore:
         return self.claim_state(timer, settle_seconds=settle_seconds) == "won"
 
     def claim_state(self, timer: WakeTimer, *, settle_seconds: float = 0.0) -> str:
-        """Claim this firing: ``won`` (fire now), ``wait`` (ours is written, let it settle)
-        or ``lost`` (another bot has it, or the bus could not be read or written).
+        """Claim this firing: ``won`` (fire now), ``wait`` (ours is written, let it settle),
+        ``taken`` (another bot's claim holds it) or ``lost`` (the bus could not be read or
+        written, so nobody here can say).
 
         The claim is an append-only file, one per timer per firing, and the winner is the
         lowest alias among the claims *for that firing*. Two pushes can overlap, so a claim
@@ -861,7 +871,7 @@ class WakeStore:
         if not mine:
             # Someone claimed it before we did: the earliest claim holds the firing.
             if before:
-                return "lost"
+                return "taken"
             stamp = self._write_claim(timer, firing)
             if stamp is None:
                 return "lost"                 # it did not reach the bus: do not fire on it
@@ -892,7 +902,7 @@ class WakeStore:
             return "won"                      # only ours is on the bus: it holds the firing
         # Several are there: the one the bus got first holds the firing, ties by lowest alias.
         # A claim that arrives after that decision finds one already there and loses.
-        return "won" if after[0].alias == self.safe_alias else "lost"
+        return "won" if after[0].alias == self.safe_alias else "taken"
 
     def _write_claim(self, timer: WakeTimer, firing: int) -> Optional[float]:
         """Write this bot's claim for one firing, and push it once.

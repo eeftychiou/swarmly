@@ -190,11 +190,23 @@ class ClaudeAdapter(SubprocessAdapter):
         # per turn under `usage`; when it does not, the ledger records unknown rather than zero.
         usage = data.get("usage")
         if isinstance(usage, dict):
-            for name, source in (("tokens_in", "input_tokens"),
-                                 ("tokens_out", "output_tokens")):
+            def count(source: str) -> Optional[int]:
                 value = usage.get(source)
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    meta[name] = value
+                    return value
+                return None
+
+            fresh = count("input_tokens")
+            if fresh is not None:
+                # `input_tokens` leaves out the prompt cache, which is most of a long session's
+                # input: the cache reads and writes are input too (live: 192 tokens for 17
+                # turns that cost $4.60).
+                meta["tokens_in"] = fresh + sum(
+                    count(source) or 0 for source in ("cache_creation_input_tokens",
+                                                      "cache_read_input_tokens"))
+            out = count("output_tokens")
+            if out is not None:
+                meta["tokens_out"] = out
         model = reported_model(data.get("modelUsage"))
         if model:
             meta["model"] = model                         # the online notice names it

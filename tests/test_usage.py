@@ -315,6 +315,31 @@ class TestTheAdapterReports(unittest.TestCase):
         self.assertEqual((reply.meta["tokens_in"], reply.meta["tokens_out"]), (11, 4))
         self.assertEqual(reply.meta["total_cost_usd"], 0.2)
 
+    def test_claude_input_counts_the_prompt_cache(self):
+        # Live: 192 input tokens for 17 turns that cost $4.60, because the cache was left out.
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        payload = json.dumps({"result": "done", "subtype": "success", "total_cost_usd": 0.3,
+                              "usage": {"input_tokens": 12, "output_tokens": 900,
+                                        "cache_creation_input_tokens": 3000,
+                                        "cache_read_input_tokens": 40000}})
+        reply = ClaudeAdapter("Hermes").parse_output(payload, 1.0)
+        self.assertEqual((reply.meta["tokens_in"], reply.meta["tokens_out"]), (43012, 900))
+
+    def test_codex_output_tokens_land_in_the_meta(self):
+        from swarmly.telegram.adapters.codex import codex_output_tokens
+        out = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "t1"}),
+            json.dumps({"type": "turn.completed",
+                        "usage": {"input_tokens": 5000, "output_tokens": 321}})])
+        self.assertEqual(codex_output_tokens(out), 321)
+        self.assertIsNone(codex_output_tokens("no events"))
+
+    def test_nothing_ran_is_zero_not_unknown(self):
+        ledger = us.Ledger(None, alias="Hermes", clock=lambda: NOW)
+        totals = ledger.totals(NOW)
+        self.assertEqual((totals["tokens_in"], totals["tokens_out"], totals["cost_usd"]),
+                         (0, 0, 0.0))
+
 
 if __name__ == "__main__":
     unittest.main()
