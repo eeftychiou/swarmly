@@ -23,6 +23,30 @@ _COMMAND = re.compile(r"^\s*(?:\[[^\]\n]{1,40}\]\s*)?/(?P<cmd>[A-Za-z0-9_]+)"
 
 DIAG_COMMANDS = ("ping", "status", "diag", "where", "role")
 
+#: The menu Telegram offers when someone types "/" (setMyCommands). Every transport registers
+#: this list on start, replacing whatever an earlier program left on the same bot token
+#: (live: one bot still offered another tool's /memory, /cron and /session).
+MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
+    ("status", "This bot's state, model and peers"),
+    ("usage", "What this bot spent today; add 'all' for the swarm"),
+    ("swarm", "The swarm: bus, coordinator and members"),
+    ("round", "What the open round waits on"),
+    ("wakes", "This bot's armed WAKE timers"),
+    ("model", "Show or set the model for this topic"),
+    ("reasoning", "Show or set the reasoning effort for this topic"),
+    ("role", "Show or set a bot's role"),
+    ("ping", "Check that the bot answers"),
+    ("where", "Where this bot runs"),
+    ("stop", "Admin: stop this bot's running turn"),
+    ("pause", "Admin: pause this bot"),
+    ("resume", "Admin: resume a paused bot"),
+    ("cli", "Admin: run a native CLI command, no tokens"),
+    ("cleanup", "Admin: tidy finished topics"),
+    ("admit", "Admin: admit a bot to the swarm"),
+    ("remove", "Admin: remove a bot from the swarm"),
+    ("sync", "Admin: resync the roster"),
+)
+
 #: A peer transport's built-in answer to one of those commands (or /model): machine traffic.
 _COMMAND_REPLY = re.compile(r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\]\s*)?"
                             r"(?:PONG|STATUS|DIAG|WHERE|ROLE|MODEL)\s+\S")

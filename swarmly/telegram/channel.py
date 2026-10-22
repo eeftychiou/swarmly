@@ -2785,6 +2785,39 @@ class AgentChannel:
         await self.check_peer_liveness(now=moment)
         return said
 
+    async def _register_command_menu(self) -> str:
+        """Put Swarmly's commands in Telegram's "/" menu, replacing an earlier program's.
+
+        Telegram keeps a bot's menu across programs: a token that once ran another tool keeps
+        offering that tool's commands, and a bot that never set one offers none (live: one of
+        five bots autocompleted, with commands Swarmly does not have). Scoped lists shadow the
+        default one, so they are cleared first. Never fatal: the menu is a convenience.
+        """
+        from aiogram.types import (BotCommand, BotCommandScopeAllGroupChats,
+                                   BotCommandScopeAllPrivateChats)
+        from swarmly.telegram.commands import MENU_COMMANDS
+        bot = self.bot
+        if bot is None or not hasattr(bot, "set_my_commands"):
+            return "no bot"
+        try:
+            for scope in (BotCommandScopeAllPrivateChats(), BotCommandScopeAllGroupChats()):
+                try:
+                    if await bot.get_my_commands(scope=scope):
+                        await bot.delete_my_commands(scope=scope)
+                except Exception:                  # noqa: BLE001 - nothing set there
+                    logger.debug("menu: no %s commands to clear", type(scope).__name__)
+            wanted = [(name, text) for name, text in MENU_COMMANDS]
+            current = [(c.command, c.description) for c in (await bot.get_my_commands() or [])]
+            if current == wanted:
+                return "unchanged"
+            await bot.set_my_commands([BotCommand(command=name, description=text)
+                                       for name, text in wanted])
+            logger.info("menu: registered %d commands with Telegram", len(wanted))
+            return "registered"
+        except Exception:                          # noqa: BLE001 - a menu is not a reason to stop
+            logger.warning("menu: could not register the command menu", exc_info=True)
+            return "failed"
+
     def _pulse_message_path(self) -> Optional[Path]:
         return _state_file(self.config, "pulse-message")
 
@@ -6850,6 +6883,7 @@ class AgentChannel:
         self._started_wall = time.time()
         me = await self.bot.get_me()
         self._me_id = getattr(me, "id", None)
+        await self._register_command_menu()
         logger.info("connected as @%s (alias %s) in chat %s",
                     me.username, self.config.identity.alias, self.config.identity.home_channel_id)
         # Issue #70: a dedicated MACHINE receipt line, so the upgrade gate does not
