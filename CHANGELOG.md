@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Waking on news (`#163`, first slice): a row wakes the bot that owes it only when the value
+  observed for it differs from the value that last woke anyone (`Row.woken`, `wakes`), and the
+  wake names the delta -- "a result on #146 at c166987: pending to green" -- instead of "check
+  again". A repeat with no news goes to the admin once, and a bot's claim the facts do not
+  support is a notice, never a closed row.
 - The expectations table's other five sources (`#174`): a sweep on the heartbeat tick opens a
   new head's CI result and both verdicts, the developer's fix row after a fix-first or QA fail,
   the coordinator's merge row once CI, review and QA agree on one head, progress on unticked
