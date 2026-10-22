@@ -23,6 +23,8 @@ This document describes the component relationships, data flow, and architectura
 - **Acting Coordinator & Bus Leases**:
   - An append-only coordinator lease (`.agents/leases/<term>-<alias>-<nonce>.json`) on the durable bus determines the coordinator dynamically.
   - Succession order defaults to `reviewer` -> `qa-tester` -> `developer`, yielding when superseded by higher terms or admin `/role`.
+  - **Old-Release & Clock Validation (#126 Item 3)**: Claims stamped with implausible timestamps (< 2020 or > 1 day in the future) are rejected as old releases using host uptime clocks instead of wall clock. Rejected aliases are logged once and reported in `/status` and `/swarm`.
+  - **Configured Coordinator Failback (#126 Item 4)**: When the configured/named coordinator has been UP and idle for a configurable window (`limits.coordinator_reclaim_idle_seconds`, default 180s) while a successor holds a live lease, it claims term N+1 (`promoted=True`) and announces the reclaim once.
   - Durable round state writes require coordinator authority and term fencing (`Authority(alias, source="lease", term)`), preventing split-brain updates and stale overwrites.
 - **Human-in-the-Loop & Override**:
   - A human operator has visibility and control over all agent turns and can intervene in Telegram at any time.

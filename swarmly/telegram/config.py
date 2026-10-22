@@ -722,6 +722,9 @@ class ChannelLimits:
     #: the shared bus branch, so it is rare. Liveness is Telegram's job (presence), and a holder
     #: that goes DOWN loses the lease at once, whatever its expiry (admin, 2026-10-21).
     lease_renew_seconds: float = 1800.0
+    #: Issue #126: how long the configured coordinator must be UP and idle while a successor
+    #: holds a live lease before taking its role back.
+    coordinator_reclaim_idle_seconds: float = 180.0
     #: Issue #31: the channel's reply budget, in characters (the swarm's 500-char convention).
     #: A project may override it per topic (``projects.<key>.reply_chars``); everything else
     #: -- General, unbound topics, the reply tickets -- uses this.
