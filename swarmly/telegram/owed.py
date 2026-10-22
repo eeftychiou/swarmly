@@ -41,6 +41,7 @@ are the model, the persistence, and pure functions from facts to rows.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -145,6 +146,10 @@ class Row:
     deadline: float = 0.0           # absolute; 0 means "no deadline"
     state: str = OPEN
     closed_by: str = ""             # the fact that closed it
+    #: What tells two debts of the same kind, item and debtor apart: the topic a hand-off was
+    #: made in, or a digest of the question an admin row is about. Without it, one peer's two
+    #: hand-offs in two topics are one row, and a reply in either closes both (#173 review).
+    key_extra: str = ""
     #: The bot that wrote this row, like `.agents/wakes/<alias>/` (#162 review): two observers
     #: of the same debt write the same id in different directories, and `fold` reconciles them.
     writer: str = ""
@@ -167,6 +172,7 @@ class Row:
             # The head is in the id on purpose: a verdict on older code must close nothing,
             # so a debt that is *about* a head cannot exist without naming it.
             raise OwedError(f"a {self.kind} row must name the head it is bound to")
+        self.key_extra = str(self.key_extra or "").strip()
         self.writer = _alias(self.writer)
         self.state = str(self.state or OPEN).strip().lower()
         if self.state not in STATES:
@@ -184,10 +190,12 @@ class Row:
     # -- identity --------------------------------------------------------------------
     @property
     def id(self) -> str:
-        """``<kind>:<item>[@<head>]:<debtor>`` -- the whole settlement rule, in one string."""
+        """``<kind>:<item>[@<head>][@<key_extra>]:<debtor>`` -- the settlement rule, in a string."""
         item = self.item or "-"
         if self.head:
             item = f"{item}@{self.head}"
+        if self.key_extra:
+            item = f"{item}@{self.key_extra}"
         return f"{self.kind}:{item}:{self.debtor}"
 
     @property
@@ -218,7 +226,8 @@ class Row:
             "version": self.version, "kind": self.kind, "item": self.item,
             "debtor": self.debtor, "owes": self.owes, "waiting_on": self.waiting_on,
             "opened_by": self.opened_by, "observed": self.observed, "head": self.head,
-            "topic": self.topic, "deadline": self.deadline, "state": self.state,
+            "topic": self.topic, "key_extra": self.key_extra,
+            "deadline": self.deadline, "state": self.state,
             "closed_by": self.closed_by, "writer": self.writer,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -238,7 +247,8 @@ class Row:
             waiting_on=str(data.get("waiting_on") or ""),
             opened_by=str(data.get("opened_by") or ""),
             observed=str(data.get("observed") or ""), head=str(data.get("head") or ""),
-            topic=str(data.get("topic") or ""), deadline=data.get("deadline") or 0.0,
+            topic=str(data.get("topic") or ""), key_extra=str(data.get("key_extra") or ""),
+            deadline=data.get("deadline") or 0.0,
             state=str(data.get("state") or OPEN),
             closed_by=str(data.get("closed_by") or ""),
             writer=str(data.get("writer") or ""),
@@ -278,7 +288,8 @@ def handoff_rows(*, asked: Iterable[str], asker: str = "", item: str = "", topic
             continue                        # a bot does not owe itself an answer
         rows.append(Row(kind="handoff", item=item, debtor=alias, owes="an answer",
                         waiting_on=who, opened_by=opened_by or f"hand-off in {topic or 'a topic'}",
-                        topic=topic, deadline=deadline, created_at=moment, updated_at=moment))
+                        topic=topic, key_extra=topic, deadline=deadline,
+                        created_at=moment, updated_at=moment))
     return rows
 
 
@@ -384,7 +395,11 @@ def admin_row(*, question: str, item: str = "", topic: str = "", asked_by: str =
     """
     moment = time.time() if at is None else float(at)
     text = str(question or "").strip()
+    # Every question is its own debt: without this, one admin row swallows the next question
+    # the moment it is observed (#173 review).
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:7] if text else ""
     return Row(kind="admin", item=item, debtor=ADMIN, owes="an answer",
+               key_extra=f"{topic or '-'}#q{digest}" if digest else "",
                waiting_on=_alias(asked_by), opened_by=f"question: {text[:120]}" if text
                else "a question to the admin", topic=topic, deadline=deadline,
                created_at=moment, updated_at=moment)
@@ -429,7 +444,8 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
     if fact.kind == "ci":
         # CI's own result on this head answers the CI row for it, and nothing else: a result
         # is not a review verdict, and a result on older code is not a result on this head.
-        return f"CI {fact.verdict or 'concluded'}" if same_item and same_head             and row.kind == "ci" else None
+        # A result that does not say which head it is about answers nothing (#173 review).
+        return f"CI {fact.verdict or 'concluded'}" if same_item and head and same_head             and row.kind == "ci" else None
     if fact.kind == "merge":
         # The merge answers every debt bound to that item: the result, the verdicts, the fix
         # and the merge itself.
@@ -445,17 +461,19 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
             return f"new head {head}"
         return None
     if fact.kind == "verdict":
-        if not same_item or row.kind != "verdict":
-            return None
+        if not same_item or row.kind != "verdict" or not head:
+            return None              # a verdict that names no head answers no verdict debt
         if who and row.debtor and who.lower() != row.debtor.lower():
             return None
         if head and row.head and head != row.head:
             return None              # a verdict on older code answers nothing here
         return f"{row.debtor} filed {fact.verdict or 'a verdict'}"
     if fact.kind == "reply":
-        if row.kind == "handoff" and (not who or who.lower() == row.debtor.lower()):
-            if not same_item or row.item == item:
-                return f"{row.debtor} answered"
+        # A reply answers the hand-off where it was made: the item it names, the topic it was
+        # posted in, or -- with neither -- any of that peer's open hand-offs.
+        where = (not item) or same_item or item.lower() == str(row.topic or "").lower()
+        if row.kind == "handoff" and (not who or who.lower() == row.debtor.lower()) and where:
+            return f"{row.debtor} answered"
         if row.kind == "admin" and who.lower() == ADMIN.lower():
             return "the admin answered"
         return None
@@ -560,6 +578,17 @@ class OwedStore:
         relpath = f"{OWED_RELPATH}/{self.safe_alias}/{path.name if path else row.id}.json"
         if not is_bus_document(relpath):
             raise OwedPushError(f"refusing to write outside {OWED_RELPATH}: {relpath!r}")
+        if self.root is None:
+            raise OwedPushError("no checkout root to write the bus document into")
+        # The document the bus carries has to be *written* before it can be committed: the
+        # local state copy is this bot's, the document under the checkout is the swarm's, and
+        # a push of a path nothing wrote is a push of nothing (#173 review).
+        document = self.root / relpath
+        try:
+            document.parent.mkdir(parents=True, exist_ok=True)
+            document.write_text(json.dumps(row.to_dict(), sort_keys=True), encoding="utf-8")
+        except OSError as exc:
+            raise OwedPushError(f"the row document could not be written: {exc}") from exc
         try:
             if hasattr(transport, "commit_and_push"):
                 transport.commit_and_push(f"owed: {row.id} {row.state} [{self.safe_alias}]",
@@ -617,6 +646,24 @@ class OwedStore:
                 row.observed = seen.observed or row.observed
             row.updated_at = moment
         return list(rows)
+
+    @staticmethod
+    def documents(root: Path) -> List[Row]:
+        """Every row document under *root*'s `.agents/owed/`, folded across writers.
+
+        This is how a successor inherits the table: it reads the checkout, not its own state
+        directory, and :func:`fold` settles the ids two bots both observed.
+        """
+        base = Path(root) / OWED_RELPATH
+        if not base.is_dir():
+            return []
+        rows: List[Row] = []
+        for path in sorted(base.glob("*/*.json")):
+            try:
+                rows.append(Row.from_dict(json.loads(path.read_text(encoding="utf-8"))))
+            except Exception:                        # noqa: BLE001 - one bad document, one row
+                logger.warning("owed: unreadable row document %s; skipping it", path)
+        return sorted(fold(rows), key=lambda row: row.id)
 
     def summary(self, now: Optional[float] = None, *, limit: int = 10) -> str:
         """One line for ``/owed``: what is open, or that nothing is."""

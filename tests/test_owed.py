@@ -195,6 +195,67 @@ class TestTheReviewPins(unittest.TestCase):
         self.assertEqual(store.load()[0].writer, "DeepSeek")
 
 
+class TestThePullRequestReview(unittest.TestCase):
+    """What the review of PR #173 proved against the code, now pinned as tests."""
+
+    def test_the_bus_document_is_written_before_it_is_committed(self):
+        """Blocker: save() committed `.agents/owed/...` while writing only the state copy."""
+        pushed = []
+
+        class Bus:
+            ref = "refs/heads/main"
+
+            def commit_and_push(self, message, paths=None):
+                pushed.append(list(paths or []))
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "checkout"
+            store = ow.OwedStore("DeepSeek", state_dir=Path(tmp) / "state", transport=Bus(),
+                                 root=root, clock=lambda: 1000.0)
+            row = store.save(ow.handoff_rows(asked=["Reasonix"], asker="Claudebot",
+                                             topic="tg-1", at=1000.0)[0])
+            relpath = pushed[0][0]
+            document = root / relpath
+            self.assertTrue(document.is_file(), relpath)      # written, not just named
+            self.assertEqual(ow.Row.from_dict(json.loads(document.read_text(encoding="utf-8"))).id,
+                             row.id)
+            # ... and a successor reads it from the checkout, not from the writer's state dir.
+            self.assertEqual([r.id for r in ow.OwedStore.documents(root)], [row.id])
+
+    def test_two_hand_offs_in_two_topics_are_two_debts(self):
+        """Blocker: the id carried no topic, so one reply in either topic closed both."""
+        first = ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot", topic="tg-1", at=1000.0)[0]
+        second = ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot", topic="tg-2", at=1000.0)[0]
+        self.assertNotEqual(first.id, second.id)
+        closed = ow.settle([first, second], ow.Fact(kind="reply", who="DeepSeek"))
+        self.assertEqual(len(closed), 2)                     # a reply answers both, by design
+        # A reply in one topic answers that topic's hand-off, not the other one.
+        again = [ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot", topic="tg-1",
+                                 at=1000.0)[0],
+                 ow.handoff_rows(asked=["DeepSeek"], asker="Claudebot", topic="tg-2",
+                                 at=1000.0)[0]]
+        closed = ow.settle(again, ow.Fact(kind="reply", who="DeepSeek", item="tg-1"))
+        self.assertEqual([row.topic for row in closed], ["tg-1"])
+
+    def test_every_question_to_the_admin_is_its_own_row(self):
+        """Should-fix: every question collapsed into one `admin:-:admin` row."""
+        first = ow.admin_row(question="Do I deploy?", topic="tg-1", at=1000.0)
+        second = ow.admin_row(question="Which topic carries the report?", topic="tg-1", at=1000.0)
+        again = ow.admin_row(question="Do I deploy?", topic="tg-1", at=1200.0)
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(first.id, again.id)                  # the same question is one row
+
+    def test_a_fact_with_no_head_answers_no_head_bound_row(self):
+        """Should-fix: a verdict or result with no head closed rows bound to any head."""
+        rows = ow.head_rows(item="#170", head="22e68c5",
+                            roles={"review": "Reasonix", "qa": "Antigravity"}, at=1000.0)
+        self.assertEqual(ow.settle(rows, ow.Fact(kind="verdict", item="#170",
+                                                 who="Reasonix", verdict="merge")), [])
+        self.assertEqual(ow.settle(rows, ow.Fact(kind="ci", item="#170", verdict="pass")), [])
+        # A merge is the item's answer and may be reported without a head.
+        self.assertTrue(ow.settle(rows, ow.Fact(kind="merge", item="#170")))
+
+
 class TestClosingOnFacts(unittest.TestCase):
 
     def rows(self):
