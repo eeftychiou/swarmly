@@ -973,6 +973,89 @@ output says where its history now starts).
 the `usage.today` its latest heartbeat carried. The coordinator gets the same lines added to each
 turn's prompt (code, no tokens), so a cost report never needs anyone to look for ledger files.
 
+**The command centre — a pinned dashboard (issue #117).** The coordinator keeps one message
+pinned in a control topic (or the admin's DM) and edits it in place on every heartbeat, so the
+swarm's state is readable at a glance without asking anyone anything and without a model turn.
+Set where it lives in `config.yaml`; with no `control` section, nothing is pinned:
+
+```yaml
+control:
+  chat_id: -1001234567890     # optional: the admin's DM, or the group; defaults to the home channel
+  topic_id: 307               # optional: the forum topic; defaults to General
+```
+
+The message is built in code from the records the transport already holds — the status
+snapshots (#124), the turn ledger (#125) and the round state (#86) — and it reads in four
+parts. **Alerts first**: a bot DOWN or stuck over its timeout, one frozen or out of quota, a
+hand-off nobody answered, the round's blockers. Then **a line per bot**: state and since when,
+the topic as its `tg-…` token, queue and armed WAKEs, model and effort, rev, uptime and
+restarts, today's tokens and cost, quota and its reset. Then the **round board**: each item's
+owner, PR, head, CI, the review and QA verdicts — a verdict counts only on the head it names —
+and whether it can merge. A number no runtime reported stays **unknown**, never zero.
+
+Each bot's spend rides its own heartbeat: the pulse carries today's totals from that bot's
+ledger (`turns`, tokens in and out, cost, quota and its reset time, each with the count of
+rows that actually reported one), so the dashboard shows every bot's tokens and cost without
+asking any of them for a turn. A peer that has not said anything is `unknown` there — never a
+zero it did not report.
+
+Telegram allows 4,096 characters in one message, so the layout drops whole lines in that
+order when it runs out of room — the round board first, the alerts last — and says how many
+it hid. The pin is the state, and a failover retires it rather than adopting it: a new
+coordinator (a failover, #83) reads the chat's pinned message and recognises the previous
+dashboard by its `SWARM` marker, but **Telegram lets a bot edit only its own messages**, so it
+cannot take that message over. It unpins the predecessor's message (retiring its keyboard with
+it) and pins its own, so there is still exactly one live dashboard — a different message, not
+a second one. A restart of the same bot adopts its own pin and posts nothing. If the unpin
+fails (a bot without pin rights), the press path is the second line of defence: a control
+pressed on a bot the lease no longer names as coordinator is refused, so a stale pin answers
+"<that bot> coordinates now" instead of "done". A refresh that cannot be delivered is a log line and a status,
+never a failed heartbeat, and an unchanged dashboard sends nothing at all.
+
+The buttons under it come from `CONTROLS` in `swarmly/telegram/control.py` — pause, resume,
+stop turn, restart, model, effort, WAKE, freeze and read-only `/cli` per bot; pause-all, the
+lease, roles, cleanup, sync and admit for the swarm; and a nudge that costs the owner a turn.
+Only a control the running transport can actually carry out is shown, so a button that exists
+is a button that works (today: pause, resume, freeze, a safe restart and a stop of one bot;
+model, effort, WAKE and read-only `/cli`, which only *report*; pause *everything*; a resync of
+the swarm; the cleanup dry run; and a nudge to an item's owner, which costs that bot a turn).
+A press on a reporting control answers with what the setting is now and the command that
+changes it — a one-tap button cannot take the value a change would need — it changes nothing
+and leaves no `CONTROL` note, because the durable line is for who stopped what, not for who
+read a setting. `/sync` is one of the controls that is not confirmed, like pause and resume:
+it changes no bot's state, it asks the peers to say who they are again. The cleanup button is
+the *dry run* — the same code `/cleanup` runs with no argument — so a press can never delete
+anything; the words it answers with name the command that would, with its own code. **Stop**
+cancels the turns in flight, drops the messages queued behind them and kills any `/cli` run —
+the `/stop all` form, because the dashboard speaks for the whole bot rather than one topic. Three rules bound every press:
+
+- **The admin only.** The presser's Telegram user id is checked before the action is even
+  looked up, so a stranger is refused and learns nothing about what the buttons do.
+- **Anything that stops or changes something asks twice.** The first tap mints a one-use code
+  and says what the second tap will do; only `ctl:confirm:<code>` runs it, and the code dies
+  when it is used or after 2 minutes.
+- **Every action leaves a record.** A run posts one `NOTE intent=CONTROL` line —
+  `CONTROL bot.restart target=self by=<user id> at=<UTC> state=done` — so the durable plane
+  says who stopped what and when.
+
+A swarm-wide control — pause everything — holds the bot that owns the message and broadcasts
+`target=*`, so every peer applies it: one press stops the swarm, and each bot keeps its own
+`CONTROL` record of the press that stopped it.
+
+That note is also how a control reaches **another** bot: the transport that holds the message
+carries out a press for itself, and for any other bot the same `CONTROL` line *is* the
+dispatch. Three checks decide it, and none of them trusts the note's own words: **who sent
+it** (only the bot holding the dashboard — the coordinator — commands the others, or any known
+peer while no lease is readable; `by=` is free text, so without this any bot could write an
+admin's id and stop the swarm), **who it names** (the target, or `*` for a swarm-wide
+control), and **which admin pressed** (the id must be *this* bot's admin, so a peer repeats the
+authorisation against its own config). A note that fails any of them is refused and only
+logged — and a note this bot cannot actually carry out answers `failed:`, never `applied:`.
+One press is one line on the bus: a swarm-wide control posts its own `target=*` note, and the
+pressing bot does not add a second, local one.
+
+Deploy, upgrade, merging a PR and editing configs or secrets are not on the keyboard at all.
+
 **Native CLI commands — `/cli` (admin only, no model turn).** Swarmly does not reimplement
 what each CLI already does. `/cli@<bot> <command>` runs the command on that bot's CLI and
 streams the output back into one message that is edited as it goes. It never sends a prompt and

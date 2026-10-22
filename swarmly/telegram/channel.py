@@ -65,6 +65,10 @@ from swarmly.telegram import native as native_cli
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.presence import Presence, Pulse
 
+from swarmly.telegram import control as control_mod
+from swarmly.telegram.control_center import ControlCenter
+from swarmly.telegram.control_press import PressPolicy
+from swarmly.telegram import control_press as press_mod
 from swarmly.telegram import snapshot as snapshot_mod
 
 from swarmly.telegram import usage as usage_mod
@@ -385,6 +389,10 @@ class ChannelEvent:
     cooldown_left: float = 0.0             # set by routing: a message to this bot the cooldown dropped
     self_task: bool = False                # a brief this agent gave itself (topic or membership)
     reassembled: bool = False              # #29: the split parts of one reply, joined already
+
+
+class ControlRefused(Exception):
+    """A control that cannot be carried out here, with the words to answer the presser."""
 
 
 @dataclass
@@ -1209,13 +1217,7 @@ class AgentChannel:
                            command, event.author_username)
             return True
         if command == "sync":
-            self.roster.start_sync()
-            await self.send(format_message(
-                Envelope(type=MessageType.HELLO, to="*", intent="SYNC",
-                         ref=self._alias_ref(), rev=self._running_revision),
-                f"🔄 {self.config.identity.alias} peers: {self.roster.sync_list() or 'none'}"),
-                chat_id=event.chat_id, thread_id=event.thread_id, silent=True,
-                allow_when_frozen=True, notice=True)
+            await self._sync_now(chat_id=event.chat_id, thread_id=event.thread_id)
             return True
         handles = self.roster.handles(event.text or "")
         if command == "remove":
@@ -1230,6 +1232,23 @@ class AgentChannel:
                 chat_id=event.chat_id, thread_id=event.thread_id, silent=True,
                 allow_when_frozen=True, notice=True)
         return True
+
+    async def _sync_now(self, *, chat_id: Optional[int] = None,
+                        thread_id: Optional[int] = None) -> str:
+        """Ask the swarm to re-introduce itself: what ``/sync`` does, and its button too.
+
+        One implementation for both, so a press can never resync a different list than the
+        command would. Returns the line the caller answers with.
+        """
+        self.roster.start_sync()
+        line = (f"🔄 {self.config.identity.alias} peers: "
+                f"{self.roster.sync_list() or 'none'}")
+        await self.send(format_message(
+            Envelope(type=MessageType.HELLO, to="*", intent="SYNC",
+                     ref=self._alias_ref(), rev=self._running_revision), line),
+            chat_id=chat_id, thread_id=thread_id, silent=True,
+            allow_when_frozen=True, notice=True)
+        return line
 
     def _command_reply(self, command: str, event: Optional[ChannelEvent] = None) -> str:
         alias = self.config.identity.alias
@@ -2529,7 +2548,7 @@ class AgentChannel:
                      busy_since=now - max(durations) if durations else None,
                      frozen=bool(self._frozen), status=status)
 
-    def _pulse_usage(self, now: float) -> Dict[str, Any]:
+    def _pulse_usage(self, now: float, *, advance: bool = True) -> Dict[str, Any]:
         """What this bot spent, from its own turn ledger: since the last beat and today (UTC).
 
         Read from the ledger the turns already wrote, so the heartbeat costs no tokens. A number
@@ -2540,12 +2559,15 @@ class AgentChannel:
             if ledger is None:
                 return {}
             last = float(self.__dict__.get("_pulse_usage_from") or 0.0)
-            self._pulse_usage_from = now
+            if advance:
+                # The dashboard reads the same window without consuming it (#117).
+                self._pulse_usage_from = now
             midnight = now - (now % 86400.0)
 
             def brief(totals: Dict[str, Any]) -> Dict[str, Any]:
                 return {key: totals.get(key) for key in
-                        ("turns", "failed", "tokens_in", "tokens_out", "cost_usd")}
+                        ("turns", "failed", "tokens_in", "tokens_out", "cost_usd",
+                         "tokens_in_known", "tokens_out_known", "cost_known")}
 
             usage: Dict[str, Any] = {
                 "beat": brief(ledger.totals(last or now - self.heartbeat_seconds())),
@@ -2762,6 +2784,426 @@ class AgentChannel:
         return self.usage_ledger().render(since_boot=since)
 
 
+    # -- the control centre (issue #117) ------------------------------------------------
+    def control_center(self) -> Optional[Any]:
+        """The pinned dashboard, when ``control`` names a chat. Built once, reused.
+
+        No section, no dashboard: a bot that was not told where the message belongs keeps
+        nothing pinned, which is what every config without ``control`` does today.
+        """
+        settings = getattr(self.config, "control", None)
+        if settings is None:
+            return None
+        existing = getattr(self, "_control_center", None)
+        if existing is not None:
+            return existing
+        bot = getattr(self, "bot", None)
+        if bot is None:                       # not started, and no test double injected
+            return None
+        chat_id = settings.chat_id or self.config.identity.home_channel_id
+        centre = ControlCenter(bot, chat_id=chat_id, thread_id=settings.topic_id,
+                               render=self.control_text,
+                               markup=lambda: control_mod.keyboard(self.control_actions()),
+                               me_username=self.config.identity.name)
+        self._control_center = centre
+        return centre
+
+    def control_snapshots(self, now: Optional[float] = None) -> List[Any]:
+        """Every bot's snapshot: this one's, and each peer's as it last published it (#124)."""
+        moment = self.presence_clock() if now is None else float(now)
+        rows: List[Any] = [self.status_snapshot(moment)]
+        table = self.presence()
+        for alias, peer in sorted(table.peers.items()):
+            if alias.strip().lower() == self.config.identity.alias.strip().lower():
+                continue
+            if peer.snapshot:
+                try:
+                    rows.append(snapshot_mod.Snapshot.from_dict(peer.snapshot))
+                    continue
+                except Exception:              # noqa: BLE001 - an unreadable peer record
+                    logger.warning("control centre: unreadable snapshot from %s", alias)
+            rows.append(snapshot_mod.Snapshot(
+                alias=alias, state=table.status(alias, moment), at=peer.last_seen,
+                every=self.heartbeat_seconds(), term=peer.term, rev=peer.rev))
+        return rows
+
+    def control_round(self) -> Optional[Any]:
+        """The round the bus knows, for the dashboard's board. None when there is none.
+
+        Never raises: a dashboard without a round is a smaller dashboard, not a failed beat.
+        """
+        try:
+            from swarmly.telegram.rounds import RoundStore
+            store = self.round_store()
+            repo = str(getattr(self.config.bus, "repo", "") or "")
+            prefix = RoundStore.safe_key(f"{repo}#")[:-1] if repo else ""
+            names = sorted(name for name in store.rounds()
+                           if not prefix or name.startswith(prefix))
+            if not names:
+                return None
+            return max((store.load(name) for name in names),
+                       key=lambda state: (state.updated_at, state.seq))
+        except Exception:                      # noqa: BLE001 - see the docstring
+            logger.warning("control centre: the round state is not readable", exc_info=True)
+            return None
+
+    def control_text(self, now: Optional[float] = None) -> str:
+        """The dashboard's text, built in code from this bot's own records -- no turn."""
+        moment = self.presence_clock() if now is None else float(now)
+        usage = self.control_usage()
+        return control_mod.dashboard(now=moment, snapshots=self.control_snapshots(moment),
+                                     round_state=self.control_round(), usage=usage,
+                                     coordinator=str(self.current_coordinator() or ""),
+                                     limit=self.config.limits.max_message_chars)
+
+    def control_usage(self) -> Dict[str, Dict[str, Any]]:
+        """What each bot spent today: this bot from its ledger, peers from their own pulses.
+
+        A peer that has not said is *absent* from the map, so the dashboard renders ``unknown``
+        for it -- never a zero it did not report (#117).
+        """
+        moment = self.presence_clock()
+        usage: Dict[str, Dict[str, Any]] = {}
+        mine = self._pulse_usage(moment, advance=False)
+        if mine.get("today"):
+            usage[self.config.identity.alias] = dict(
+                mine["today"], quota_left=mine.get("quota_left"),
+                quota_resets_at=mine.get("quota_resets_at"))
+        try:
+            for alias, peer in self.presence().peers.items():
+                record = (peer.snapshot or {}).get("usage") or {}
+                today = record.get("today")
+                if isinstance(today, dict):
+                    usage[alias] = dict(today, quota_left=record.get("quota_left"),
+                                        quota_resets_at=record.get("quota_resets_at"))
+        except Exception:                      # noqa: BLE001 - a dashboard without peers
+            logger.warning("control centre: peer usage is not readable", exc_info=True)
+        return usage
+
+    def apply_control_note(self, text: str, *, sender: str = "") -> str:
+        """Apply a ``CONTROL`` note addressed to this bot. Returns what it did, for a test.
+
+        Three checks, in this order, and none of them trusts the note's own words:
+
+        1. **Who sent it.** A press lands on the transport that holds the dashboard, and that
+           is the coordinator: only its notes are obeyed while a lease is readable, and only
+           a known peer's when it is not. Without this, ``by=`` -- which is free text -- would
+           let any bot on the bus write an admin's id and stop the swarm. A note from this bot
+           itself, or from nobody, is never a peer's press.
+        2. **Who it names.** This bot, ``self``, or ``*`` for a swarm-wide control.
+        3. **Which admin pressed.** The id must be *this* bot's admin, so a peer repeats the
+           authorisation against its own config instead of trusting whoever passed it on.
+
+        What is left is forgery at the bus identity level (a bot impersonating the
+        coordinator), which is the transport's authentication problem, not this one's.
+        """
+        note = press_mod.parse_note(text)
+        if note is None:
+            return "not a control note"
+        if not self._note_sender_may_command(sender):
+            logger.warning("control note for %s refused: %r does not hold the dashboard",
+                           self.config.identity.alias, sender)
+            return f"refused: {sender or 'an unknown bot'} does not hold the dashboard"
+        target = note.target.strip().lower()
+        if target not in ("", "self", "*", self.config.identity.alias.lower()):
+            return f"for {note.target}: not mine"
+        if not self._is_my_admin(note.by):
+            logger.warning("control note for %s refused: by=%s is not the admin",
+                           self.config.identity.alias, note.by)
+            return f"refused: {note.by} is not the admin"
+        if note.action not in self.control_actions():
+            return f"refused: {note.action} is not a control here"
+        if note.action in self.CONTROL_REPORTS:
+            # A report answers the person who pressed it; a peer's note may not ask for one
+            # (there is nothing to apply, and nothing to send back).
+            return f"refused: {note.action} is a report, not a control"
+        try:
+            # Synchronous on purpose: this runs inside the machine-note path, which must not
+            # need an event loop of its own to hold a bot.
+            done = self._run_control_now(note.action)
+        except Exception:                      # noqa: BLE001 - a note must not break routing
+            logger.warning("control note: %s failed", note.action, exc_info=True)
+            return f"failed: {note.action}"
+        if not done:
+            # It passed every check and still could not be carried out: say so, loudly.
+            logger.warning("control note: %s arrived but this bot cannot carry it out",
+                           note.action)
+            return f"failed: {note.action} is not carried out here"
+        logger.info("control: %s applied from a peer note (by=%s)", note.action, note.by)
+        return f"applied: {note.action}"
+
+    def _note_sender_may_command(self, sender: str) -> bool:
+        """Whether a bot that sent a CONTROL note may command this one.
+
+        The coordinator holds the dashboard, so its notes are the ones that count; while no
+        lease is readable, any *known* peer of this swarm is accepted, because a swarm that
+        cannot read its lease still has to be stoppable. A note from this bot itself, from an
+        empty sender, or from a stranger is refused either way.
+        """
+        who = str(sender or "").strip().lower()
+        me = str(self.config.identity.alias or "").strip().lower()
+        if not who or who == me:
+            return False
+        leader = str(self.current_coordinator() or "").strip().lower()
+        if leader:
+            return who == leader
+        peers = {str(alias).strip().lower() for alias in
+                 (getattr(self.config, "peers", None) or {})}
+        return who in peers
+
+    def _is_my_admin(self, user_id: Any) -> bool:
+        """Whether a note's id is this bot's admin. A malformed id authorises nothing."""
+        try:
+            return self.config.is_admin(int(str(user_id).strip()))
+        except (TypeError, ValueError):
+            return False
+
+    def _run_control_now(self, action: str) -> bool:
+        """The synchronous half of :meth:`_run_control`: the controls that only set state.
+
+        Returns whether it actually carried the action out. That matters more than it looks:
+        a note this bot cannot carry out must say **failed**, never ``applied`` -- the peer
+        that broadcast it, and the admin reading the log, would otherwise be told that a
+        swarm-wide pause happened on a bot that never froze (review, #133).
+        """
+        if action == "bot.pause":
+            self._set_frozen(True, "pause")
+        elif action == "bot.resume":
+            self._set_frozen(False, None)
+        elif action == "bot.freeze":
+            self._set_frozen(True, "freeze")
+        elif action == "bot.restart":
+            self.request_restart()
+        elif action == "bot.stop_turn":
+            self._stop_every_turn()
+        elif action == "swarm.pause_all":
+            # The broadcast half: the presser holds itself, and every peer that receives
+            # ``target=*`` holds itself here.
+            self._set_frozen(True, "pause")
+        else:
+            return False
+        return True
+
+    def _stop_every_turn(self) -> str:
+        """Stop this bot's turns and queued messages: what ``/stop all`` does, from a button.
+
+        The dashboard is per bot rather than per topic, so a stop pressed there is the
+        everything form: the running turns are cancelled, the messages waiting behind them are
+        dropped, and any ``/cli`` run in flight is killed. What was already answered stays
+        answered; a message a turn was cut off from is not re-sent (the inbox keeps the ones it
+        accepted, and a restart replays those).
+        """
+        cleared = self._busy_waiting + sum(self._cooldown_waiting.values())
+        self._stop_generation += 1
+        running = [turn for turn in self._turns if not turn.done()]
+        for turn in running:
+            self._stopping_turns.add(turn)
+            turn.cancel()
+        self.stats.stopped += len(running)
+        native = self._stop_native(self.config.identity.home_channel_id, None, everything=True)
+        logger.info("control: stopped %d turn(s), dropped %d queued, killed %d /cli run(s)",
+                    len(running), cleared, native)
+        return f"{len(running)} turn(s), {cleared} queued message(s), {native} /cli run(s)"
+
+    def control_actions(self) -> Tuple[str, ...]:
+        """The controls this build can actually carry out, so no button is offered in vain.
+
+        The rest of the table in :mod:`swarmly.telegram.control` -- the swarm-wide controls
+        (lease, fail back, roles, cleanup, sync, admit) -- joins this tuple as each is wired;
+        until then they are neither shown nor run.
+        """
+        return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart", "bot.stop_turn",
+                "bot.model", "bot.effort", "bot.wake", "bot.cli",
+                "swarm.pause_all", "swarm.sync", "swarm.cleanup",
+                "item.nudge")
+
+    #: The controls that only *report*, read off the one table in
+    #: :mod:`swarmly.telegram.control`: they change nothing, so they need no second tap and
+    #: leave no note, and a peer's note may not ask for one -- a report answers a person.
+    CONTROL_REPORTS = control_mod.reports()
+
+    #: The controls that broadcast their own ``target=*`` note, so the press must not also
+    #: post the local one: one press is one line on the bus (review, #133).
+    CONTROL_BROADCASTS = ("swarm.pause_all",)
+
+    def _control_event(self, command: str) -> ChannelEvent:
+        """A synthetic event for a report control: the admin, typing a bare command.
+
+        The report answers through the *same* functions the typed commands use (``/model``,
+        ``/reasoning``, ``/wakes``), so a button and a command can never drift apart. It
+        carries no arguments on purpose: a press says what the setting is and how to change
+        it, it never changes one -- a one-tap button that silently switched a bot's model
+        would be the wrong shape for a control that is not asked twice.
+        """
+        settings = getattr(self.config, "control", None)
+        return ChannelEvent(text=f"/{command}",
+                            chat_id=self.config.identity.home_channel_id or 0,
+                            author_id=self.config.identity.admin_user_id,
+                            author_username=self.config.identity.name,
+                            thread_id=getattr(settings, "topic_id", None))
+
+    def control_report(self, action: str) -> Optional[str]:
+        """What a report control answers, in code and costing no turn (None for the others)."""
+        if action == "bot.model":
+            return self._model_command(self._control_event("model"))
+        if action == "bot.effort":
+            return self._reasoning_command(self._control_event("reasoning"))
+        if action == "bot.wake":
+            return self._wakes_command(None)
+        if action == "bot.cli":
+            return self._cli_report()
+        return None
+
+    def _cli_report(self) -> str:
+        """What ``/cli`` could run here: the runtime's own allowlist, or why there is none.
+
+        Read-only by construction -- it lists, it never runs anything: the first tap of a
+        button must not be able to execute a command nobody typed.
+        """
+        alias = self.config.identity.alias
+        adapter = self.config.adapter
+        why = native_cli.available(adapter.type, command=adapter.command)
+        if why:
+            return f"{alias}: no /cli here — {why}."
+        commands = native_cli.commands_for(adapter.type)
+        return (f"{alias}: /cli passes {', '.join(commands)} to the {adapter.type} CLI "
+                f"(admin only, no turn). Anything that changes something needs /cli! and a "
+                f"confirmation.")
+
+    def _control_elsewhere(self) -> str:
+        """The bot that coordinates instead of this one, when the lease names another.
+
+        Empty when this bot is the coordinator, or when no lease is readable at all: a swarm
+        that cannot read its lease must still be stoppable from wherever its dashboard is.
+        """
+        try:
+            leader = str(self.current_coordinator() or "").strip()
+        except Exception:                      # noqa: BLE001 - a press must not fail on this
+            return ""
+        if not leader or leader.lower() == str(self.config.identity.alias).strip().lower():
+            return ""
+        return leader
+
+    def control_policy(self) -> Any:
+        """The press policy: admin-only, a second tap for anything that stops, one log line."""
+        existing = getattr(self, "_control_policy", None)
+        if existing is not None:
+            return existing
+        policy = PressPolicy(admin_id=self.config.identity.admin_user_id,
+                             available=self.control_actions(),
+                             code=lambda: secrets.token_hex(2))
+        self._control_policy = policy
+        return policy
+
+    async def handle_control_press(self, press: Any) -> str:
+        """One button press: decide, act, log, answer. Never raises.
+
+        Answering is what the presser sees in the chat; the log line rides the channel NOTE
+        path (and so the bus, when ``bus.repo`` is set), so a control leaves a record of who
+        stopped what.
+        """
+        stale = self._control_elsewhere()
+        if stale:
+            # A dashboard from an earlier coordinator can outlive its failover (Telegram will
+            # not let this bot unpin everything), and its buttons would otherwise answer
+            # "done" from a bot that no longer coordinates (review, #133).
+            answer = f"{stale} coordinates now: press the dashboard in its message."
+            self._control_answer = answer
+            return answer
+        try:
+            decision = self.control_policy().decide(press, actor=str(press.user_id))
+            if decision.verdict == press_mod.RUN:
+                answer = await self._run_control(decision.action, decision.target,
+                                                 presser=str(press.user_id))
+                if answer:
+                    decision.text = answer
+            if decision.log and decision.action not in self.CONTROL_BROADCASTS:
+                # A swarm-wide control posts its own ``target=*`` note (which already names
+                # the pressing bot); a second, local note would double every press on the bus.
+                await self._post_control_note(decision.log)
+            self._control_answer = decision.text
+            return decision.text
+        except ControlRefused as exc:
+            return str(exc)
+        except Exception:                      # noqa: BLE001 - a press must not break the bot
+            logger.warning("control centre: the press failed", exc_info=True)
+            return "the press failed; the log has the reason"
+
+    async def _post_control_note(self, line: str) -> None:
+        """Put a CONTROL line on the durable plane: how a press reaches the other bots."""
+        await self.send(format_message(
+            Envelope(type=MessageType.NOTE, to="*", intent="CONTROL", ref=self._alias_ref()),
+            line), silent=True, notice=True, allow_when_frozen=True)
+
+    async def _run_control(self, action: str, target: str, *, presser: str = "") -> Optional[str]:
+        """Carry out one wired control, here and -- for a swarm-wide one -- everywhere else.
+
+        Returns the words to answer the presser with when the control is one that *reports*
+        (None otherwise, and the policy's own line is the answer).
+        """
+        report = self.control_report(action)
+        if report is not None:
+            return report
+        if action == "swarm.sync":
+            return await self._sync_now()
+        if action == "swarm.cleanup":
+            # The dry run *is* the control: it deletes nothing, and the words it answers with
+            # name the command that would (with its own confirmation code).
+            return await self.cleanup.handle_args(
+                [], is_admin=True,
+                chat_id=self.config.identity.home_channel_id)
+        if action == "swarm.pause_all":
+            # Hold this bot, and broadcast the hold: every peer applies the same note, so one
+            # press stops the swarm instead of only the bot that owns the message.
+            self._set_frozen(True, "pause")
+            await self._post_control_note(press_mod.every_bot(action, presser or "0"))
+            return
+        if action == "item.nudge":
+            await self._nudge_item(target)
+            return
+        if target and target.strip().lower() not in ("", "self",
+                                                     self.config.identity.alias.lower()):
+            # Another bot's control travels as the CONTROL note the press already posts; that
+            # bot applies it to itself (#117). Nothing to do here, and nothing to double-apply.
+            return
+        # The launcher starts the transport again on a restart; nothing is left running when
+        # it does, which is why that control asks for a second tap (#117).
+        self._run_control_now(action)
+
+    async def _nudge_item(self, key: str) -> None:
+        """Send the owner of round item *key* a short "carry on" — it costs that bot a turn."""
+        key = str(key or "").strip().lstrip("#")
+        if not key:
+            raise ControlRefused("nudge needs an item: press it under that item's line")
+        owner = ""
+        for item_key, item in getattr(self.control_round(), "items", {}).items():
+            if str(item_key) == key and isinstance(item, dict):
+                owner = str(item.get("owner") or "").strip()
+        if not owner:
+            raise ControlRefused(f"# {key}: the round records no owner, so there is nobody "
+                                 "to nudge")
+        handle = str(self.config.peers.get(owner, owner)).lstrip("@")
+        await self.send(f"@{handle} carry on with #{key} please — the dashboard has no "
+                        "movement on it.", notice=True)
+        logger.info("control: nudged %s about #%s", owner, key)
+
+    async def refresh_control_center(self, *, now: Optional[float] = None) -> Optional[Any]:
+        """Edit the pinned dashboard for this beat. Never raises; ``None`` when there is none."""
+        centre = self.control_center()
+        if centre is None:
+            return None
+        try:
+            # The round state comes off the bus (git, subprocesses): off the event loop, like
+            # the pulse's own bus work, or this beat would stall delivery and every turn with it.
+            text = await asyncio.to_thread(self.control_text, now)
+            return await centre.refresh(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                      # noqa: BLE001 - a dashboard must not kill a beat
+            logger.warning("control centre: refresh failed", exc_info=True)
+            return None
+
+
     async def _heartbeat_tick(self, *, now: Optional[float] = None) -> str:
         """Publish one pulse, then judge the peers. Returns what it said, for a test.
 
@@ -2797,6 +3239,10 @@ class AgentChannel:
             how = await self._publish_pulse_line(line)
             said = f"pulse {how} rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
         await self.check_peer_liveness(now=moment)
+        # The pinned dashboard rides the beat, and only its holder edits it: every bot
+        # refreshing one message would fight over it (#117).
+        if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
+            await self.refresh_control_center(now=moment)
         return said
 
     async def _register_command_menu(self) -> str:
@@ -2995,7 +3441,8 @@ class AgentChannel:
     # Machine-class envelope kinds recorded as state without waking the adapter (token
     # economy, issue #43). REQUEST/RESPONSE/BLOCKED are never machine-class.
     _MACHINE_STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED", "PULSE"})
-    _MACHINE_NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE"})
+    _MACHINE_NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE",
+                                       "CONTROL"})
 
     def _machine_event_class(self, envelope: Envelope) -> Optional[str]:
         """Classify a machine-only envelope; ``None`` means it follows the normal path.
@@ -3031,6 +3478,12 @@ class AgentChannel:
         self.stats.machine_events += 1
         logger.info("machine event recorded without dispatch: kind=%s from=%s ref=%s",
                     kind, alias, envelope.ref)
+        if (envelope.type == MessageType.NOTE
+                and (envelope.intent or "").upper() == "CONTROL" and event.text):
+            # Issue #117: a control pressed on another bot's dashboard, for this one. The admin
+            # check is repeated here: the note only ever carries the presser's Telegram id. The
+            # envelope's own header is not part of the line, so the body is what is parsed.
+            self.apply_control_note(parse_message(event.text)[1], sender=alias)
         if (envelope.type == MessageType.NOTE
                 and (envelope.intent or "").upper() == "TOPIC_GONE" and envelope.ref):
             # Issue #63: one bot ran /cleanup and deleted a topic; every peer forgets it here,
@@ -7002,6 +7455,11 @@ class AgentChannel:
                        default=DefaultBotProperties(parse_mode="HTML"))
         self.dispatcher = Dispatcher()
         self.dispatcher.message.register(self._on_aiogram_message)
+        # Issue #117: the buttons under the pinned dashboard. Guarded because a test stubs the
+        # dispatcher with just the one router it needs; a real Dispatcher always has this one.
+        presses = getattr(getattr(self.dispatcher, "callback_query", None), "register", None)
+        if presses is not None:
+            presses(self._on_aiogram_callback)
         self.dispatcher.edited_message.register(self._on_aiogram_edited)
         self._started_wall = time.time()
         me = await self.bot.get_me()
@@ -7287,6 +7745,27 @@ class AgentChannel:
             topic_name_current=topic_name_current,
             attachments=attachments_from_aiogram(message),
         )
+
+    async def _on_aiogram_callback(self, callback: Any) -> None:
+        """A press under the pinned dashboard: answer it in the chat, then refresh (#117).
+
+        The policy decides; this only carries the answer back to the presser, because a
+        Telegram button that is never answered spins for the presser until it times out.
+        """
+        data = str(getattr(callback, "data", "") or "")
+        if not data.startswith(press_mod.PREFIX):
+            return                          # somebody else's keyboard: not ours to answer
+        user = getattr(callback, "from_user", None)
+        press = press_mod.Press(user_id=int(getattr(user, "id", 0) or 0), data=data,
+                                at=time.time())
+        text = await self.handle_control_press(press)
+        answer = getattr(callback, "answer", None)
+        if answer is not None:
+            try:
+                await answer(text[:200])
+            except Exception:               # noqa: BLE001 - the press already happened
+                logger.warning("control centre: could not answer the press", exc_info=True)
+        await self.refresh_control_center()
 
     async def _on_aiogram_message(self, message: Any) -> None:
         # Pending updates are kept across a restart (a peer's request must still arrive), but
