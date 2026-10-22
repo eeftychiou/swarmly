@@ -1242,15 +1242,24 @@ question to the admin is observed as a round item waiting on the admin, not as a
 
 **Waking on news (#163).** A row wakes the bot that owes it only when the value observed for it
 differs from the value that last woke anyone (`Row.woken`), and the wake carries the delta —
-"a result on #146 at c166987: pending to green", not "check again" — so a standing check that
-finds nothing unchanged starts no turn at all. The transport looks at the table once per
-heartbeat, right after the sweep: it resolves the row's `tg-` token back to a chat and thread
-through its own topics (a debt no topic owns wakes in General), **holds** the wake while that
-topic already has a turn running (the rule from #160 — a turn queued behind a turn usually
-settles the same debt), and starts at most two turns a tick until the per-round budget lands
-(#164). What woke whom is written onto the row before the next tick, so a restart cannot wake
-the same bot about the same observation twice; a row that would wake its debtor a third time
-with no news escalates to the admin instead, once.
+"a result on c166987 on #146: pending to green", not "check again", with the head said once
+rather than twice — so a standing check that finds nothing unchanged starts no turn at all.
+**A wake needs a bot behind it**: `CI` owes a result and `admin` owes an answer, and neither
+has a turn to start, so their rows are observed and never woken; the transport passes the
+roster (`owed_bots()`) and a debtor off it is treated the same way. The transport looks at the
+table once per heartbeat, right after the sweep: it resolves the row's `tg-` token back to a
+chat and thread through its own topics (a debt no topic owns wakes in General), **holds** the
+wake while that topic already has a turn running (the rule from #160 — a turn queued behind a
+turn usually settles the same debt), and starts at most two turns a tick until the per-round
+budget lands (#164). What woke whom, and when (`Row.woken_at`), is written onto the row before
+the next tick, so a restart cannot wake the same bot about the same observation twice. **An
+ignored wake is nudged, then escalated**: a wake is given `WAKE_GRACE` (ten minutes), after
+which the same observation earns one more wake that says nothing has changed, and after
+`MAX_WAKES` the row goes to the admin instead — **in General**, the place the admin is
+addressed, not the discussion the debt lives in — and only once. Silence is not the same as an
+ignored wake: a row seeded with a value and never woken (`wakes == 0`) still wakes nobody. A
+claim that contradicts the facts compares heads through `same_head`, so a seven-character SHA
+the forty-character head agrees with is not a contradiction.
 
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt

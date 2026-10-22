@@ -2,7 +2,8 @@
 
 The decision is a pure function (`owed_wake.plan`); this file pins the half that knows the
 world: which chat and thread a row's discussion is, that a topic already running a turn is
-held, and that what woke whom is written down before the next tick.
+held, that what woke whom is written down before the next tick, and that the debtor is a bot
+the roster knows -- never ``CI``, which has no turn behind it.
 """
 
 import unittest
@@ -12,13 +13,15 @@ from tempfile import TemporaryDirectory
 from swarmly.telegram import owed as ow
 from tests.test_telegram_channel import GROUP, make_channel, make_config
 
+BOT = "Codex"                       # a configured peer in make_config's roster
 
-def ci_row(**fields):
-    """One CI row with the fields these tests all need, so each test names only its own."""
-    fields.setdefault("kind", "ci")
+
+def bot_row(**fields):
+    """One head-bound row with the fields these tests all need, so each names only its own."""
+    fields.setdefault("kind", "verdict")
     fields.setdefault("item", "#146")
-    fields.setdefault("debtor", ow.CI)
-    fields.setdefault("owes", "a result on c166987")
+    fields.setdefault("debtor", BOT)
+    fields.setdefault("owes", "a verdict on c166987")
     fields.setdefault("head", "c166987")
     return ow.Row(**fields)
 
@@ -46,7 +49,7 @@ class TestWhereTheWakeGoes(unittest.TestCase):
 
     def open_row(self, channel, **fields):
         fields.setdefault("observed", "green")
-        row = ci_row(**fields)
+        row = bot_row(**fields)
         channel._test_table[1].save_all([row])
         return row
 
@@ -78,6 +81,23 @@ class TestWhereTheWakeGoes(unittest.TestCase):
         self.assertEqual(channel._test_turns, [])
         self.assertIn("no discussion to wake in", " ".join(done))
 
+    def test_a_ci_row_wakes_nobody(self):
+        """CI owes a result and has no turn to start: observed, never woken (#163 review)."""
+        channel = self.channel()
+        channel.topics.remember(GROUP, 5122, "round 5")
+        token = channel.topics.context(GROUP, 5122)
+        ci = ow.Row(kind="ci", item="#146", debtor=ow.CI, owes="a result on c166987",
+                    head="c166987", observed="green", woken="pending", topic=token)
+        channel._test_table[1].save_all([ci])
+        self.assertEqual(channel.owed_wake_tick(now=1000.0), [])
+        self.assertEqual(channel._test_turns, [])
+
+    def test_a_debtor_off_the_roster_wakes_nobody(self):
+        channel = self.channel()
+        self.open_row(channel, debtor="Stranger", topic="")
+        self.assertEqual(channel.owed_wake_tick(now=1000.0), [])
+        self.assertEqual(channel._test_turns, [])
+
 
 class TestNoNewsNoTurnInTheTransport(unittest.TestCase):
 
@@ -85,7 +105,7 @@ class TestNoNewsNoTurnInTheTransport(unittest.TestCase):
         channel = channel_with_table()
         self.addCleanup(channel._test_table[0].cleanup)
         channel.topics.remember(GROUP, 5122, "round 5")
-        row = ci_row(topic=channel.topics.context(GROUP, 5122), observed="green")
+        row = bot_row(topic=channel.topics.context(GROUP, 5122), observed="green")
         channel._test_table[1].save_all([row])
         return channel, row
 
@@ -98,6 +118,19 @@ class TestNoNewsNoTurnInTheTransport(unittest.TestCase):
         channel.owed_wake_tick(now=1060.0)
         self.assertEqual(len(channel._test_turns), 1)
         self.assertEqual(channel._test_table[1].load()[0].woken, "green")
+
+    def test_a_wake_nobody_acts_on_reaches_the_admin(self):
+        """The whole path, through the saved table -- not a hand-seeded ``wakes``."""
+        from swarmly.telegram.owed_wake import WAKE_GRACE
+        channel, _row = self.channel()
+        channel.owed_wake_tick(now=1000.0)                       # news: one turn
+        channel.owed_wake_tick(now=1000.0 + WAKE_GRACE + 1)      # ignored: one nudge
+        self.assertEqual(len(channel._test_turns), 2)
+        self.assertEqual(channel._test_table[1].load()[0].wakes, 2)
+        channel.owed_wake_tick(now=1000.0 + 2 * WAKE_GRACE + 2)  # still ignored: the admin
+        self.assertEqual(len(channel._test_turns), 3)
+        self.assertIn("Owed-row escalation", channel._test_turns[-1][0])
+        self.assertTrue(channel._test_table[1].load()[0].escalated)
 
     def test_closed_rows_wake_nobody(self):
         channel, row = self.channel()
@@ -115,16 +148,16 @@ class TestTheBusyHoldAndTheBudget(unittest.TestCase):
         channel.topics.remember(GROUP, 5122, "round 5")
         return channel
 
-    def open_row(self, channel, item, debtor, observed="green", thread=5122):
+    def open_row(self, channel, item, debtor=BOT, observed="green", thread=5122):
         channel.topics.remember(GROUP, thread, f"topic {thread}")
         token = channel.topics.context(GROUP, thread)
-        channel._test_table[1].save_all([ci_row(item=item, debtor=debtor, topic=token,
-                                                observed=observed)])
+        channel._test_table[1].save_all([bot_row(item=item, debtor=debtor, topic=token,
+                                                 observed=observed)])
 
     def test_a_busy_topic_holds_the_wake_and_keeps_it_armed(self):
         """#160 applies to these wakes too: a turn already running here is not queued behind."""
         channel = self.channel()
-        self.open_row(channel, "#146", ow.CI)
+        self.open_row(channel, "#146")
         channel._busy_since[(GROUP, 5122)] = 990.0
         done = channel.owed_wake_tick(now=1000.0)
         self.assertEqual(channel._test_turns, [])
@@ -139,7 +172,7 @@ class TestTheBusyHoldAndTheBudget(unittest.TestCase):
         channel = self.channel()
         from swarmly.telegram.owed_wake import MAX_WAKES_PER_TICK
         for index in range(MAX_WAKES_PER_TICK + 2):
-            self.open_row(channel, f"#{500 + index}", ow.CI, thread=5200 + index)
+            self.open_row(channel, f"#{500 + index}", thread=5200 + index)
         done = channel.owed_wake_tick(now=1000.0)
         self.assertEqual(len(channel._test_turns), MAX_WAKES_PER_TICK)
         self.assertIn("wake budget", " ".join(done))
@@ -149,8 +182,8 @@ class TestTheBusyHoldAndTheBudget(unittest.TestCase):
 
     def test_only_one_turn_per_topics_per_tick(self):
         channel = self.channel()
-        self.open_row(channel, "#146", ow.CI)
-        self.open_row(channel, "#147", ow.CI)
+        self.open_row(channel, "#146")
+        self.open_row(channel, "#147")
         done = channel.owed_wake_tick(now=1000.0)
         self.assertEqual(len(channel._test_turns), 1)      # one turn, not two in one topic
         self.assertIn("held: turn running", " ".join(done))
@@ -158,17 +191,20 @@ class TestTheBusyHoldAndTheBudget(unittest.TestCase):
 
 class TestAnEscalationWakesTheAdminOnce(unittest.TestCase):
 
-    def test_a_row_that_keeps_repeating_is_escalated_once(self):
+    def test_an_escalation_goes_to_general_and_never_repeats(self):
         channel = channel_with_table()
         self.addCleanup(channel._test_table[0].cleanup)
         channel.topics.remember(GROUP, 5122, "round 5")
         token = channel.topics.context(GROUP, 5122)
-        row = ci_row(topic=token, observed="green", woken="green", wakes=2)
+        row = bot_row(topic=token, observed="green", woken="green", wakes=2)
         channel._test_table[1].save_all([row])
         channel.owed_wake_tick(now=1000.0)
         self.assertEqual(len(channel._test_turns), 1)
-        self.assertIn("Owed-row escalation", channel._test_turns[0][0])
-        self.assertIn("admin", channel._test_turns[0][0])
+        text, chat_id, thread_id, _name = channel._test_turns[0]
+        self.assertIn("Owed-row escalation", text)
+        self.assertIn("admin", text)
+        # The admin is spoken to in General, not in the discussion the debt lives in.
+        self.assertEqual((chat_id, thread_id), (GROUP, None))
         # Marked, so it never comes back.
         self.assertEqual(channel.owed_wake_tick(now=1060.0), [])
         self.assertTrue(channel._test_table[1].load()[0].escalated)

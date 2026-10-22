@@ -4957,6 +4957,20 @@ class AgentChannel:
             add(alias, role)
         return roles
 
+    def owed_bots(self) -> Set[str]:
+        """The debtors a wake can actually reach: this bot, and the peers it is configured with.
+
+        A wake starts a turn, so it needs a chat handler behind it. ``CI`` owes a result and
+        ``admin`` owes an answer, and neither is one (#163 review): the roster decides, never
+        the round state, and a debtor off it keeps its row without getting a turn.
+        """
+        bots = {str(getattr(self.config.identity, "alias", "") or "").strip()}
+        for table in ("peers", "peer_roles"):
+            for alias in (getattr(self.config, table, None) or {}):
+                bots.add(str(alias or "").strip())
+        bots.discard("")
+        return bots
+
     def owed_sweep(self, *, now: Optional[float] = None) -> List[str]:
         """Open and close the rows the round state answers -- every source but a hand-off.
 
@@ -5107,10 +5121,9 @@ class AgentChannel:
             return (f"Owed-row escalation: {wake.text}. Nobody acted on it and it is still "
                     f"open; tell the admin in one short line. This is the last notice for "
                     f"this row.")
-        return (f"Owed-row wake: {wake.text}. That fact only just changed, so this is news "
-                f"and not a reminder: act on it, or say in one line why you cannot. Do not "
-                f"answer with a status line. (Row {wake.row}; after {MAX_WAKES} wake-ups with "
-                f"no news the admin is told instead.)")
+        return (f"Owed-row wake: {wake.text}. Act on it, or say in one line why you cannot. Do "
+                f"not answer with a status line. (Row {wake.row}; after {MAX_WAKES} wake-ups "
+                f"with no news the admin is told instead, and the row stops asking.)")
 
     def owed_wake_tick(self, *, now: Optional[float] = None) -> List[str]:
         """Start one turn for each row whose fact has changed, and none for the rest (#163).
@@ -5120,6 +5133,7 @@ class AgentChannel:
         and thread, a topic with a turn already running is held (a wake queued behind a turn
         often settles the same debt, #160), and what woke whom is written to the row before
         the next tick, so a restart cannot wake the same bot about the same observation twice.
+        A wake nobody acts on is nudged once, then escalated to the admin in General, once.
         """
         from swarmly.telegram.owed_wake import MAX_WAKES_PER_TICK, mark_woken, plan
         moment = time.time() if now is None else float(now)
@@ -5129,7 +5143,10 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - a tick must survive
             logger.warning("owed wake: the table could not be read", exc_info=True)
             return []
-        wakes = plan(rows, now=moment)
+        # The roster, not the table: a row whose debtor is CI or the admin is observed here and
+        # woken nowhere -- there is no turn behind those names. An escalation goes to General,
+        # the place the admin is addressed in, not to the discussion the debt lives in.
+        wakes = plan(rows, now=moment, bots=self.owed_bots(), admin_topic="")
         if not wakes:
             return []
         done: List[str] = []
