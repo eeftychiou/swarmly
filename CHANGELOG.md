@@ -8,12 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- An open item whose next actor cannot be derived is **flagged** on its row (`⚑ no next actor: …`
+  in `/owed`) instead of looking like one more coordinator debt, and the coordinator is still
+  named so the item is not lost (`#194`, the second #164 invariant).
 - Invariants, deadlines and a wake budget (`#164`): an open round item nothing owes opens a row
   for the coordinator carrying the concrete gap (the #146 case, where no WAKE was armed), every
   open PR names its next actor or is flagged, a row no fact has moved for
   `limits.stall_minutes` climbs a three-rung ladder once per rung — a reminder in code, one
   coordinator turn, then the admin — and a round's coordinator wakes are capped per day by
   `limits.round_wake_budget`, pausing them and telling the admin instead of spending through it.
+  The notice is said once per round per day, not once per process; the budget counts against the
+  round written last (by its own `term`/`seq`/`updated_at`, not the last name); and both settings
+  are validated with the rest of `limits`.
 - Waking on news (`#163`, first slice): a row wakes the bot that owes it only when the value
   observed for it differs from the value that last woke anyone (`Row.woken`, `wakes`), and the
   wake names the delta -- "a result on c166987 on #146: pending to green" -- instead of "check

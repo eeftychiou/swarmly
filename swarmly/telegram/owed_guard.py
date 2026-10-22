@@ -125,11 +125,18 @@ def orphans(items: Iterable[Tuple[str, Mapping[str, Any]]], rows: Sequence[Row],
         if actor in (CI, ADMIN):
             actor = ""                  # a fact this transport waits on, or the admin: no bot
         debtor = actor or lead
+        # #164's second invariant: every open item names a next actor, or it is **flagged**.
+        # The row still goes to the coordinator -- an item nobody can be derived for is theirs
+        # to assign -- but it says so, so `/owed` shows a PR nobody is on instead of quietly
+        # looking like one more coordinator debt.
+        flagged = "" if actor or roles is None else (
+            f"no next actor: the roles name nobody for {gap(item, key=key)}")
         out.append(Row(kind="progress", item=label, debtor=debtor,
                        owes=f"a next step on {label}", observed=gap(item, key=key),
                        waiting_on=lead if debtor.lower() != lead.lower() else "",
                        opened_by=(f"the item is open and {debtor} has the next step"
                                   if actor else "the item is open and nothing owes it"),
+                       flag=flagged,
                        deadline=deadline, created_at=moment, updated_at=moment))
     return out
 
@@ -222,7 +229,12 @@ class WakeBudget:
         self.clock = clock
 
     @staticmethod
-    def _day(moment: float) -> str:
+    def day(moment: float) -> str:
+        """The UTC day a count belongs to: the budget is a day's, not a process's.
+
+        Public because the transport records *which* day it last told the admin the budget was
+        spent, so the notice returns at midnight instead of never (#191 review).
+        """
         return time.strftime("%Y-%m-%d", time.gmtime(float(moment)))
 
     def _read(self) -> Dict[str, Any]:
@@ -239,7 +251,7 @@ class WakeBudget:
 
     def used(self, round_key: str, *, now: Optional[float] = None) -> int:
         """Wakes this round has spent today."""
-        day = self._day(self.clock() if now is None else float(now))
+        day = self.day(self.clock() if now is None else float(now))
         entry = self._read().get(str(round_key or ""))
         if not isinstance(entry, dict) or entry.get("day") != day:
             return 0                      # a new day starts at zero
@@ -260,7 +272,7 @@ class WakeBudget:
         key = str(round_key or "")
         data = self._read()
         total = self.used(key, now=moment) + 1
-        data[key] = {"day": self._day(moment), "count": total}
+        data[key] = {"day": self.day(moment), "count": total}
         if self.path is not None:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
