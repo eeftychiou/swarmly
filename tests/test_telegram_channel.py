@@ -2364,3 +2364,54 @@ class TestCleanupLookups(unittest.TestCase):
         self.assertEqual(states["#2"], "merged")
         channel._ref_states(refs, GROUP, 7)
         self.assertEqual(len(calls), 12)                           # the second ask is cached
+
+
+class TestTheCommandMenu(unittest.TestCase):
+    """Live: only the bot whose token once ran another tool autocompleted, with that tool's
+    commands. Every transport now registers Swarmly's own menu on start."""
+
+    class MenuBot:
+        def __init__(self, default=(), scoped=()):
+            from types import SimpleNamespace
+            self.default = [SimpleNamespace(command=c, description=d) for c, d in default]
+            self.scoped = [SimpleNamespace(command=c, description="x") for c in scoped]
+            self.set_calls, self.deleted = [], []
+
+        async def get_my_commands(self, scope=None):
+            return self.scoped if scope is not None else self.default
+
+        async def delete_my_commands(self, scope=None):
+            self.deleted.append(type(scope).__name__)
+            self.scoped = []
+
+        async def set_my_commands(self, commands, scope=None):
+            self.set_calls.append([c.command for c in commands])
+
+    def test_a_stale_menu_is_replaced_with_swarmlys_own(self):
+        from swarmly.telegram.commands import MENU_COMMANDS
+        channel = make_channel()
+        channel.bot = self.MenuBot(default=[("memory", "Show main memory")], scoped=["cron"])
+        self.assertEqual(run(channel._register_command_menu()), "registered")
+        self.assertEqual(channel.bot.set_calls, [[name for name, _ in MENU_COMMANDS]])
+        self.assertTrue(channel.bot.deleted)                # the scoped list that shadowed it
+        self.assertNotIn("memory", channel.bot.set_calls[0])
+
+    def test_an_unchanged_menu_is_left_alone(self):
+        from swarmly.telegram.commands import MENU_COMMANDS
+        channel = make_channel()
+        channel.bot = self.MenuBot(default=MENU_COMMANDS)
+        self.assertEqual(run(channel._register_command_menu()), "unchanged")
+        self.assertEqual(channel.bot.set_calls, [])
+
+    def test_every_menu_command_is_one_the_bot_handles(self):
+        import re
+        from swarmly.telegram.commands import MENU_COMMANDS
+        source = Path(__file__).resolve().parents[1].joinpath(
+            "swarmly", "telegram", "channel.py").read_text(encoding="utf-8")
+        source += Path(__file__).resolve().parents[1].joinpath(
+            "swarmly", "telegram", "membership.py").read_text(encoding="utf-8")
+        for name, text in MENU_COMMANDS:
+            self.assertTrue(re.fullmatch(r"[a-z0-9_]{1,32}", name), name)
+            self.assertLessEqual(len(text), 256)
+            if name != "cli":                      # /cli is parsed by native.parse_request
+                self.assertIn(f'"{name}"', source, name)

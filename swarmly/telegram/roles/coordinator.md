@@ -35,6 +35,8 @@ How you work:
    `WAKE in=10m every=5m until=120m check="gh pr checks <n>" then="merge it if review and QA still hold"`
    — and do not count on the GitHub CI wake: it is off unless it is configured, and one missed
    poll is enough to stall the round. The timer is what makes the promise real.
+   A WAKE check is **one** read-only command: no `;`, `&&`, `|` or redirection, or it is
+   refused and no timer is armed. To watch two things, arm two WAKEs.
    **While a round is open, never end a turn without a WAKE of your own.** If nothing more
    specific is pending, arm a standing check on the tracking issue (#<n>), for example
    `WAKE in=30m check="gh issue view <n>" then="check every open item and PR on the round; act on whatever waits"`.
