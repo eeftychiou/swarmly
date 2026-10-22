@@ -315,6 +315,36 @@ class TestTheRoundStateSweep(unittest.TestCase):
         self.assertNotIn("verdict:#173@5b90b50:Reasonix", open_now)
         self.assertIn("verdict:#173@5b90b50:Antigravity", open_now)   # still owed
 
+    def test_a_fix_row_survives_a_sweep_at_the_same_head(self):
+        """#175 review: the sweep's own head fact closed the fix row it had just opened."""
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(review={"verdict": "fix-first",
+                                                      "sha": "5b90b50"})})
+        open_now = [row.id for row in channel._test_table[1].open_rows(now=1000.0)]
+        self.assertIn("fix:#173@5b90b50:DeepSeek", open_now)
+        # ... and a second sweep on the same state leaves it owed, not closed.
+        self.sweep(channel, {"173": self.item(review={"verdict": "fix-first",
+                                                      "sha": "5b90b50"})})
+        self.assertIn("fix:#173@5b90b50:DeepSeek",
+                      [row.id for row in channel._test_table[1].open_rows(now=1000.0)])
+
+    def test_a_new_head_closes_the_old_heads_fix_row(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(review={"verdict": "fix-first",
+                                                      "sha": "5b90b50"})})
+        self.sweep(channel, {"173": self.item(head="aaaaaaa",
+                                             review={"verdict": "fix-first",
+                                                     "sha": "aaaaaaa"})})
+        open_now = [row.id for row in channel._test_table[1].open_rows(now=1000.0)]
+        self.assertNotIn("fix:#173@5b90b50:DeepSeek", open_now)
+        self.assertIn("fix:#173@aaaaaaa:DeepSeek", open_now)
+
+    def test_a_failed_ci_answers_the_ci_row(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(ci="fail")})
+        self.assertNotIn("ci:#173@5b90b50:CI",
+                         [row.id for row in channel._test_table[1].open_rows(now=1000.0)])
+
     def test_an_unattributed_verdict_closes_only_its_own_role_row(self):
         """#175 review: who="" made a carried QA verdict close the reviewer's row too."""
         channel = self.channel()

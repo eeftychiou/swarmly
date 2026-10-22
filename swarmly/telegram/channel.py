@@ -5008,10 +5008,12 @@ class AgentChannel:
                     if who:
                         facts.append(Fact(kind="verdict", item=label, head=head, who=who,
                                           verdict=verdict.verdict))
-                green = str(item.get("ci") or "").strip().lower() in ("green", "pass", "passed",
-                                                                     "ok")
-                if green:
-                    facts.append(Fact(kind="ci", item=label, head=head, verdict="pass"))
+                ci = str(item.get("ci") or "").strip().lower()
+                green = ci in ("green", "pass", "passed", "ok")
+                # **Any** result answers the CI row, not only a green one: a failed run is a
+                # result, and leaving that row open would have CI owing for ever (#175 review).
+                if ci in ("green", "pass", "passed", "ok", "fail", "failed", "red", "error"):
+                    facts.append(Fact(kind="ci", item=label, head=head, verdict=ci))
                 if item.get("pr") and head:
                     # A new head answers the old head's verdicts and opens the new head's debts.
                     facts.append(Fact(kind="head", item=label, head=head))
