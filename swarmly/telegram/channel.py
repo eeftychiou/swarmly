@@ -3739,6 +3739,11 @@ class AgentChannel:
         # Round 5.5 (#161): a turn whose CLI has gone silent past the kill limit is stopped
         # here, through the /stop path. Liveness only -- this never starts a turn.
         await self.check_stuck_turns(now=moment)
+        # Round 5.5 (#162): the round state's own facts open and close rows each beat.
+        try:
+            self.owed_sweep(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("owed: sweep failed this beat", exc_info=True)
         # The pinned dashboard rides the beat, and only its holder edits it: every bot
         # refreshing one message would fight over it (#117).
         if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
@@ -4924,6 +4929,150 @@ class AgentChannel:
             return str(ref.get("topic") or ref.get("ref") or ref.get("channel") or "") or "x"
         except Exception:                          # noqa: BLE001 - book-keeping, not a turn
             return "x"
+
+    def owed_roles(self) -> Dict[str, str]:
+        """Who owes a verdict, and who owes the merge: the roster, never the round state.
+
+        ``agent.role`` for this bot and ``peers[*].role`` for the rest (``config.peer_roles``),
+        the same roster ``/role`` prints. A role nobody was given simply opens no row: a debt
+        with no holder is a line to post, not a row to wake.
+        """
+        roles: Dict[str, str] = {}
+        names = {"reviewer": "review", "qa-tester": "qa", "qa": "qa",
+                 "developer": "developer", "coordinator": "coordinator"}
+
+        def add(alias: Any, role: Any) -> None:
+            key = names.get(str(role or "").strip().lower())
+            if key and alias and key not in roles:
+                roles[key] = str(alias).strip()
+
+        add(self.config.identity.alias, self.config.identity.role)
+        for alias, role in (getattr(self.config, "peer_roles", {}) or {}).items():
+            add(alias, role)
+        return roles
+
+    def owed_sweep(self, *, now: Optional[float] = None) -> List[str]:
+        """Open and close the rows the round state answers -- every source but a hand-off.
+
+        A round's items already carry the facts this needs: the PR and its head, the owner, the
+        CI state and the two verdicts, each bound to the head it was given on. Two rules keep it
+        honest. **A fact that is already there closes as well as opens** -- a verdict the state
+        carries answers its own row, a green CI answers the CI row, a merge answers everything
+        bound to the item -- or ``/owed`` would list debts the swarm has already settled (#173
+        review). And **only a changed row is written**: a beat that rewrote every row pushed a
+        bus commit a minute for nothing, and moved the row's ``created_at`` with it.
+        """
+        from swarmly.telegram.owed import (Fact, Row, admin_row, fix_rows, head_rows, merge_row,
+                                           progress_rows, settle)
+        moment = time.time() if now is None else float(now)
+        roles = self.owed_roles()
+        store = self.owed_store()
+        try:
+            rounds = self.round_store()
+            keys = rounds.rounds()
+        except Exception:                          # noqa: BLE001 - a sweep is best effort
+            logger.warning("owed: no round state to sweep", exc_info=True)
+            return []
+        rows = store.load()
+        facts: List["Fact"] = []
+        fresh: List[Row] = []
+        for key in keys:
+            try:
+                state = rounds.load(key)
+            except Exception:                      # noqa: BLE001 - one round, one failure
+                logger.warning("owed: could not read round %s", key, exc_info=True)
+                continue
+            if state.status != "ok":
+                continue                           # absent or unreadable: open nothing
+            for item_key in (state.order or list(state.items)):
+                item = state.item(item_key)
+                if not item:
+                    continue
+                label = f"#{item_key}"
+                head = str(item.get("head") or "").strip().lower()
+                if str(item.get("state") or "").strip().lower() in ("merged", "closed", "done"):
+                    facts.append(Fact(kind="merge", item=label, head=head))
+                    continue
+                verdicts: Dict[str, str] = {}
+                for kind in ("review", "qa"):
+                    verdict = state.verdict(item_key, kind, head=head or None)
+                    if verdict is None:
+                        continue
+                    verdicts[kind] = verdict.verdict
+                    # The state already carries this verdict: the row it answers is closed.
+                    # An unattributed verdict must answer one row, not every verdict row on
+                    # that head: the role's owner stands in for it, and with neither the
+                    # verdict answers nothing rather than closing a debt nobody settled
+                    # (#175 review).
+                    who = verdict.by or roles.get(kind, "")
+                    if who:
+                        facts.append(Fact(kind="verdict", item=label, head=head, who=who,
+                                          verdict=verdict.verdict))
+                ci = str(item.get("ci") or "").strip().lower()
+                green = ci in ("green", "pass", "passed", "ok")
+                # **Any** result answers the CI row, not only a green one: a failed run is a
+                # result, and leaving that row open would have CI owing for ever (#175 review).
+                if ci in ("green", "pass", "passed", "ok", "fail", "failed", "red", "error"):
+                    facts.append(Fact(kind="ci", item=label, head=head, verdict=ci))
+                if item.get("pr") and head:
+                    # A new head answers the old head's verdicts and opens the new head's debts.
+                    facts.append(Fact(kind="head", item=label, head=head))
+                    fresh.extend(head_rows(item=label, head=head, roles=roles, at=moment,
+                                           opened_by=f"head {head} on {label}"))
+                    fresh.extend(fix_rows(item=label, head=head,
+                                          developer=roles.get("developer", ""),
+                                          verdicts=verdicts, at=moment))
+                    if green:
+                        merge = merge_row(item=label, head=head,
+                                          coordinator=roles.get("coordinator", ""),
+                                          ci_green=True, verdicts=verdicts, at=moment)
+                        if merge is not None:
+                            fresh.append(merge)
+                fresh.extend(progress_rows(items=[{**item, "key": item_key}], at=moment))
+                if str(item.get("waits_on") or "").strip().lower() in ("admin", "owner", "human"):
+                    fresh.append(admin_row(
+                        question=str(item.get("note") or f"waiting on the admin on {label}"),
+                        item=label, at=moment))
+        # A snapshot, not the objects themselves: settling mutates the rows in `table`, and a
+        # comparison against the same objects would always say "unchanged".
+        seen = {row.id: row.to_dict() for row in rows}
+        # The table as it will be: what is already open, plus what this sweep opens. The
+        # closing facts are applied to *that*, so a fact the state carries in the same pass as
+        # the row it answers still closes it (#173 review).
+        table = {row.id: row for row in rows}
+        for row in fresh:
+            table.setdefault(row.id, row)
+        closed: List[Row] = []
+        for fact in facts:
+            closed.extend(settle(list(table.values()), fact))
+        # Write only what actually changed: a beat is not a reason for a bus commit.
+        def differs(before: Dict[str, Any], row: Row) -> bool:
+            after = row.to_dict()
+            before = dict(before)
+            before.pop("updated_at", None)
+            after.pop("updated_at", None)
+            return before != after
+
+        writes = [row for row in table.values()
+                  if row.id not in seen or differs(seen[row.id], row)]
+        done: List[str] = []
+        if writes:
+            try:
+                store.save_all(writes)
+            except Exception:                      # noqa: BLE001 - the sweep is best effort
+                logger.warning("owed: could not write the swept rows", exc_info=True)
+                return done
+        for row in closed:
+            done.append(f"closed {row.id}")
+        for row in fresh:
+            if row.id in seen:
+                continue                       # already owed: this beat found nothing new
+            if not row.is_open:
+                continue                       # opened and answered in the same pass
+            done.append(f"open {row.id}")
+        if done:
+            logger.info("owed: %s", "; ".join(done[:8]))
+        return done
 
     def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
                             thread_id: Optional[int]) -> None:

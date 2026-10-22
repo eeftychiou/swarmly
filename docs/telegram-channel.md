@@ -1219,17 +1219,26 @@ who is waiting, the fact that opened it, the last value observed and a deadline,
 id `<kind>:<item>[@<head>]…:<debtor>` *is* the settlement rule: re-observing a fact updates
 one row, a different head is a different debt.
 
-What this transport infers and records **today** is the hand-off: a reply that addresses a
-peer opens one row per peer addressed (the multi-recipient case that missed DeepSeek on
-22 Oct), in the discussion it was made in; that peer's reply **in that discussion** closes it,
-and a reply anywhere else does not. Rows live in this bot's state (`.agents/state/owed/`, one
-file per row) and are mirrored as bus documents under `.agents/owed/<alias>/`, so a successor
-coordinator inherits what is still open. `/owed@<bot>` lists the open rows, most overdue
-first, and says `cannot read the table` rather than "nothing is owed" when a row file is
-unreadable. The other sources — heads and CI from a poll of `items[*].pr`, verdicts, merges,
-unticked items with an owner, questions to the admin — are the same model with tests in
-`tests/test_owed.py`; they open no rows yet, because nothing in this transport observes them
-(no `gh` poll of PR heads, and a question is prose, which is deliberately not a fact).
+What this transport infers and records **today**: the hand-off, and the facts the round
+state already carries. A reply that addresses a peer opens one row per peer addressed (the
+multi-recipient case that missed DeepSeek on 22 Oct), in the discussion it was made in; that
+peer's reply **in that discussion** closes it, and a reply anywhere else does not. A sweep on
+the heartbeat tick reads the round's items and opens the rest, each bound to the fact that
+opened it: a new head (CI owes a result, the reviewer and QA owe verdicts on **that** head), a
+fix-first or QA fail (the developer owes a new head), CI green with a merge verdict and a QA
+pass on one head (the coordinator owes the merge), an unticked item with an owner (that owner
+owes progress), and an item waiting on the admin (the admin owes an answer — a reminder, never
+an action). A fact the state already carries closes its own row in the same pass — a verdict,
+a CI result (a failed run counts: it is an answer), a new head answering the old head's
+verdicts, a merge answering the item — and a row for a head becomes owed again only when the
+head moves.
+
+Rows live in this bot's state (`.agents/state/owed/`, one file per row) and are mirrored as bus
+documents under `.agents/owed/<alias>/`, so a successor coordinator inherits what is still
+open; only a row that actually changed is written, so a beat without news costs no bus commit.
+`/owed@<bot>` lists the open rows, most overdue first, and says `cannot read the table` rather
+than "nothing is owed" when a row file is unreadable. Nothing here reads a bot's prose: a
+question to the admin is observed as a round item waiting on the admin, not as a sentence.
 
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt
@@ -1423,3 +1432,4 @@ python -m unittest discover -s tests -t .        # no network, no aiogram needed
 The routing, loop-safety, pacing, escaping and adapter command construction are all exercised
 with an injected sender and a fake subprocess runner, so the suite makes no API calls and
 spawns no agent processes. aiogram-specific paths are covered behind `skipUnless`.
+

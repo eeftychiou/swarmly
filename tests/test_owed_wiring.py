@@ -223,3 +223,192 @@ class TestTheLeadAndUntokenedPlaces(unittest.TestCase):
         channel._mirror_handoffs("@CodexBot: take #173.", GROUP + 1, None, 56)
         self.assertEqual(len(rows(channel)), 2)
 
+
+class FakeRounds:
+    """A round store with states a test writes, standing in for the bus fold."""
+
+    def __init__(self, states):
+        self.states = states
+
+    def rounds(self):
+        return list(self.states)
+
+    def load(self, key):
+        return self.states[key]
+
+
+def round_state(items, *, status="ok", order=None):
+    from swarmly.telegram.rounds import RoundState
+    return RoundState(round="repo#167", status=status, order=list(order or items),
+                      items=items, source="ref")
+
+
+class TestTheRoundStateSweep(unittest.TestCase):
+    """#162's other sources: the round state's own facts open and close the rows."""
+
+    def channel(self):
+        channel = channel_with_table()
+        self.addCleanup(channel._test_table[0].cleanup)
+        channel.owed_roles = lambda: {"review": "Reasonix", "qa": "Antigravity",
+                                      "developer": "DeepSeek", "coordinator": "Claudebot"}
+        return channel
+
+    def sweep(self, channel, items, **state):
+        channel.round_store = lambda: FakeRounds({"repo#167": round_state(items, **state)})
+        return channel.owed_sweep(now=1000.0)
+
+    def item(self, **fields):
+        base = {"pr": 173, "head": "5b90b50", "owner": "DeepSeek", "ci": "pending"}
+        base.update(fields)
+        return base
+
+    def test_a_quiet_beat_reports_nothing(self):
+        """#175 review: `done` said "open …" on every beat, whatever actually landed."""
+        channel = self.channel()
+        first = self.sweep(channel, {"173": self.item()})
+        self.assertTrue(first)                               # the first sweep opens rows
+        self.assertEqual(self.sweep(channel, {"173": self.item()}), [])   # the second, nothing
+        # A row opened and answered in the same pass is reported as closed, not as opened.
+        done = self.sweep(channel, {"173": self.item(ci="green", head="aaaaaaa",
+                                                     review={"verdict": "merge",
+                                                             "sha": "aaaaaaa"},
+                                                     qa={"verdict": "pass", "sha": "aaaaaaa"})})
+        self.assertIn("closed ci:#173@aaaaaaa:CI", done)
+        self.assertNotIn("open ci:#173@aaaaaaa:CI", done)
+        self.assertNotIn("open verdict:#173@aaaaaaa:Reasonix", done)
+
+    def test_a_new_head_opens_ci_and_both_verdicts(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item()})
+        ids = sorted(row.id for row in rows(channel))
+        self.assertEqual(ids, ["ci:#173@5b90b50:CI", "progress:#173:DeepSeek",
+                               "verdict:#173@5b90b50:Antigravity",
+                               "verdict:#173@5b90b50:Reasonix"])
+
+    def test_a_fix_first_verdict_makes_the_developer_owe_a_head(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(review={"verdict": "fix-first",
+                                                      "sha": "5b90b50"})})
+        self.assertIn("fix:#173@5b90b50:DeepSeek", [row.id for row in rows(channel)])
+
+    def test_green_merge_and_pass_on_one_head_make_the_coordinator_owe_the_merge(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(
+            ci="green", review={"verdict": "merge", "sha": "5b90b50"},
+            qa={"verdict": "pass", "sha": "5b90b50"})})
+        self.assertIn("merge:#173@5b90b50:Claudebot", [row.id for row in rows(channel)])
+
+    def test_green_without_a_pass_owes_no_merge(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(ci="green",
+                                             review={"verdict": "merge", "sha": "5b90b50"})})
+        self.assertNotIn("merge:#173@5b90b50:Claudebot", [row.id for row in rows(channel)])
+
+    def test_an_item_waiting_on_the_admin_opens_an_admin_row(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(waits_on="admin")})
+        self.assertIn("admin", [row.kind for row in rows(channel)])
+
+    def test_a_merged_item_closes_what_it_owed(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item()})
+        self.assertTrue(rows(channel))
+        self.sweep(channel, {"173": self.item(state="merged")})
+        self.assertEqual([row for row in rows(channel) if row.is_open], [])
+
+    def test_an_unreadable_round_opens_nothing(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item()}, status="unreadable")
+        self.assertEqual(rows(channel), [])
+
+    def test_a_verdict_the_state_carries_closes_its_own_row(self):
+        """#173 review: the sweep listed debts the round state had already settled."""
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(review={"verdict": "merge", "sha": "5b90b50",
+                                                      "by": "Reasonix"})})
+        open_now = [row.id for row in rows(channel) if row.is_open]
+        self.assertNotIn("verdict:#173@5b90b50:Reasonix", open_now)
+        self.assertIn("verdict:#173@5b90b50:Antigravity", open_now)   # still owed
+
+    def test_a_fix_row_survives_a_sweep_at_the_same_head(self):
+        """#175 review: the sweep's own head fact closed the fix row it had just opened."""
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(review={"verdict": "fix-first",
+                                                      "sha": "5b90b50"})})
+        open_now = [row.id for row in channel._test_table[1].open_rows(now=1000.0)]
+        self.assertIn("fix:#173@5b90b50:DeepSeek", open_now)
+        # ... and a second sweep on the same state leaves it owed, not closed.
+        self.sweep(channel, {"173": self.item(review={"verdict": "fix-first",
+                                                      "sha": "5b90b50"})})
+        self.assertIn("fix:#173@5b90b50:DeepSeek",
+                      [row.id for row in channel._test_table[1].open_rows(now=1000.0)])
+
+    def test_a_new_head_closes_the_old_heads_fix_row(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(review={"verdict": "fix-first",
+                                                      "sha": "5b90b50"})})
+        self.sweep(channel, {"173": self.item(head="aaaaaaa",
+                                             review={"verdict": "fix-first",
+                                                     "sha": "aaaaaaa"})})
+        open_now = [row.id for row in channel._test_table[1].open_rows(now=1000.0)]
+        self.assertNotIn("fix:#173@5b90b50:DeepSeek", open_now)
+        self.assertIn("fix:#173@aaaaaaa:DeepSeek", open_now)
+
+    def test_a_failed_ci_answers_the_ci_row(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(ci="fail")})
+        self.assertNotIn("ci:#173@5b90b50:CI",
+                         [row.id for row in channel._test_table[1].open_rows(now=1000.0)])
+
+    def test_an_unattributed_verdict_closes_only_its_own_role_row(self):
+        """#175 review: who="" made a carried QA verdict close the reviewer's row too."""
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(qa={"verdict": "pass", "sha": "5b90b50"})})
+        open_now = [row.id for row in rows(channel) if row.is_open]
+        self.assertNotIn("verdict:#173@5b90b50:Antigravity", open_now)   # its own row closed
+        self.assertIn("verdict:#173@5b90b50:Reasonix", open_now)         # the reviewer's stays
+
+    def test_a_verdict_nobody_can_be_attributed_to_closes_nothing(self):
+        channel = self.channel()
+        channel.owed_roles = lambda: {}
+        self.sweep(channel, {"173": self.item(qa={"verdict": "pass", "sha": "5b90b50"})})
+        # With nobody to attribute it to, no verdict row exists to close; the facts that do
+        # name a debtor still open theirs.
+        self.assertEqual(sorted(row.id for row in rows(channel) if row.is_open),
+                         ["ci:#173@5b90b50:CI", "progress:#173:DeepSeek"])
+
+    def test_a_green_ci_closes_the_ci_row(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(ci="green")})
+        self.assertNotIn("ci:#173@5b90b50:CI",
+                         [row.id for row in rows(channel) if row.is_open])
+
+    def test_the_whole_settled_head_leaves_only_the_merge(self):
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item(
+            ci="green", review={"verdict": "merge", "sha": "5b90b50", "by": "Reasonix"},
+            qa={"verdict": "pass", "sha": "5b90b50", "by": "Antigravity"})})
+        open_now = sorted(row.id for row in rows(channel) if row.is_open)
+        self.assertEqual(open_now, ["merge:#173@5b90b50:Claudebot", "progress:#173:DeepSeek"])
+
+    def test_a_second_sweep_writes_nothing_and_keeps_created_at(self):
+        """#173 review: every beat rewrote and pushed every row."""
+        channel = self.channel()
+        self.sweep(channel, {"173": self.item()})
+        store = channel._test_table[1]
+        writes = []
+        real = store.save_all
+        store.save_all = lambda batch: (writes.append(list(batch)), real(batch))[1]
+        created = {row.id: row.created_at for row in rows(channel)}
+        channel.owed_sweep(now=2000.0)
+        self.assertEqual(writes, [])                       # no beat, no bus commit
+        self.assertEqual({row.id: row.created_at for row in rows(channel)}, created)
+
+    def test_roles_come_from_the_roster(self):
+        channel = self.channel()
+        channel.owed_roles = lambda: {}
+        self.sweep(channel, {"173": self.item()})
+        # No reviewer or QA in the roster: the CI row is the only one the facts support.
+        self.assertEqual(sorted(row.id for row in rows(channel)),
+                         ["ci:#173@5b90b50:CI", "progress:#173:DeepSeek"])
+

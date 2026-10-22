@@ -482,11 +482,13 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
             return f"merged ({head or item})" if head else "merged"
         return None
     if fact.kind == "head":
-        # A new head answers the verdicts for the *old* head -- and nothing else: the new head
-        # opens new rows, it does not close the CI row of the head it replaced.
-        if same_item and row.kind == "verdict" and row.head and head and row.head != head:
-            return f"new head {head}"
-        if same_item and row.kind == "fix":
+        # A new head answers the debts bound to the head it *replaced* -- and only those. The
+        # new head opens new rows and closes none of them: a fix row for this head is still
+        # owed while the head is this one (#175 review: the sweep's own head fact closed the
+        # fix-first row it had just opened).
+        if not (same_item and head and row.head and row.head != head):
+            return None
+        if row.kind in ("verdict", "fix"):
             return f"new head {head}"
         return None
     if fact.kind == "verdict":

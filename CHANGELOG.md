@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- The expectations table's other five sources (`#174`): a sweep on the heartbeat tick opens a
+  new head's CI result and both verdicts, the developer's fix row after a fix-first or QA fail,
+  the coordinator's merge row once CI, review and QA agree on one head, progress on unticked
+  items, and the admin's question row -- each bound to the fact that opened it. A fact the round
+  state already carries closes its row in the same pass, and a beat writes only the rows that
+  changed.
 - The expectations table (`#162` slice 1): rows saying who owes what — a debtor, what is owed,
   the item and (when it is about one commit) the head, who waits, the fact that opened it, the
   last value seen and a deadline. Facts open and close them, never a bot's word; they are kept
