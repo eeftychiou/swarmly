@@ -275,10 +275,6 @@ class TestTheKillPath(unittest.TestCase):
         self.assertFalse(channel._test_sender.sent)
 
 
-if __name__ == "__main__":                       # pragma: no cover
-    unittest.main()
-
-
 class TestStreamingOutput(unittest.TestCase):
     """A `--output-format stream-json` run is progress the transport can see (and parse).
 
@@ -291,14 +287,14 @@ class TestStreamingOutput(unittest.TestCase):
         import json
         return "\n".join(json.dumps(event) for event in events) + "\n"
 
-    def events(self, result="the answer", **extra):
-        first = {"type": "system", "subtype": "init", "session_id": "s-1"}
-        said = {"type": "assistant", "message": {"content": [{"type": "text",
-                                                              "text": "working"}]}}
-        last = {"type": "result", "subtype": "success", "is_error": False, "result": result,
-                "session_id": "s-1", "total_cost_usd": 0.02}
-        last.update(extra)
-        return [first, said, last]
+    def events(self, result="the answer"):
+        return [
+            {"type": "system", "subtype": "init", "session_id": "s-1"},
+            {"type": "assistant", "message": {"content": [{"type": "text",
+                                                           "text": "working"}]}},
+            {"type": "result", "subtype": "success", "is_error": False, "result": result,
+             "session_id": "s-1", "total_cost_usd": 0.02},
+        ]
 
     def test_the_reply_is_the_result_event_not_an_earlier_one(self):
         from swarmly.telegram.adapters.claude import parse_claude_json
@@ -337,3 +333,7 @@ class TestStreamingOutput(unittest.TestCase):
         self.assertFalse(looks_like_event_stream("just a reply\nsecond line\n"))
         self.assertFalse(looks_like_event_stream(""))
         self.assertTrue(looks_like_event_stream('{"type":"system"}\n{"type":"result"}\n'))
+
+
+if __name__ == "__main__":                       # pragma: no cover
+    unittest.main()
