@@ -277,6 +277,7 @@ class CodexAdapter(SubprocessAdapter):
         return channel_rules(getattr(message, "mentions", None),
                              getattr(message, "maintainer_username", None),
                              role=self.role_text,
+                             me=self.alias,
                              reply_chars=getattr(message, "reply_chars", None))
 
     def add_system_rules(self, argv: List[str], rules: str) -> List[str]:
@@ -374,6 +375,7 @@ class CodexAdapter(SubprocessAdapter):
             discussion=discussion_line(message),
             project=project_line(message),
             role=self.role_text,
+            me=self.alias,
             card=turn_card(message),
             reply_chars=getattr(message, "reply_chars", None),
         )
@@ -545,6 +547,7 @@ class CodexThreadAdapter(AgentAdapter):
             discussion=discussion_line(message),
             project=project_line(message),
             role=self.role_text,
+            me=self.alias,
             card=turn_card(message),
             reply_chars=getattr(message, "reply_chars", None),
         )

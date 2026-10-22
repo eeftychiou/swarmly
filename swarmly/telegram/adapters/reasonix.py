@@ -55,6 +55,7 @@ from swarmly.telegram.adapters.base import (
     rules_digest,
     save_state,
     turn_card,
+    usage_tokens,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,7 @@ class ReasonixAdapter(SubprocessAdapter):
         return rules_digest(channel_rules(getattr(message, "mentions", None),
                                           getattr(message, "maintainer_username", None),
                                           role=self.role_text,
+                                          me=self.alias,
                                           reply_chars=getattr(message, "reply_chars", None)))
 
     async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
@@ -273,6 +275,8 @@ class ReasonixAdapter(SubprocessAdapter):
             return super().parse_output(out, duration)
         meta = {key: data[key] for key in ("session_id", "total_cost_usd", "num_turns")
                 if key in data}
+        # The cost was reported and the tokens dropped, so the pulse read null (live, round 5).
+        meta.update(usage_tokens(data))
         result = str(data.get("result") or "").strip()
         if data.get("is_error"):
             reason = result or str(data.get("subtype") or "error")
@@ -301,6 +305,7 @@ class ReasonixAdapter(SubprocessAdapter):
             discussion=discussion_line(message),
             project=project_line(message),
             role=self.role_text,
+            me=self.alias,
             card=turn_card(message),
             reply_chars=getattr(message, "reply_chars", None),
         )

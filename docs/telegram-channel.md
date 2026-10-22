@@ -1099,7 +1099,12 @@ a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|lis
 `git status|log|diff|show|rev-parse` — never `git fetch` or `git ls-remote`, whose `ext::`
 remotes run a command); `-X`/`--method`/`-f`/`--input`/`--output`, shell
 metacharacters and anything not on `PATH` are refused, and the refusal is posted in place of the
-line. Times are absolute, so a restart resumes the schedule instead of re-arming it. Limits:
+line. Times are absolute, so a restart resumes the schedule instead of re-arming it.
+**One standing check per topic:** arming the same check again in the same topic replaces the
+armed timer (the ack says `replaces <id>`) instead of adding one, and a check that exits 0 with
+the same output the bot last acted on re-arms silently instead of starting a turn, so a standing
+`gh issue view` costs a turn only when the issue changed (live, round 5: ten copies filled the
+cap and each firing posted "nothing changed"). Limits:
 
 | `limits.` | default | what it bounds |
 |---|---|---|

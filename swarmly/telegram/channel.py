@@ -4094,7 +4094,7 @@ class AgentChannel:
                                topic=self.topics.name(event.chat_id, event.thread_id) or "",
                                now=time.time())
             try:
-                store.add(timer, max_timers=max(1, int(limits.wake_max)))
+                replaced = store.add(timer, max_timers=max(1, int(limits.wake_max)))
             except WakePushError as exc:
                 # Armed here, but the bus did not take it: say so, loudly, rather than
                 # promise the swarm a timer only this checkout can see.
@@ -4104,7 +4104,8 @@ class AgentChannel:
             except WakeError as exc:
                 notes.append(f"WAKE refused: {exc}")
                 continue
-            notes.append(timer.ack(now=time.time()))
+            notes.append(timer.ack(now=time.time())
+                         + (f" (replaces {', '.join(replaced)})" if replaced else ""))
         if len(specs) > per_reply:
             notes.append(f"WAKE refused: a reply may arm at most {per_reply} timers")
         notes.extend(f"WAKE refused: {reason}" for reason in reasons)
@@ -4230,11 +4231,13 @@ class AgentChannel:
                             + ("claim written, firing after the settle window"
                                if claim == "wait" else "claim not confirmed on the bus"))
                 continue
-            code, tail = await run_check_async(
+            result = await run_check_async(
                 timer.argv, cwd=self._workdir_for(timer.chat_id, timer.thread_id),
                 timeout=float(self.config.limits.wake_check_seconds))
+            code, tail = result[0], result[1]
             action = decide(timer, code, now=moment,
-                            max_attempts=int(self.config.limits.wake_max_attempts))
+                            max_attempts=int(self.config.limits.wake_max_attempts),
+                            digest=result[2] if len(result) > 2 else "")
             timer.last_exit, timer.last_tail = code, tail
             done.append(f"{timer.id}: {action.kind}")
             if action.kind == "fire":
@@ -4290,7 +4293,10 @@ class AgentChannel:
             parts.append(action.reason)
         if timer.last_tail:
             parts.append("Last output:\n" + timer.last_tail)
-        parts.append("Act in this turn: do not promise to act later.")
+        parts.append("Act in this turn: do not promise to act later. A WAKE with the same "
+                     "check replaces this one and fires only when its output changes. If "
+                     "nothing changed and nobody needs telling, answer NO_REPLY: a post "
+                     "saying so costs the topic a message.")
         return "\n\n".join(parts)
 
     def _wakes_command(self, event: Optional[ChannelEvent]) -> str:
@@ -5935,6 +5941,8 @@ class AgentChannel:
         # split, so the block is never counted against limits.reply_chars and never posted.
         body = self.apply_wake_lines(reply.text or "", event)
         body = self.apply_round_block(body, event).strip()
+        if event.self_task:
+            body = self._unaddress_self(body)
         if not body or is_silent_reply(body):
             if body:
                 logger.info("turn for message %s chose to stay silent", event.message_id)
@@ -6645,6 +6653,23 @@ class AgentChannel:
         logger.info("topic %s went quiet without a report back; asking for one", key)
         self._run_own_task(REPORT_NOTE, event.chat_id, event.thread_id,
                            self.topics.name(event.chat_id, event.thread_id))
+
+    def _unaddress_self(self, body: str) -> str:
+        """Drop a reply's leading address to this bot itself.
+
+        An own brief is authored as "<alias> (own brief)", so the model answered it with
+        "@Claudebot (own brief): ..." in the topic, once per WAKE (live, round 5). A message
+        addressed to its own sender tells nobody anything.
+        """
+        names = {self.config.identity.alias.strip().lstrip("@").lower(),
+                 str(self.config.identity.name or "").strip().lstrip("@").lower()}
+        names.discard("")
+        if not names:
+            return body
+        pattern = re.compile(
+            r"^\s*@?(?:" + "|".join(re.escape(name) for name in sorted(names)) +
+            r")(?:\s*\(own brief\))?\s*[:,\u2014-]\s*", re.IGNORECASE)
+        return pattern.sub("", body, count=1)
 
     def _alias_for(self, event: ChannelEvent) -> str:
         if self.config.is_admin(event.author_id):

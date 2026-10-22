@@ -6,6 +6,7 @@ numbers shown as unknown instead of as zero.
 """
 
 import json
+from tempfile import TemporaryDirectory
 import re
 import tempfile
 import unittest
@@ -324,6 +325,26 @@ class TestTheAdapterReports(unittest.TestCase):
                                         "cache_read_input_tokens": 40000}})
         reply = ClaudeAdapter("Hermes").parse_output(payload, 1.0)
         self.assertEqual((reply.meta["tokens_in"], reply.meta["tokens_out"]), (43012, 900))
+
+    def test_reasonix_tokens_land_in_the_meta(self):
+        # Live, round 5: DeepSeek and Reasonix reported their cost with null tokens.
+        with TemporaryDirectory() as tmp:
+            from tests.test_reasonix_adapter import config
+            from swarmly.telegram.adapters import build_adapter
+            adapter = build_adapter(config(tmp))
+            adapter._turn_session.set("s1")
+            for usage, expected in (
+                    ({"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 90},
+                     (100, 5)),
+                    ({"prompt_tokens": 120, "completion_tokens": 7,
+                      "prompt_cache_hit_tokens": 100}, (120, 7))):
+                payload = json.dumps({"result": "done", "session_id": "s1",
+                                      "total_cost_usd": 0.01, "usage": usage})
+                reply = adapter.parse_output(payload, 1.0)
+                self.assertEqual((reply.meta["tokens_in"], reply.meta["tokens_out"]), expected)
+            reply = adapter.parse_output(json.dumps({"result": "done", "total_cost_usd": 0.01}),
+                                         1.0)
+            self.assertNotIn("tokens_in", reply.meta)       # not reported is unknown, not 0
 
     def test_codex_output_tokens_land_in_the_meta(self):
         from swarmly.telegram.adapters.codex import codex_output_tokens
