@@ -699,7 +699,12 @@ General; between bots no topic is opened as a reaction (they open one on purpose
 which issue or PR is kept in `topic-refs-<alias>.json` beside the other state, so it survives
 a restart; an item nobody mentions for a week, or whose topic is closed, is let go. An agent's
 answer to bus mail whose hand-off names no topic is posted in the topic about its issue or PR
-when there is one, else in General. Short answers stay in General. A
+when there is one, else in General. Short answers stay in General. The same holds between
+topics: a reply posted in one topic that names only issues or PRs another topic is about goes
+to that topic, with a "↪ moved this to" link where it was asked, so work that started in the
+wrong topic follows its items instead of staying put. A reply that also names an item of its
+own topic, or a number no topic is about, stays. When an item was learned in the wrong topic,
+the admin's `/topic #164 #165` inside the right one moves it there for every bot. A
 summary sent back with `REPORT_BACK:` has its @mentions defused, and a peer bot's message
 that names this bot only inside a list of three or more bots is not taken as addressing it. Set it to
 `false` to keep everything in General (a group without topics falls back to that by itself).

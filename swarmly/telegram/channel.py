@@ -6102,6 +6102,16 @@ class AgentChannel:
             self.stats.ignored += 1
             return None
 
+        # /topic #N: the admin says which topic an item lives in; every bot applies it.
+        pin_reply = self._handle_topic_pin(event)
+        if pin_reply == "":
+            return None
+        if pin_reply is not None:
+            self.stats.handled += 1
+            return await self.send(pin_reply, reply_to_message_id=event.message_id,
+                                   chat_id=event.chat_id, thread_id=event.thread_id,
+                                   allow_when_frozen=True)
+
         # /pause and /resume hold and release every bot (or one, named) for the admin.
         pause_reply = self._handle_pause(event)
         if pause_reply == "":
@@ -7085,6 +7095,9 @@ class AgentChannel:
                 # test, each with a fresh context.
                 return await self._open_topic(event, title_from(event.text or ""), body,
                                               moved=True)
+        elsewhere = self._topic_elsewhere(event, body)
+        if elsewhere is not None:
+            return await self._post_in_known_topic(event, body, elsewhere)
         origin = self._topic_origins.get((event.chat_id, event.thread_id))
         report = parse_report_back(body) if origin is not None else None
         elapsed = self._clock() - started
@@ -7190,16 +7203,19 @@ class AgentChannel:
             reply_to_message_id=event.message_id, chat_id=event.chat_id, silent=True,
             notice=True)
 
-    def _learn_topic_refs(self, chat_id: int, thread_id: int, text: str) -> None:
+    def _learn_topic_refs(self, chat_id: int, thread_id: int, text: str,
+                          pin: bool = False) -> None:
         """Remember which topic first talked about each issue or PR (any bot's topic: every
         transport sees the group), so later work on it goes there, not to a new topic.
-        An entry not seen for REF_TOPIC_SECONDS is let go: the item has moved on."""
+        An entry not seen for REF_TOPIC_SECONDS is let go: the item has moved on.
+        ``pin``: the admin's ``/topic #N`` -- this topic takes the item, whoever spoke first."""
         now = time.time()
         changed = False
         topic = (int(chat_id), int(thread_id))
         for ref in issue_refs(text):
             known = self._ref_topics.get(ref)
-            if known is None or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS:
+            if known is None or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS \
+                    or (pin and known != topic):
                 self._ref_topics[ref] = topic
                 changed = True
             elif known != topic:
@@ -7238,11 +7254,66 @@ class AgentChannel:
             ref: [chat, thread, self._ref_seen.get(ref, time.time())]
             for ref, (chat, thread) in self._ref_topics.items()}}, "issue topics")
 
+    def _handle_topic_pin(self, event: ChannelEvent) -> Optional[str]:
+        """``/topic #164 #165``, from the admin inside a topic: those items live here. Every
+        bot applies it to its own topic map, so the next reply about them is posted here
+        (see :meth:`_topic_elsewhere`); the bot it names answers, or the coordinator for a
+        bare one. The fix when the map learned an item in the wrong topic."""
+        parsed = parse_command(event.text or "")
+        if not parsed or parsed[0] != "topic":
+            return None
+        target = parsed[1]
+        mine = target is not None and target.lstrip("@").lower() == \
+            self.config.identity.name.lstrip("@").lower()
+        speaks = mine or (target is None and self.is_coordinator())
+        if event.author_is_bot or not self.config.is_admin(event.author_id):
+            return "⛔ only the admin can move items between topics" \
+                if speaks and not event.author_is_bot else ""
+        refs = issue_refs(" ".join(command_args(event.text or "")))
+        if event.thread_id is None or not refs:
+            return ("📌 /topic works inside a topic, with the items that live there: "
+                    "/topic #164 #165") if speaks else ""
+        self._learn_topic_refs(event.chat_id, event.thread_id, " ".join(refs), pin=True)
+        return (f"📌 {', '.join(refs)} live in this topic now: replies about them are "
+                "posted here.") if speaks else ""
+
+    def _topic_elsewhere(self, event: ChannelEvent, body: str) -> Optional[Tuple[int, int]]:
+        """The topic a reply in another topic belongs in, when it is only about items that
+        topic is about.
+
+        A bot answers where it was asked, so work that starts in the wrong topic stays there
+        however often it is told to move (live, 22 Oct: round 5.5 items were worked on in the
+        Round 5 topic for hours). The reply goes where its items live, and the next message
+        follows it. Conservative: every issue or PR the reply names must map to the same other
+        topic; a reply naming one of this topic's items, an unknown number, or none stays."""
+        home = self.config.identity.home_channel_id
+        if not getattr(self.config.limits, "work_in_topics", False) or home is None \
+                or event.thread_id is None or int(event.chat_id) != int(home) \
+                or is_command_reply(body) or parse_report_back(body) is not None:
+            return None
+        refs = issue_refs(body)
+        if not refs:
+            return None
+        now = time.time()
+        targets = set()
+        for ref in refs:
+            if ref not in self._ref_topics \
+                    or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS:
+                return None
+            targets.add(self._ref_topics[ref])
+        if len(targets) != 1:
+            return None
+        target = targets.pop()
+        if target == (int(event.chat_id), int(event.thread_id)) or target[0] != int(home) \
+                or target in self._gone_topics:
+            return None
+        return target
+
     async def _post_in_known_topic(self, event: ChannelEvent, body: str,
                                    topic: Tuple[int, int]) -> Any:
         chat_id, thread_id = topic
-        logger.info("moving work from General to topic %s, which is about the same item",
-                    thread_id)
+        logger.info("moving work from %s to topic %s, which is about the same item",
+                    event.thread_id or "General", thread_id)
         await self.send(body, chat_id=chat_id, thread_id=thread_id)
         self._log_topic(chat_id, thread_id, self.config.identity.alias, body,
                         self.last_first_message_id)
@@ -7250,8 +7321,8 @@ class AgentChannel:
         self._mirror_handoffs(body, chat_id, thread_id, self.last_first_message_id,
                               asker=self._asker(event))
         return await self.send(f"↪ moved this to {topic_link(chat_id, thread_id)}",
-                               chat_id=event.chat_id, reply_to_message_id=event.message_id,
-                               notice=True)
+                               chat_id=event.chat_id, thread_id=event.thread_id,
+                               reply_to_message_id=event.message_id, notice=True)
 
     def _work_moves_to_topics(self, event: ChannelEvent) -> bool:
         """Whether this message is in the home group's General with limits.work_in_topics on
