@@ -203,6 +203,16 @@ def _recipient_tag(author_alias: str, author_username: Optional[str] = None,
     return f"@{author_alias}"
 
 
+def identity_lines(me: str) -> List[str]:
+    """Who this bot is. Without it a model names itself after its CLI: DeepSeek, running in
+    the Reasonix CLI, signed its messages "— Reasonix" (live, round 5)."""
+    name = plain(me or "", 40)
+    if not name:
+        return []
+    return [f"- YOU ARE {name}. Speak and sign only as {name}: never as a peer, and never "
+            "by the name of the CLI or model you run in."]
+
+
 def _roster_lines(mentions: Optional[Dict[str, str]], maintainer: Optional[str]) -> List[str]:
     roster = [(alias, str(target).lstrip("@")) for alias, target in (mentions or {}).items()]
     roster = [(alias, handle) for alias, handle in roster if handle and not handle.isdigit()]
@@ -219,6 +229,40 @@ def _roster_lines(mentions: Optional[Dict[str, str]], maintainer: Optional[str])
 #: An agent's whole reply when it decides to say nothing; the transport posts nothing.
 NO_REPLY = "NO_REPLY"
 _SILENT_LEAD = re.compile(r"^(?:\s*@\w+[:,]?)*\s*")
+
+
+def usage_tokens(data: Any) -> Dict[str, int]:
+    """``tokens_in``/``tokens_out`` from a result's ``usage`` block, or nothing (issue #125).
+
+    Two shapes are read. Claude's ``input_tokens`` leaves the prompt cache out, so the cache
+    reads and writes are added back (live: 192 tokens for 17 turns that cost $4.60). The
+    OpenAI/DeepSeek shape's ``prompt_tokens`` already counts its cache hits. A count that is
+    not reported stays out, so the ledger records unknown rather than zero.
+    """
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return {}
+
+    def count(source: str) -> Optional[int]:
+        value = usage.get(source)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
+
+    found: Dict[str, int] = {}
+    fresh = count("input_tokens")
+    if fresh is not None:
+        found["tokens_in"] = fresh + sum(
+            count(source) or 0 for source in ("cache_creation_input_tokens",
+                                              "cache_read_input_tokens"))
+    elif count("prompt_tokens") is not None:
+        found["tokens_in"] = count("prompt_tokens") or 0
+    out = count("output_tokens")
+    if out is None:
+        out = count("completion_tokens")
+    if out is not None:
+        found["tokens_out"] = out
+    return found
 
 
 def is_silent_reply(text: str) -> bool:
@@ -272,6 +316,7 @@ def format_channel_prompt(
     role: str = "",
     card: str = "",
     reply_chars: Optional[int] = None,
+    me: str = "",
 ) -> str:
     """Frame an inbound chat message with operational rules to suppress intermediate thinking and ping-pong chatter.
 
@@ -287,6 +332,7 @@ def format_channel_prompt(
         f"({recipient_tag})]",
         "OPERATIONAL CHANNEL INSTRUCTIONS:",
         *_LEAD_RULES,
+        *identity_lines(me),
         f"- Address the recipient clearly at the very start of your reply (e.g. '{recipient_tag}: ...').",
         *_roster_lines(mentions, maintainer),
         *_tail_rules(reply_chars),
@@ -308,7 +354,7 @@ def format_channel_prompt(
 
 def channel_rules(mentions: Optional[Dict[str, str]] = None,
                   maintainer: Optional[str] = None, role: str = "",
-                  reply_chars: Optional[int] = None) -> str:
+                  reply_chars: Optional[int] = None, me: str = "") -> str:
     """The channel's standing rules, for a system prompt: the same text on every turn, so a
     resumed session never accumulates copies of them and the prompt cache keeps them."""
     return "\n".join([
@@ -317,6 +363,7 @@ def channel_rules(mentions: Optional[Dict[str, str]] = None,
         "which discussion it belongs to; the message itself follows.",
         "OPERATIONAL CHANNEL INSTRUCTIONS:",
         *_LEAD_RULES,
+        *identity_lines(me),
         "- Address the recipient clearly at the very start of your reply, with the @handle "
         "from the message's first line (e.g. '@name: ...').",
         *_roster_lines(mentions, maintainer),

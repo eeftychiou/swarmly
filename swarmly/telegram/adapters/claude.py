@@ -60,6 +60,7 @@ from swarmly.telegram.adapters.base import (
     format_channel_prompt,
     is_silent_reply,
     load_state,
+    usage_tokens,
     project_line,
     rules_digest,
     save_state,
@@ -157,6 +158,7 @@ class ClaudeAdapter(SubprocessAdapter):
             discussion=discussion_line(message),
             project=project_line(message),
             role=self.role_text,
+            me=self.alias,
             card=turn_card(message),
             reply_chars=getattr(message, "reply_chars", None),
         )
@@ -170,6 +172,7 @@ class ClaudeAdapter(SubprocessAdapter):
         return channel_rules(getattr(message, "mentions", None),
                              getattr(message, "maintainer_username", None),
                              role=self.role_text,
+                             me=self.alias,
                              reply_chars=getattr(message, "reply_chars", None))
 
     def rules_inline(self, rules: str) -> bool:
@@ -197,27 +200,8 @@ class ClaudeAdapter(SubprocessAdapter):
             return super().parse_output(out, duration)
         meta = {key: data[key] for key in ("session_id", "total_cost_usd", "num_turns")
                 if key in data}
-        # Issue #125: the turn ledger wants the tokens, not just the money. Claude reports them
-        # per turn under `usage`; when it does not, the ledger records unknown rather than zero.
-        usage = data.get("usage")
-        if isinstance(usage, dict):
-            def count(source: str) -> Optional[int]:
-                value = usage.get(source)
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    return value
-                return None
-
-            fresh = count("input_tokens")
-            if fresh is not None:
-                # `input_tokens` leaves out the prompt cache, which is most of a long session's
-                # input: the cache reads and writes are input too (live: 192 tokens for 17
-                # turns that cost $4.60).
-                meta["tokens_in"] = fresh + sum(
-                    count(source) or 0 for source in ("cache_creation_input_tokens",
-                                                      "cache_read_input_tokens"))
-            out = count("output_tokens")
-            if out is not None:
-                meta["tokens_out"] = out
+        # Issue #125: the turn ledger wants the tokens, not just the money.
+        meta.update(usage_tokens(data))
         model = reported_model(data.get("modelUsage"))
         if model:
             meta["model"] = model                         # the online notice names it

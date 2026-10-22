@@ -45,6 +45,7 @@ start would re-arm forever), and ``attempts`` bounds the chain even if a clock m
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -353,6 +354,9 @@ class WakeTimer:
     #: The bot this copy was adopted from, empty for the bot's own timer. An adopted copy is
     #: a stand-in for a dead peer's promise, not one of this bot's own.
     adopted_from: str = ""
+    #: A digest of the output the bot last acted on for this same check. A ready check whose
+    #: output still matches it re-arms instead of starting a turn: nothing has changed.
+    seen_digest: str = ""
 
     def __post_init__(self) -> None:
         self.argv = tuple(self.argv)
@@ -370,6 +374,11 @@ class WakeTimer:
         return self.state in ("armed", "firing")
 
     @property
+    def standing_key(self) -> Tuple[Tuple[str, ...], int, Optional[int]]:
+        """What makes two timers the same standing check: the argv, in the same topic."""
+        return self.argv, self.chat_id, self.thread_id
+
+    @property
     def in_flight(self) -> bool:
         """A ready firing whose turn was written down but has not been started yet."""
         return self.state == "firing" and bool(self.pending)
@@ -383,6 +392,7 @@ class WakeTimer:
             "attempts": self.attempts, "fires": self.fires, "last_exit": self.last_exit,
             "last_tail": self.last_tail, "pending": self.pending, "replays": self.replays,
             "state": self.state, "adopted_from": self.adopted_from,
+            "seen_digest": self.seen_digest,
         }
 
     @classmethod
@@ -418,6 +428,7 @@ class WakeTimer:
             replays=int(data.get("replays") or 0),
             state=str(data.get("state") or "armed"),
             adopted_from=str(data.get("adopted_from") or ""),
+            seen_digest=str(data.get("seen_digest") or ""),
         )
 
     def ack(self, *, now: float) -> str:
@@ -450,9 +461,20 @@ class WakeAction:
     tail: str = ""
 
 
+def output_digest(text: str) -> str:
+    """A short digest of a check's whole output, blank lines and trailing spaces ignored."""
+    rows = [row.rstrip() for row in str(text or "").splitlines() if row.strip()]
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()[:16]
+
+
 def decide(timer: WakeTimer, returncode: Optional[int], *, now: float,
-           max_attempts: int = 0) -> WakeAction:
-    """The action for a timer that is due, given its check's exit code (or ``None``)."""
+           max_attempts: int = 0, digest: str = "") -> WakeAction:
+    """The action for a timer that is due, given its check's exit code (or ``None``).
+
+    ``digest`` is the check's :func:`output_digest`. A ready check whose output is what the
+    bot last acted on counts as pending: ``gh issue view`` exits 0 every time, and a standing
+    check on it started a turn per firing to say nothing had changed (live, round 5).
+    """
     timer.attempts += 1
     if max_attempts and timer.attempts >= max_attempts:
         timer.state = "failed"
@@ -462,23 +484,32 @@ def decide(timer: WakeTimer, returncode: Optional[int], *, now: float,
         timer.state = "failed"
         return WakeAction("error", timer, reason="the check did not finish")
     verdict = classify(timer.argv, returncode)
+    unchanged = bool(verdict == READY and digest and digest == timer.seen_digest)
+    if unchanged:
+        verdict = PENDING
     if verdict == READY:
         # Not "done" yet: the turn text is written to the record first, so a crash between
         # here and the turn replays it once instead of losing it (PR #92 review, blocker 3).
         timer.state = "firing"
         timer.fires += 1
+        timer.seen_digest = digest or timer.seen_digest
         return WakeAction("fire", timer)
     if verdict == PENDING and timer.every_seconds:
         nxt = now + timer.every_seconds
         if nxt > timer.expires_at:
             timer.state = "expired"
             return WakeAction("expire", timer,
-                              reason="the wait expired before the check said ready")
+                              reason=("the wait expired and the output has not changed since "
+                                      "you last acted on it" if unchanged else
+                                      "the wait expired before the check said ready"))
         timer.next_at = nxt
         return WakeAction("rearm", timer)
     if verdict == PENDING:                        # pending, but nothing to re-arm on
         timer.state = "expired"
-        return WakeAction("expire", timer, reason="still pending, and the timer has no every=")
+        return WakeAction("expire", timer,
+                          reason=("the output has not changed since you last acted on it, "
+                                  "and the timer has no every=" if unchanged else
+                                  "still pending, and the timer has no every="))
     timer.state = "failed"
     return WakeAction("error", timer, reason=f"the check exited {returncode}")
 
@@ -501,6 +532,15 @@ def run_check(argv: Tuple[str, ...], *, cwd: Optional[Path],
     ``None`` as the code means it timed out: the whole process group is killed, so a check
     that spawned children cannot outlive it (issue #81 review, should-fix 9).
     """
+    code, tail, _ = run_check_digest(argv, cwd=cwd, timeout=timeout)
+    return code, tail
+
+
+def run_check_digest(argv: Tuple[str, ...], *, cwd: Optional[Path],
+                     timeout: float = CHECK_TIMEOUT_SECONDS
+                     ) -> Tuple[Optional[int], str, str]:
+    """:func:`run_check`, plus the :func:`output_digest` of the whole output (not the tail:
+    a standing check's change can be anywhere in it)."""
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GH_PROMPT_DISABLED="1", LC_ALL="C")
     try:
         process = subprocess.Popen(
@@ -510,14 +550,14 @@ def run_check(argv: Tuple[str, ...], *, cwd: Optional[Path],
             creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
         )
     except OSError as exc:
-        return None, f"could not run {argv[0]}: {exc}"
+        return None, f"could not run {argv[0]}: {exc}", ""
     try:
         out, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_group(process)
         out, _ = process.communicate()
-        return None, tail_of(f"(timed out after {timeout:.0f}s)\n{out or ''}")
-    return process.returncode, tail_of(out or "")
+        return None, tail_of(f"(timed out after {timeout:.0f}s)\n{out or ''}"), ""
+    return process.returncode, tail_of(out or ""), output_digest(out or "")
 
 
 def _kill_group(process: "subprocess.Popen[str]") -> None:
@@ -537,9 +577,10 @@ def _kill_group(process: "subprocess.Popen[str]") -> None:
 
 
 async def run_check_async(argv: Tuple[str, ...], *, cwd: Optional[Path],
-                          timeout: float = CHECK_TIMEOUT_SECONDS) -> Tuple[Optional[int], str]:
-    """One check, off the event loop."""
-    return await asyncio.to_thread(run_check, argv, cwd=cwd, timeout=timeout)
+                          timeout: float = CHECK_TIMEOUT_SECONDS
+                          ) -> Tuple[Optional[int], str, str]:
+    """One check, off the event loop: ``(returncode, output_tail, output_digest)``."""
+    return await asyncio.to_thread(run_check_digest, argv, cwd=cwd, timeout=timeout)
 
 
 # ------------------------------------------------------------------------------------
@@ -610,14 +651,39 @@ class WakeStore:
         tmp.write_text(json.dumps(timer.to_dict(), indent=1, sort_keys=True), encoding="utf-8")
         os.replace(tmp, path)
 
-    def add(self, timer: WakeTimer, *, max_timers: int) -> bool:
+    def add(self, timer: WakeTimer, *, max_timers: int) -> List[str]:
+        """Arm *timer*. Returns the ids of the timers it replaced.
+
+        One standing check per topic: arming the same check again in the same topic replaces
+        the armed one instead of adding a second (live, round 5: re-arms filled the cap with
+        ten copies of one check). The new timer inherits what the bot last acted on, so a
+        re-armed check fires only when its output changes.
+        """
+        rows = self.load()
+        own = [row for row in rows if not row.adopted_from]
+        same = [row for row in own if row.standing_key == timer.standing_key
+                and (row.alias or self.alias) == (timer.alias or self.alias)]
+        seen = max((row for row in same if row.seen_digest),
+                   key=lambda row: row.created_at, default=None)
+        if seen is not None and not timer.seen_digest:
+            timer.seen_digest = seen.seen_digest
+        replaced = [row for row in same if row.state == "armed" and row.id != timer.id]
         # The cap is on this bot's own promises: copies it holds for dead peers must not crowd
         # out the WAKE it needs to keep its own word (live, round 5: ten stale copies refused it).
-        live = [row for row in self.load() if row.live and not row.adopted_from]
+        gone = {row.id for row in replaced}
+        live = [row for row in own if row.live and row.id not in gone]
         if len(live) >= max_timers:
             raise WakeError(f"{len(live)} timers are already armed (limits.wake_max={max_timers})")
+        for row in replaced:
+            row.state = "cancelled"
+            self.write(row)
+            try:
+                self.publish_state(row)
+            except WakePushError:
+                logger.warning("wake: replaced timer %s was not cancelled on the bus", row.id)
         self.write(timer)
-        return self.publish_state(timer)
+        self.publish_state(timer)
+        return [row.id for row in replaced]
 
     def cancel(self, timer_id: str) -> bool:
         found = False

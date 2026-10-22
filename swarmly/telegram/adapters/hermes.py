@@ -70,6 +70,7 @@ class HermesAdapter(SubprocessAdapter):
             discussion=discussion_line(message),
             project=project_line(message),
             role=self.role_text,
+            me=self.alias,
             card=turn_card(message),
             reply_chars=getattr(message, "reply_chars", None),
         )

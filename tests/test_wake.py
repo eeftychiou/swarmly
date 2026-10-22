@@ -244,7 +244,7 @@ class TestStore(unittest.TestCase):
             store = self.store(tmp)
             store.add(self.timer(), max_timers=1)
             with self.assertRaises(wk.WakeError):
-                store.add(self.timer(), max_timers=1)
+                store.add(self.timer(argv=("gh", "pr", "checks", "76")), max_timers=1)
 
     def test_cancel_by_prefix(self):
         with TemporaryDirectory() as tmp:
@@ -258,7 +258,8 @@ class TestStore(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = self.store(tmp)
             store.add(self.timer(next_at=900.0), max_timers=10)
-            store.add(self.timer(next_at=1500.0), max_timers=10)
+            store.add(self.timer(next_at=1500.0, argv=("gh", "pr", "checks", "76")),
+                      max_timers=10)
             due = store.due(1000.0)
             self.assertEqual([timer.next_at for timer in due], [900.0])
 
@@ -1734,3 +1735,126 @@ class TestGitBusTimerFires(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             channel = make_channel(make_config(fallback={"gitbus_root": tmp}))
             self.assertIs(channel.wake_store(), channel.wake_store())
+
+
+class TestOneStandingCheck(unittest.TestCase):
+    """Live, round 5: a standing ``gh issue view 120`` check exits 0 every time, so each
+    firing started a turn that said nothing had changed, and each re-arm added a timer until
+    the cap refused the WAKE that mattered."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self):
+        return wk.WakeStore("Claude", state_dir=Path(self.tmp.name), clock=lambda: 1000.0)
+
+    @staticmethod
+    def timer(**kwargs):
+        base = dict(argv=("gh", "issue", "view", "120"), then="check the round",
+                    next_at=1000.0, expires_at=9000.0, every_seconds=300.0, chat_id=-1,
+                    thread_id=7, alias="Claude")
+        base.update(kwargs)
+        return wk.WakeTimer(**base)
+
+    def test_arming_the_same_check_replaces_the_armed_one(self):
+        store = self.store()
+        first, second = self.timer(), self.timer(then="check it again")
+        store.add(first, max_timers=10)
+        self.assertEqual(store.add(second, max_timers=10), [first.id])
+        live = [row for row in store.load() if row.live]
+        self.assertEqual([row.id for row in live], [second.id])
+
+    def test_re_arms_never_fill_the_cap(self):
+        store = self.store()
+        for _ in range(5):
+            store.add(self.timer(), max_timers=2)
+        self.assertEqual(store.live_count, 1)
+
+    def test_the_same_check_in_another_topic_is_another_timer(self):
+        store = self.store()
+        store.add(self.timer(), max_timers=10)
+        self.assertEqual(store.add(self.timer(thread_id=8), max_timers=10), [])
+        self.assertEqual(store.live_count, 2)
+
+    def test_a_ready_check_with_the_output_already_acted_on_re_arms(self):
+        timer = self.timer(seen_digest=wk.output_digest("open\n[ ] 117"))
+        action = wk.decide(timer, 0, now=1000.0, digest=wk.output_digest("open\n[ ] 117\n"))
+        self.assertEqual(action.kind, "rearm")
+        self.assertEqual(timer.next_at, 1300.0)
+
+    def test_new_output_fires_and_becomes_what_was_acted_on(self):
+        timer = self.timer(seen_digest=wk.output_digest("open\n[ ] 117"))
+        new = wk.output_digest("open\n[x] 117")
+        self.assertEqual(wk.decide(timer, 0, now=1000.0, digest=new).kind, "fire")
+        self.assertEqual(timer.seen_digest, new)
+
+    def test_unchanged_until_the_deadline_says_so_when_it_expires(self):
+        same = wk.output_digest("open")
+        timer = self.timer(seen_digest=same, expires_at=1100.0)
+        action = wk.decide(timer, 0, now=1000.0, digest=same)
+        self.assertEqual(action.kind, "expire")
+        self.assertIn("not changed", action.reason)
+
+    def test_a_re_armed_check_inherits_what_the_fired_one_acted_on(self):
+        store = self.store()
+        fired = self.timer(seen_digest="abc", state="done")
+        store.write(fired)
+        again = self.timer()
+        store.add(again, max_timers=10)
+        self.assertEqual(again.seen_digest, "abc")
+
+    def test_the_digest_covers_the_whole_output_not_the_tail(self):
+        head = "comments: 3\n" + "\n".join(f"line {n}" for n in range(40))
+        moved = "comments: 4\n" + "\n".join(f"line {n}" for n in range(40))
+        self.assertEqual(wk.tail_of(head), wk.tail_of(moved))
+        self.assertNotEqual(wk.output_digest(head), wk.output_digest(moved))
+
+    def test_the_tick_re_arms_an_unchanged_check_without_a_turn(self):
+        import asyncio
+        from unittest import mock
+        channel = TestTick.channel(self)
+        started = []
+        channel._run_own_task = lambda text, chat_id, thread_id, name: started.append(text)
+        store = channel.wake_store()
+        output = "state: OPEN\n[ ] #117"
+        timer = wk.WakeTimer(argv=("gh", "issue", "view", "120"), then="check", next_at=1.0,
+                             expires_at=time.time() + 3600, every_seconds=300, chat_id=-1,
+                             alias=channel.config.identity.alias,
+                             seen_digest=wk.output_digest(output))
+        store.add(timer, max_timers=10)
+
+        async def check(argv, *, cwd, timeout):
+            return 0, output, wk.output_digest(output)
+
+        with mock.patch("swarmly.telegram.wake.run_check_async", check):
+            done = asyncio.run(channel._wake_tick(now=time.time()))
+        self.assertEqual(done, [f"{timer.id}: rearm"])
+        self.assertEqual(started, [])
+        self.assertEqual(channel.wake_store().live_count, 1)
+
+
+class TestOwnBriefIsNotAddressedToItself(unittest.TestCase):
+
+    def channel(self):
+        return TestTick.channel(self)
+
+    def test_the_self_address_is_dropped(self):
+        channel = self.channel()
+        alias = channel.config.identity.alias
+        self.assertEqual(
+            channel._unaddress_self(f"@{alias} (own brief): Nothing changed on #120."),
+            "Nothing changed on #120.")
+        self.assertEqual(channel._unaddress_self(f"@{alias}: re-arming."), "re-arming.")
+
+    def test_an_address_to_a_peer_stays(self):
+        channel = self.channel()
+        self.assertEqual(channel._unaddress_self("@agy_dd_bot: please QA #151."),
+                         "@agy_dd_bot: please QA #151.")
+
+    def test_the_wake_turn_may_stay_silent(self):
+        timer = wk.WakeTimer(argv=("git", "status"), then="go", next_at=1.0, expires_at=2.0,
+                             every_seconds=0, chat_id=-1)
+        from swarmly.telegram.channel import AgentChannel
+        prompt = AgentChannel._wake_prompt(wk.WakeAction("fire", timer))
+        self.assertIn("NO_REPLY", prompt)

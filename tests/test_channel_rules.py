@@ -95,7 +95,7 @@ class ClaudeRulesTests(unittest.TestCase):
         at = argv.index("--append-system-prompt-file")
         self.assertLess(at, argv.index("--"))
         self.assertEqual(Path(argv[at + 1]).read_text(encoding="utf-8"),
-                         channel_rules(ROSTER, "alice_h"))
+                         channel_rules(ROSTER, "alice_h", me="Claude"))
         prompt = argv[-1]
         self.assertNotIn("OPERATIONAL", prompt)
         self.assertEqual(prompt.splitlines()[1:], ["remember 42"])
@@ -172,7 +172,7 @@ class CodexRulesTests(unittest.TestCase):
         for argv in runner.calls:
             key, value = codex_rules(argv)
             self.assertEqual(key, "developer_instructions")
-            self.assertEqual(value, channel_rules(ROSTER, "alice_h"))
+            self.assertEqual(value, channel_rules(ROSTER, "alice_h", me="Codex"))
             self.assertNotIn("\n", argv[argv.index("-c") + 1])     # one line, for Windows
             self.assertNotIn("OPERATIONAL", argv[-1])
         resumed = runner.calls[1]
@@ -248,3 +248,24 @@ class ProcessTreeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IdentityTests(unittest.TestCase):
+    """Live, round 5: DeepSeek runs in the Reasonix CLI and signed its posts "— Reasonix"."""
+
+    def test_the_rules_name_the_bot(self):
+        rules = channel_rules(ROSTER, "alice_h", me="DeepSeek")
+        self.assertIn("YOU ARE DeepSeek", rules)
+        self.assertIn("never by the name of the CLI", rules)
+
+    def test_no_name_adds_no_line(self):
+        self.assertNotIn("YOU ARE", channel_rules(ROSTER, "alice_h"))
+
+    def test_a_reasonix_bot_is_told_its_own_alias(self):
+        from swarmly.telegram.adapters import build_adapter
+        from tests.test_reasonix_adapter import config
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            adapter = build_adapter(config(tmp))
+            prompt = adapter.build_prompt(topic_message())
+        self.assertIn("YOU ARE DeepSeek", prompt)
