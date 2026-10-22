@@ -2196,6 +2196,15 @@ class AgentChannel:
             ttl=ttl_for(self._freeze_until, self._wall()), rev=self._running_revision),
             self._frozen_line())
 
+    def _paused_notice(self) -> str:
+        """``/pause`` answered with a machine FROZEN line (ref=pause, no ttl), so every peer
+        records the freeze and stops handing this bot work. Live, 22 Oct: a paused Antigravity
+        posted only "⏸ paused", and the others kept asking it for QA."""
+        return format_message(Envelope(
+            type=MessageType.STATUS, to="*", intent="FROZEN", ref="pause",
+            rev=self._running_revision),
+            f"⏸ {self.config.identity.alias} paused. /resume to continue.")
+
     def _resumed_notice(self, why: str) -> str:
         return format_message(Envelope(
             type=MessageType.STATUS, to="*", intent="RESUMED", ref="quota",
@@ -2277,6 +2286,22 @@ class AgentChannel:
             # A restarted peer that is still frozen says FROZEN again right after ONLINE.
             if self._peers_frozen.pop(alias, None) is None:
                 return
+        else:
+            return
+        save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
+
+    def _freeze_from_pulse(self, alias: str, pulse: Any) -> None:
+        """A pulse says whether its bot is frozen. Keep the peer-freeze table in step with it,
+        so a freeze whose FROZEN line was missed (an older build, a restart, a deleted notice)
+        still routes work away, and a bot that is no longer frozen gets work again."""
+        frozen = bool(getattr(pulse, "frozen", False))
+        known = alias in self._peers_frozen
+        if frozen and not known:
+            status = pulse.status if isinstance(getattr(pulse, "status", None), dict) else {}
+            ref = "quota" if status.get("state") == "frozen" else "pause"
+            self._peers_frozen[alias] = {"ref": ref, "until": None}
+        elif not frozen and known:
+            self._peers_frozen.pop(alias, None)
         else:
             return
         save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
@@ -2443,6 +2468,8 @@ class AgentChannel:
                 pulse = Pulse.from_dict(json.loads(body)) if body else None
             except (ValueError, TypeError):
                 pulse = None
+            if pulse is not None:
+                self._freeze_from_pulse(alias, pulse)
             if pulse is None:
                 # A pulse we cannot parse is still a sign of life; only its detail is lost.
                 logger.warning("presence: unreadable pulse from %s; counting it as liveness",
@@ -6300,9 +6327,8 @@ class AgentChannel:
         self._pause_pending = False
         self._set_frozen(True, "pause")
         chat_id, thread_id = self._pause_where
-        await self.send(f"⏸ {self.config.identity.alias} paused. /resume to continue.",
-                        chat_id=chat_id, thread_id=thread_id, allow_when_frozen=True,
-                        silent=True, notice=True)
+        await self.send(self._paused_notice(), chat_id=chat_id, thread_id=thread_id,
+                        allow_when_frozen=True, silent=True, notice=True)
 
     def _handle_pause(self, event: ChannelEvent) -> Optional[str]:
         """``/pause`` and ``/resume`` from the admin: a bare one reaches every bot, and
@@ -6326,12 +6352,17 @@ class AgentChannel:
             self._announce_resumed = self._freeze_ref == "quota"     # peers route around it
             self._pause_pending = False
             self._set_frozen(False, None)
-            return f"▶ {alias} resumed." if was else f"▶ {alias} was not paused."
+            if not was:
+                return f"▶ {alias} was not paused."
+            # A machine RESUMED line too: peers drop the freeze and route work here again.
+            return format_message(Envelope(type=MessageType.STATUS, to="*", intent="RESUMED",
+                                           ref="pause", rev=self._running_revision),
+                                  f"▶ {alias} resumed.")
         if self._frozen:
             return f"⏸ {alias} is already paused. /resume to continue."
         if not self._turn_running():
             self._set_frozen(True, "pause")
-            return f"⏸ {alias} paused. /resume to continue."
+            return self._paused_notice()
         self._pause_pending = True
         self._note_state(paused=True)
         self._pause_where = (event.chat_id, event.thread_id)

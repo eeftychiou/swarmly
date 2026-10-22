@@ -210,3 +210,42 @@ class TestResetTimes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPauseReachesThePeers(unittest.TestCase):
+    """Live, 22 Oct: the admin paused Antigravity and Codex; Antigravity posted only "⏸
+    paused", so the coordinator never recorded the freeze and kept asking it for QA."""
+
+    def test_pause_and_resume_post_machine_lines(self):
+        channel = make_channel()
+        admin_says(channel, "/pause@HermesBot")
+        self.assertIn("intent=FROZEN ref=pause", channel._test_sender.last)
+        admin_says(channel, "/resume@HermesBot", message_id=11)
+        self.assertIn("intent=RESUMED ref=pause", channel._test_sender.last)
+
+    def test_a_peer_records_the_pause_and_its_end(self):
+        channel = make_channel()
+        run(channel.handle_event(event("[Codex] [A2A v1.1] STATUS to=* intent=FROZEN ref=pause"
+                                       "\n\n⏸ Codex paused. /resume to continue.",
+                                       username="CodexBot", is_bot=True, message_id=20)))
+        self.assertIn("Codex", channel.frozen_peers())
+        run(channel.handle_event(event("[Codex] [A2A v1.1] STATUS to=* intent=RESUMED ref=pause"
+                                       "\n\n▶ Codex resumed.", username="CodexBot",
+                                       is_bot=True, message_id=21)))
+        self.assertNotIn("Codex", channel.frozen_peers())
+
+    def test_a_frozen_pulse_freezes_the_peer_and_a_live_one_lifts_it(self):
+        import json
+        channel = make_channel()
+
+        def pulse(frozen, message_id):
+            body = json.dumps({"alias": "Codex", "at": NOW, "frozen": frozen,
+                               "status": {"state": "paused" if frozen else "idle"}})
+            run(channel.handle_event(event("[A2A v1.1] STATUS to=* intent=PULSE ref=Codex\n\n"
+                                           + body, username="CodexBot", is_bot=True,
+                                           message_id=message_id)))
+
+        pulse(True, 30)
+        self.assertEqual(channel.frozen_peers()["Codex"]["ref"], "pause")
+        pulse(False, 31)
+        self.assertNotIn("Codex", channel.frozen_peers())
