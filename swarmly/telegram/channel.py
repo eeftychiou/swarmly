@@ -4962,7 +4962,7 @@ class AgentChannel:
         review). And **only a changed row is written**: a beat that rewrote every row pushed a
         bus commit a minute for nothing, and moved the row's ``created_at`` with it.
         """
-        from swarmly.telegram.owed import (Fact, admin_row, fix_rows, head_rows, merge_row,
+        from swarmly.telegram.owed import (Fact, Row, admin_row, fix_rows, head_rows, merge_row,
                                            progress_rows, settle)
         moment = time.time() if now is None else float(now)
         roles = self.owed_roles()
