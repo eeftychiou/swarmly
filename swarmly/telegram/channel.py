@@ -4619,6 +4619,15 @@ class AgentChannel:
                 store.write(timer)
                 done.append(f"{timer.id}: handed back to {timer.adopted_from}")
                 continue
+            if mine(timer) and (timer.chat_id, timer.thread_id) in self._busy_since:
+                # A turn already running in this topic very often settles the same item, so a
+                # second turn queued behind it is a paid "nothing changed" (round 5, 22 Oct:
+                # the standing check woke the coordinator behind its own running turn). The
+                # timer stays armed and unclaimed, and is evaluated -- expiry included -- on
+                # the first tick after that topic's turn ends: nothing is lost, nothing is
+                # extended.
+                done.append(f"{timer.id}: held: turn running")
+                continue
             if timer.expires_at and moment >= timer.expires_at:
                 late = moment - timer.expires_at
                 timer.state = "expired"

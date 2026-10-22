@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A WAKE that comes due while its topic already has a turn running is neither claimed nor
+  run: it stays armed and is evaluated, expiry included, on the first tick after that turn
+  ends (the tick reports `held: turn running`). A running turn often settles the same item,
+  so the second turn queued behind it was a paid "nothing changed" (`#160`).
+
 ## [0.11.0] - 2026-10-21
 
 ### Added
