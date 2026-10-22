@@ -13,7 +13,8 @@ from tempfile import TemporaryDirectory
 from swarmly.telegram import owed as ow
 from tests.test_telegram_channel import GROUP, make_channel, make_config
 
-BOT = "Codex"                       # a configured peer in make_config's roster
+BOT = "Hermes"                      # make_config's own alias: the debtor this bot can act on
+PEER = "Codex"                      # a configured peer: its debts are not this bot's to wake
 
 
 def bot_row(**fields):
@@ -26,8 +27,9 @@ def bot_row(**fields):
     return ow.Row(**fields)
 
 
-def channel_with_table():
-    channel = make_channel(make_config())
+def channel_with_table(*, role=None):
+    overrides = {"agent": {"role": role}} if role else {}
+    channel = make_channel(make_config(**overrides))
     channel.bot = object()
     directory = TemporaryDirectory()
     store = ow.OwedStore("Hermes", state_dir=Path(directory.name), clock=lambda: 1000.0)
@@ -92,9 +94,26 @@ class TestWhereTheWakeGoes(unittest.TestCase):
         self.assertEqual(channel.owed_wake_tick(now=1000.0), [])
         self.assertEqual(channel._test_turns, [])
 
+    def test_a_peers_debt_wakes_nobody_here(self):
+        """The table folds every writer's documents: a peer's row must not start my turn.
+
+        Waking it here would run *my* turn about *their* debt, and write `woken` on the shared
+        row before the debtor ever saw the news (#163 review).
+        """
+        channel = self.channel()
+        channel.topics.remember(GROUP, 5122, "round 5")
+        token = channel.topics.context(GROUP, 5122)
+        self.open_row(channel, debtor=PEER, topic=token, woken="pending")
+        done = channel.owed_wake_tick(now=1000.0)
+        self.assertEqual(channel._test_turns, [])
+        self.assertIn(f"owed by {PEER}, not me", " ".join(done))
+        # ... and nothing was consumed: the row is still news for the bot that owes it.
+        kept = channel._test_table[1].load()[0]
+        self.assertEqual((kept.woken, kept.wakes), ("pending", 0))
+
     def test_a_debtor_off_the_roster_wakes_nobody(self):
         channel = self.channel()
-        self.open_row(channel, debtor="Stranger", topic="")
+        self.open_row(channel, debtor="Stranger", topic="")   # nobody this swarm knows
         self.assertEqual(channel.owed_wake_tick(now=1000.0), [])
         self.assertEqual(channel._test_turns, [])
 
@@ -122,7 +141,11 @@ class TestNoNewsNoTurnInTheTransport(unittest.TestCase):
     def test_a_wake_nobody_acts_on_reaches_the_admin(self):
         """The whole path, through the saved table -- not a hand-seeded ``wakes``."""
         from swarmly.telegram.owed_wake import WAKE_GRACE
-        channel, _row = self.channel()
+        channel = channel_with_table(role="coordinator")
+        self.addCleanup(channel._test_table[0].cleanup)
+        channel.topics.remember(GROUP, 5122, "round 5")
+        row = bot_row(topic=channel.topics.context(GROUP, 5122), observed="green")
+        channel._test_table[1].save_all([row])
         channel.owed_wake_tick(now=1000.0)                       # news: one turn
         channel.owed_wake_tick(now=1000.0 + WAKE_GRACE + 1)      # ignored: one nudge
         self.assertEqual(len(channel._test_turns), 2)
@@ -191,8 +214,19 @@ class TestTheBusyHoldAndTheBudget(unittest.TestCase):
 
 class TestAnEscalationWakesTheAdminOnce(unittest.TestCase):
 
-    def test_an_escalation_goes_to_general_and_never_repeats(self):
+    def test_only_the_coordinator_posts_an_escalation(self):
+        """One voice to the admin: the coordinator's. Everyone else holds the row."""
         channel = channel_with_table()
+        self.addCleanup(channel._test_table[0].cleanup)
+        stalled = bot_row(observed="green", woken="green", wakes=2, topic="")
+        channel._test_table[1].save_all([stalled])
+        done = channel.owed_wake_tick(now=1000.0)
+        self.assertEqual(channel._test_turns, [])
+        self.assertIn("the coordinator's to post", " ".join(done))
+        self.assertFalse(channel._test_table[1].load()[0].escalated)   # still owed, not spent
+
+    def test_an_escalation_goes_to_general_and_never_repeats(self):
+        channel = channel_with_table(role="coordinator")
         self.addCleanup(channel._test_table[0].cleanup)
         channel.topics.remember(GROUP, 5122, "round 5")
         token = channel.topics.context(GROUP, 5122)

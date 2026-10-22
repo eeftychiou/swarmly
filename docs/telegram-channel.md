@@ -1246,7 +1246,11 @@ differs from the value that last woke anyone (`Row.woken`), and the wake carries
 rather than twice — so a standing check that finds nothing unchanged starts no turn at all.
 **A wake needs a bot behind it**: `CI` owes a result and `admin` owes an answer, and neither
 has a turn to start, so their rows are observed and never woken; the transport passes the
-roster (`owed_bots()`) and a debtor off it is treated the same way. The transport looks at the
+roster (`owed_bots()`) and a debtor off it is treated the same way. **A bot wakes only what it
+owes**: every table folds every writer's documents, so a peer's row is on it too, and waking it
+here would run *my* turn about *their* debt and write `woken` on the shared row before the
+debtor ever saw the news. An escalation is posted by the **coordinator** — the swarm's one
+voice to the admin — and held by everyone else. The transport looks at the
 table once per heartbeat, right after the sweep: it resolves the row's `tg-` token back to a
 chat and thread through its own topics (a debt no topic owns wakes in General), **holds** the
 wake while that topic already has a turn running (the rule from #160 — a turn queued behind a

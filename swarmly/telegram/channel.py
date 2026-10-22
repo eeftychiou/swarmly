@@ -5134,6 +5134,10 @@ class AgentChannel:
         often settles the same debt, #160), and what woke whom is written to the row before
         the next tick, so a restart cannot wake the same bot about the same observation twice.
         A wake nobody acts on is nudged once, then escalated to the admin in General, once.
+        A bot starts turns only for the debts **it** owes: the table folds every writer's
+        documents, so a peer's row is here too, and waking it here would spend the news on the
+        wrong bot. An escalation is posted by the coordinator, the swarm's one voice to the
+        admin, and held by everyone else.
         """
         from swarmly.telegram.owed_wake import MAX_WAKES_PER_TICK, mark_woken, plan
         moment = time.time() if now is None else float(now)
@@ -5152,10 +5156,23 @@ class AgentChannel:
         done: List[str] = []
         acted: List[Any] = []
         fired: Set[Any] = set()
+        me = str(getattr(self.config.identity, "alias", "") or "").strip().lower()
         for wake in wakes:
+            # Every bot's table folds every writer's documents, so a peer's debt is on this
+            # table too. Waking it here would start *my* turn about *their* debt and then write
+            # `woken` on the shared row before the debtor ever saw it -- the news spent on the
+            # wrong bot (#163 review). A bot wakes only what it owes, and the admin hears it
+            # from one voice: the coordinator's.
+            if wake.escalated:
+                if not self.is_coordinator(now=moment):
+                    done.append(f"{wake.row}: held: the escalation is the coordinator's to post")
+                    continue
+            elif str(wake.debtor or "").strip().lower() != me:
+                done.append(f"{wake.row}: held: owed by {wake.debtor}, not me")
+                continue
             if len(acted) >= MAX_WAKES_PER_TICK:
                 done.append(f"{wake.row}: held: the tick's wake budget is spent")
-                break
+                continue
             target = self._place_target(wake.topic)
             if target is None:
                 done.append(f"{wake.row}: held: no discussion to wake in")
