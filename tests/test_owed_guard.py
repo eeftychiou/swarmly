@@ -172,7 +172,11 @@ class TestTheGuardTick(unittest.TestCase):
     """The transport half: a stalled row's rung becomes one turn, in the row's discussion."""
 
     def channel(self):
-        channel = make_channel(make_config(limits={"stall_minutes": 30}))
+        bus = TemporaryDirectory()
+        self.addCleanup(bus.cleanup)
+        channel = make_channel(make_config(limits={"stall_minutes": 30},
+                                          fallback={"gitbus_root": bus.name,
+                                                    "gitbus_ref": ""}))
         channel.bot = object()
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)

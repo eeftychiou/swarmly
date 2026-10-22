@@ -1932,8 +1932,17 @@ class _GatedAdapter(EchoAdapter):
 
 def gated_channel(config=None):
     # The drop/notice tests need the old semantics; queueing is the default now.
+    # The bus root is a temp dir (#190, #164): a channel with none reads *this checkout's*
+    # lease and round state, and a real-world lease timestamp against this fixture's fake
+    # clock is recorded as an "old release" in a process-global set, which then leaks into
+    # `/status` and made the length bound below depend on test order.
+    import tempfile
+    bus = tempfile.TemporaryDirectory()
     channel = make_channel(config if config is not None
-                           else make_config(limits={"busy_behavior": "drop"}))
+                           else make_config(limits={"busy_behavior": "drop"},
+                                           fallback={"gitbus_root": bus.name,
+                                                     "gitbus_ref": ""}))
+    channel._test_bus = bus                       # kept alive for the channel's lifetime
     adapter = _GatedAdapter("Hermes")
     channel.adapter = adapter
     return channel, adapter
@@ -2076,7 +2085,12 @@ class TestBusyDropVisibility(unittest.TestCase):
         # Not a guarantee — /status is unbounded in general (`stats.last_error` carries `str(exc)`,
         # and `replies.summary()` grows with its row count). It holds here because this fixture has
         # `replies is None` and no error set, so the bound catches only a token explosion.
-        self.assertLess(len(status), 200)
+        # `old_releases=` is excluded: it comes from a process-global set (#126) that any earlier
+        # suite folding a lease claim against a fake clock can fill, so its length says nothing
+        # about this fixture and made the bound depend on test order (#164).
+        import re as _re
+        measured = _re.sub(r"old_releases=.*?(?= blocker=|$)", "", status)
+        self.assertLess(len(measured), 200)
 
     def test_diag_reports_the_drop_as_its_own_token_inside_seen(self):
         """A busy drop is inside `seen` (it bumps `ignored`, which `seen` sums) *and* is its own

@@ -28,8 +28,16 @@ def bot_row(**fields):
 
 
 def channel_with_table(*, role=None):
+    """A channel whose table is a temp dir and whose bus root is one too.
+
+    The bus root matters: a channel with no bus root reads *this checkout's* lease and round
+    state, so a test would see the developer's own files (the rule #190 set for test channels).
+    """
     overrides = {"agent": {"role": role}} if role else {}
+    bus = TemporaryDirectory()
+    overrides["fallback"] = {"gitbus_root": bus.name, "gitbus_ref": ""}
     channel = make_channel(make_config(**overrides))
+    channel._test_bus = bus
     channel.bot = object()
     directory = TemporaryDirectory()
     store = ow.OwedStore("Hermes", state_dir=Path(directory.name), clock=lambda: 1000.0)
@@ -143,6 +151,9 @@ class TestNoNewsNoTurnInTheTransport(unittest.TestCase):
         from swarmly.telegram.owed_wake import WAKE_GRACE
         channel = channel_with_table(role="coordinator")
         self.addCleanup(channel._test_table[0].cleanup)
+        # An escalation is the coordinator's to post, and who that is comes from the lease. The
+        # bus root here is a temp dir, so the lease is named rather than read.
+        channel.current_coordinator = lambda *a, **k: "Hermes"
         channel.topics.remember(GROUP, 5122, "round 5")
         row = bot_row(topic=channel.topics.context(GROUP, 5122), observed="green")
         channel._test_table[1].save_all([row])
@@ -228,6 +239,7 @@ class TestAnEscalationWakesTheAdminOnce(unittest.TestCase):
     def test_an_escalation_goes_to_general_and_never_repeats(self):
         channel = channel_with_table(role="coordinator")
         self.addCleanup(channel._test_table[0].cleanup)
+        channel.current_coordinator = lambda *a, **k: "Hermes"
         channel.topics.remember(GROUP, 5122, "round 5")
         token = channel.topics.context(GROUP, 5122)
         row = bot_row(topic=token, observed="green", woken="green", wakes=2)

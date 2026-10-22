@@ -5206,6 +5206,7 @@ class AgentChannel:
         # lease read behind them is a bus fetch, and most ticks wake nobody here.
         counts_budget: Optional[bool] = None
         round_key = ""
+        has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
         try:
             store = self.owed_store()
             rows = store.open_rows(now=moment)
@@ -5248,7 +5249,9 @@ class AgentChannel:
                 # debt stays armed and is looked at again on the next tick.
                 done.append(f"{wake.row}: held: turn running")
                 continue
-            if wake.debtor.strip().lower() == me:
+            if has_bus and wake.debtor.strip().lower() == me:
+                # A round budget needs a round, and a round lives on the bus: without one there
+                # is nothing to count against, and no lease worth reading for it.
                 if counts_budget is None:
                     counts_budget = self.is_coordinator()
                     round_key = self.owed_round_key() if counts_budget else ""
