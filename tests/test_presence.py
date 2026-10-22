@@ -510,7 +510,9 @@ class TestThePulseCarriesUsage(unittest.TestCase):
         # The next beat counts only what came after this one.
         later = channel.own_pulse(NOW + 120).status
         self.assertEqual(later["usage"]["beat"]["turns"], 0)
-        self.assertIsNone(later["usage"]["beat"]["tokens_in"])
+        # No turn, so nothing spent: zeros, not nulls (live: the pulse read as all nulls).
+        self.assertEqual((later["usage"]["beat"]["tokens_in"], later["usage"]["beat"]["cost_usd"]),
+                         (0, 0.0))
 
     def test_a_beat_never_runs_a_model_turn(self):
         class CountingAdapter:

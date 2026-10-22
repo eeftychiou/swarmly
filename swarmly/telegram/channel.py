@@ -2613,7 +2613,8 @@ class AgentChannel:
         wakes: List[Tuple[str, float]] = []
         try:
             wakes = [(timer.id, float(timer.next_at))
-                     for timer in self.wake_store().load() if timer.live][:20]
+                     for timer in self.wake_store().load()
+                     if timer.live and timer.next_at > moment - WAKE_STALE_SECONDS][:20]
         except Exception:                              # noqa: BLE001 - no timer list, no fun
             logger.debug("snapshot: no wake timers this beat", exc_info=True)
 
@@ -2626,11 +2627,18 @@ class AgentChannel:
             logger.debug("snapshot: no lease this beat", exc_info=True)
 
         adapter = self.config.adapter
+        model, effort = adapter.model, adapter.effort
+        try:
+            # The same answer the online notice gives (#99): the CLI's own settings and the
+            # model it last reported fill what the config leaves blank.
+            model, effort = self.running_model_and_effort()
+        except Exception:                              # noqa: BLE001 - the config's names
+            logger.debug("snapshot: no resolved model this beat", exc_info=True)
         return snapshot_mod.Snapshot(
             alias=self.config.identity.alias, state=state, since=since, at=moment,
             every=every, topic=str(topic), turn_elapsed=elapsed, turn_timeout=turn_timeout,
             queue=queue, wakes=tuple(wakes),
-            model=str(adapter.model or ""), effort=str(adapter.effort or ""),
+            model=str(model or ""), effort=str(effort or ""),
             rev=str(self._running_revision or ""),
             uptime=max(0.0, self._clock() - self._booted_at), restarts=max(0, self._boots - 1),
             term=term, lease_ends=lease_ends)
@@ -3532,7 +3540,7 @@ class AgentChannel:
 
     async def _wake_tick(self, *, now: Optional[float] = None) -> List[str]:
         """One pass over the due timers. Returns what it did, so a test can read it."""
-        from swarmly.telegram.wake import decide, run_check_async
+        from swarmly.telegram.wake import WakeAction, decide, run_check_async
         moment = time.time() if now is None else now
         if self._frozen or getattr(self, "_pause_pending", False):
             # The same gate that holds turns: paused is paused, for checks too (#92 S3).
@@ -3548,7 +3556,8 @@ class AgentChannel:
             try:                                     # a dead bot's armed timers are promises
                 for adopted in await asyncio.to_thread(
                         store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),
-                        allow=tuple(self.config.limits.wake_check_allow or ())):
+                        allow=tuple(self.config.limits.wake_check_allow or ()),
+                        skip=self._peers_not_down(moment)):
                     done.append(f"{adopted.id}: adopted from the bus")
             except Exception:                        # noqa: BLE001 - adoption is best effort
                 logger.warning("wake: adoption failed; carrying on", exc_info=True)
@@ -3580,15 +3589,46 @@ class AgentChannel:
             self._wake_persist(store, pending, done)
             done.append(f"{pending.id}: replayed after a restart")
         settle = float(self.config.limits.wake_claim_settle_seconds)
+        alive = {alias.lower() for alias in self._peers_not_down(moment)}
         for timer in store.due(moment):
+            if timer.adopted_from and timer.adopted_from.strip().lower() in alive:
+                # Its owner is up again and keeps its own promise: two holders only ever race.
+                timer.state = "done"
+                store.write(timer)
+                done.append(f"{timer.id}: handed back to {timer.adopted_from}")
+                continue
+            if timer.expires_at and moment >= timer.expires_at:
+                late = moment - timer.expires_at
+                timer.state = "expired"
+                if not timer.adopted_from and mine(timer) and late < WAKE_STALE_SECONDS:
+                    self._wake_persist(store, timer, done)
+                    self._run_own_task(self._wake_prompt(
+                        WakeAction("expire", timer, reason="its until= passed"),
+                        expired=True), timer.chat_id, timer.thread_id, timer.topic or None)
+                    done.append(f"{timer.id}: expired")
+                else:
+                    # Long past its deadline (a restart, a claim that kept losing): a turn now
+                    # would act on a world that has moved on, so it is retired quietly, and
+                    # locally: a bus push per stale copy is noise nobody reads.
+                    store.write(timer)
+                    done.append(f"{timer.id}: retired, expired {int(late // 60)}m ago")
+                continue
             if not mine(timer):
                 done.append(f"{timer.id}: adopted, held while this bot is not the coordinator")
                 continue
             claim = await asyncio.to_thread(store.claim_state, timer, settle_seconds=settle)
+            if claim == "taken":
+                # Another bot holds this firing and acts on it. Keeping our copy armed would
+                # retry the lost claim every tick and count against wake_max forever (live,
+                # round 5: ten such copies refused the WAKE that would have merged a PR).
+                timer.state = "done"
+                store.write(timer)
+                done.append(f"{timer.id}: another bot claimed this firing; copy retired")
+                continue
             if claim != "won":
                 done.append(f"{timer.id}: "
                             + ("claim written, firing after the settle window"
-                               if claim == "wait" else "another bot claimed this firing"))
+                               if claim == "wait" else "claim not confirmed on the bus"))
                 continue
             code, tail = await run_check_async(
                 timer.argv, cwd=self._workdir_for(timer.chat_id, timer.thread_id),
@@ -3617,6 +3657,21 @@ class AgentChannel:
             else:
                 self._wake_persist(store, action.timer, done)
         return done
+
+    def _peers_not_down(self, now: float) -> Tuple[str, ...]:
+        """Peers presence has heard from and that are not DOWN: their timers are theirs to keep.
+
+        Empty when heartbeats are off, because then nobody can tell, and adoption works as before.
+        """
+        try:
+            if self.down_after_seconds() == float("inf"):
+                return ()
+            table = self.presence()
+            return tuple(sorted(alias for alias in table.peers
+                                if not table.is_down(alias, now)))
+        except Exception:                          # noqa: BLE001 - adoption decides alone
+            logger.debug("wake: presence unreadable; adopting as before", exc_info=True)
+            return ()
 
     @staticmethod
     def _wake_prompt(action: Any, *, failed: bool = False, expired: bool = False) -> str:
@@ -5731,7 +5786,9 @@ class AgentChannel:
             return None
         try:
             own = self.config.identity.alias
+            moment = time.time()
             if any(timer.live and (not timer.alias or timer.alias == own)
+                   and timer.next_at > moment - WAKE_STALE_SECONDS
                    for timer in self.wake_store().load()):
                 return None                       # it already promised itself a wake-up
         except Exception:                         # noqa: BLE001 - the watchdog is best effort
@@ -7112,6 +7169,10 @@ REASSIGN_NOTE = ("{alias} has not answered your hand-off in this topic for {minu
                  "has not said it is busy, so it may be down. Decide what happens to the work "
                  "now: hand it to another peer whose role fits, or do it yourself, and say so "
                  "here. If it can wait for {alias}, reply exactly NO_REPLY.")
+#: A WAKE timer overdue by more than this is not a live promise: it is not counted as one, and
+#: past its until= it is retired without a turn (live, round 5: ten day-old copies blocked a merge).
+WAKE_STALE_SECONDS = 3600.0
+
 #: The coordinator's watchdog turn (check_coordinator_watch): nothing woke it for a while.
 WATCH_NOTE = ("Coordinator check: you have had no turn for {minutes} minutes and hold no WAKE. "
               "Look at the open tracking issue and every item and PR on it (gh issue view, "

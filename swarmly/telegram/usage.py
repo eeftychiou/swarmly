@@ -202,6 +202,12 @@ class Ledger:
         known instead.
         """
         rows = self.since(moment)
+        if not rows:
+            # Nothing ran, so nothing was spent: zero is known, not unknown (a pulse beat with
+            # no turn read as all nulls).
+            return {"turns": 0, "ok": 0, "failed": 0, "tokens_in": 0, "tokens_out": 0,
+                    "cost_usd": 0.0, "cost_known": 0, "tokens_in_known": 0,
+                    "tokens_out_known": 0, "since": moment}
         known_cost = [row.cost_usd for row in rows if row.cost_usd is not None]
         known_in = [row.tokens_in for row in rows if row.tokens_in is not None]
         known_out = [row.tokens_out for row in rows if row.tokens_out is not None]
