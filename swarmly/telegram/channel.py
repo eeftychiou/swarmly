@@ -28,6 +28,7 @@ import contextlib
 import html
 import json
 import contextvars
+import hashlib
 import logging
 import os
 import re
@@ -40,7 +41,7 @@ import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -1529,7 +1530,7 @@ class AgentChannel:
         if command == "effort":
             command = "reasoning"
         if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes",
-                            "usage"):
+                            "owed", "usage"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1545,6 +1546,8 @@ class AgentChannel:
             return self._round_summary(event)
         if command == "wakes":
             return self._wakes_command(event)
+        if command == "owed":
+            return self._owed_command(event)
         if command == "usage":
             return self.usage_text(event)
         return self._command_reply(command, event)
@@ -4868,6 +4871,100 @@ class AgentChannel:
         newest = max(states, key=lambda state: (state.updated_at, state.seq))
         return newest.summary()
 
+    def _owed_command(self, event: Optional[ChannelEvent]) -> str:
+        """``/owed[@bot]``: the rows this bot holds open -- facts, not a model's word (#162).
+
+        Read-only, like ``/round``: it reports, it changes nothing, and it costs no turn.
+        """
+        try:
+            return self.owed_store().summary()
+        except Exception:                          # noqa: BLE001 - the command must answer
+            logger.warning("owed: the table could not be read", exc_info=True)
+            return "owed: cannot read the table (the log has the reason); this is not 'nothing is owed'"
+
+    def owed_store(self) -> Any:
+        """This bot's expectations table: rows in its state, documents on the bus (#162).
+
+        The state copy is this bot's own, like ``.agents/wakes/<alias>/``; the document under
+        the checkout is the swarm's, and :meth:`OwedStore.documents` is how a successor reads
+        it. A fresh store per call, like ``round_store``: a cached one keeps the ref it first
+        fetched, and ``/owed`` on a bot that has just started must see what the bus holds now.
+        """
+        from swarmly.telegram.owed import OwedStore
+        from swarmly.telegram.wake import wake_dir_for
+        root = self._gitbus_root()
+        has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+        return OwedStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
+                         transport=self.bus_transport(root) if has_bus else None, root=root,
+                         clock=time.time)
+
+    def _topic_token(self, chat_id: int, thread_id: Optional[int]) -> str:
+        """The discussion a debt belongs to, as a ``tg-`` token (never the chat id)."""
+        try:
+            return str(self.topics.context(int(chat_id), thread_id) or "")
+        except Exception:                          # noqa: BLE001 - book-keeping, not a turn
+            return ""
+
+    def _place_key(self, chat_id: int, thread_id: Optional[int]) -> str:
+        """What tells two hand-offs apart: the topic token, or a digest when there is none.
+
+        General and an unbound topic have no token (``context_for`` fails closed), and using ""
+        for both made one peer's hand-offs in two such places a single row (#173 review): a
+        digest keeps them apart without putting a chat id in a row that travels on the bus.
+        """
+        token = self._topic_token(chat_id, thread_id)
+        if token:
+            return token
+        # No token (General, or a topic that fails closed): the redactor already names such a
+        # place without a chat id, and it is the one place that decides what may go on the bus
+        # (#173 review).
+        try:
+            ref = Redactor.from_config(self.config).topic_ref(
+                int(chat_id), thread_id, getattr(self, "router", None))
+            return str(ref.get("topic") or ref.get("ref") or ref.get("channel") or "") or "x"
+        except Exception:                          # noqa: BLE001 - book-keeping, not a turn
+            return "x"
+
+    def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
+                            thread_id: Optional[int]) -> None:
+        """Record a durable row per peer just handed work (#162, the wiring).
+
+        The in-memory ``_pending_handoffs`` is the same debt in a second book and is lost on a
+        restart; these rows are the copy the swarm and a successor coordinator can read. A
+        book-keeping failure is logged and never fails the hand-off itself.
+        """
+        from swarmly.telegram.owed import handoff_rows
+        asked = [peer for peer in peers if peer]
+        if not asked or self.bot is None:
+            return
+        topic = self._topic_token(chat_id, thread_id)
+        place = self._place_key(chat_id, thread_id)
+        try:
+            store = self.owed_store()
+            rows = store.observe(handoff_rows(asked=asked, asker=self.config.identity.alias,
+                                              topic=topic, place=place,
+                                              opened_by=f"hand-off in {topic or 'a topic'}"))
+            store.save_all(rows)               # one push for the whole reply, not one per peer
+        except Exception:                          # noqa: BLE001 - reported, not swallowed
+            logger.warning("owed: could not record the hand-off to %s",
+                           ", ".join(asked), exc_info=True)
+
+    def _close_owed_handoff(self, peer: str, chat_id: int, thread_id: Optional[int]) -> None:
+        """A peer's reply in a discussion answers the hand-off recorded **there**, not others.
+
+        The topic goes into the fact on purpose: a reply in ``tg-1`` must not close a debt
+        opened in ``tg-2`` (#173 review, QA).
+        """
+        from swarmly.telegram.owed import Fact, settle
+        try:
+            store = self.owed_store()
+            closed = settle(store.load(),
+                            Fact(kind="reply", item=self._place_key(chat_id, thread_id),
+                                 who=peer))
+            store.save_all(closed)             # one push for the close, not one per row
+        except Exception:                          # noqa: BLE001 - reported, not swallowed
+            logger.warning("owed: could not close the hand-off to %s", peer, exc_info=True)
+
     def _default_bus_pull(self, root: Path) -> None:
         self.bus_transport(root).refresh()
 
@@ -6816,15 +6913,22 @@ class AgentChannel:
         leads = {name.strip().lower() for name in
                  (self.membership.state.coordinator, self.current_coordinator())
                  if isinstance(name, str) and name.strip()}
+        owed_to_leads: List[str] = []
         for peer in named:
             if peer not in peers and peer.strip().lower() in leads                     and peer.strip().lower() != self.config.identity.alias.strip().lower():
                 self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
                     "at": self._clock(), "message_id": message_id, "nudged": False}
+                owed_to_leads.append(peer)          # waited on, so it is owed a row (#173)
+        if owed_to_leads:
+            # Recorded before the early return: a reply that hands work only to the coordinator
+            # has no mirror copy, and used to open no row at all (#173 review).
+            self._note_owed_handoffs(owed_to_leads, chat_id, thread_id)
         if not peers:
             return
         for peer in peers:
             self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
                 "at": self._clock(), "message_id": message_id, "nudged": False}
+        self._note_owed_handoffs(peers, chat_id, thread_id)
         if not (self.config.bus.repo and getattr(self.config.bus, "mirror_handoffs", True)):
             return
         # Issue #22: the bus carries a topic token, never the chat id. The token resolves
@@ -6926,6 +7030,7 @@ class AgentChannel:
                     self._pending_handoffs[key].update(at=self._clock(), nudged=False)
                 else:
                     self._pending_handoffs.pop(key, None)
+                    self._close_owed_handoff(alias, event.chat_id, event.thread_id)
             elif event.thread_id is not None:
                 self._peer_followed_up(event, prose, alias, str(target).lstrip("@"))
 

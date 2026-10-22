@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- The expectations table (`#162` slice 1): rows saying who owes what — a debtor, what is owed,
+  the item and (when it is about one commit) the head, who waits, the fact that opened it, the
+  last value seen and a deadline. Facts open and close them, never a bot's word; they are kept
+  per writer under `.agents/owed/<alias>/` on the bus and folded when read, so a successor
+  inherits the open ones; `/owed` lists them without a model turn. Hand-offs are the first
+  source wired (`#174` wires the rest).
 - Stuck detection from the CLI's own output (round 5.5 `#161`): the adapter behind each topic
   reads its CLI's stdout and stderr as they arrive and records when the last byte landed, so a
   turn that is running but not progressing shows as `stuck (silent Nm)` in the snapshot, the

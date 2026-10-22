@@ -162,8 +162,12 @@ WAKES_RELPATH = ".agents/wakes"
 #: last-writer-wins race the wake claims were built to avoid.
 LEASES_RELPATH = ".agents/leases"
 
+#: Where the expectations table keeps its rows (round 5.5, #162): one file per row, per bot,
+#: so a successor coordinator inherits what is still owed, not an empty table.
+OWED_RELPATH = ".agents/owed"
+
 #: The directories a bus *document* may live in.
-BUS_DOCUMENT_DIRS = (ROUNDS_RELPATH, WAKES_RELPATH, LEASES_RELPATH)
+BUS_DOCUMENT_DIRS = (ROUNDS_RELPATH, WAKES_RELPATH, LEASES_RELPATH, OWED_RELPATH)
 
 
 def is_bus_document(relpath: str) -> bool:

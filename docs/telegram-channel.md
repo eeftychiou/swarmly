@@ -1213,6 +1213,24 @@ bot runs no check, and neither does a paused one. The fire claims live on the bu
 `.agents/wakes/<alias>/`, one per timer per firing, so an acting
 coordinator (#83) can see a timer a dead bot left armed, and two bots cannot fire it twice.
 
+**The expectations table — `/owed` (issue #162).** Facts open and close rows; a model's word
+never does. Each row names who owes what (a bot, `CI`, or `admin`), on which item and head,
+who is waiting, the fact that opened it, the last value observed and a deadline, and its
+id `<kind>:<item>[@<head>]…:<debtor>` *is* the settlement rule: re-observing a fact updates
+one row, a different head is a different debt.
+
+What this transport infers and records **today** is the hand-off: a reply that addresses a
+peer opens one row per peer addressed (the multi-recipient case that missed DeepSeek on
+22 Oct), in the discussion it was made in; that peer's reply **in that discussion** closes it,
+and a reply anywhere else does not. Rows live in this bot's state (`.agents/state/owed/`, one
+file per row) and are mirrored as bus documents under `.agents/owed/<alias>/`, so a successor
+coordinator inherits what is still open. `/owed@<bot>` lists the open rows, most overdue
+first, and says `cannot read the table` rather than "nothing is owed" when a row file is
+unreadable. The other sources — heads and CI from a poll of `items[*].pr`, verdicts, merges,
+unticked items with an owner, questions to the admin — are the same model with tests in
+`tests/test_owed.py`; they open no rows yet, because nothing in this transport observes them
+(no `gh` poll of PR heads, and a question is prose, which is deliberately not a fact).
+
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt
 failures. Each transport deletes **its own** notices from General once they are older than

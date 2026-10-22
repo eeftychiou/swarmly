@@ -32,6 +32,7 @@ MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("swarm", "The swarm: bus, coordinator and members"),
     ("round", "What the open round waits on"),
     ("wakes", "This bot's armed WAKE timers"),
+    ("owed", "What is owed right now: the open rows"),
     ("model", "Show or set the model for this topic"),
     ("reasoning", "Show or set the reasoning effort for this topic"),
     ("role", "Show or set a bot's role"),
