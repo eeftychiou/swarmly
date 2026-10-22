@@ -620,6 +620,79 @@ class TestTheValueCarryingKeyboard(unittest.TestCase):
         run(channel.handle_control_press(press("ctl:confirm:" + code)))
 
 
+class TestTheRolePick(unittest.TestCase):
+    """Two values in one mechanism: which bot, then which role (#153).
+
+    The bot rides the target slot and the role the value slot, so the whole pick still arrives
+    in a single callback and the second tap confirms it exactly as a single-value pick does.
+    """
+
+    def channel(self):
+        config = make_config(control={"chat_id": -1001234567890, "topic_id": 307})
+        channel = make_channel(config)
+        channel.bot = FakeBot()
+        channel.presence_clock = lambda: NOW
+        channel.control_round = lambda: None
+        asked = []
+
+        async def assign(handle, role, reason=""):
+            asked.append((handle, role))
+            return True
+
+        channel.membership.assign = assign
+        channel.assigned = asked
+        return channel
+
+    def test_the_first_press_offers_the_bots_and_names_none_of_them_yet(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:swarm.role")))
+        labels = [pair[0] for line in buttons_of(channel.bot.sent[0]["reply_markup"])
+                  for pair in line]
+        self.assertEqual(labels, ["Antigravity", "Codex", "Hermes"])   # its own alias too
+
+    def test_the_bot_choice_lands_in_the_target_slot(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:swarm.role")))
+        data = [pair[1] for line in buttons_of(channel.bot.sent[0]["reply_markup"])
+                for pair in line]
+        self.assertEqual(data, ["ctl:swarm.role:Antigravity", "ctl:swarm.role:Codex",
+                                "ctl:swarm.role:Hermes"])
+
+    def test_the_second_press_offers_the_roles_for_that_bot(self):
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:swarm.role:Codex")))
+        data = [pair[1] for line in buttons_of(channel.bot.sent[0]["reply_markup"])
+                for pair in line]
+        self.assertIn("ctl:swarm.role:Codex:reviewer", data)
+        self.assertIn("ctl:swarm.role:Codex:qa-tester", data)
+        self.assertEqual(channel.assigned, [])                        # nothing assigned yet
+
+    def test_the_complete_pick_asks_twice_and_then_assigns(self):
+        channel = self.channel()
+        asked = run(channel.handle_control_press(press("ctl:swarm.role:Codex:reviewer")))
+        self.assertIn("Tap again", asked)
+        self.assertEqual(channel.assigned, [])
+        code = channel.control_policy().pending()[0].code
+        done = run(channel.handle_control_press(press("ctl:confirm:" + code)))
+        self.assertIn("Codex is now reviewer", done)
+        self.assertEqual(channel.assigned, [("Codex", "reviewer")])
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL swarm.role" in entry["text"]]
+        self.assertEqual(len(notes), 1)                               # and it is on the record
+
+    def test_a_refused_role_says_so_rather_than_pretending(self):
+        channel = self.channel()
+
+        async def refuse(handle, role, reason=""):
+            return False
+
+        channel.membership.assign = refuse
+        run(channel.handle_control_press(press("ctl:swarm.role:Codex:reviewer")))
+        code = channel.control_policy().pending()[0].code
+        self.assertIn("refused",
+                      run(channel.handle_control_press(press("ctl:confirm:" + code))))
+
+
 class TestAStaleDashboardAnswersNothing(unittest.TestCase):
     """A press on a dashboard whose bot no longer coordinates is refused (review, #133).
 

@@ -1064,7 +1064,11 @@ so the data always fits Telegram's 64 bytes. A picked value *always* asks for th
 whatever the bare control's rule is, and it is applied by the same function the typed command
 runs — `/model <name>`, `/reasoning <level>`, `/wakes cancel <id>` — so a picked value has the
 same validation and the same words back as a typed one. A control joins the pickers only when
-its choices can be read in code: listing them costs no model turn.
+its choices can be read in code: listing them costs no model turn. Reassigning a role needs
+**two** values, so it picks twice: the bot goes in the target slot (`ctl:swarm.role:Codex`) and
+the role fills the value next to it (`ctl:swarm.role:Codex:qa-tester`), which keeps one callback
+carrying the whole choice. Offering a list is not confirmed — it changes nothing; the second tap
+arrives with the finished pick.
 
 Deploy, upgrade, merging a PR and editing configs or secrets are not on the keyboard at all.
 

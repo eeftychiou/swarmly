@@ -137,7 +137,7 @@ def keyboard(actions: Iterable[str]) -> List[List[Dict[str, str]]]:
 #: The controls that take a **picked value**: pressing one with no value offers the choices,
 #: pressing one with a value sets it after the second tap (#153). The list is short on purpose
 #: -- a control joins it when its choices can actually be read in code, with no model turn.
-PICKERS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.wake")
+PICKERS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.wake", "swarm.role")
 
 
 def is_picker(action: str) -> bool:
@@ -146,7 +146,7 @@ def is_picker(action: str) -> bool:
 
 
 def picker(action: str, choices: Iterable[Tuple[str, str]],
-           target: str = "") -> List[List[Dict[str, str]]]:
+           target: str = "", as_target: bool = False) -> List[List[Dict[str, str]]]:
     """The keyboard that carries a picked value: one button per choice, three to a row.
 
     The value rides the button's own callback data (``ctl:<action>:<target>:<value>``), not a
@@ -157,7 +157,13 @@ def picker(action: str, choices: Iterable[Tuple[str, str]],
     buttons = []
     for label, value in choices:
         value = str(value)[:MAX_VALUE_CHARS]
-        buttons.append({"text": str(label), "callback_data": callback_data(action, target, value)})
+        # ``as_target`` is for the controls that need *two* values (reassign a role: which bot,
+        # then which role): the first choice goes in the target slot, and the second press
+        # fills the value next to it, so the whole pick still arrives in one callback (#153).
+        buttons.append({"text": str(label),
+                        "callback_data": (callback_data(action, value)
+                                          if as_target else
+                                          callback_data(action, target, value))})
     return [buttons[index:index + PER_ROW] for index in range(0, len(buttons), PER_ROW)]
 
 

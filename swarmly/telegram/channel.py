@@ -3014,7 +3014,7 @@ class AgentChannel:
         """
         return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart", "bot.stop_turn",
                 "bot.model", "bot.effort", "bot.wake", "bot.cli",
-                "swarm.pause_all", "swarm.sync", "swarm.cleanup",
+                "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
                 "item.nudge")
 
     #: The controls that only *report*, read off the one table in
@@ -3042,7 +3042,7 @@ class AgentChannel:
                             author_username=self.config.identity.name,
                             thread_id=getattr(settings, "topic_id", None))
 
-    def control_choices(self, action: str) -> List[Tuple[str, str]]:
+    def control_choices(self, action: str, target: str = "") -> List[Tuple[str, str]]:
         """The live choices a picker offers, read in code and costing no turn (#153).
 
         Model names come from the list the CLI already reported (``/model``'s own cache), the
@@ -3055,6 +3055,16 @@ class AgentChannel:
             return [(name, name) for name in names][:12]
         if action == "bot.effort":
             return [(level, level) for level in EFFORT_LEVELS]
+        if action == "swarm.role":
+            from swarmly.telegram.roles import known_roles
+            if not target:
+                # Step one: which bot. Its own alias included, because a bot may hand its own
+                # role on (the coordinator's job is a role like any other).
+                names = sorted({str(alias) for alias in
+                                (getattr(self.config, "peers", None) or {})}
+                               | {self.config.identity.alias})
+                return [(name, name) for name in names][:12]
+            return [(name, name) for name in sorted(known_roles())][:12]
         if action == "bot.wake":
             now = time.time()
             timers = [timer for timer in self.wake_store().load() if timer.live]
@@ -3062,7 +3072,7 @@ class AgentChannel:
                     for timer in sorted(timers, key=lambda row: row.next_at)][:10]
         return []
 
-    async def _offer_picker(self, action: str) -> str:
+    async def _offer_picker(self, action: str, target: str = "") -> str:
         """Send the picker for *action*: a small message of its own, one button per value.
 
         The keyboard cannot live on the dashboard -- every heartbeat edits that message with
@@ -3071,13 +3081,16 @@ class AgentChannel:
         """
         found = control_mod.control(action)
         label = found.label if found else action
-        choices = self.control_choices(action)
+        choices = self.control_choices(action, target)
         if not choices:
             raise ControlRefused(f"{label}: there is nothing to pick from just now")
         bot = getattr(self, "bot", None)
         if bot is None:
             raise ControlRefused(f"{label}: this transport cannot post the picker")
-        rows = control_mod.picker(action, choices)
+        # A role pick asks for the *bot* first, and that choice belongs in the target slot;
+        # every other picker's single choice is the value itself.
+        rows = control_mod.picker(action, choices, target=target,
+                                  as_target=bool(action == "swarm.role" and not target))
         try:
             from aiogram.types import InlineKeyboardMarkup
             markup = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -3089,7 +3102,7 @@ class AgentChannel:
                                disable_web_page_preview=True, reply_markup=markup)
         return f"{label}: {len(choices)} choice(s) offered"
 
-    async def _apply_pick(self, action: str, value: str) -> str:
+    async def _apply_pick(self, action: str, value: str, target: str = "") -> str:
         """Set what a picker chose -- through the same function the typed command runs.
 
         ``/model <name>``, ``/reasoning <level>`` and ``/wakes cancel <id>`` are the transport's
@@ -3102,6 +3115,14 @@ class AgentChannel:
             return self._reasoning_command(self._control_event("reasoning", value))
         if action == "bot.wake":
             return self._wakes_command(self._control_event("wakes", f"cancel {value}"))
+        if action == "swarm.role":
+            who = str(target or "").strip()
+            if not who:
+                raise ControlRefused("swarm.role needs a bot: pick one, then a role")
+            assigned = await self.membership.assign(who, value)
+            if not assigned:
+                raise ControlRefused(f"{who}: that role was refused")
+            return f"{who} is now {value}"
         raise ControlRefused(f"{action}: this build cannot apply a picked value")
 
     def control_report(self, action: str) -> Optional[str]:
@@ -3206,7 +3227,10 @@ class AgentChannel:
         (None otherwise, and the policy's own line is the answer).
         """
         if value:
-            return await self._apply_pick(action, value)
+            return await self._apply_pick(action, value, target)
+        if action == "swarm.role" and target:
+            # Step two of the role pick: the bot is chosen, now ask which role.
+            return await self._offer_picker(action, target)
         if control_mod.is_picker(action):
             return await self._offer_picker(action)
         report = self.control_report(action)

@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from swarmly.telegram.control import control as lookup
+from swarmly.telegram.control import control as lookup, is_picker
 
 #: The callback-data prefix. Every button this module handles starts with it, so a callback
 #: from anything else on the bot's keyboard is ignored rather than parsed.
@@ -229,6 +229,11 @@ class PressPolicy:
                             text=(f"Tap again to set {found.label} to `{command.value}`. "
                                   f"Or answer `{PREFIX}confirm:{code}` within "
                                   f"{self.confirm_seconds / 60:g} minute(s)."))
+        if not command.value and is_picker(command.action):
+            # Step one of a pick -- offering the list -- changes nothing, so it is not
+            # confirmed even when the action itself is one that changes something (#153).
+            return Decision(RUN, command=command, action=command.action,
+                            target=command.target, text=f"{found.label}: pick one below.")
         if not found.confirm:
             # A report changes nothing, so it leaves no CONTROL note: the durable line is for
             # "who stopped what", and a read-only press would only add noise to the bus.
