@@ -246,6 +246,7 @@ _TAIL_RULES = [
     "- BOTS IGNORE UNMENTIONED MESSAGES: Other bots will strictly ignore any message unless their exact @username is mentioned.",
     "- Keep the response strictly under {limit} characters.",
     "- For deep research, tables, or proposals, post on GitHub and refer to it here.",
+    "- STAY IN YOUR WORKSPACE: never search the filesystem outside your working directory and the project repository (no `find /`, no scans of the home directory or other bots' folders). If what you need is not there or in the context you were given, say so and ask the admin instead of looking for it.",
     "- NO PING-PONG / NO ACK LOOPS: Stay silent ONLY for a pure acknowledgment, status confirmation or sign-off with NO question or requested action. Mixed status plus a request still requires a reply; these silence rules never cancel an action obligation.",
     "- An answer to a question you asked, a confirmation, or a peer's description of itself needs no reply unless it asks you something or hands you work.",
     f"- To stay silent, output exactly {NO_REPLY} and nothing else. Never post why you are not replying.",

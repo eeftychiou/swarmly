@@ -719,3 +719,49 @@ class TestOnlyPeersAreTracked(unittest.TestCase):
         channel = live_channel()
         channel.presence().seen("Claude_obot", NOW - 3600)
         self.assertNotIn("Claude_obot", " ".join(run(channel.check_peer_liveness(now=NOW))))
+
+
+class TestSwarmUsageForTheCoordinator(unittest.TestCase):
+    """Live, 22 Oct: asked for the cost per bot, the coordinator ran a whole-disk find for
+    usage files, which ran on in the background and swallowed its reply. The swarm's usage
+    comes from each peer's heartbeat instead, read in code, never a model turn."""
+
+    def channel_with_codex_usage(self):
+        channel = live_channel()
+        channel.presence().note(pr.Pulse(alias="Codex", at=NOW, status={
+            "state": "idle", "usage": {"today": {"turns": 6, "tokens_in": 3030593,
+                                                 "tokens_out": None, "cost_usd": None}}}),
+            seen_at=NOW)
+        return channel
+
+    def test_peers_usage_comes_from_their_heartbeats(self):
+        text = self.channel_with_codex_usage().swarm_usage_text(now=NOW)
+        self.assertIn("- Codex: 6 turns, 3.0M in", text)
+        self.assertIn("- Hermes: 0 turns", text)
+
+    def test_usage_all_answers_in_code(self):
+        channel = self.channel_with_codex_usage()
+        reply = run(channel.handle_event(event("/usage@HermesBot all", author_id=ADMIN_ID,
+                                               username="alice", is_bot=False, message_id=31)))
+        self.assertIn("Swarm usage today", reply or channel._test_sender.last)
+
+    def test_only_the_coordinator_gets_the_note(self):
+        channel = self.channel_with_codex_usage()
+        channel.is_coordinator = lambda now=None: False
+        self.assertEqual(channel._swarm_usage_note(), "")
+        channel.is_coordinator = lambda now=None: True
+        note = channel._swarm_usage_note()
+        self.assertIn("Codex: 6 turns", note)
+        self.assertIn("never search the disk", note)
+
+    def test_a_non_peer_is_left_out(self):
+        channel = self.channel_with_codex_usage()
+        channel.presence().note(pr.Pulse(alias="Claude_obot", at=NOW), seen_at=NOW)
+        self.assertNotIn("Claude_obot", channel.swarm_usage_text(now=NOW))
+
+
+class TestTheWorkspaceRule(unittest.TestCase):
+    def test_every_turn_is_told_to_stay_in_its_workspace(self):
+        from swarmly.telegram.adapters.base import _tail_rules
+        self.assertTrue(any("STAY IN YOUR WORKSPACE" in rule and "find /" in rule
+                            for rule in _tail_rules()))
