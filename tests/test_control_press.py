@@ -842,6 +842,7 @@ class TestTheLeaseControls(unittest.TestCase):
         def __init__(self, term=4, holder="Hermes"):
             self.term, self.holder = term, holder
             self.yielded = []
+            self.yielded_terms = []
             self.claimed = []
 
         def state(self, *, now=None):
@@ -849,8 +850,9 @@ class TestTheLeaseControls(unittest.TestCase):
             return LeaseState(status="ok", term=self.term, holder=self.holder,
                               expires_at=1e12)
 
-        def yield_lease(self, *, reason="", now=None):
+        def yield_lease(self, *, reason="", now=None, term=None):
             self.yielded.append(reason)
+            self.yielded_terms.append(term)
             self.holder = ""
 
         def claim(self, *, term=None, now=None, promoted=False):
@@ -916,6 +918,7 @@ class TestTheLeaseControls(unittest.TestCase):
 
         self.assertEqual(len(channel.store.yielded), 1)
         self.assertIn("Codex", channel.store.yielded[0])
+        self.assertEqual(channel.store.yielded_terms, [4])      # the term it read, not None
         notes = self.notes(channel)
         self.assertEqual(len(notes), 1)                        # one press, one line on the bus
         self.assertIn("target=Codex", notes[0])
@@ -943,7 +946,10 @@ class TestTheLeaseControls(unittest.TestCase):
         channel = self.channel(term=4, holder="Claude", leader="")
         line = ("CONTROL swarm.lease target=Hermes by=%d at=2027-01-15T08:00:00Z "
                 "state=done value=take" % self.ADMIN)
-        self.assertEqual(apply(channel, line, sender="Claude"), "applied: swarm.lease")
+        answer = apply(channel, line, sender="Claude")
+        self.assertIn("accepted: swarm.lease", answer)         # the claim is still in flight
+        self.assertNotIn("applied", answer)
+        self.assertIn("claiming the next term", answer)
         self.assertEqual(channel.store.claimed, [(5, True)])   # the next term, promoted
 
     def test_a_hand_over_for_another_bot_is_not_applied_here(self):

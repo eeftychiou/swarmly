@@ -2919,11 +2919,15 @@ class AgentChannel:
             return f"refused: {note.action} is a report, not a control"
         try:
             # Synchronous on purpose: this runs inside the machine-note path, which must not
-            # need an event loop of its own to hold a bot.
+            # need an event loop of its own to hold a bot. A control that schedules its work
+            # (a hand-over's claim is git work) answers with its own words instead of True,
+            # so this path never reports "applied" for something still in flight (#154).
             done = self._run_control_now(note.action)
         except Exception:                      # noqa: BLE001 - a note must not break routing
             logger.warning("control note: %s failed", note.action, exc_info=True)
             return f"failed: {note.action}"
+        if isinstance(done, str):
+            return done
         if not done:
             # It passed every check and still could not be carried out: say so, loudly.
             logger.warning("control note: %s arrived but this bot cannot carry it out",
@@ -2979,7 +2983,7 @@ class AgentChannel:
         except (TypeError, ValueError):
             return False
 
-    def _run_control_now(self, action: str) -> bool:
+    def _run_control_now(self, action: str) -> Any:
         """The synchronous half of :meth:`_run_control`: the controls that only set state.
 
         Returns whether it actually carried the action out. That matters more than it looks:
@@ -3000,8 +3004,12 @@ class AgentChannel:
         elif action == "swarm.lease":
             # The second half of a hand-over (#154): the holder has already yielded and named
             # this bot, so it claims the next term -- no loop needed, because the note path
-            # must not wait for one.
-            return self._take_lease_soon()
+            # must not wait for one. "accepted", never "applied": the claim is a git write
+            # that has not landed when this returns.
+            if not self._take_lease_soon():
+                return False
+            return (f"accepted: {action} -- {self.config.identity.alias} is claiming the next "
+                    f"term now")
         elif action == "swarm.pause_all":
             # The broadcast half: the presser holds itself, and every peer that receives
             # ``target=*`` holds itself here.
@@ -3408,7 +3416,11 @@ class AgentChannel:
             "swarm.lease", who, presser or "0", time.time(), done=True, value="take"))
         try:
             async with self._lease_lock():
-                await asyncio.to_thread(store.yield_lease, reason=f"handed over to {who}")
+                # The term read above, not the current one: the successor may already have
+                # claimed N+1 from the note, and a yield written at N+1 would elect its own
+                # claim and mark the new term dead (#154 review).
+                await asyncio.to_thread(store.yield_lease, reason=f"handed over to {who}",
+                                        term=term)
         except Exception as exc:                   # noqa: BLE001 - reported to the presser
             logger.warning("lease: %s could not yield for a hand-over", me, exc_info=True)
             raise ControlRefused(f"hand-over: the note is out but the yield did not reach the "

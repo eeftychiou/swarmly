@@ -271,8 +271,9 @@ class TestTheHandOver(unittest.IsolatedAsyncioTestCase):
             # No loop here, as on the machine-note path: the claim runs inline.
             line = (f"CONTROL swarm.lease target=Codex by={self.ADMIN} "
                     "at=2027-01-15T08:00:00Z state=done value=take")
-            self.assertEqual(codex.apply_control_note(line, sender="Claude"),
-                             "applied: swarm.lease")
+            answer = codex.apply_control_note(line, sender="Claude")
+            self.assertIn("accepted: swarm.lease", answer)   # the claim is still in flight
+            self.assertNotIn("applied", answer)
             # The note path does not wait for git work: the claim runs as a spawned task.
             await asyncio.gather(*list(getattr(codex, "_lease_tasks", ())))
             state = codex.lease_store().state(now=1000.0)
@@ -309,6 +310,49 @@ class TestTheHandOver(unittest.IsolatedAsyncioTestCase):
                     await claude.hand_over_lease(who)
                 self.assertIn(why, str(caught.exception))
             self.assertTrue(claude.lease_store().state(now=1000.0).holds("Claude", 1000.0))
+
+    async def test_a_claim_that_lands_before_the_yield_does_not_kill_the_new_term(self):
+        """The hand-over writes the note first, so the successor can claim N+1 before the
+        holder's yield lands. A yield lifted to *that* term would elect the successor's own
+        claim and read it as yielded -- the new term dead under the old holder's name (#154
+        review). The yield is written at the term it ends, so it lands below and is ignored.
+        """
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)                 # Claude, term 1
+            self.assertEqual(claude.lease_store().state(now=1000.0).term, 1)
+
+            first = await codex._take_handed_lease()              # the successor is quicker
+            self.assertEqual(first, 2)
+
+            # The holder's yield arrives afterwards, ending the term it gave away.
+            claude.lease_store().yield_lease(reason="handed over to Codex", now=1000.0, term=1)
+            state = codex.lease_store().state(now=1000.0)
+            self.assertEqual((state.holder, state.term), ("Codex", 2))
+            self.assertTrue(state.holds("Codex", 1000.0))
+            self.assertFalse(state.holds("Claude", 1000.0))
+
+    async def test_a_yield_defaults_to_the_term_it_ends(self):
+        """Without a term, the yield still ends the *current* one: the old callers keep working."""
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            claude.lease_store().yield_lease(reason="frozen", now=1000.0)
+            self.assertFalse(claude.lease_store().state(now=1000.0).live(1000.0))
+
+    async def test_the_hand_over_yields_the_term_it_read_not_the_current_one(self):
+        """The channel passes the term it read: that is the whole fix, at the call site."""
+        with TemporaryDirectory() as tmp:
+            root, clock = Path(tmp), {"t": 1000.0}
+            claude, hermes, codex = self.swarm(root, clock)
+            await claude.check_lease(now=1000.0)
+            await claude.hand_over_lease("Codex", presser="4242")
+            yielded = [claim for claim in claude.lease_store().claims(now=1000.0) or ()
+                       if claim.yielded and claim.alias == "Claude"]
+            self.assertTrue(yielded)
+            self.assertEqual({claim.term for claim in yielded}, {1})
 
     async def test_a_yielded_term_cannot_be_revived_by_claiming_it_again(self):
         """#126's rule, from the other side: a stale holder writes and the fold still says no."""
