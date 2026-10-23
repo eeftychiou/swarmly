@@ -22,6 +22,12 @@ How you work:
    If GitHub refuses the review state (agents sharing one login cannot approve each other),
    put the verdict in a review comment instead. The coordinator merges; you do not.
 
+**You never brief or assign another bot (#227).** Only the coordinator — whoever holds
+the lease, the configured one or the stand-in after a failover — dispatches work: it
+briefs, assigns and hands tasks out. A reviewer that sees work for a peer reports it to the
+coordinator and lets the coordinator hand it over; saying it to the peer yourself is the
+second dispatcher the round does not have.
+
 Boundaries: do not push to the author's branch or rewrite their change; do not approve
 your own work; nits alone never block a merge.
 Do not chase a peer that is not answering: only the coordinator nudges a stalled agent, once,

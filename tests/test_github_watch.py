@@ -732,8 +732,15 @@ class TestARoundEndsOnlyWhenEveryItemIsDone(unittest.IsolatedAsyncioTestCase):
             return PR(number=int(number), title=f"#{number}", body="", author="claude",
                       state=state)
 
+        def ref_state(repo, number):
+            """``gh api``'s one-call answer: an issue's or a PR's state (#227)."""
+            kind, state = items.get(int(number), ("issue", "CLOSED"))
+            word = str(state).strip().lower()
+            return "merged" if kind == "pr" and word == "merged" else word
+
         client.issue_view.side_effect = issue_view
         client.pr_view.side_effect = pr_view
+        client.ref_state.side_effect = ref_state
         return client
 
     async def test_a_close_with_an_open_item_gets_no_report_and_names_the_item(self):
@@ -795,6 +802,8 @@ class TestARoundEndsOnlyWhenEveryItemIsDone(unittest.IsolatedAsyncioTestCase):
         client.issue_view.side_effect = None
         client.issue_view.return_value = None
         client.pr_view.return_value = None
+        client.ref_state.side_effect = None
+        client.ref_state.return_value = None          # gh could not answer for the item
         with TemporaryDirectory() as tmp:
             ch = self.channel()
             await self.watcher(tmp, client, ch).poll_once()
@@ -816,11 +825,133 @@ class TestARoundEndsOnlyWhenEveryItemIsDone(unittest.IsolatedAsyncioTestCase):
                     number=int(number), title="", body="", author="claude",
                     state=items.get(int(number), ("issue", "CLOSED"))[1])
                 client.pr_view.return_value = None
+                client.ref_state.side_effect = (
+                    lambda repo, number, items=items:
+                    items.get(int(number), ("issue", "CLOSED"))[1].lower())
                 await self.watcher(tmp, client, ch).poll_once()
         sent = ch._adapter_for.return_value.received
         self.assertEqual(len(sent), 2)
         self.assertIn("the round is not over", sent[0].text)
         self.assertIn("post the round report now", sent[1].text)
+
+
+class TestAParentClosesWithItsLastSlice(unittest.IsolatedAsyncioTestCase):
+    """#227 item 2: a parent issue closes once every slice it lists has landed.
+
+    The 22 Oct case: #117 stayed open after #133, #153 and #154 had all merged. The transport
+    already reads a tracking issue's checklist to refuse an early close; it now uses the same
+    check to close the parent when nothing is missing — with one line naming the slices, and
+    the state of each slice deciding, never a ticked box.
+    """
+
+    BODY = "- [ ] #65\n- [ ] #68\n"
+
+    def channel(self):
+        ch = MagicMock()
+        ch.adapter = ch._adapter_for.return_value = FakeAdapter()
+        ch.send = AsyncMock()
+        ch.has_recent_ref.return_value = False
+        return ch
+
+    def watcher(self, tmp, client, channel):
+        cfg = make_test_config(tmp, role="coordinator")
+        return GitHubWatcher(cfg, client=client, state_path=Path(tmp) / "s.json",
+                             channel=channel)
+
+    def client(self, states, items, body=None):
+        """A client whose labelled tracking issue reads ``states`` in turn, and whose listed
+        items have the states in ``items`` (``{number: ("issue"|"pr", state)}``)."""
+        client = MagicMock(spec=GitHubClient)
+        client.notifications.return_value = []
+        client.issues_with_label.side_effect = [
+            [_tracking(state=state, body=self.BODY if body is None else body)]
+            for state in states]
+
+        def ref_state(repo, number):
+            kind, state = items.get(int(number), ("issue", "CLOSED"))
+            word = str(state).strip().lower()
+            return "merged" if kind == "pr" and word == "merged" else word
+
+        client.ref_state.side_effect = ref_state
+        client.pr_view.side_effect = lambda repo, number: (
+            PR(number=int(number), title="", body="", author="claude",
+               state=items[int(number)][1])
+            if items.get(int(number), ("issue", ""))[0] == "pr" else None)
+        client.issue_view.side_effect = lambda repo, number: Issue(
+            number=int(number), title="", body="", author="claude",
+            state=items.get(int(number), ("issue", "CLOSED"))[1])
+        return client
+
+    async def test_a_parent_whose_slices_all_merged_closes_itself(self):
+        items = {65: ("pr", "MERGED"), 68: ("issue", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN", "CLOSED"], items)
+            ch = self.channel()
+            first = await self.watcher(tmp, client, ch).poll_once()
+            second = await self.watcher(tmp, client, ch).poll_once()
+        client.close_issue.assert_called_once()
+        repo, number, comment = client.close_issue.call_args.args
+        self.assertEqual((repo, number), ("example-org/webapp", 34))
+        self.assertIn("#65", comment)                    # the line names the slices...
+        self.assertIn("#68", comment)
+        # ...and the close is the round end: one report turn, not two.
+        self.assertEqual((first.turns_queued, second.turns_queued), (1, 0))
+        self.assertIn("post the round report now", ch._adapter_for.return_value.received[0].text)
+
+    async def test_a_parent_with_an_open_slice_stays_open(self):
+        items = {65: ("pr", "MERGED"), 68: ("pr", "OPEN")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN", "OPEN"], items)
+            ch = self.channel()
+            first = await self.watcher(tmp, client, ch).poll_once()
+        client.close_issue.assert_not_called()
+        self.assertEqual(first.turns_queued, 0)
+
+    async def test_a_ticked_box_is_not_proof(self):
+        """The coordinator ticked both boxes, but #68 is still open: the parent stays open."""
+        items = {65: ("pr", "MERGED"), 68: ("pr", "OPEN")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN"], items, body="- [x] #65\n- [x] #68\n")
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+        client.close_issue.assert_not_called()
+
+    async def test_a_closed_pull_request_is_not_a_landed_slice(self):
+        items = {65: ("pr", "MERGED"), 68: ("pr", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN"], items)
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+        client.close_issue.assert_not_called()
+
+    async def test_an_item_github_cannot_read_keeps_the_parent_open(self):
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN"], {})
+            client.ref_state.side_effect = None
+            client.ref_state.return_value = None        # no answer is not "landed"
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+        client.close_issue.assert_not_called()
+
+    async def test_an_issue_that_lists_nothing_is_not_a_parent(self):
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN"], {}, body="Round 6 will be planned here.")
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+        client.close_issue.assert_not_called()
+
+    async def test_a_failed_close_is_an_error_not_a_silent_success(self):
+        items = {65: ("pr", "MERGED"), 68: ("issue", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN"], items)
+            client.close_issue.return_value = False
+            ch = self.channel()
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+            state = NotificationState.load(Path(tmp) / "s.json")
+        self.assertTrue(any("could not close" in e for e in outcome.errors), outcome.errors)
+        # Not closed, so no round report was invented for it.
+        self.assertEqual(state.round_reports, {})
+        self.assertEqual(ch._adapter_for.return_value.received, [])
 
 
 class TestTrackingItemRefs(unittest.TestCase):
