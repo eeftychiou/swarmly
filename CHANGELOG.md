@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The head under review is frozen (`#183`): a message that claims a PR's head is checked against
+  the PR's `headRefOid` and a mismatch is one notice, never a closed row; a verdict still open on
+  a head the item no longer has is flagged once as a rewrite under review (the #173 case, where a
+  rebuild dropped a fix); and `ready_blockers()` answers a "ready" claim with GitHub's
+  `mergeable` fact and the head the verdicts were given on.
+
 ### Fixed
 
 - The `/owed` line says the item once and with one preposition (`… owes a review verdict on
