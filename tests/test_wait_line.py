@@ -57,6 +57,31 @@ class TestAKindEach(unittest.TestCase):
                 self.assertTrue(wl.parse_line(line, at=1000.0).is_open)
 
 
+class TestTwoQuestionsAreTwoDebts(unittest.TestCase):
+    """An admin row has no item, so it is keyed by the question -- two questions, two rows.
+
+    Without the key both rows write the id ``admin:-:admin`` and the table keeps one: the second
+    question the bot said it waits on is never owed (#209 review).
+    """
+
+    def test_two_questions_in_one_topic_key_apart(self):
+        first = wl.parse_line("WAIT answer on the Drive credentials", topic="tg-3556", at=1000.0)
+        second = wl.parse_line("WAIT answer on the CT100 network", topic="tg-3556", at=1000.0)
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(len(ow.fold([first, second])), 2)
+
+    def test_the_same_question_asked_again_is_one_debt(self):
+        said = "WAIT answer on the Drive credentials"
+        self.assertEqual(wl.parse_line(said, topic="tg-3556", at=1000.0).id,
+                         wl.parse_line(said, topic="tg-3556", at=2000.0).id)
+
+    def test_the_admin_still_settles_it_by_answering(self):
+        row = wl.parse_line("WAIT answer on the Drive credentials", topic="tg-3556", at=1000.0)
+        closed = ow.settle([row], ow.Fact(kind="reply", item="tg-3556", who=ow.ADMIN),
+                           now=2000.0)
+        self.assertEqual(len(closed), 1)                     # the key does not trap the row
+
+
 class TestARefusalSaysWhy(unittest.TestCase):
     """A line that cannot become a row is refused with the shape that would work."""
 
@@ -124,6 +149,59 @@ class TestExtraction(unittest.TestCase):
         self.assertIn("recorded", said)
 
 
+class TestARetiredWakeBecomesARow(unittest.TestCase):
+    """#165: the timer goes, the promise stays -- a ``WAKE`` line is the row that replaces it."""
+
+    def spec(self, line):
+        from swarmly.telegram import wake as wk
+        return wk.parse_line(line)
+
+    def test_a_checks_wake_is_progress_on_that_pr(self):
+        row = wl.from_wake(self.spec('WAKE in=10m check="gh pr checks 209" then="merge it"'),
+                           alias="DeepSeek", topic="tg-3556", at=1000.0)
+        self.assertEqual((row.kind, row.item, row.debtor), ("progress", "#209", "DeepSeek"))
+        self.assertIn("gh pr checks 209", row.owes)          # the promise, still written down
+        self.assertIn("merge it", row.opened_by)
+        self.assertEqual(row.topic, "tg-3556")
+        self.assertEqual(row.deadline, 1600.0)               # when the timer would have fired
+
+    def test_a_check_on_nothing_is_progress_with_no_item(self):
+        row = wl.from_wake(self.spec('WAKE in=1m check="git status" then="go"'),
+                           alias="DeepSeek", at=1000.0)
+        self.assertEqual((row.kind, row.item), ("progress", ""))
+        self.assertEqual(row.deadline, 1060.0)
+
+    def test_a_line_with_no_in_is_flagged_rather_than_quietly_kept(self):
+        """A row nothing can act on is a promise nobody keeps (#213 review)."""
+        class Bare:                     # a spec whose `in=` never made it into the row
+            argv = ("git", "status")
+            then = "go"
+            in_seconds = 0.0
+            every_seconds = 0.0
+            until_seconds = 0.0
+
+        row = wl.from_wake(Bare(), alias="DeepSeek", at=1000.0)
+        self.assertEqual(row.deadline, 0.0)
+        self.assertIn("no in=", row.flag)          # `/owed` shows it, rather than hiding it
+
+    def test_every_and_until_are_written_down(self):
+        row = wl.from_wake(self.spec('WAKE in=10m every=5m until=2h '
+                                     'check="gh pr checks 209" then="merge it"'),
+                           alias="DeepSeek", at=1000.0)
+        self.assertIn("every 5m", row.opened_by)
+        self.assertIn("until 120m", row.opened_by)
+
+    def test_two_checks_on_one_pr_are_two_promises(self):
+        same = wl.from_wake(self.spec('WAKE in=1m check="gh pr checks 209" then="go"'),
+                            alias="DeepSeek", at=1000.0)
+        again = wl.from_wake(self.spec('WAKE in=1m check="gh pr checks 209" then="go"'),
+                             alias="DeepSeek", at=2000.0)
+        other = wl.from_wake(self.spec('WAKE in=1m check="gh pr diff 209" then="go"'),
+                             alias="DeepSeek", at=1000.0)
+        self.assertEqual(same.id, again.id)                  # re-arming one check is one row
+        self.assertNotEqual(same.id, other.id)
+
+
 class TestTheTransportRecordsIt(unittest.TestCase):
     """`apply_wait_lines`: the row is saved, the ack is posted, the line never is."""
 
@@ -165,6 +243,15 @@ class TestTheTransportRecordsIt(unittest.TestCase):
         self.assertEqual(channel._test_table[1].load(), [])
         self.assertIn("WAIT refused", said)
         self.assertIn("needs the head", said)
+
+    def test_two_questions_to_the_admin_are_two_rows(self):
+        channel = self.channel()
+        channel.apply_wait_lines(
+            "Two things I need.\nWAIT answer on the Drive credentials\n"
+            "WAIT answer on the CT100 network", self.event())
+        rows = channel._test_table[1].load()
+        said = sorted(row.owes for row in rows)
+        self.assertEqual(len(rows), 2, said)                 # one row per question, not one
 
     def test_a_reply_with_no_wait_line_is_untouched(self):
         channel = self.channel()

@@ -1225,18 +1225,45 @@ coordinator's, `progress` an owner's, and `answer` the admin's. A head-bound kin
 `head <sha>` is refused, a verdict/merge/progress without `from <alias>` is refused, `ci` may
 not name a bot as its debtor, and an unknown kind is refused with the list — every refusal is
 said back into the reply, and the line is removed either way (a WAIT the bot believes it made
-is a promise the ladder (#164) and the wakes (#163) both act on). The line leaves the reply
-like a `WAKE` does, so the prose is what the swarm reads and the row is what the transport
-reads. Arming a `WAKE` still works on this release; retiring it, the coordinator watchdog and
-the separate hand-off reminders is the rest of #165, once the rows are what the swarm actually
-relies on.
+is a promise the ladder (#164) and the wakes (#163) both act on). An `answer` row is keyed by
+the question it asks (the way `owed.admin_row` keys it), so two questions to the admin in one
+topic are two debts and the second is not swallowed by the first; the same question asked again
+updates the one row, and the admin answering in that topic settles it either way. The line
+leaves the reply like a `WAKE` does, so the prose is what the swarm reads and the row is what
+the transport reads. Arming a `WAKE` still works on this release; retiring it, the coordinator
+watchdog and the separate hand-off reminders is the rest of #165, once the rows are what the
+swarm actually relies on.
 
-**Self-wake timers (issue #81).** A reply can arm a timer the transport fires without a model
-turn: `WAKE in=10m every=5m until=2h check="gh pr checks 75" then="merge it"`. The line is
-stripped like the other directives and answered with one line in the topic (`⏰ wake <id>: … at
-<first fire>, every 5m, until <expiry>`), so what will run and when is auditable. The check is
-parsed with `shlex`, run without a shell in the checkout the topic uses, and may only start with
-a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|list|status|diff`,
+**Self-wake timers (issue #81) — retired by `WAIT` (#165).** A `WAKE` line no longer arms
+anything. The transport reads it as the row that replaces it: the bot owes itself a look at what
+the check watched, with the check and the action written down (the item the check named, when it
+named one), and the guard's ladder (#164) and the wakes (#163) carry it from there, on facts. The
+ack says what row it became and names the `WAIT` line to write next time. Timers armed **before**
+this release still fire until they expire — the firing machinery, `/wakes`, the adoption rules and
+`check_coordinator_watch` are removed in the next slice of #165, so nothing new enters that path.
+
+Three things the migration changes about the promise itself:
+
+- **`in=` is the row's own deadline**, and the guard's ladder honours it (#213 review). The first
+  reminder is due when that moment passes, not at `limits.stall_minutes`; and `stall_minutes: 0`,
+  which turns the ladder's own clock off, still fires the moment a row named — a promise the swarm
+  was told was recorded cannot be one nothing acts on. A deadline is spent once its rung fires, so
+  one old deadline does not climb three rungs in three beats. A row with neither a deadline nor a
+  ladder is **flagged** in `/owed` (`no in=: only limits.stall_minutes can act on this`) instead
+  of looking kept.
+- **`every=` is refused, with a pointer.** A row is opened once and then woken by facts, with the
+  ladder as the backstop; nothing repeats, so a repeating check is told to write one `WAIT` per
+  thing it watches rather than promising a recurrence nothing performs. `until=` is written into
+  the row's `opened_by`, so the end of a wait is still on the record.
+- **Two rows can name one item.** The WAKE row is keyed per check
+  (`progress:#209@wake#<digest>:DeepSeek`) while the round sweep opens `progress:#209:DeepSeek`
+  for the same item, and `/owed` shows both. They say different things — one per check, one per
+  unticked item — and neither closes the other; a `progress` row of the check kind is settled by
+  the bot acting, not by the item moving.
+
+*While a timer armed before the migration lasts*, it behaves as before, and this is what it
+did: the check was parsed with `shlex`, run without a shell in the checkout the topic uses, and
+could only start with a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|list|status|diff`,
 `gh run view|list`, `gh api` GET only, `gh issue view`, `gh search`, and
 `git status|log|diff|show|rev-parse` — never `git fetch` or `git ls-remote`, whose `ext::`
 remotes run a command); `-X`/`--method`/`-f`/`--input`/`--output`, shell
@@ -1265,7 +1292,7 @@ after that topic's turn ends; the tick reports `held: turn running`. Limits:
 | `wake_check_seconds` | 120 | a check's own budget; past it the process group is killed |
 | `wake_max_attempts` | 50 | firings of one timer before it gives up with a turn saying so |
 | `wake_claim_settle_seconds` | 30 | how long a claim must be visible before its writer may fire it, so two overlapping pushes cannot both fire |
-| `wake_check_allow` | `["gh", "git"]` | the outer gate on which binary a check may start with |
+| `wake_check_allow` | `["gh", "git"]` | the outer gate on which binary a check may start with — only for timers armed before `WAIT` (nothing new is armed) |
 
 The check is parsed token by token and every flag is normalized first, so an attached value
 (`-XPOST`, `--field=body=x`, `--output=/path`) cannot smuggle a write past the allowlist; `gh api`

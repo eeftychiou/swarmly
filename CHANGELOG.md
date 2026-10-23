@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A promise that says when it wants looking at is now looked at then (`#213` review). `WAKE` rows
+  carry their `in=` as the row's own `deadline`, but the stall ladder measured only `updated_at`:
+  a bot told "look again in ten minutes" was first reminded at `limits.stall_minutes` (thirty by
+  default) and, with `stall_minutes: 0`, never. `owed_guard.stalls` now takes the row's deadline
+  first — one rung when it passes, spent afterwards so a single old deadline cannot climb three
+  rungs in three beats — and a ladder that is off still fires the moment a row named. `every=` is
+  refused with a pointer (nothing repeats: write one `WAIT` per thing watched) instead of being
+  dropped silently, `until=` and the recurrence are written into the row, and a row with neither
+  a deadline nor a ladder is flagged in `/owed` rather than looking kept.
+
 - A round-state update that carried **only** a `repo` change wrote no segment at all (`#185`
   review): `fold` took `update.repo`, but `_unchanged` — the check that keeps a repeated turn
   from adding a commit to the bus — never compared it, so the field was folded when it arrived
@@ -22,14 +32,27 @@ All notable changes to this project are documented here. The format follows
   the oldest are kept and the new arrival is dropped with a word in the topic, and a held
   message's inbox record is cleared only once its turn actually exists.
 
+### Changed
+
+- `WAKE` no longer arms a timer (round 5.5 `#165`, second slice). A `WAKE` line is read as the
+  row that replaces it — the bot owes itself a look at what the check watched, with the check
+  and the action written down and the item the check named, so the guard's ladder (`#164`) and
+  the wakes (`#163`) carry it on facts — and the ack names the `WAIT` line to write next time.
+  Nothing new enters the timer path; timers armed before this release still fire until they
+  expire, and the firing machinery, `/wakes`, the adoption rules and
+  `check_coordinator_watch` are removed in the next slice. The developer and coordinator role
+  texts now say to declare a `WAIT` where they used to say to arm a `WAKE`.
+
 ### Added
 
 - The `WAIT` line (round 5.5 `#165`, first slice): a reply says what it waits on — `WAIT review
   #133 head 38f1977 from Reasonix`, `WAIT ci #173 head 9fb2f21`, `WAIT answer on the Drive
   credentials` — and the transport opens the matching row (verdict, CI, merge, progress, the
   admin's answer) with no timer and no check. A malformed line is refused in the reply with the
-  shape that would work, and the line is stripped either way. `WAKE` still arms on this release;
-  retiring it, the coordinator watchdog and the separate reminders is the rest of `#165`.
+  shape that would work, and the line is stripped either way. An `answer` row is keyed by the
+  question it asks, so two questions to the admin in one topic are two debts rather than one
+  (`#209` review, folded in here because the merge landed at `32205e1`). The coordinator
+  watchdog and the separate hand-off reminders are the rest of `#165`.
 - A verdict is kept **once per head** (`#185`): the round state already holds the fact, so a
   repeated `review`/`qa` verdict — same `verdict`, `sha` and `by`, even with a newer `at` — writes
   no new segment and is logged as suppressed instead of restated. A verdict on a new head, or

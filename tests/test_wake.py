@@ -348,7 +348,7 @@ class TestClaims(unittest.TestCase):
 
 
 class TestChannelWiring(unittest.TestCase):
-    """A reply arms a timer, the line never reaches the channel, and /wakes lists it."""
+    """A WAKE line becomes a WAIT row and arms nothing; the line never reaches the channel."""
 
     def channel(self):
         from tests.test_telegram_channel import event, make_channel, make_config
@@ -357,18 +357,55 @@ class TestChannelWiring(unittest.TestCase):
         config = make_config(agent={"role": "developer"},
                              fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
                              limits={"wake_tick_seconds": 0})
-        return make_channel(config), event
+        channel = make_channel(config)
+        # A table of its own, so the migration test writes no row to this checkout (#190).
+        from swarmly.telegram import owed as ow
+        table = TemporaryDirectory()
+        self.addCleanup(table.cleanup)
+        table_store = ow.OwedStore("Hermes", state_dir=Path(table.name), clock=lambda: 1000.0)
+        channel.owed_store = lambda: table_store
+        channel._test_table = table_store
+        return channel, event
 
-    def test_a_wake_line_is_armed_and_stripped(self):
+    def arm(self, channel):
+        """One timer, written locally (this throwaway root is not a git bus, so it cannot be
+        pushed -- the store writes the state before it reports that)."""
+        try:
+            channel.wake_store().add(
+                wk.make_timer(wk.parse_line('WAKE in=1m check="git status" then="go"'),
+                              alias="Hermes", chat_id=-1001, thread_id=None, topic="",
+                              now=1000.0),
+                max_timers=10)
+        except wk.WakePushError:
+            pass
+
+    def test_a_wake_line_becomes_a_row_and_arms_no_timer(self):
+        """#165: the promise survives the timer. `WAKE in=10m check=… ` is progress owed."""
         channel, event = self.channel()
         body = channel.apply_wake_lines(
-            'merging once green\nWAKE in=10m every=5m until=2h check="gh pr checks 75" '
-            'then="merge it"',
+            'merging once green\nWAKE in=10m check="gh pr checks 75" then="merge it"',
             event("hi", username="ClaudeBot"))
         self.assertNotIn('check="gh pr checks 75"', body)   # the line itself is gone
         self.assertIn("merging once green", body)
-        self.assertIn("⏰ wake", body)
-        self.assertEqual(channel.wake_store().live_count, 1)
+        self.assertIn("no longer arms a timer", body)       # and the bot is told to use WAIT
+        self.assertEqual(channel.wake_store().live_count, 0)
+        rows = channel._test_table.load()
+        self.assertEqual([row.kind for row in rows], ["progress"])
+        self.assertEqual(rows[0].item, "#75")
+        self.assertIn("gh pr checks 75", rows[0].owes)
+        self.assertIn("merge it", rows[0].opened_by)
+        # The row is due when the timer would first have fired (in=10m).
+        self.assertAlmostEqual(rows[0].deadline - time.time(), 600.0, delta=30.0)
+
+    def test_a_repeating_check_is_refused_with_a_pointer(self):
+        """#213 review: `every=` promised a recurrence the rows do not perform."""
+        channel, event = self.channel()
+        body = channel.apply_wake_lines(
+            'x\nWAKE in=1m every=5m until=2h check="gh pr checks 209" then="merge it"',
+            event("hi", username="ClaudeBot"))
+        self.assertIn("repeating check has no row", body)
+        self.assertIn("second WAIT", body)
+        self.assertEqual(channel._test_table.load(), [])
 
     def test_a_refused_line_is_stripped_and_explained(self):
         channel, event = self.channel()
@@ -378,13 +415,13 @@ class TestChannelWiring(unittest.TestCase):
         self.assertNotIn('check="gh pr merge 75"', body)     # the line itself is gone
         self.assertIn("WAKE refused", body)
         self.assertEqual(channel.wake_store().live_count, 0)
+        self.assertEqual(channel._test_table.load(), [])
 
     def test_slash_wakes_lists_and_cancels(self):
         from tests.test_telegram_channel import event as make_event
-        channel, event = self.channel()
+        channel, _event = self.channel()
         self.assertIn("none armed", channel.wake_summary())
-        channel.apply_wake_lines('x\nWAKE in=1m check="git status" then="go"',
-                                 event("hi", username="ClaudeBot"))
+        self.arm(channel)
         self.assertIn("wakes=1", channel.wake_summary())
         timer_id = channel.wake_store().load()[-1].id
         admin = make_event(f"/wakes cancel {timer_id}", author_id=1234567890,
@@ -394,9 +431,8 @@ class TestChannelWiring(unittest.TestCase):
 
     def test_only_the_admin_cancels(self):
         from tests.test_telegram_channel import event as make_event
-        channel, event = self.channel()
-        channel.apply_wake_lines('x\nWAKE in=1m check="git status" then="go"',
-                                 event("hi", username="ClaudeBot"))
+        channel, _event = self.channel()
+        self.arm(channel)
         timer_id = channel.wake_store().load()[-1].id
         peer = make_event(f"/wakes cancel {timer_id}", author_id=202, username="CodexBot")
         self.assertIn("only the admin", channel._wakes_command(peer))
@@ -1351,28 +1387,26 @@ class TestPublicationSurfaces(unittest.TestCase):
                 store.add(self.timer(), max_timers=10)
             self.assertEqual(store.live_count, 1)       # it is armed here, and said so
 
-    def test_a_refused_state_is_reported_in_the_wake_ack(self):
+    def test_a_refused_table_is_reported_in_the_ack(self):
+        """#165: the row is the promise now, so a table that will not take it must say so."""
         from tests.test_telegram_channel import event, make_channel, make_config
+        from swarmly.telegram import owed as ow
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         config = make_config(agent={"role": "developer"},
                              fallback={"gitbus_root": tmp.name, "gitbus_ref": ""},
                              limits={"wake_tick_seconds": 0})
         channel = make_channel(config)
-        store = wk.WakeStore(channel.config.identity.alias,
-                             state_dir=Path(tmp.name) / "state", transport=None,
-                             root=Path(tmp.name), clock=time.time)
+        store = ow.OwedStore("Hermes", state_dir=Path(tmp.name) / "state", clock=time.time)
 
-        def refuse(timer, *, max_timers):
-            store.write(timer)
-            raise wk.WakePushError("the bus did not take the state")
+        def refuse(rows):
+            raise ow.OwedPushError("the bus did not take the state")
 
-        store.add = refuse
-        channel.wake_store = lambda: store
-        channel.lease_fence = lambda now=None: True
+        store.save_all = refuse
+        channel.owed_store = lambda: store
         body = channel.apply_wake_lines('x\nWAKE in=1m check="git status" then="go"',
                                         event("hi", username="ClaudeBot"))
-        self.assertIn("armed locally only", body)
+        self.assertIn("WAKE not recorded", body)
         self.assertIn("the bus did not take the state", body)
 
 

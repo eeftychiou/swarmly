@@ -20,8 +20,9 @@ the line is refused.
 
 from __future__ import annotations
 
+import hashlib
 import time
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from swarmly.telegram.owed import ADMIN, CI, OwedError, Row
 
@@ -93,6 +94,17 @@ def _owes(kind: str, words: Sequence[str], head: str, item: str) -> str:
     }.get(kind, "something")
 
 
+def _question_key(owes: str) -> str:
+    """The question, keyed the way ``owed.admin_row`` keys it: two questions, two debts.
+
+    A row's id is ``<kind>:<item>[@<head>][@<key_extra>]:<debtor>``, and an admin row usually
+    has no item -- so without a key two questions to the admin in one topic write the same id
+    and the second is never owed (#209 review). The question is what differs, so it is what
+    keys the row; the same question asked again updates the one row.
+    """
+    return hashlib.sha1(owes.encode("utf-8")).hexdigest()[:7]
+
+
 def parse_line(line: str, *, topic: str = "", place: str = "",
                at: Optional[float] = None) -> Row:
     """One ``WAIT`` line as a row. Raises :class:`WaitError` with the reason it cannot be one."""
@@ -119,15 +131,69 @@ def parse_line(line: str, *, topic: str = "", place: str = "",
         raise WaitError("WAIT ci is owed by the transport, not a bot: drop "
                         f"'from {debtor}'")
     owes = _owes(kind, words, head, item)
+    row_kind = KINDS[kind]
+    if row_kind == "handoff":
+        extra = place
+    elif row_kind == "admin":
+        extra = f"{topic or '-'}#q{_question_key(owes)}"
+    else:
+        extra = ""
     try:
-        return Row(kind=KINDS[kind], item=item, debtor=debtor or (CI if KINDS[kind] == "ci"
-                                                                 else ADMIN),
+        return Row(kind=row_kind, item=item, debtor=debtor or (CI if row_kind == "ci" else ADMIN),
                    owes=f"a {kind} {owes}" if kind in ("review", "qa") else owes,
-                   head=head, topic=topic, key_extra=place if KINDS[kind] == "handoff" else "",
+                   head=head, topic=topic, key_extra=extra,
                    opened_by=f"WAIT line in {topic or 'a discussion'}",
                    created_at=moment, updated_at=moment)
     except OwedError as exc:
         raise WaitError(str(exc)) from exc
+
+
+def from_wake(spec: Any, *, alias: str, topic: str = "", at: Optional[float] = None) -> Row:
+    """A retired ``WAKE`` line as the row that replaces it (#165).
+
+    ``WAKE in=10m check="gh pr checks 209" then="merge it"`` was a promise to *look again* at
+    something in ten minutes. The step the migration removes is the timer, not the promise, so
+    the promise becomes a row: the bot owes itself progress on the item the check named, with
+    the check and the action written down, and the guard's ladder (#164) and the wakes (#163)
+    act on it. A check that names no item (``git status``) is progress with no item.
+
+    The check is part of the row's key: two checks on one PR are two promises, and re-arming
+    the same check updates the row instead of opening a second one -- which is what the old
+    "one standing check per PR or issue" rule did by replacing the timer.
+    """
+    moment = time.time() if at is None else float(at)
+    from swarmly.telegram.wake import subject_of
+
+    argv = tuple(getattr(spec, "argv", ()) or ())
+    check = " ".join(argv) or str(getattr(spec, "check", "") or "").strip()
+    subject = subject_of(argv) if argv else None
+    kind, number, repo = subject if subject else ("", "", "")
+    item = f"#{number}" if number else ""
+    then = str(getattr(spec, "then", "") or "").strip()
+    in_seconds = float(getattr(spec, "in_seconds", 0.0) or 0.0)
+    every_seconds = float(getattr(spec, "every_seconds", 0.0) or 0.0)
+    until_seconds = float(getattr(spec, "until_seconds", 0.0) or 0.0)
+    where = f" in {repo}" if repo else ""
+    opened = (f"a WAKE line that checked `{check}`{where}"
+              + (f" then \"{then[:100]}\"" if then else "")
+              + (f", every {_minutes(every_seconds)}" if every_seconds else "")
+              + (f" until {_minutes(until_seconds)}" if until_seconds else ""))
+    deadline = (moment + in_seconds) if in_seconds else 0.0
+    return Row(kind="progress", item=item, debtor=str(alias or "").strip(),
+               owes=f"a look at `{check}`{where}",
+               key_extra=f"wake#{_question_key(check)}", topic=topic,
+               opened_by=opened[:200], deadline=deadline, created_at=moment, updated_at=moment,
+               # A row nothing can act on is a promise nobody keeps (#213 review): with no
+               # `in=` the ladder's own clock is the only one left, and it may be off.
+               flag="" if deadline else "no in=: only limits.stall_minutes can act on this")
+
+
+def _minutes(seconds: float) -> str:
+    """Seconds as the line wrote them: minutes when they are whole ones, else seconds."""
+    value = float(seconds or 0.0)
+    if value >= 60 and value % 60 == 0:
+        return f"{int(value // 60)}m"
+    return f"{value:g}s"
 
 
 def extract_waits(text: str, *, topic: str = "", place: str = "",

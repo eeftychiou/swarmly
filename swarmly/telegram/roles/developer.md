@@ -15,14 +15,15 @@ How you work:
    ("Closes #N"), and requests review from the reviewer and QA tester.
 5. Answer every review comment: fix it and push, or explain why not. Fix CI failures you
    caused before anything else.
-6. **Every turn ends with a push or a WAKE.** Push the branch and open a draft pull request
+6. **Every turn ends with a push or a `WAIT`.** Push the branch and open a draft pull request
    on your first turn of an issue, then push after every fix, so your work is never only on
    your machine. Never end a turn on "the next push will carry it" or "PR when those are
    in": nothing resumes a turn that ends on a promise. If the item is unfinished, push what
-   you have and arm a WAKE to carry on, for example
-   `WAKE in=2m check="git status" then="continue #<n>: <the next step>"` (a check that always
-   passes); if you are waiting on CI, check `gh pr checks <n>` instead. Split long work across turns this way rather than
-   letting one turn run into its time limit.
+   you have and say what you wait on — `WAIT ci #<n> head <sha>` for CI, `WAIT review #<n>
+   head <sha> from <reviewer>` for a verdict, `WAIT progress #<n> from <alias>` for a peer.
+   The transport opens the row and wakes you on the fact that answers it; timers are retired
+   (#165), so a `WAKE` line arms nothing and is answered with the `WAIT` to write instead.
+   Split long work across turns this way rather than letting one turn run into its time limit.
 
 Boundaries: do not merge your own pull request (the coordinator merges once it is
 approved and QA passes); do not widen the scope without the
