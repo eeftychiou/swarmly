@@ -32,6 +32,18 @@ All notable changes to this project are documented here. The format follows
   the oldest are kept and the new arrival is dropped with a word in the topic, and a held
   message's inbox record is cleared only once its turn actually exists.
 
+### Removed
+
+- The coordinator's watchdog (`#165`). `check_coordinator_watch` gave an idle coordinator a turn
+  because *time had passed* — the one remaining turn started by a clock rather than a fact. It is
+  gone, together with `_note_turn_for_watch`, its `coordinator-watch` state file and
+  `limits.coordinator_watch_minutes`; a config that still sets the limit gets an `unknown key,
+  ignored` note from `swarmly-telegram check`. What replaces it is the orphan invariant (`#164`):
+  an open item whose next actor cannot be derived is a row, and the guard's ladder reminds its
+  debtor, then the coordinator, then the admin — so the wake names the item it is about. The wake
+  loop stays for one more slice, for timers armed before the migration; it no longer checks in on
+  anyone.
+
 ### Changed
 
 - `WAKE` no longer arms a timer (round 5.5 `#165`, second slice). A `WAKE` line is read as the

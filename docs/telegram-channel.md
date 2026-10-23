@@ -627,11 +627,14 @@ dropped without a word. A restart that interrupted several turns resumes them on
 time, oldest first: each resumed turn claims the next when it finishes, so six cut-off turns
 never become six turns at once.
 
-**The coordinator checks in when nothing wakes it.** A coordinator that holds no WAKE and has
-had no turn for `limits.coordinator_watch_minutes` (default 30) gets one turn in the topic it
-last worked in, asking it to look at the round and act on whatever waits, or to answer
-`NO_REPLY`. The wait doubles after each check (up to 8 hours), any other turn resets it, and
-it stops a day after the last turn. `0` turns it off.
+**Nothing wakes a coordinator on a clock (retired, #165).** The watchdog
+(`check_coordinator_watch`) is gone: it started a turn because *time had passed*, which is the
+behaviour round 5.5 removes. What replaces it is the orphan invariant (#164) — an open item whose
+next actor cannot be derived is a row, and the guard's ladder reminds its debtor, then tells the
+coordinator, then the admin — so an idle coordinator is woken by a **fact about the work**, never
+by a timer, and the wake names the item it is about. `limits.coordinator_watch_minutes` is
+removed; a config that still sets it gets an `unknown key, ignored` note from
+`swarmly-telegram check`, not a silent no-op.
 **A bot that dies says nothing, so the swarm listens for its pulse.** Every transport writes one
 heartbeat every `limits.heartbeat_minutes` (default 2) carrying its revision, term, role and,
 while a turn is running, `busy_since`. It is a silent Telegram line (`limits.heartbeat_plane:
@@ -1240,7 +1243,8 @@ the check watched, with the check and the action written down (the item the chec
 named one), and the guard's ladder (#164) and the wakes (#163) carry it from there, on facts. The
 ack says what row it became and names the `WAIT` line to write next time. Timers armed **before**
 this release still fire until they expire — the firing machinery, `/wakes`, the adoption rules and
-`check_coordinator_watch` are removed in the next slice of #165, so nothing new enters that path.
+are removed in the next slice of #165, so nothing new enters that path (`check_coordinator_watch`
+is gone already: see "Nothing wakes a coordinator on a clock").
 
 Three things the migration changes about the promise itself:
 
