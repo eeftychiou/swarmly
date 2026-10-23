@@ -944,6 +944,10 @@ class GitHubSettings:
     #: The label that marks a tracking issue (round end): closing one wakes the coordinator
     #: to post the round report (issue #25). "" disables the watch.
     tracking_label: str = "tracking"
+    #: Watch CI on every open PR of each project's repo on every poll, and wake the
+    #: coordinator when a run finishes (admin, 23 Oct): what is watched never depends on a
+    #: model having named the PR. Only the lease holder polls.
+    watch_repo_ci: bool = True
 
 
 @dataclass
@@ -1297,12 +1301,14 @@ class AgentConfig:
             gpoll = _parse_int("github.poll_minutes", github_raw.get("poll_minutes"), 5)
             gmark = _parse_bool("github.mark_read", github_raw.get("mark_read", True))
             glabel = str(github_raw.get("tracking_label", "tracking") or "").strip()
+            grepo_ci = _parse_bool("github.watch_repo_ci", github_raw.get("watch_repo_ci", True))
             github = GitHubSettings(
                 login=glogin,
                 token_env=gtoken_env,
                 poll_minutes=gpoll,
                 mark_read=gmark,
                 tracking_label=glabel,
+                watch_repo_ci=grepo_ci,
             )
         elif github_raw is not None:
             raise ConfigError("'github' must be a mapping")

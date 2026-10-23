@@ -41,7 +41,7 @@ import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -4823,38 +4823,12 @@ class AgentChannel:
             try:
                 self.owed_store().save_all(rows)
                 notes.extend(ack(row) for row in rows)
-                self._watch_ci_rows(rows, event)
             except Exception as exc:               # noqa: BLE001 - said back, not swallowed
                 logger.warning("WAIT: the rows could not be recorded", exc_info=True)
                 notes.extend(f"WAIT not recorded: {exc}" for _row in rows)
         notes.extend(f"WAIT refused: {reason}" for reason in reasons)
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
-
-    def _watch_ci_rows(self, rows: Sequence[Any], event: ChannelEvent) -> None:
-        """A ``WAIT ci #n`` row is a wait on that PR's checks: watch them, so the bot that
-        wrote it gets a turn when they finish. Live, round 5.5 (23 Oct): the row said "CI owes
-        a result", CI is no bot, and the round's last merge waited an hour for a person. A bare
-        ``#n`` only watched in a topic bound to a project; the round topic was not."""
-        if not self.config.github or self.config.github.poll_minutes <= 0:
-            return
-        project = self.router.project_for(event.chat_id, event.thread_id)
-        if project is None and len(self.config.projects) == 1:
-            project = next(iter(self.config.projects.values()))    # the swarm's one repo
-        repo = getattr(project, "repo", "") if project is not None else ""
-        if not repo:
-            return
-        from swarmly.github.watch import register_ci_watch
-        for row in rows:
-            number = str(row.item or "").lstrip("#")
-            if row.kind != "ci" or not number.isdigit():
-                continue
-            try:
-                register_ci_watch(self.config, repo, int(number), int(event.chat_id),
-                                  event.thread_id, project=getattr(project, "key", None))
-            except Exception:                              # noqa: BLE001 - the row stands
-                logger.warning("WAIT: could not watch %s#%s for CI", repo, number,
-                               exc_info=True)
 
     def apply_memory_block(self, text: str, event: ChannelEvent) -> str:
         """Take a ``MEMORY:`` block out of a reply and save it as this bot's lessons (#226).

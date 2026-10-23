@@ -870,6 +870,9 @@ class GitHubWatcher:
         for pkey, project in self.config.projects.items():
             repo = project.repo
             outcome.polled_repos.append(repo)
+            # CI on the repo itself, before and apart from the notifications: a failed
+            # notification fetch must not also blind the swarm to finished runs.
+            await self._poll_repo_ci(project, router, outcome)
             try:
                 notifs = self.client.notifications(repo=repo)
             except GitHubError as exc:
@@ -1051,6 +1054,76 @@ class GitHubWatcher:
         # turn lock and posts the reply, and the CLI path has no topic to post into.
         return await self._deliver(project, incoming, chat_id, thread_id, self._router)
 
+    async def _poll_repo_ci(self, project: Any, router: Optional[ProjectRouter],
+                            outcome: GitHubPollOutcome) -> None:
+        """Every open PR of the project's repo, every poll: a run that finishes wakes the
+        coordinator once, in the topic already about that PR (admin, 23 Oct).
+
+        What is watched comes from GitHub, never from a model: live, round 5.5, the last merge
+        waited an hour because no reply had named the PR the way the per-PR watch needed. The
+        poll runs on the lease holder only (``poll_once`` returns early elsewhere), so the
+        bot it wakes *is* the coordinator, and a successor after a failover takes it over.
+
+        A wake needs a run this poll **saw running**: ``reported`` keeps ``<sha>:pending`` for
+        a head in flight, and only a later ``<sha>:success``/``failure`` wakes. A PR already
+        finished when it is first seen (a restart, the first poll after a deploy) is recorded
+        and wakes nobody, so turning this on cannot flood the coordinator with old results.
+        """
+        github = self.config.github
+        if github is None or not getattr(github, "watch_repo_ci", True):
+            return
+        repo = str(getattr(project, "repo", "") or "")
+        if not repo:
+            return
+        lister = getattr(self.client, "open_pr_checks", None)
+        if not callable(lister):
+            return                                        # a client that cannot list PRs
+        try:
+            found = lister(repo)
+        except Exception as exc:                          # a poll must never die on CI
+            outcome.errors.append(f"repo CI {repo}: {exc}")
+            logger.warning("repo CI %s could not be polled: %s", repo, exc)
+            return
+        if found is None:
+            return
+        self._router = router
+        self.ci_state.merge_from(self.ci_state_path)
+        home = int(self.config.identity.home_channel_id or 0)
+        topics = router.topics_of(project.key) if router is not None else []
+        default = topics[0] if topics else (home, None)
+        wakes: List[Tuple[Dict[str, Any], PRChecks]] = []
+        changed = False
+        for checks in found:
+            if not checks.head_sha:
+                continue
+            key = _ci_key(repo, checks.number)
+            revision = f"{checks.head_sha}:{checks.state}"
+            before = self.ci_state.reported_result(key)
+            if before == revision:
+                continue
+            self.ci_state.mark_reported(key, revision)
+            changed = True
+            outcome.ci_watched += 1
+            if checks.state == "pending" or before != f"{checks.head_sha}:pending":
+                continue                                  # in flight, or never seen running
+            where = default
+            finder = getattr(self.channel, "topic_for_text", None)
+            if callable(finder):
+                try:
+                    hit = finder(f"#{checks.number}")
+                    if isinstance(hit, tuple) and len(hit) == 2:
+                        where = (int(hit[0]), hit[1])
+                except Exception:                         # noqa: BLE001 - keep the default
+                    logger.debug("repo CI: no topic lookup for #%s", checks.number,
+                                 exc_info=True)
+            self.ci_state.drop(key)                       # one wake: the per-PR watch is spent
+            wakes.append(({"repo": repo, "number": checks.number, "chat_id": where[0],
+                           "thread_id": where[1], "project": project.key}, checks))
+        if changed:
+            self._save_ci_state({_ci_key(repo, c.number) for _w, c in wakes})  # before turns
+        for watch, checks in wakes:
+            await self._wake_on_ci(watch, checks, outcome, router)
+
     async def _poll_ci_watches(self, outcome: GitHubPollOutcome,
                                router: Optional[ProjectRouter] = None) -> None:
         """Wake each waiting agent once when its PR's checks reach a terminal state (#24).
@@ -1154,7 +1227,8 @@ class GitHubWatcher:
             text += (" Fix the failing checks — or say on the PR why they cannot be fixed — "
                      "then push again.")
         else:
-            text += " The PR is ready for review and QA."
+            text += (" The PR is ready for review and QA -- or to merge, if both verdicts are "
+                     "already on this head.")
         if checks.url:
             text += f"\n{checks.url}"
         project = None
