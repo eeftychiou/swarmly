@@ -319,6 +319,80 @@ class TestChannelWiring(unittest.TestCase):
         self.assertIn("waiting=#86:ci", reply)
 
 
+class TestOneVerdictPerHead(unittest.TestCase):
+    """#185: a verdict is one fact on one head, and the transport keeps it once.
+
+    Live, 22 Oct: every verdict was posted two or three times ("Already posted…"), and a bot
+    repeated its own MERGE on the same head. The state already holds the fact -- a repeat is
+    suppressed with one log line instead of another segment and another notice.
+    """
+
+    VERDICT = {"verdict": "merge", "sha": HEAD_A, "by": "Reasonix", "at": "2026-10-23T09:00:00Z"}
+
+    def _store(self, tmp):
+        return rs.RoundStore(None, root=Path(tmp), alias="Claude",
+                             authority=rs.Authority(alias="Claude"))
+
+    def _merge(self, store, verdict, *, item="202", round_key="repo#202", **extra):
+        store.append(rs.RoundUpdate(round=round_key, writer="Claude",
+                                    items={item: {"review": dict(verdict)}}, **extra))
+
+    def test_a_repeated_verdict_is_suppressed_with_one_log_line(self):
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._merge(store, self.VERDICT)
+            again = dict(self.VERDICT, at="2026-10-23T09:05:00Z")   # same fact, later stamp
+            with self.assertLogs("swarmly.telegram.rounds", level="INFO") as captured:
+                self._merge(store, again)
+            self.assertEqual(len(list(Path(tmp).rglob("*.json"))), 1,
+                             "a repeated verdict does not add a segment to the bus")
+            said = [r.getMessage() for r in captured.records
+                    if "already recorded" in r.getMessage()]
+            self.assertEqual(len(said), 1, captured.output)
+            self.assertIn("Reasonix", said[0])
+            self.assertIn("#202", said[0])
+            self.assertIn(HEAD_A, said[0])
+            held = store.load("repo#202").verdict("202", "review", head=HEAD_A)
+            self.assertEqual(held.verdict, "merge", "the verdict the round holds is unchanged")
+
+    def test_the_same_verdict_on_a_new_head_is_not_a_repeat(self):
+        """A head that moved is new information: the verdict is on new code."""
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._merge(store, self.VERDICT)
+            self._merge(store, dict(self.VERDICT, sha=HEAD_B))
+            self.assertEqual(len(list(Path(tmp).rglob("*.json"))), 2)
+            state = store.load("repo#202")
+            self.assertEqual(state.verdict("202", "review", head=HEAD_B).verdict, "merge")
+            self.assertIsNone(state.verdict("202", "review", head=HEAD_A),
+                              "the old head's verdict does not survive the move")
+
+    def test_another_bots_verdict_is_its_own_fact(self):
+        """One reviewer's word does not answer for another's: that is not a repeat."""
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._merge(store, self.VERDICT)
+            self._merge(store, dict(self.VERDICT, by="Codex"))
+            self.assertEqual(len(list(Path(tmp).rglob("*.json"))), 2)
+            self.assertEqual(store.load("repo#202").verdict("202", "review",
+                                                            head=HEAD_A).by, "Codex")
+
+    def test_a_repeat_riding_along_a_real_change_does_not_restate_the_verdict(self):
+        """The repeat is dropped from the segment; the change alongside it is still written."""
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._merge(store, self.VERDICT)
+            store.append(rs.RoundUpdate(
+                round="repo#202", writer="Claude",
+                items={"202": {"review": dict(self.VERDICT), "ci": "green"}}))
+            segments = list(Path(tmp).rglob("*.json"))
+            self.assertEqual(len(segments), 2)
+            written = json.loads(sorted(segments)[-1].read_text(encoding="utf-8"))
+            self.assertEqual(written["items"]["202"].get("ci"), "green")
+            self.assertNotIn("review", written["items"]["202"],
+                             "the repeat is not re-written into the new segment")
+
+
 class TestUnchanged(unittest.TestCase):
     """A turn that repeats the state must not add a commit to the bus's history."""
 

@@ -824,6 +824,23 @@ class RoundStore:
         if not update.term:
             update.term = trusted
 
+        if current.status == "ok":
+            repeats = _repeat_verdicts(update, current)
+            for field_name in repeats:
+                key, kind = field_name.rsplit(".", 1)
+                held = (current.items.get(key) or {}).get(kind) or {}
+                logger.info("rounds: %s's %s verdict on #%s at %s is already recorded; the "
+                            "repeat is suppressed", held.get("by") or "a bot", kind,
+                            str(key).lstrip("#"), held.get("sha") or "?")
+                update.items[key].pop(kind, None)
+                if not update.items[key]:
+                    update.items.pop(key, None)
+            if repeats and not update.items and update.order is None \
+                    and update.blockers is None and update.timers is None and not update.note:
+                # Nothing but the repeat: no new segment for a fact the round already holds.
+                existing = sorted(self.directory(update.round).glob("*.json"))
+                return str(existing[-1]) if existing else str(self.directory(update.round))
+
         if current.status == "ok" and _unchanged(update, current):
             # Nothing new: a turn that emits the same state again must not add a commit to
             # the bus's history (issue #86 review B7). Checked before the fence, so a no-op
@@ -874,6 +891,36 @@ class RoundStore:
                 f"round {update.round} is held by {settled.holder}; "
                 f"{update.holder} wrote a claim it does not hold")
         return str(path)
+
+
+def _repeat_verdicts(update: RoundUpdate, state: RoundState) -> List[str]:
+    """The verdict fields in *update* the state already holds, as ``"<item>.<kind>"`` (#185).
+
+    A verdict is one fact -- this bot said this, about this head. The same fact again says
+    nothing new, and re-stating it is how one verdict became three in the 22 Oct exports
+    (Reasonix twice on a head, Antigravity twice on a QA). Compared on the fact, not on the
+    dict: a newer ``at`` alone is still a repeat, and a different bot's verdict is that bot's
+    own -- the item's slot is per kind, and one review does not answer for another reviewer.
+    """
+    repeats: List[str] = []
+    for key, patch in update.items.items():
+        current = state.items.get(key) or {}
+        for kind in VERDICT_KINDS:
+            if kind not in patch:
+                continue
+            incoming, held = patch.get(kind), current.get(kind)
+            if not isinstance(incoming, dict) or not isinstance(held, dict):
+                continue
+            if (_fact(incoming.get("sha")) == _fact(held.get("sha"))
+                    and _fact(incoming.get("verdict")) == _fact(held.get("verdict"))
+                    and _fact(incoming.get("by")) == _fact(held.get("by"))):
+                repeats.append(f"{key}.{kind}")
+    return repeats
+
+
+def _fact(value: Any) -> str:
+    """One part of a verdict, compared the lenient way its writer will compare it."""
+    return str(value or "").strip().lower()
 
 
 def _unchanged(update: RoundUpdate, state: RoundState) -> bool:

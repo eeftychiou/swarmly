@@ -18,7 +18,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- `/diag` and `/status` report `busy_held=<n>` next to `busy_dropped=<n>` (`#204`): since `#184`
+- A verdict is kept **once per head** (`#185`): the round state already holds the fact, so a
+  repeated `review`/`qa` verdict — same `verdict`, `sha` and `by`, even with a newer `at` — writes
+  no new segment and is logged as suppressed instead of restated. A verdict on a new head, or
+  another bot's verdict, is still written. (The `NO_REPLY` half of the issue landed in `#180`:
+  `drop_stray_silence` removes the sentinel anywhere in a reply, and a reply that is only it posts
+  nothing.)
   a full queue holds more than it drops, so `busy_dropped=0` alone reads as "nothing was lost"
   while a message waits in the held queue. The `/status` line grows by one token, and the test
   that bounds its length moves with the token set.
