@@ -530,7 +530,10 @@ delegation above keeps its teeth: a message that asks **one** bot and mentions a
 who should receive the work is still that one bot's. The test is in code, not in a model's
 reading (`swarmly/telegram/handoff_split.py`): a bot has a request when its words carry a
 politeness word, a question mark, or one of the verbs the swarm uses (`review`, `QA`, `push`,
-`fix`, `merge`, …).
+`fix`, `merge`, …) **in the first sentence after its handle** — a question two sentences on
+belongs to whoever that sentence is for. A line is split too, not just a message: two asks on
+one line (`@a: review it. @b: QA it.`) give each bot its own half, and a line that only
+*mentions* another bot is context both of them keep.
 
 **Loop brake:** a forum topic takes at most `limits.max_peer_turns_per_topic` (default 8; it was 3, which a round of questions to four bots tripped in a live test)
 turns in a row that a peer bot started, explicit mentions included. Visible progress resets

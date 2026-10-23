@@ -56,6 +56,22 @@ def _known(handles: Iterable[str]) -> List[str]:
     return out
 
 
+#: The end of a sentence: a terminator followed by a space or the end of the text. The
+#: terminator itself is kept, so a question mark still counts as the ask it is.
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+
+
+def _first_sentence(text: str) -> str:
+    """*text* up to the end of its first sentence.
+
+    A question mark two sentences after a handle belongs to whoever that later sentence is
+    for: "@Codex: the review is in. Any news?" asks Codex, but "@Codex: the review is in, and
+    @B agreed yesterday. Any news?" must not ask @B (#181 review).
+    """
+    match = _SENTENCE_END.search(text)
+    return text[:match.end()] if match else text
+
+
 def _segments(text: str, known: Sequence[str]) -> List[Tuple[int, str, str]]:
     """``(position, handle, what follows it)`` for every known handle, in the text's order.
 
@@ -98,8 +114,9 @@ def requests(text: str, handles: Iterable[str]) -> List[str]:
             continue
         # An ask carries a politeness word, a question mark, or one of the verbs the swarm
         # uses. A mention in passing carries none of those ("... and @B agreed yesterday"),
-        # which is context: `is_multi_recipient` must not split a message over it.
-        if _ASKS.search(body_after):
+        # which is context: `is_multi_recipient` must not split a message over it. Only the
+        # segment's first sentence counts, so a question two sentences on is not this bot's.
+        if _ASKS.search(_first_sentence(body_after)):
             asked.append(name)
     return asked
 
@@ -127,20 +144,27 @@ def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
     for line in body.splitlines():
         names = [_norm(match.group(1)) for match in _HANDLE.finditer(line)]
         names = [name for name in names if name in known]
-        if not names or mine in names:
-            kept.append(line)               # shared context, or this bot's own line
+        if not names:
+            kept.append(line)               # shared context: it asks nobody
+            continue
+        asked = [_norm(name) for name in requests(line, known)]
+        if mine in asked:
+            # My share of *this* line: the shared prefix when mine is its first handle, then
+            # my segment up to the next handle. Two asks on one line therefore give each bot
+            # its own, which is the shape Claudebot posts most (#181 review).
+            segments = _segments(line, known)
+            for index, (offset, name, _tail) in enumerate(segments):
+                if name != mine:
+                    continue
+                stop = segments[index + 1][0] if index + 1 < len(segments) else len(line)
+                prefix = line[:offset] if index == 0 else ""
+                piece = (prefix + line[offset:stop]).strip()
+                if piece:
+                    kept.append(piece)
+                break
+            continue
+        if asked:
+            continue                        # another bot's ask: theirs, not mine
+        kept.append(line)                   # a mention only: context, not a task
     kept_text = "\n".join(kept).strip()
     return kept_text or body
-
-
-def split(text: str, handles: Iterable[str]) -> dict:
-    """Every bot with a request, and the brief it should read: ``{handle: brief}``.
-
-    The transport uses this to say, in one place, who was handed what -- and a test can assert
-    the whole split instead of one bot's view of it.
-    """
-    known = _known(handles)
-    asked = requests(text, known)
-    if len(asked) < 2:
-        return {}
-    return {name: own_brief(text, name, known) for name in asked}

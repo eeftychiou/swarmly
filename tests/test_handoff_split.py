@@ -37,7 +37,14 @@ class TestWhoIsAsked(unittest.TestCase):
         """The case the refusal was written for: A is asked to hand the work to B."""
         text = "@Codex please hand @Reasonix the task, it is already in the topic."
         self.assertFalse(hs.is_multi_recipient(text, BOTS))
-        self.assertEqual(hs.split(text, BOTS), {})
+        self.assertEqual(hs.requests(text, BOTS), ["codex"])   # A is asked, B is not
+
+    def test_a_question_after_a_passing_mention_is_not_an_ask(self):
+        """#181 review: the "?" closed Codex's sentence, not the mention inside it."""
+        text = ("@Codex: the review is in, and @reasonix_dd_bot agreed with it yesterday. "
+                "Any news?")
+        self.assertEqual(hs.requests(text, BOTS), ["codex"])
+        self.assertFalse(hs.is_multi_recipient(text, BOTS))
 
     def test_a_name_in_passing_is_not_a_request(self):
         text = "@Codex: the review is in, and @Reasonix agreed with the verdict yesterday."
@@ -60,24 +67,50 @@ class TestTheSplit(unittest.TestCase):
                 "@reasonix_dd_bot: re-review #195.\n"
                 "@agy_dd_bot: QA #195 at cc57d8a.\n"
                 "Both need the result in this topic.")
-        split = hs.split(text, BOTS)
-        self.assertEqual(sorted(split), ["agy_dd_bot", "reasonix_dd_bot"])
-        self.assertIn("The round is stuck", split["reasonix_dd_bot"])
-        self.assertIn("re-review #195", split["reasonix_dd_bot"])
-        self.assertNotIn("QA #195", split["reasonix_dd_bot"])     # that is the other bot's ask
-        self.assertIn("Both need the result", split["reasonix_dd_bot"])   # shared context
-        self.assertIn("QA #195", split["agy_dd_bot"])
-        self.assertNotIn("re-review #195", split["agy_dd_bot"])
+        reasonix = hs.own_brief(text, "reasonix_dd_bot", BOTS)
+        agy = hs.own_brief(text, "agy_dd_bot", BOTS)
+        self.assertIn("The round is stuck", reasonix)
+        self.assertIn("re-review #195", reasonix)
+        self.assertNotIn("QA #195", reasonix)              # that is the other bot's ask
+        self.assertIn("Both need the result", reasonix)    # shared context
+        self.assertIn("QA #195", agy)
+        self.assertNotIn("re-review #195", agy)
+
+    def test_two_asks_on_one_line_give_each_bot_its_own(self):
+        """The blocker at f7a5793: a line-level split handed each bot *both* asks.
+
+        This is the shape Claudebot posts most: one line, two handles, two asks.
+        """
+        text = "@reasonix_dd_bot: review it. @agy_dd_bot: QA it."
+        reasonix = hs.own_brief(text, "reasonix_dd_bot", BOTS)
+        agy = hs.own_brief(text, "agy_dd_bot", BOTS)
+        self.assertIn("review it", reasonix)
+        self.assertNotIn("QA it", reasonix)
+        self.assertIn("QA it", agy)
+        self.assertNotIn("review it", agy)
 
     def test_one_recipient_is_not_split(self):
-        self.assertEqual(hs.split("@Codex: review #195 please.", BOTS), {})
+        text = "@Codex: review #195 please."
+        self.assertEqual(hs.own_brief(text, "Codex", BOTS), text)
 
     def test_a_brief_is_never_emptied(self):
         """A message that is only bullets for others still gives context, not nothing."""
         text = ("- @reasonix_dd_bot: re-review #195 today please\n"
                 "- @agy_dd_bot: QA #195 at cc57d8a this morning")
-        split = hs.split(text, BOTS)
-        self.assertTrue(all(brief.strip() for brief in split.values()))
+        asked = hs.requests(text, BOTS)
+        self.assertEqual(sorted(asked), ["agy_dd_bot", "reasonix_dd_bot"])
+        self.assertTrue(all(hs.own_brief(text, bot, BOTS).strip() for bot in asked))
+
+    def test_a_line_that_only_mentions_another_bot_is_context(self):
+        """#181 review: a mention is not an ask, so the line is not another bot's brief."""
+        text = ("@reasonix_dd_bot: review #195.\n"
+                "@agy_dd_bot: QA #195 at cc57d8a.\n"
+                "@Codex agreed with the spec yesterday.")
+        self.assertTrue(hs.is_multi_recipient(text, BOTS))      # so a split happens at all
+        own = hs.own_brief(text, "reasonix_dd_bot", BOTS)
+        self.assertIn("review #195", own)
+        self.assertNotIn("QA #195", own)                        # @agy's ask
+        self.assertIn("agreed with the spec", own)               # context, not a task for @Codex
 
     def test_a_bots_own_brief_keeps_its_line_when_it_is_not_first(self):
         """The live shape: the bot that was not the first handle still gets its own ask."""
