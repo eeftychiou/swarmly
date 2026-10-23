@@ -128,6 +128,21 @@ def _git_head(*rev_parse_args: str) -> str:
     return "unknown"
 
 
+def _next_actor_row(row: Any) -> bool:
+    """Whether *row* is the sweep's own "nobody has the next step on this item" row.
+
+    Two spellings are in play: the current one carries the sweep's ``key_extra``, and a row
+    written before it did says so in its text. Both are the same debt, and both must be kept
+    out of the "does this item still have a live row" count -- otherwise a row from before the
+    upgrade keeps its item looking live and no item is ever flagged (#196 review).
+    """
+    if str(getattr(row, "kind", "")) != "progress":
+        return False
+    if str(getattr(row, "key_extra", "")) == "next":
+        return True
+    return str(getattr(row, "owes", "")).strip().startswith("a next step on ")
+
+
 def _ref_state(state: Optional[str]) -> Optional[str]:
     """An issue or PR state from ``gh`` as /cleanup reads it: open, closed or merged."""
     word = (state or "").strip().lower()
@@ -5195,10 +5210,18 @@ class AgentChannel:
                 return
             if not existing.is_open:
                 return
-            moved = (existing.observed != derived.observed
-                     or existing.flag != derived.flag)
-            existing.observed = derived.observed
-            existing.flag = derived.flag
+            moved = False
+            # ``observed`` is refreshed only where the sweep is the thing that observes: the
+            # gap it derives for a ``progress`` row (and for a row with nothing observed yet).
+            # Any other kind may be observed by another source -- #165's poll, a wake -- and a
+            # sweep that overwrote it would reset a live value to the one it opened with
+            # (#199 review).
+            if derived.observed and (derived.kind == "progress" or not existing.observed):
+                moved = existing.observed != derived.observed
+                existing.observed = derived.observed
+            if existing.flag != derived.flag:
+                moved = True
+                existing.flag = derived.flag
             existing.opened_by = derived.opened_by or existing.opened_by
             if moved:
                 existing.updated_at = moment
@@ -5213,20 +5236,28 @@ class AgentChannel:
         # next step on was never flagged (#195 review). The sweep's own next-actor rows are
         # left out of that count for the same reason: they *are* the "nobody owes it" row, and
         # counting them as live froze the gap at the day the item opened (#195 review).
-        live_now = [row for row in table.values()
-                    if not (row.kind == "progress" and row.key_extra == NEXT_ACTOR_KEY)]
+        live_now = [row for row in table.values() if not _next_actor_row(row)]
         orphaned = orphans(open_items, live_now,
                            coordinator=roles.get("coordinator", ""), roles=roles, at=moment)
         fresh.extend(orphaned)
         keeping = {row.id for row in orphaned}
         covered = {f"#{str(key).lstrip('#')}" for key, _item in open_items}
         for row in list(table.values()):
-            if (row.kind == "progress" and row.key_extra == NEXT_ACTOR_KEY and row.is_open
-                    and row.item in covered and row.id not in keeping):
-                # The item found its actor (a new debtor, and a new row), or it gained a live
-                # row: the flag that says "nobody can act on it" is no longer true, and left
-                # open it would keep saying so for ever (#195 review).
-                row.state, row.closed_by = CLOSED, "the item's next actor is decided"
+            if _next_actor_row(row) and row.is_open and row.id not in keeping:
+                # The item found its actor (a new debtor, and a new row), gained a live row, or
+                # left the round: either way the flag that says "nobody can act on it" is no
+                # longer true, and left open it would keep saying so for ever (#195 review).
+                # An item that vanished or finished is exactly that case -- waiting for it to
+                # be "covered" again is waiting for ever (#199 review).
+                row.state = CLOSED
+                if row.key_extra != NEXT_ACTOR_KEY:
+                    # A row written before the flag carried a ``key``: it is the same debt, and
+                    # the row above replaces it. Left open it would also keep the item looking
+                    # live, so no item ever got flagged after the upgrade (#196 review).
+                    row.closed_by = "superseded by the next-actor row"
+                else:
+                    row.closed_by = ("the item's next actor is decided" if row.item in covered
+                                     else "the item is no longer open in the round")
                 row.updated_at = moment
                 closed.append(row)
         for row in orphaned:

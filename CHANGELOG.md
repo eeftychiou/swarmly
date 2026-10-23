@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The `/owed` line says the item once and with one preposition (`… owes a review verdict on
+  22e68c5 for #170`), and a sweep no longer resets an observation another source made: it
+  refreshes the gap it derives for a progress row, and leaves a `ci` row's polled value alone
+  (`#199`). An orphan flag row also closes when its item leaves the round, not only when the
+  item finds an actor (`#199`).
+
 ### Added
 
 - A peer's message that asks several bots at once is one hand-off **per bot** (`#181`): each

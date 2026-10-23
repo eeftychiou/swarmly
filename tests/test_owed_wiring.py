@@ -454,6 +454,54 @@ class TestTheRoundStateSweep(unittest.TestCase):
         self.assertIn("QA pass", after.observed)
         self.assertNotIn("no QA pass", after.observed)
 
+    def test_a_sweep_does_not_clobber_an_observation_another_source_made(self):
+        """#199 review: ``learn()`` reset a ci row's ``observed`` to what it opened with.
+
+        The sweep is not the only thing that observes a row -- #165's poll and a wake write
+        there too -- so it refreshes an observation only where it derives one itself.
+        """
+        channel = self.channel()
+        self.sweep(channel, {"146": {"pr": 146, "head": "c166987", "ci": "pending"}})
+        store = channel._test_table[1]
+        polled = store.load()
+        ci = [row for row in polled if row.kind == "ci"][0]
+        self.assertEqual(ci.observed, "pending")                 # what the sweep derived
+        ci.observed = "green"                                    # what the poll saw
+        store.save_all([ci])
+        self.sweep(channel, {"146": {"pr": 146, "head": "c166987", "ci": "pending"}})
+        again = [row for row in rows(channel) if row.kind == "ci"][0]
+        self.assertEqual(again.observed, "green")                # not reset to "pending"
+
+    def test_a_flag_row_for_an_item_that_left_the_round_closes(self):
+        """#199 review: the row never closed once the item was gone from the state."""
+        channel = self.channel()
+        channel.owed_roles = lambda: {"coordinator": "Claudebot"}
+        flagged = {"pr": 146, "head": "c166987", "ci": "green"}
+        self.sweep(channel, {"146": dict(flagged)})
+        self.assertTrue([row for row in rows(channel) if row.is_open and row.flag])
+        self.sweep(channel, {})                                  # the item is gone from the round
+        self.assertEqual([row for row in rows(channel) if row.is_open and row.flag], [])
+        retired = [row for row in rows(channel)
+                   if row.kind == "progress" and not row.is_open and row.item == "#146"]
+        self.assertTrue(retired)
+        self.assertIn("no longer open in the round", retired[0].closed_by)
+
+    def test_a_row_from_before_the_flag_does_not_keep_its_item_live(self):
+        """#196 review: a pre-``@next`` row is the same debt, and it blocked the flag."""
+        channel = self.channel()
+        channel.owed_roles = lambda: {"coordinator": "Claudebot"}
+        legacy = ow.Row(kind="progress", item="#146", debtor="Claudebot",
+                        owes="a next step on #146",
+                        observed="PR #146: no CI result, no merge verdict, no QA pass, not merged")
+        channel._test_table[1].save_all([legacy])
+        self.sweep(channel, {"146": {"pr": 146, "head": "c166987", "ci": "green"}})
+        open_now = {row.id: row for row in rows(channel) if row.is_open}
+        self.assertIn("progress:#146@next:Claudebot", open_now)     # the row that flags it
+        self.assertIn("no next actor", open_now["progress:#146@next:Claudebot"].flag)
+        retired = [row for row in rows(channel) if row.id == "progress:#146:Claudebot"][0]
+        self.assertFalse(retired.is_open)
+        self.assertIn("superseded", retired.closed_by)
+
     def test_roles_come_from_the_roster(self):
         channel = self.channel()
         channel.owed_roles = lambda: {}

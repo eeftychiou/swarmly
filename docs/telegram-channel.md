@@ -1245,7 +1245,10 @@ coordinator (#83) can see a timer a dead bot left armed, and two bots cannot fir
 never does. Each row names who owes what (a bot, `CI`, or `admin`), on which item and head,
 who is waiting, the fact that opened it, the last value observed and a deadline, and its
 id `<kind>:<item>[@<head>]…:<debtor>` *is* the settlement rule: re-observing a fact updates
-one row, a different head is a different debt.
+one row, a different head is a different debt. The line says each thing once — `Reasonix owes a
+review verdict on 22e68c5 for #170`, one `on` and the item introduced by `for` — and a sweep
+refreshes a row's observation only where it is the thing that observes (the gap on a progress
+row), never a value another source wrote.
 
 What this transport infers and records **today**: the hand-off, and the facts the round
 state already carries. A reply that addresses a peer opens one row per peer addressed (the

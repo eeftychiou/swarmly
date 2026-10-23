@@ -64,8 +64,10 @@ class TestTheRow(unittest.TestCase):
     def test_the_line_says_who_owes_what_and_how_late(self):
         row = self.row(deadline=1900.0, observed="no verdict", waiting_on="Claudebot")
         self.assertEqual(row.line(now=1000.0),
-                         "Reasonix owes a review verdict on 22e68c5 on #170 "
+                         "Reasonix owes a review verdict on 22e68c5 for #170 "
                          "(Claudebot waiting) [no verdict] 15m left")
+        # One "on" per line: the head is owed *on*, the item is owed *for* (#199 review).
+        self.assertEqual(row.line(now=1000.0).count(" on "), 1)
         self.assertIn("overdue", self.row(deadline=900.0).line(now=1000.0))
 
     def test_the_line_says_an_owes_that_names_its_item_once(self):
