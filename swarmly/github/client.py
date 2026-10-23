@@ -481,6 +481,7 @@ class GitHubClient:
         return True
 
     def create_issue(
+        self,
         repo: str,
         title: str,
         body: str,
