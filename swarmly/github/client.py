@@ -480,7 +480,7 @@ class GitHubClient:
             return False
         return True
 
-    def create_issue(        self,
+    def create_issue(
         repo: str,
         title: str,
         body: str,

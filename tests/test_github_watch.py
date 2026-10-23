@@ -933,6 +933,67 @@ class TestAParentClosesWithItsLastSlice(unittest.IsolatedAsyncioTestCase):
             await self.watcher(tmp, client, ch).poll_once()
         client.close_issue.assert_not_called()
 
+    async def test_a_prose_body_that_merely_mentions_issues_does_not_close(self):
+        """#227 review blocker: #189's own shape.
+
+        Its body describes items 2-4 in prose and names eight other issues — all merged or
+        closed — so the broad reading (`tracking_item_refs`) says "nothing open". Closing on
+        that would close the parent of *this* round two slices early.
+        """
+        # #189's body, in the shape that matters: numbers mentioned, no listing.
+        body = chr(10).join([
+            'Found in the 22 Oct exports:',
+            '- **Parent issues left open:** #117 stayed open after all its slices (#133, #153, #154) merged.',
+            '- **Reviewers dispatching work:** Reasonix sent Codex to #170 (18:03).',
+            '**Decide and do:**',
+            "1. **Codex's role:** full re-reviews of #173 and #175.",
+            "4. **Identities:** one login, so a merge claim (#155) can't be checked.",
+        ]) + chr(10)
+        items = {117: ("issue", "CLOSED"), 133: ("pr", "MERGED"), 153: ("pr", "MERGED"),
+                 154: ("pr", "MERGED"), 170: ("issue", "CLOSED"), 173: ("pr", "MERGED"),
+                 175: ("pr", "MERGED"), 155: ("pr", "MERGED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN"], items, body=body)
+            ch = self.channel()
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+        client.close_issue.assert_not_called()          # a mention is not a listing...
+        self.assertEqual(outcome.turns_queued, 0)       # ...and no round end was invented
+        # The narrow reading is what stops it: the broad one would have said "all landed".
+        self.assertEqual(len(tracking_item_refs(body, 34)), 8)
+
+    async def test_a_split_into_line_states_the_slices(self):
+        """The other listing form #227 names: "split into #a, #b" is a statement, so it closes."""
+        items = {65: ("pr", "MERGED"), 68: ("issue", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN"], items, body="Split into #65 and #68." + chr(10))
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+        client.close_issue.assert_called_once()
+
+    async def test_a_failed_close_posts_its_line_once(self):
+        """#227 review nit: a close that keeps failing must not re-post the same comment."""
+        items = {65: ("pr", "MERGED"), 68: ("issue", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN", "OPEN", "OPEN"], items)
+            client.close_issue.return_value = False
+            ch = self.channel()
+            for _ in range(3):
+                await self.watcher(tmp, client, ch).poll_once()
+            state = NotificationState.load(Path(tmp) / "s.json")
+        comments = [call.args[2] for call in client.close_issue.call_args_list]
+        self.assertEqual(len(comments), 3)               # the close is retried every poll...
+        self.assertEqual(sum(1 for text in comments if text), 1)   # ...the line goes once
+        self.assertEqual(list(state.parent_notes), ["example-org/webapp#34"])
+
+    async def test_a_close_that_lands_clears_the_note(self):
+        items = {65: ("pr", "MERGED"), 68: ("issue", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN", "CLOSED"], items)
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+            state = NotificationState.load(Path(tmp) / "s.json")
+        self.assertEqual(state.parent_notes, {})
+
     async def test_an_issue_that_lists_nothing_is_not_a_parent(self):
         with TemporaryDirectory() as tmp:
             client = self.client(["OPEN"], {}, body="Round 6 will be planned here.")

@@ -35,12 +35,16 @@ the coordinator, and the coordinator hands it over. A reviewer's "Codex should r
 a developer's wake naming three bots, is a second dispatcher the round does not have.
 
 **A parent issue closes with its last slice (#227).** When an issue lists sub-issues or pull
-requests — a checklist, or "split into #a, #b" — the transport reads the same refs it uses to
-refuse an early close, and once every one of them is merged (a pull request) or closed (an
-issue) it closes the parent itself, with one line naming the slices. The state of each slice
-decides, never a ticked box, so a checklist ticked over an unmerged PR keeps the parent open.
-The close is a round end like a hand close: the coordinator gets the report turn. This is why
-#117 no longer sits open after #133, #153 and #154 all merged.
+requests — a checklist, or a line that says what the list is ("split into #a, #b", "slices:
+#a, #b") — the transport reads those refs, and once every one of them is merged (a pull
+request) or closed (an issue) it closes the parent itself, with one line naming the slices. The
+refs have to be **stated, not mentioned**: a body that only names numbers in prose closes from
+nobody, so `#189`'s "see #117, #133, #153, #154" is a mention and its parent waits for the
+coordinator. The state of each slice decides, never a ticked box, so a checklist ticked over an
+unmerged PR keeps the parent open. And the transport closes a parent once: the line goes out on
+the first attempt, and a close that keeps failing is retried without re-posting it. The close is
+a round end like a hand close: the coordinator gets the report turn. This is why #117 no longer
+sits open after #133, #153 and #154 all merged.
 
 **The admin deploys.** No agent tells another to install, upgrade, pull or switch the
 swarmly it runs on; a post-merge notice says what landed (PR, merge commit) and stops

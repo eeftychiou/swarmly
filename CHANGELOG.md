@@ -70,7 +70,11 @@ All notable changes to this project are documented here. The format follows
   slice decides, never a ticked box: a checklist ticked over an unmerged PR keeps the parent
   open, and an item `gh` could not answer for counts as not landed. The close is a round end
   like a hand close, so the same poll queues the coordinator's report turn, and a parent the
-  transport closed is not closed twice. Item states are read with `ref_state` — one `gh api`
+  transport closed is not closed twice. The refs must be **stated, not mentioned**: a
+  checklist or a "split into #a, #b" line closes the parent, while a body that only names
+  numbers in prose (`#189`'s own shape) closes nothing — that reading would have closed #189
+  with #228 and #226 still open. The line is posted once; a close that keeps failing is
+  retried without re-posting it. Item states are read with `ref_state` — one `gh api`
   call for an issue *or* a pull request — because this now runs once per poll rather than only
   when an issue closes.
 
