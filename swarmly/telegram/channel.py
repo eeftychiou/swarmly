@@ -7564,6 +7564,8 @@ class AgentChannel:
         body = self.apply_wake_lines(reply.text or "", event)
         # Round 5.5 (#165): a WAIT line is a row, taken out of the reply the same way.
         body = self.apply_wait_lines(body, event)
+        # The coordinator switches a peer's role with a ROLE line in any reply (#189).
+        body = await self.membership.apply_role_lines(body, event)
         body = self.apply_round_block(body, event).strip()
         if event.self_task:
             body = self._unaddress_self(body)

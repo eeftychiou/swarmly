@@ -61,6 +61,12 @@ of a swarm coordinates. The maintainer overrides any role at any time:
 /role @codex_bot reviewer
 ```
 
+**The swarm fills its own gaps.** The coordinator also switches a peer's role later, with a
+`ROLE: @bot <role> <reason>` line in any of its replies: when a role the round needs has no
+working bot (frozen, paused, out of quota or down) or a bot keeps failing at its role. Every
+agent records the change, the group sees it with the reason, and the line itself is not
+posted. The coordinator cannot give or take the coordinator role; only you move it.
+
 The role's instructions reach the agent at once: its next turn introduces the role in full
 and asks it to request its first task from the coordinator, and from then on they ride in
 every turn. Every agent also knows the team's roles, so it knows whom to hand work to.
