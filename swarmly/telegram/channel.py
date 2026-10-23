@@ -64,7 +64,7 @@ from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig
                                      model_problem)
 from swarmly.telegram import native as native_cli
 from swarmly.telegram.poll import bus_poll_once
-from swarmly.telegram.presence import Presence, Pulse
+from swarmly.telegram.presence import Presence, Pulse, hold_action
 
 from swarmly.telegram import control as control_mod
 from swarmly.telegram.control_center import ControlCenter
@@ -725,6 +725,10 @@ class AgentChannel:
         self._hold_path = _state_file(config, "hold")
         held = load_state(self._hold_path, "hold")
         self._hold: Dict[str, Any] = held if held.get("held") else {}
+        #: When the admin last *lifted* the hold (#234). Kept, not discarded, so a bot that was
+        #: down at that moment can tell a peer's release from its own older hold and adopt it.
+        self._hold_released_at: float = (0.0 if self._hold
+                                         else float(held.get("at") or 0.0))
 
         self.bot: Any = None
         self.dispatcher: Any = None
@@ -2573,6 +2577,9 @@ class AgentChannel:
                 table.seen(alias, now)
             else:
                 table.note(dataclasses.replace(pulse, alias=alias), seen_at=now)
+                # #234: a beat that carries the admin's hold or release is applied here, on
+                # the Telegram plane, so a bot that never saw the command follows the peer.
+                self._adopt_hold(dataclasses.replace(pulse, alias=alias))
             self._save_presence()
             return
         table.seen(alias, now)
@@ -2672,10 +2679,13 @@ class AgentChannel:
         usage = self._pulse_usage(now)
         if usage:
             status["usage"] = usage
+        held = ({"at": float(self._hold.get("at") or 0.0),
+                 "reason": str(self._hold.get("reason") or "")} if self._hold else None)
         return Pulse(alias=self.config.identity.alias, at=now, rev=self._running_revision,
                      role=self._role_name() if self.config.identity.role else "", term=term,
                      busy_since=now - max(durations) if durations else None,
-                     frozen=bool(self._frozen), status=status)
+                     frozen=bool(self._frozen), status=status, held=held,
+                     released_at=None if self._hold else (self._hold_released_at or None))
 
     def _pulse_usage(self, now: float, *, advance: bool = True) -> Dict[str, Any]:
         """What this bot spent, from its own turn ledger: since the last beat and today (UTC).
@@ -3860,8 +3870,15 @@ class AgentChannel:
         on_ref = bool(bus and await asyncio.to_thread(bus.publish, pulse))
         table = self.presence()
         if on_ref:
-            counted = notes_from(await asyncio.to_thread(bus.read), table, now=moment,
+            read = await asyncio.to_thread(bus.read)
+            counted = notes_from(read, table, now=moment,
                                  skip=[self.config.identity.alias])
+            # #234: the same read reconciles the hold both ways -- a bot that was down for the
+            # /hold, or for the /release, is put right by the next beat it hears.
+            for alias, record in (read or {}).items():
+                if str(alias).strip().lower() != \
+                        self.config.identity.alias.strip().lower():
+                    self._adopt_hold(record)
             self._save_presence()
             said = f"pulse ref rev={pulse.rev or '?'} busy_since={pulse.busy_since} peers={counted}"
         else:
@@ -6828,16 +6845,62 @@ class AgentChannel:
         """Whether the admin has put the swarm on hold (/hold, until /release)."""
         return bool(self._hold)
 
-    def _set_hold(self, reason: Optional[str]) -> None:
-        self._hold = ({"held": True, "reason": reason or "", "at": self._wall()}
-                      if reason is not None else {})
+    def _hold_action_at(self) -> float:
+        """When this bot last applied a hold or a release: 0.0 if it never heard one (#234).
+
+        This is the stamp a peer's beat is compared against, so the *latest* admin action wins
+        no matter which bot the admin happened to address.
+        """
         if self._hold:
-            save_state(self._hold_path, self._hold, "hold")
-        elif self._hold_path is not None:
-            try:
-                self._hold_path.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning("hold state could not be cleared: %s", exc)
+            stamp = self._hold.get("at")
+            return float(stamp) if isinstance(stamp, (int, float)) else 0.0
+        return float(self._hold_released_at or 0.0)
+
+    def _set_hold(self, reason: Optional[str], *, at: Optional[float] = None) -> None:
+        """Hold (a reason, ``""`` included) or release (``None``) the swarm, stamped to be
+        reconciled with the peers' beats (#234).
+
+        A release is *stored*, not deleted: its time is what tells a bot that was down at the
+        moment -- and so missed it -- that the hold it is still carrying is the older fact.
+        """
+        moment = self._wall() if at is None else float(at)
+        if reason is not None:
+            self._hold = {"held": True, "reason": reason or "", "at": moment}
+        else:
+            self._hold = {}
+            self._hold_released_at = moment
+        if self._hold_path is None:
+            return
+        try:
+            self._hold_path.parent.mkdir(parents=True, exist_ok=True)
+            save_state(self._hold_path,
+                       self._hold if self._hold else {"held": False, "at": moment}, "hold")
+        except OSError as exc:
+            logger.warning("hold state could not be written: %s", exc)
+
+    def _adopt_hold(self, pulse: Any) -> str:
+        """Take a peer's hold or release when it is **newer** than this bot's own (#234).
+
+        Accepts the peer's beat as a :class:`Pulse` (from Telegram) or as the raw record (from
+        the bus). Returns ``"held"``, ``"released"`` or ``""`` -- what, if anything, changed -- so
+        a caller can say it and a test can see it.
+        """
+        try:
+            beat = pulse if isinstance(pulse, Pulse) else Pulse.from_dict(pulse)
+        except (ValueError, TypeError):
+            return ""
+        stamp = hold_action(beat)
+        if stamp is None or stamp <= self._hold_action_at():
+            return ""
+        if beat.held:
+            reason = str(beat.held.get("reason") or "")
+            self._set_hold(reason, at=stamp)
+            logger.info("%s: adopted %s's hold (%s)", self.config.identity.alias, beat.alias,
+                        reason or "no reason")
+            return "held"
+        self._set_hold(None, at=stamp)
+        logger.info("%s: adopted %s's release", self.config.identity.alias, beat.alias)
+        return "released"
 
     def _hold_note(self) -> str:
         if not self._hold:
