@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A round-state update that carried **only** a `repo` change wrote no segment at all (`#185`
+  review): `fold` took `update.repo`, but `_unchanged` — the check that keeps a repeated turn
+  from adding a commit to the bus — never compared it, so the field was folded when it arrived
+  beside something else and dropped when it arrived alone. It is compared now, so a repo change
+  is written and reaches the bus.
+
 - A full busy queue **holds** a message instead of dropping it (`#184`): past
   `limits.busy_queue_max` the message goes to the durable inbox and is taken, oldest first, as
   each turn ends, so every message is answered in arrival order. The topic is told once per
@@ -18,7 +24,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- `/diag` and `/status` report `busy_held=<n>` next to `busy_dropped=<n>` (`#204`): since `#184`
+- A verdict is kept **once per head** (`#185`): the round state already holds the fact, so a
+  repeated `review`/`qa` verdict — same `verdict`, `sha` and `by`, even with a newer `at` — writes
+  no new segment and is logged as suppressed instead of restated. A verdict on a new head, or
+  another bot's verdict, is still written. (The `NO_REPLY` half of the issue landed in `#180`:
+  `drop_stray_silence` removes the sentinel anywhere in a reply, and a reply that is only it posts
+  nothing.)
   a full queue holds more than it drops, so `busy_dropped=0` alone reads as "nothing was lost"
   while a message waits in the held queue. The `/status` line grows by one token, and the test
   that bounds its length moves with the token set.

@@ -363,6 +363,15 @@ is expanded against it; a prefix that does not identify that head is refused. Re
 for a different head returns nothing — a new head clears the verdict instead of carrying an
 approval onto code nobody reviewed.
 
+**A verdict is kept once (#185).** A verdict is one fact — this bot said this, about this head.
+Re-stating it (the same `verdict`, `sha` and `by`, even with a newer `at`) writes no new segment
+and posts nothing: the transport logs `… verdict on #<item> at <sha> is already recorded; the
+repeat is suppressed` and leaves the round as it was. Live on 22 Oct, every verdict was posted
+two or three times. A verdict on a *new* head is new information and is written, and another bot's
+verdict on the same head is that bot's own fact — one reviewer's word does not answer for
+another's. A repeat that arrives alongside a real change (say `ci`) is dropped from that segment
+and the change is still written.
+
 **Authority.** GitHub wins for what exists, merged/closed state, the PR head and CI on that head;
 the file wins for owners' intent, order, blockers, verdicts, timers and term. `coordinator.json`
 (#83) is the authority for `term`; a segment from a lower term than the bus already holds is
