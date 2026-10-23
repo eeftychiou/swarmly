@@ -4724,6 +4724,32 @@ class AgentChannel:
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
 
+    def apply_wait_lines(self, text: str, event: ChannelEvent) -> str:
+        """Record the ``WAIT`` lines in a reply as rows, and strip them from it (#165).
+
+        A line is removed in every case -- a refused one must not be posted as prose -- and
+        every refusal is said back into the reply, because a WAIT the bot believes it made is
+        a promise the rest of the swarm counts on: the guard's ladder (#164) and the wakes
+        (#163) both act on these rows.
+        """
+        from swarmly.telegram.wait_line import ack, extract_waits
+        body, rows, reasons = extract_waits(
+            text or "", topic=self._topic_token(event.chat_id, event.thread_id),
+            place=self._place_key(event.chat_id, event.thread_id))
+        if not rows and not reasons:
+            return text
+        notes: List[str] = []
+        if rows:
+            try:
+                self.owed_store().save_all(rows)
+                notes.extend(ack(row) for row in rows)
+            except Exception as exc:               # noqa: BLE001 - said back, not swallowed
+                logger.warning("WAIT: the rows could not be recorded", exc_info=True)
+                notes.extend(f"WAIT not recorded: {exc}" for _row in rows)
+        notes.extend(f"WAIT refused: {reason}" for reason in reasons)
+        joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
+        return joined
+
     async def _wake_loop(self) -> None:
         """Fire due timers: one check, one action, for as long as this bot runs."""
         last: List[str] = []
@@ -7536,6 +7562,8 @@ class AgentChannel:
         # is taken out here -- on the adapter's raw text, before the reply is clamped or
         # split, so the block is never counted against limits.reply_chars and never posted.
         body = self.apply_wake_lines(reply.text or "", event)
+        # Round 5.5 (#165): a WAIT line is a row, taken out of the reply the same way.
+        body = self.apply_wait_lines(body, event)
         body = self.apply_round_block(body, event).strip()
         if event.self_task:
             body = self._unaddress_self(body)

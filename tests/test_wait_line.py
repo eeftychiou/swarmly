@@ -1,0 +1,184 @@
+"""The WAIT line: a reply says what it waits on, and the transport opens the row (#165).
+
+The lines here are the ones the round produced, plus every way a line can be wrong -- each
+wrong one is said back to the bot, never posted as prose.
+"""
+
+import unittest
+
+from swarmly.telegram import owed as ow
+from swarmly.telegram import wait_line as wl
+from tests.test_telegram_channel import GROUP
+
+
+class TestAKindEach(unittest.TestCase):
+
+    def test_a_review_verdict_row(self):
+        row = wl.parse_line("WAIT review #133 head 38f1977 from Reasonix", topic="tg-3556",
+                            at=1000.0)
+        self.assertEqual(row.kind, "verdict")
+        self.assertEqual(row.debtor, "Reasonix")
+        self.assertEqual(row.item, "#133")
+        self.assertEqual(row.head, "38f1977")
+        self.assertEqual(row.topic, "tg-3556")
+        self.assertTrue(row.is_open)
+
+    def test_a_qa_verdict_row(self):
+        row = wl.parse_line("WAIT qa #195 head cc57d8a from Antigravity", at=1000.0)
+        self.assertEqual((row.kind, row.debtor, row.head), ("verdict", "Antigravity", "cc57d8a"))
+
+    def test_a_ci_row_is_owed_by_the_transport(self):
+        row = wl.parse_line("WAIT ci #173 head 9fb2f21", at=1000.0)
+        self.assertEqual((row.kind, row.debtor), ("ci", ow.CI))
+
+    def test_a_merge_row(self):
+        row = wl.parse_line("WAIT merge #173 head b40f3ae from Claudebot", at=1000.0)
+        self.assertEqual((row.kind, row.debtor), ("merge", "Claudebot"))
+
+    def test_a_progress_row(self):
+        row = wl.parse_line("WAIT progress #166 from Antigravity", at=1000.0)
+        self.assertEqual((row.kind, row.debtor, row.head), ("progress", "Antigravity", ""))
+
+    def test_an_answer_is_the_admins(self):
+        row = wl.parse_line("WAIT answer on the Drive credentials", at=1000.0)
+        self.assertEqual((row.kind, row.debtor), ("admin", ow.ADMIN))
+        self.assertIn("Drive credentials", row.owes)
+
+    def test_the_shapes_the_swarm_actually_wrote(self):
+        """Every WAIT this round produced parses into a row, so the migration can start."""
+        lines = [
+            "WAIT review #191 head e326779 from Reasonix",
+            "WAIT qa #208 head 9bed565 from Antigravity",
+            "WAIT merge #207 head fc9c810 from Claudebot",
+            "WAIT answer on the #189 ruling",
+        ]
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertTrue(wl.parse_line(line, at=1000.0).is_open)
+
+
+class TestARefusalSaysWhy(unittest.TestCase):
+    """A line that cannot become a row is refused with the shape that would work."""
+
+    def refused(self, line):
+        with self.assertRaises(wl.WaitError) as caught:
+            wl.parse_line(line, at=1000.0)
+        return str(caught.exception)
+
+    def test_a_head_bound_kind_without_a_head(self):
+        self.assertIn("needs the head", self.refused("WAIT review #133 from Reasonix"))
+
+    def test_a_verdict_without_a_bot(self):
+        self.assertIn("needs the bot that owes it", self.refused("WAIT review #133 head 38f1977"))
+
+    def test_an_unknown_kind_lists_the_ones_there_are(self):
+        said = self.refused("WAIT sometime #133")
+        self.assertIn("does not know", said)
+        self.assertIn("review", said)
+
+    def test_ci_may_not_be_owed_by_a_bot(self):
+        self.assertIn("owed by the transport",
+                      self.refused("WAIT ci #173 head 9fb2f21 from Reasonix"))
+
+    def test_a_bare_marker_is_not_a_line(self):
+        self.assertIn("needs a kind", self.refused("WAIT"))
+
+
+class TestExtraction(unittest.TestCase):
+
+    def test_the_line_leaves_the_reply_and_becomes_a_row(self):
+        text = ("Reviewed #191 at e326779 and it is fine.\n"
+                "WAIT merge #191 head e326779 from Claudebot\n"
+                "I will look again when it lands.")
+        body, rows, reasons = wl.extract_waits(text, topic="tg-3556", at=1000.0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(reasons, [])
+        self.assertNotIn("WAIT", body)                       # never posted as prose
+        self.assertIn("Reviewed #191", body)
+        self.assertIn("I will look again", body)
+
+    def test_a_refused_line_is_removed_too_and_said_back(self):
+        text = "Here is the verdict.\nWAIT review #133\nDone."
+        body, rows, reasons = wl.extract_waits(text, at=1000.0)
+        self.assertEqual(rows, [])
+        self.assertEqual(len(reasons), 1)
+        self.assertNotIn("WAIT review", body)
+        self.assertIn("Here is the verdict.", body)
+
+    def test_prose_that_starts_with_the_word_is_left_alone(self):
+        text = "WAITING for the bus to come back, no row for this.\nWAIT progress #166 from Agy"
+        body, rows, reasons = wl.extract_waits(text, at=1000.0)
+        self.assertIn("WAITING for the bus", body)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(reasons, [])
+
+    def test_text_without_the_marker_is_untouched(self):
+        text = "No rows here, just a sentence about the bus."
+        self.assertEqual(wl.extract_waits(text), (text, [], []))
+
+    def test_the_ack_names_the_row(self):
+        row = wl.parse_line("WAIT review #133 head 38f1977 from Reasonix", at=1000.0)
+        said = wl.ack(row)
+        self.assertIn("Reasonix", said)
+        self.assertIn("38f1977", said)
+        self.assertIn("recorded", said)
+
+
+class TestTheTransportRecordsIt(unittest.TestCase):
+    """`apply_wait_lines`: the row is saved, the ack is posted, the line never is."""
+
+    def channel(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from tests.test_telegram_channel import make_channel, make_config
+        channel = make_channel(make_config())
+        channel.bot = object()
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = ow.OwedStore("Hermes", state_dir=Path(directory.name), clock=lambda: 1000.0)
+        channel.owed_store = lambda: store
+        channel._test_table = (directory, store)
+        channel.topics.remember(GROUP, 307, "round 5.5")   # the home group: it has a token
+        return channel
+
+    def event(self):
+        from tests.test_telegram_channel import event
+        return event("anything", chat_id=GROUP, thread_id=307, message_id=90)
+
+    def test_a_wait_line_becomes_a_row_in_that_discussion(self):
+        channel = self.channel()
+        said = channel.apply_wait_lines(
+            "Reviewed the head.\nWAIT review #191 head e326779 from Reasonix", self.event())
+        rows = channel._test_table[1].load()
+        self.assertEqual([row.kind for row in rows], ["verdict"])
+        self.assertEqual(rows[0].debtor, "Reasonix")
+        self.assertEqual(rows[0].topic, channel.topics.context(GROUP, 307))
+        self.assertIn("Reasonix", said)
+        self.assertIn("e326779", said)
+        self.assertNotIn("WAIT review", said)                 # never posted as prose
+        self.assertIn("Reviewed the head.", said)
+
+    def test_a_refused_line_says_why_and_records_nothing(self):
+        channel = self.channel()
+        said = channel.apply_wait_lines("Here it is.\nWAIT review #191", self.event())
+        self.assertEqual(channel._test_table[1].load(), [])
+        self.assertIn("WAIT refused", said)
+        self.assertIn("needs the head", said)
+
+    def test_a_reply_with_no_wait_line_is_untouched(self):
+        channel = self.channel()
+        text = "Nothing owed here, just a sentence."
+        self.assertEqual(channel.apply_wait_lines(text, self.event()), text)
+
+    def test_a_table_that_refuses_says_so_instead_of_pretending(self):
+        channel = self.channel()
+
+        def broken():
+            raise ow.OwedError("the bus rejected the push")
+
+        channel.owed_store = broken
+        with self.assertLogs("swarmly.telegram", level="WARNING"):
+            said = channel.apply_wait_lines("Done.\nWAIT progress #166 from Agy", self.event())
+        self.assertIn("WAIT not recorded", said)
+        self.assertIn("the bus rejected the push", said)
