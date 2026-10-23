@@ -4696,14 +4696,18 @@ class AgentChannel:
         rows: List[Row] = []
         notes: List[str] = []
         for spec in specs[:per_reply]:
-            if float(getattr(spec, "every_seconds", 0) or 0) > 0:
-                # Nothing repeats now: a row is opened once and then woken by facts, with the
-                # guard's ladder as the backstop. Accepting `every=` silently would promise a
-                # recurrence nothing performs (#213 review).
-                notes.append("WAKE refused: a repeating check has no row -- `every=` is not "
-                             "carried. Write one `WAIT`; the ladder (limits.stall_minutes) "
-                             "reminds you if it stalls. To watch a second thing, write a "
-                             "second WAIT")
+            repeats = float(getattr(spec, "every_seconds", 0) or 0) > 0
+            expires = bool(getattr(spec, "until_explicit", False))
+            if repeats or expires:
+                # Nothing repeats and nothing expires now: a row is opened once, then woken by
+                # facts, with the guard's ladder as the backstop. `every=` and `until=` promise
+                # a recurrence and an end that nothing performs, so both are refused rather
+                # than dropped quietly (#213 review: `until=` was the same bug one keyword
+                # over).
+                said = "`every=`" if repeats else "`until=`"
+                notes.append(f"WAKE refused: {said} is not carried -- a WAKE becomes a row, "
+                             "opened once and then woken by facts. Write one `WAIT`; the "
+                             "ladder (limits.stall_minutes) reminds you if it stalls")
                 continue
             try:
                 rows.append(from_wake(spec, alias=self.config.identity.alias, topic=topic,

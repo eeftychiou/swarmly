@@ -251,6 +251,10 @@ class WakeSpec:
     in_seconds: float
     every_seconds: float
     until_seconds: float
+    #: Whether ``until=`` was **written**, not merely derived: `parse_line` fills
+    #: ``until_seconds`` from ``in=`` when the line names none, and a reader that refuses an
+    #: explicit `until=` must not refuse every line (#213 review).
+    until_explicit: bool = False
 
     @property
     def check(self) -> str:
@@ -294,7 +298,8 @@ def parse_line(line: str, *, now: Optional[float] = None) -> WakeSpec:
     if until_seconds < in_seconds:
         raise WakeError("until= must not be shorter than in=")
     return WakeSpec(argv=argv, then=fields["then"].strip(), in_seconds=in_seconds,
-                    every_seconds=every_seconds, until_seconds=until_seconds)
+                    every_seconds=every_seconds, until_seconds=until_seconds,
+                    until_explicit=bool(fields.get("until")))
 
 
 def extract_wakes(text: str, *, now: Optional[float] = None

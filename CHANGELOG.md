@@ -13,10 +13,14 @@ All notable changes to this project are documented here. The format follows
   a bot told "look again in ten minutes" was first reminded at `limits.stall_minutes` (thirty by
   default) and, with `stall_minutes: 0`, never. `owed_guard.stalls` now takes the row's deadline
   first — one rung when it passes, spent afterwards so a single old deadline cannot climb three
-  rungs in three beats — and a ladder that is off still fires the moment a row named. `every=` is
-  refused with a pointer (nothing repeats: write one `WAIT` per thing watched) instead of being
-  dropped silently, `until=` and the recurrence are written into the row, and a row with neither
-  a deadline nor a ladder is flagged in `/owed` rather than looking kept.
+  rungs in three beats — and a ladder that is off still fires the moment a row named. `every=`
+  and `until=` are refused with a pointer (nothing repeats and nothing expires: write one `WAIT`
+  per thing watched) instead of being dropped silently — `WakeSpec.until_explicit` tells an
+  explicit `until=` from the one `parse_line` derives from `in=`, so the refusal cannot hit a
+  line that named none. With the ladder off, a spent deadline ends at that one reminder and is
+  not chased to the coordinator or the admin: that is what "ladder off" means, and the docs say
+  so. `in=` is required by the `WAKE` grammar, so every row this opens has a moment and there is
+  no deadline-less case to flag.
 
 - A round-state update that carried **only** a `repo` change wrote no segment at all (`#185`
   review): `fold` took `update.repo`, but `_unchanged` — the check that keeps a repeated turn

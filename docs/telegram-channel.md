@@ -1252,13 +1252,17 @@ Three things the migration changes about the promise itself:
   reminder is due when that moment passes, not at `limits.stall_minutes`; and `stall_minutes: 0`,
   which turns the ladder's own clock off, still fires the moment a row named — a promise the swarm
   was told was recorded cannot be one nothing acts on. A deadline is spent once its rung fires, so
-  one old deadline does not climb three rungs in three beats. A row with neither a deadline nor a
-  ladder is **flagged** in `/owed` (`no in=: only limits.stall_minutes can act on this`) instead
-  of looking kept.
-- **`every=` is refused, with a pointer.** A row is opened once and then woken by facts, with the
-  ladder as the backstop; nothing repeats, so a repeating check is told to write one `WAIT` per
-  thing it watches rather than promising a recurrence nothing performs. `until=` is written into
-  the row's `opened_by`, so the end of a wait is still on the record.
+  one old deadline does not climb three rungs in three beats.
+  **With the ladder off, that one rung is the end of it:** a spent deadline leaves the row with no
+  clock, so it is reminded once and not chased to the coordinator or the admin. That is what
+  "ladder off" means — the swarm still gets the reminder the bot asked for itself — and it is a
+  choice, not an omission (#213 review). `in=` is required by the `WAKE` grammar, so every row
+  opened this way has a moment; there is no deadline-less case to flag.
+- **`every=` and `until=` are refused, with a pointer.** A row is opened once and then woken by
+  facts, with the ladder as the backstop: nothing repeats, and nothing expires. A repeating check
+  is told to write one `WAIT` per thing it watches; an `until=` is told the same, because a row
+  that stops itself is a rule nothing would carry out. Both are refused where `every=` already
+  was, rather than one of them being dropped quietly (#213 review).
 - **Two rows can name one item.** The WAKE row is keyed per check
   (`progress:#209@wake#<digest>:DeepSeek`) while the round sweep opens `progress:#209:DeepSeek`
   for the same item, and `/owed` shows both. They say different things — one per check, one per

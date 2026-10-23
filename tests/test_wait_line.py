@@ -171,25 +171,16 @@ class TestARetiredWakeBecomesARow(unittest.TestCase):
         self.assertEqual((row.kind, row.item), ("progress", ""))
         self.assertEqual(row.deadline, 1060.0)
 
-    def test_a_line_with_no_in_is_flagged_rather_than_quietly_kept(self):
-        """A row nothing can act on is a promise nobody keeps (#213 review)."""
-        class Bare:                     # a spec whose `in=` never made it into the row
-            argv = ("git", "status")
-            then = "go"
-            in_seconds = 0.0
-            every_seconds = 0.0
-            until_seconds = 0.0
-
-        row = wl.from_wake(Bare(), alias="DeepSeek", at=1000.0)
-        self.assertEqual(row.deadline, 0.0)
-        self.assertIn("no in=", row.flag)          # `/owed` shows it, rather than hiding it
-
-    def test_every_and_until_are_written_down(self):
-        row = wl.from_wake(self.spec('WAKE in=10m every=5m until=2h '
-                                     'check="gh pr checks 209" then="merge it"'),
+    def test_the_row_always_has_the_moment_the_line_named(self):
+        """`in=` is required by the grammar, so every row carries its own deadline: the flag for
+        a row nothing could act on was unreachable and is gone (#213 review)."""
+        from swarmly.telegram import wake as wk
+        with self.assertRaises(wk.WakeError):
+            wk.parse_line('WAKE check="git status" then="go"')      # no `in=` never parses
+        row = wl.from_wake(self.spec('WAKE in=2m check="git status" then="go"'),
                            alias="DeepSeek", at=1000.0)
-        self.assertIn("every 5m", row.opened_by)
-        self.assertIn("until 120m", row.opened_by)
+        self.assertEqual(row.deadline, 1120.0)
+        self.assertEqual(row.flag, "")
 
     def test_two_checks_on_one_pr_are_two_promises(self):
         same = wl.from_wake(self.spec('WAKE in=1m check="gh pr checks 209" then="go"'),
