@@ -378,3 +378,87 @@ class TestFollowUps(unittest.TestCase):
                 patch.object(gitbus.subprocess, "run") as fake:
             GitTransport(Path(tmp))._git("status")
         self.assertEqual(fake.call_args.kwargs["env"]["LC_ALL"], "C")
+
+
+class TestTheRefLockRace(_Repos):
+    """#235: two writers push to one bus at once; the loser's push must be retried, not lost.
+
+    The 23 Oct logs carried this refusal from a configured bus ref:
+
+    ``! [remote rejected] … -> agents-bus (cannot lock ref 'refs/heads/agents-bus': is at
+    b591d81… but expected afe4a1e…)``
+
+    which matched none of the signs the retry looked for, so the push raised on the first
+    refusal and the owed row stayed local.
+    """
+
+    REFUSAL = ("! [remote rejected] 1a2b3c4 -> agents-bus (cannot lock ref "
+               "'refs/heads/agents-bus': is at b591d81d0 but expected afe4a1e7c)")
+
+    def _refusal(self):
+        return subprocess.CompletedProcess(args=["git", "push"], returncode=1, stdout="",
+                                           stderr=self.REFUSAL)
+
+    def test_a_ref_lock_refusal_counts_as_a_race(self):
+        self.assertTrue(gitbus._remote_moved(self._refusal()))
+        # ... and a refusal that is not a race is still not retried as one.
+        self.assertFalse(gitbus._remote_moved(subprocess.CompletedProcess(
+            args=["git", "push"], returncode=1, stdout="",
+            stderr="fatal: could not read Username for 'https://example.invalid'")))
+
+    def test_the_pause_between_retries_is_jittered(self):
+        with patch.object(gitbus, "TIP_RETRY_WAIT_SECONDS", 1.0), \
+                patch.object(gitbus, "TIP_RETRY_JITTER_SECONDS", 0.5):
+            pauses = {gitbus._retry_pause(1) for _ in range(20)}
+        self.assertTrue(all(1.0 <= pause <= 1.5 for pause in pauses))
+        self.assertGreater(len(pauses), 1, "two writers must not retry in step")
+
+    def test_two_writers_racing_on_one_bus_both_get_their_row(self):
+        """Both rows land on the bus; neither writer sees OwedPushError."""
+        racer = self.clone_as("two")
+        row_one = self.clone / ".agents" / "owed" / "one" / "verdict-a.json"
+        row_two = racer / ".agents" / "owed" / "two" / "verdict-b.json"
+        for path, name in ((row_one, "a"), (row_two, "b")):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"id": f"verdict:#235@{name}"}), encoding="utf-8")
+        # The other writer commits and pushes in the window between this writer's fetch and
+        # its push, so the push is refused on the ref's old value -- the logged refusal.
+        git(racer, "add", ".agents")
+        git(racer, "commit", "-q", "-m", "owed: b")
+        git(racer, "push", "-q", "origin", "main")
+        original = GitTransport._git
+        refused = []
+
+        def racing(transport, *args, **kwargs):
+            if args and args[0] == "push" and not refused:
+                refused.append(True)
+                return self._refusal()
+            return original(transport, *args, **kwargs)
+
+        with patch.object(GitTransport, "_git", racing), \
+                patch.object(gitbus, "TIP_RETRY_WAIT_SECONDS", 0), \
+                patch.object(gitbus, "TIP_RETRY_JITTER_SECONDS", 0):
+            GitTransport(self.clone, ref="origin/main").commit_and_push(
+                "owed: verdict:#235@a", paths=[".agents/owed/one/verdict-a.json"])
+        files = git(self.base, "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",
+                    "main").splitlines()
+        self.assertIn(".agents/owed/one/verdict-a.json", files)
+        self.assertIn(".agents/owed/two/verdict-b.json", files)
+
+    def test_a_bus_document_stuck_locally_rides_the_next_push(self):
+        """The marker: a row a refused push left local goes up with the next write (#235)."""
+        row = self.clone / ".agents" / "owed" / "one" / "row.json"
+        row.parent.mkdir(parents=True, exist_ok=True)
+        row.write_text(json.dumps({"id": "stuck"}), encoding="utf-8")
+        git(self.clone, "add", ".agents/owed/one/row.json")
+        git(self.clone, "commit", "-q", "-m", "owed: stuck")
+        other = self.clone / ".agents" / "inbox" / ENVELOPE
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("---\nid: x\n---\nbody\n", encoding="utf-8")
+        # The earlier row's own push was refused, so only the local commit carries it.
+        gitbus.GitTransport(self.clone, ref="origin/main").commit_and_push(
+            f"bus(a2a): {ENVELOPE}", paths=[f".agents/inbox/{ENVELOPE}"])
+        files = git(self.base, "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",
+                    "main").splitlines()
+        self.assertIn(".agents/owed/one/row.json", files)
+        self.assertIn(f".agents/inbox/{ENVELOPE}", files)

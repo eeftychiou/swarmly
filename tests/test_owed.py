@@ -591,5 +591,63 @@ class TestRoundFiveReplays(unittest.TestCase):
         self.assertIn("overdue", open_now[0].line(now=state["t"]))
 
 
+class TestARefusedPushLosesNoRow(unittest.TestCase):
+    """#235: a bus that refuses a push must not leave the row local for good.
+
+    The 23 Oct logs had four ``OwedPushError``s: two writers reached the bus at once, the
+    loser's push was refused on the ref's old value, and nothing retried, so peers and a
+    successor never saw the row.
+    """
+
+    def make(self, tmp, refusals):
+        """A store whose bus refuses its next *refusals* pushes, then takes what it is given."""
+        delivered = {}
+
+        class Bus:
+            ref = "refs/heads/main"
+            refused = []
+
+            def commit_and_push(self, message, paths=None):
+                if len(self.refused) < refusals:
+                    self.refused.append(message)
+                    raise RuntimeError("! [remote rejected] (cannot lock ref 'refs/heads/main')")
+                for relpath in paths or ():
+                    delivered[relpath] = (root / relpath).read_text(encoding="utf-8")
+
+        root = Path(tmp) / "checkout"
+        store = ow.OwedStore("DeepSeek", state_dir=Path(tmp) / "state", transport=Bus(),
+                             root=root, clock=lambda: 1000.0)
+        return store, delivered
+
+    def row(self, topic):
+        return ow.handoff_rows(asked=["Reasonix"], asker="Claudebot", topic=topic,
+                               at=1000.0)[0]
+
+    def test_a_row_a_refused_push_left_local_rides_the_next_write(self):
+        with TemporaryDirectory() as tmp:
+            store, delivered = self.make(tmp, refusals=1)
+            first = self.row("tg-1")
+            with self.assertRaises(ow.OwedPushError) as caught:
+                store.save(first)
+            self.assertIn("local only", str(caught.exception))
+            self.assertEqual(delivered, {})                  # nothing reached the bus
+            # The next write retries what the bus did not take, so the earlier row lands then.
+            store.save(self.row("tg-2"))
+            self.assertEqual(len(delivered), 2, delivered)
+            landed = {ow.Row.from_dict(json.loads(text)).id for text in delivered.values()}
+            self.assertIn(first.id, landed)
+            self.assertEqual(store._undelivered(), [])        # the marker is cleared
+
+    def test_the_marker_is_not_read_as_a_row(self):
+        with TemporaryDirectory() as tmp:
+            store, _delivered = self.make(tmp, refusals=99)
+            with self.assertRaises(ow.OwedPushError):
+                store.save(self.row("tg-1"))
+            # A restart reads the same checkout: the marker must not be an unreadable debt.
+            again, _ = self.make(tmp, refusals=99)
+            self.assertEqual([row.id for row in again.load()], [self.row("tg-1").id])
+            self.assertEqual(again.unreadable, [])
+
+
 if __name__ == "__main__":                       # pragma: no cover
     unittest.main()

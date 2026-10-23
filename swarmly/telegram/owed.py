@@ -700,14 +700,59 @@ class OwedStore:
         if prepared:
             first, _relpath = prepared[0]
             more = f" (+{len(prepared) - 1} more)" if len(prepared) > 1 else ""
+            # #235: a push refused by a race used to leave the row local for good. What the
+            # bus did not take is retried with the next write, so a row that lost one race is
+            # delivered by the round that follows instead of waiting for someone to observe it
+            # again -- and only a bus that refuses every attempt leaves it marked.
+            undelivered = list(dict.fromkeys(
+                [relpath for _row, relpath in prepared] + self._undelivered()))
             try:
                 if hasattr(self.transport, "commit_and_push"):
                     self.transport.commit_and_push(
                         f"owed: {first.id} {first.state} [{self.safe_alias}]{more}",
-                        paths=[relpath for _row, relpath in prepared])
+                        paths=undelivered)
             except Exception as exc:                     # noqa: BLE001 - reported, not swallowed
+                self._mark_undelivered(undelivered)
                 raise OwedPushError(f"the row is local only: {exc}") from exc
+            self._mark_undelivered([])
         return batch
+
+    @property
+    def _undelivered_path(self) -> Optional[Path]:
+        """Where the "local only" marker lives -- beside the owed rows, never among them.
+
+        Not inside ``owed/``: :meth:`load` reads every ``*.json`` there as a row, and a marker
+        would show up as an unreadable debt.
+        """
+        return None if self.state_dir is None else self.state_dir / "owed-undelivered.json"
+
+    def _undelivered(self) -> List[str]:
+        """Row documents a refused push left local only, still waiting for a delivery."""
+        path = self._undelivered_path
+        if path is None:
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, str) and is_bus_document(item)
+                and self.root is not None and (self.root / item).is_file()]
+
+    def _mark_undelivered(self, relpaths: Sequence[str]) -> None:
+        """Record what the bus has not taken yet; an empty list clears the marker."""
+        path = self._undelivered_path
+        if path is None:
+            return
+        try:
+            if relpaths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(sorted(set(relpaths))), encoding="utf-8")
+            else:
+                path.unlink()
+        except OSError:                                  # a marker that cannot be written is
+            logger.warning("owed: could not update the local-only marker %s", path)
 
     def load(self) -> List[Row]:
         """Every row this bot can read: its own state copy **and** the bus documents.

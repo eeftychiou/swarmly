@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import subprocess
 import tempfile
 import time
@@ -17,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from swarmly.transports.base import (ROUNDS_RELPATH, is_bus_document,
+from swarmly.transports.base import (BUS_DOCUMENT_DIRS, ROUNDS_RELPATH, is_bus_document,
                                      is_envelope_name, write_envelope)
 
 logger = logging.getLogger("swarmly.transports.git")
@@ -32,8 +33,22 @@ INDEX_LOCK_RETRIES = 10
 INDEX_LOCK_WAIT_SECONDS = 0.5
 #: Agents with their own bus checkouts push to one branch: a push can lose the race to
 #: another agent's, so the retry on the remote's tip runs a few times, with a short pause.
+#: The pause is jittered (#235): two writers that lost the same race must not retry in step
+#: and collide again, which is how a row stayed local on the fourth attempt of a busy round.
 TIP_RETRIES = 4
 TIP_RETRY_WAIT_SECONDS = 1.0
+TIP_RETRY_JITTER_SECONDS = 0.5
+
+#: Every bus directory the retry carries forward, not only envelopes and round state: a
+#: lease, wake or owed row committed here whose push was refused is still undelivered, and
+#: it rides the next push that succeeds (#235 -- an owed row otherwise stayed local only).
+CARRY_PATHSPEC = tuple(dict.fromkeys((INBOX_RELPATH, ROUNDS_RELPATH, *BUS_DOCUMENT_DIRS)))
+
+
+def _retry_pause(attempt: int) -> float:
+    """How long to wait before retry number *attempt* (1-based): backoff plus jitter."""
+    base = TIP_RETRY_WAIT_SECONDS * attempt
+    return base + random.uniform(0, TIP_RETRY_JITTER_SECONDS)
 #: A single git call slower than this is logged with its subcommand and duration.
 SLOW_GIT_SECONDS = 5.0
 
@@ -296,13 +311,13 @@ class GitTransport:
         # that kept it local is carried forward too -- an envelope-only filter here would
         # drop a state rewrite silently and leave the bus a sequence behind.
         unpushed = self._git("diff", "--name-only", "--diff-filter=A", f"{tip}...HEAD", "--",
-                             INBOX_RELPATH, ROUNDS_RELPATH)
+                             *CARRY_PATHSPEC)
         # #126: the local branch is never fast-forwarded, so "added since the merge base" grows
         # with every bus file this bot ever pushed through this retry, and each one costs two
         # git calls below (live: one lease push took about 40 s). Only the files the remote's
         # tip does not have yet still need carrying.
         missing = self._git("diff", "--name-only", "--diff-filter=A", tip, "HEAD", "--",
-                            INBOX_RELPATH, ROUNDS_RELPATH)
+                            *CARRY_PATHSPEC)
         absent = set(missing.stdout.splitlines()) if missing.returncode == 0 else None
         earlier = [path for path in unpushed.stdout.splitlines()
                    if unpushed.returncode == 0
@@ -376,7 +391,7 @@ class GitTransport:
                 logger.info("gitbus: push lost a race to another agent (%s); retrying",
                             ((result.stderr or result.stdout or "").strip().splitlines()
                              or ["rejected"])[0])
-                time.sleep(TIP_RETRY_WAIT_SECONDS * (attempt + 1))
+                time.sleep(_retry_pause(attempt + 1))
                 result = self._push_onto_remote_tip(self.remote, branch, pathspec, commit_msg)
                 if result.returncode == 0 or not _remote_moved(result):
                     break
@@ -438,7 +453,7 @@ class GitTransport:
                     logger.info("gitbus: push lost a race to another agent (%s); retrying",
                                 ((push.stderr or push.stdout or "").strip().splitlines()
                                  or ["rejected"])[0])
-                    time.sleep(TIP_RETRY_WAIT_SECONDS * attempt)
+                    time.sleep(_retry_pause(attempt))
                 attempts += 1
                 push = self._push_onto_remote_tip(remote, branch, carry, commit_msg)
                 if push.returncode == 0 or not _remote_moved(push):
@@ -468,6 +483,18 @@ class GitTransport:
                                "be committed or pushed - check `git status`") from exc
 
 
+#: What a push says when a *concurrent* writer, not a permission error, refused it.
+#: ``[remote rejected]`` and ``cannot lock ref`` are the ref-lock race the 23 Oct logs caught
+#: (#235): the branch moved between this writer's fetch and its push, and the refusal names
+#: the old value it expected. Matching only ``[rejected]`` missed that wording entirely, so
+#: the retry never ran and the row stayed local.
+_RACE_SIGNS = (
+    "non-fast-forward", "fetch first", "[rejected]", "[remote rejected]",
+    "cannot lock ref", "failed to lock", "incorrect old value", "stale info",
+)
+
+
 def _remote_moved(push: "subprocess.CompletedProcess[str]") -> bool:
-    text = (push.stderr or "") + (push.stdout or "")
-    return any(sign in text for sign in ("non-fast-forward", "fetch first", "[rejected]"))
+    """True when *push* was refused because the remote's ref moved under this writer."""
+    text = ((push.stderr or "") + (push.stdout or "")).lower()
+    return any(sign in text for sign in _RACE_SIGNS)
