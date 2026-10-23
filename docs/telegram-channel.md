@@ -999,9 +999,13 @@ to N topics run a turn at the same time.
   nobody stops taking turns: the bots still answer what they are asked, but they start
   nothing — no owed wake, no stall ladder, no hand-off reminder — and every turn is told to
   start no work, merge nothing, open no pull request and hand nothing off. The hold survives
-  restarts. `/release` (or `/release@<bot>`) lifts it, swarm-wide in the same way. Each bot
-  keeps the hold itself and no machine line carries it, so a bot that was down when `/hold`
-  was sent, or joins later, is not held: send `/hold` again once it is up.
+  restarts. `/release` (or `/release@<bot>`) lifts it, swarm-wide in the same way.
+  **The hold rides the pulse (#234).** Each bot's beat carries `held` (`{at, reason}`, absent
+  when it is not held) and, after a `/release`, its `released_at`; a bot whose own last
+  `/hold`/`/release` is **older** than a peer's adopts the peer's, so a bot that was down when
+  the admin sent either command is held -- or released -- within one pulse, and a stale hold
+  never comes back over a newer release. The latest admin action wins. `/status` shows it per
+  bot (`peers=Codex:up+held,…`).
 - On start, the transport clears any webhook left on the bot so long polling can take over,
   keeping pending updates.
 

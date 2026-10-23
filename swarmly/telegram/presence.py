@@ -46,12 +46,22 @@ class Pulse:
     #: a command centre to render. Kept as the record itself, never as a typed object, so a
     #: peer on an older build reads the fields it knows and ignores the rest.
     status: Optional[Dict[str, Any]] = None
+    #: The admin's hold, carried on the beat so a bot that was down when `/hold` was sent is
+    #: held too (#234): ``{"at": epoch, "reason": str}``, or None when this bot is not held.
+    held: Optional[Dict[str, Any]] = None
+    #: When this bot last let the hold go (`/release`). Carried so a late bot that is still
+    #: held adopts the release, and an older hold can never come back over it (#234).
+    released_at: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = {"alias": self.alias, "at": self.at, "rev": self.rev, "role": self.role,
                 "term": self.term, "busy_since": self.busy_since, "frozen": self.frozen}
         if self.status:
             data["status"] = dict(self.status)
+        if self.held:
+            data["held"] = dict(self.held)
+        if self.released_at is not None:
+            data["released_at"] = float(self.released_at)
         return data
 
     @classmethod
@@ -74,11 +84,24 @@ class Pulse:
         status = data.get("status")
         if status is not None and not isinstance(status, dict):
             raise ValueError("'status' must be an object or null")
+        held = data.get("held")
+        if held is not None:
+            if not isinstance(held, dict):
+                raise ValueError("'held' must be an object or null")
+            stamp = held.get("at")
+            if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+                raise ValueError("'held' needs 'at' (epoch seconds)")
+        released = data.get("released_at")
+        if released is not None and (not isinstance(released, (int, float))
+                                     or isinstance(released, bool)):
+            raise ValueError("'released_at' must be a number or null")
         return cls(alias=alias.strip(), at=float(at), rev=str(data.get("rev") or ""),
                    role=str(data.get("role") or ""), term=term,
                    busy_since=None if busy is None else float(busy),
                    frozen=bool(data.get("frozen")),
-                   status=dict(status) if status else None)
+                   status=dict(status) if status else None,
+                   held=dict(held) if held else None,
+                   released_at=None if released is None else float(released))
 
 
 @dataclass
@@ -96,6 +119,11 @@ class Peer:
     down_notified_at: Optional[float] = None
     #: The latest status snapshot this peer published (issue #124), as it published it.
     snapshot: Optional[Dict[str, Any]] = None
+    #: The peer's hold as its latest beat carried it, or None when it is not held (#234).
+    held: Optional[Dict[str, Any]] = None
+    #: The stamp of that peer's **latest** admin action -- the hold's ``at``, or its
+    #: ``released_at`` when the release is the newer one. What reconciliation compares.
+    action_at: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         data = {"alias": self.alias, "last_seen": self.last_seen,
@@ -104,6 +132,10 @@ class Peer:
                 "down_notified_at": self.down_notified_at}
         if self.snapshot:
             data["snapshot"] = dict(self.snapshot)
+        if self.held:
+            data["held"] = dict(self.held)
+        if self.action_at:
+            data["action_at"] = float(self.action_at)
         return data
 
     @classmethod
@@ -119,12 +151,30 @@ class Peer:
         busy = data.get("busy_since")
         notified = data.get("down_notified_at")
         snapshot = data.get("snapshot")
+        held = data.get("held")
+        action = data.get("action_at")
         return cls(alias=alias.strip(), last_seen=float(last_seen),
                    busy_since=None if busy is None else float(busy),
                    frozen=bool(data.get("frozen")), term=int(data.get("term") or 0),
                    rev=str(data.get("rev") or ""), role=str(data.get("role") or ""),
                    down_notified_at=None if notified is None else float(notified),
-                   snapshot=dict(snapshot) if isinstance(snapshot, dict) else None)
+                   snapshot=dict(snapshot) if isinstance(snapshot, dict) else None,
+                   held=dict(held) if isinstance(held, dict) else None,
+                   action_at=float(action) if isinstance(action, (int, float))
+                   and not isinstance(action, bool) else 0.0)
+
+
+def hold_action(pulse: Pulse) -> Optional[float]:
+    """The stamp of the admin action *pulse* carries: a hold's ``at``, else ``released_at``.
+
+    Nothing when the beat carries neither, which is what a bot on an older build sends and
+    what a bot that has never had a `/hold` or `/release` has to say (#234).
+    """
+    if pulse.held:
+        stamp = pulse.held.get("at")
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+            return float(stamp)
+    return None if pulse.released_at is None else float(pulse.released_at)
 
 
 class Presence:
@@ -172,6 +222,12 @@ class Presence:
             older = (peer.snapshot or {}).get("at") or 0.0
             if float(pulse.status.get("at") or 0.0) >= float(older):
                 peer.snapshot = dict(pulse.status)
+        # Issue #234: the hold rides the beat, and only a *newer* admin action moves it -- so a
+        # beat that arrives late can never bring back a hold the admin has already released.
+        stamp = hold_action(pulse)
+        if stamp is not None and stamp >= peer.action_at:
+            peer.action_at = stamp
+            peer.held = dict(pulse.held) if pulse.held else None
         if peer.down_notified_at is not None:
             peer.down_notified_at = None        # a new episode may be reported again
         self.peers[pulse.alias] = peer
@@ -230,20 +286,25 @@ class Presence:
 
     # -- what the operator sees --------------------------------------------------------
     def line(self, now: float, *, order: Iterable[str] = ()) -> str:
-        """The ``/status`` and ``/swarm`` fragment: ``peers=Claudebot:up,DeepSeek:down(12m)``."""
+        """The ``/status`` and ``/swarm`` fragment: ``peers=Claudebot:up,DeepSeek:down(12m)``.
+
+        A peer the admin has put on hold carries ``+held`` (#234), so the operator sees who is
+        held per bot -- not only that somebody, somewhere, is.
+        """
         names = list(order) or [alias for alias in self.peers]
         parts = []
         for alias in names:
             state = self.status(alias, now)
+            held = "+held" if (self.peers.get(alias) and self.peers[alias].held) else ""
             if state == "down":
                 quiet = int((self.quiet_for(alias, now) or 0.0) // 60)
-                parts.append(f"{alias}:down({quiet}m)")
+                parts.append(f"{alias}:down({quiet}m){held}")
             elif state == "busy":
                 peer = self.peers[alias]
                 busy_for = int(max(0.0, now - (peer.busy_since or now)) // 60)
-                parts.append(f"{alias}:busy({busy_for}m)")
+                parts.append(f"{alias}:busy({busy_for}m){held}")
             else:
-                parts.append(f"{alias}:{state}")
+                parts.append(f"{alias}:{state}{held}")
         return "peers=" + (",".join(parts) if parts else "none")
 
     def summary(self, now: float) -> Dict[str, Any]:
