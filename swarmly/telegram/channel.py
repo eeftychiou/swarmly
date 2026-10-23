@@ -5593,6 +5593,11 @@ class AgentChannel:
         """
         from swarmly.telegram.head_freeze import (claims, mismatches, ready_blockers,
                                                   ready_claims, ready_notice)
+        # Nothing to check unless the message names an item: without this every outgoing
+        # message read the round state, and that read is a `git fetch` on the message path
+        # (cli-passthrough saw one where it expects none -- #183 review).
+        if not re.search(r"#\d+", str(text or "")):
+            return []
         facts = self._round_facts()
         heads = {label: values["head"] for label, values in facts.items() if values["head"]}
         if not heads:
