@@ -7565,6 +7565,9 @@ class AgentChannel:
         # Round 5.5 (#165): a WAIT line is a row, taken out of the reply the same way.
         body = self.apply_wait_lines(body, event)
         body = self.apply_round_block(body, event).strip()
+        from swarmly.telegram.membership import MEMBERSHIP_MARK
+        if not (event.self_task and (event.text or "").startswith(MEMBERSHIP_MARK)):
+            body = await self.membership.apply_role_lines(body)   # coordinator reassigns
         if event.self_task:
             body = self._unaddress_self(body)
         body = drop_stray_silence(body)

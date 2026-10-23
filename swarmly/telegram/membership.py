@@ -752,8 +752,7 @@ class Membership:
         target, role = envelope.to or "", str(envelope.ref or "")
         if not sender or not _ROLE_NAME(role):
             return
-        coordinator = self.state.coordinator
-        if coordinator is None or sender.lower() != coordinator.lower():
+        if not self._speaks_as_coordinator(sender):
             logger.warning("membership: ROLE from %s ignored: it is not the coordinator",
                            sender)
             return
@@ -767,11 +766,43 @@ class Membership:
         else:
             current = next((r for a, r in self.cfg.peer_roles.items()
                             if a.lower() == target.lower()), None)
-        if current:
-            logger.info("membership: ROLE %s for %s ignored: it has the role %s; only the "
-                        "admin changes a role", role, target, current)
+        if current == "coordinator":
+            logger.info("membership: ROLE %s for %s ignored: the coordinator's role is the "
+                        "admin's", role, target)
             return
+        if current == role:
+            return
+        # Self-healing roles (admin, 23 Oct): the coordinator fills a gap or switches a peer
+        # that is not performing at any time, not only for a newcomer. The admin's /role still
+        # overrides, and no bot is ever made coordinator this way.
         self.apply_role(target, role, by=sender)
+
+    def _speaks_as_coordinator(self, sender: str) -> bool:
+        """The named coordinator, or the bot holding the lease (a successor after a failover)."""
+        names = {(self.state.coordinator or "").lower()}
+        current = getattr(self.ch, "current_coordinator", None)
+        if callable(current):
+            try:
+                names.add((current() or "").lower())
+            except Exception:                         # noqa: BLE001 - no answer adds no one
+                pass
+        names.discard("")
+        return sender.lower() in names
+
+    async def apply_role_lines(self, body: str) -> str:
+        """``ROLE: @bot <role>`` lines in the coordinator's own reply: each one reassigns
+        that peer (never to or from coordinator) and is taken out of the posted text, which
+        keeps the reason. Another bot's ROLE lines are left as prose and change nothing."""
+        if not _ROLE_LINE.search(body or "") or not self.is_coordinator():
+            return body
+        for handle, role in _ROLE_LINE.findall(body):
+            alias = self.cfg.peer_alias_for(handle)
+            current = next((r for a, r in self.cfg.peer_roles.items()
+                            if alias and a.lower() == alias.lower()), None)
+            if alias is None or current == "coordinator" or current == role.lower():
+                continue
+            await self.assign(handle, role.lower(), reason=_reason(body))
+        return _ROLE_LINE.sub("", body).strip()
 
     def apply_role(self, target: str, role: str, by: str) -> None:
         """Record that *target* (an alias) now has *role*."""

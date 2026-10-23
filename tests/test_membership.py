@@ -683,10 +683,55 @@ class TrustTests(unittest.TestCase):
             run(channel.handle_event(hello("ROLE", "developer", "", "claude_x_bot", 401,
                                            to="Hermes")))
             self.assertEqual(m.state.role, "developer")
-            # A role is given once: changing it is the admin's.
+            # Self-healing roles (admin, 23 Oct): the coordinator may switch it later too.
             run(channel.handle_event(hello("ROLE", "researcher", "", "claude_x_bot", 401,
                                            to="Hermes")))
-            self.assertEqual(m.state.role, "developer")
+            self.assertEqual(m.state.role, "researcher")
+            # ...but nobody else may.
+            run(channel.handle_event(hello("ROLE", "qa-tester", "", "codex_x_bot", 402,
+                                           to="Hermes")))
+            self.assertEqual(m.state.role, "researcher")
+
+    def test_the_bot_holding_the_lease_may_reassign_and_nobody_touches_the_coordinator(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = joined(make_channel(config_at(folder, peers={
+                "Claude": "claude_x_bot", "Reasonix": "reasonix_x_bot"})), role="developer")
+            m = channel.membership
+            m._set_peer_role("Claude", "coordinator", coordinator=True)
+            m._set_peer_role("Reasonix", "reviewer")
+            channel.current_coordinator = lambda now=None: "Reasonix"   # acting after failover
+            run(channel.handle_event(hello("ROLE", "qa-tester", "", "reasonix_x_bot", 403,
+                                           to="Hermes")))
+            self.assertEqual(m.state.role, "qa-tester")
+            run(channel.handle_event(hello("ROLE", "developer", "", "reasonix_x_bot", 403,
+                                           to="Claude")))
+            self.assertEqual(channel.config.peer_roles["Claude"], "coordinator")
+
+    def test_the_coordinators_role_lines_reassign_and_leave_the_reply(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = joined(make_channel(config_at(folder, peers={
+                "Codex": "codex_x_bot", "Reasonix": "reasonix_x_bot"})))
+            m = channel.membership
+            m._set_peer_role("Codex", "reviewer")
+            m._set_peer_role("Reasonix", "developer")
+            body = ("Codex is frozen until 18 Nov, so Reasonix reviews this round.\n"
+                    "ROLE: @reasonix_x_bot reviewer\nROLE: @codex_x_bot coordinator")
+            out = run(m.apply_role_lines(body))
+            self.assertEqual(channel.config.peer_roles["Reasonix"], "reviewer")
+            self.assertEqual(channel.config.peer_roles["Codex"], "reviewer")   # never coordinator
+            self.assertNotIn("ROLE:", out)
+            self.assertIn("Reasonix reviews this round", out)
+            self.assertIn("intent=ROLE ref=reviewer", channel._test_sender.last)
+
+    def test_a_peers_role_lines_are_only_prose(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = joined(make_channel(config_at(folder, peers={"Codex": "codex_x_bot"})),
+                             role="developer")
+            m = channel.membership
+            m._set_peer_role("Codex", "reviewer")
+            body = "ROLE: @codex_x_bot developer"
+            self.assertEqual(run(m.apply_role_lines(body)), body)
+            self.assertEqual(channel.config.peer_roles["Codex"], "reviewer")
 
     def test_a_hand_written_config_never_joins_by_itself(self):
         with tempfile.TemporaryDirectory() as folder:
