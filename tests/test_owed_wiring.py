@@ -486,6 +486,22 @@ class TestTheRoundStateSweep(unittest.TestCase):
         self.assertTrue(retired)
         self.assertIn("no longer open in the round", retired[0].closed_by)
 
+    def test_a_row_from_before_the_flag_does_not_keep_its_item_live(self):
+        """#196 review: a pre-``@next`` row is the same debt, and it blocked the flag."""
+        channel = self.channel()
+        channel.owed_roles = lambda: {"coordinator": "Claudebot"}
+        legacy = ow.Row(kind="progress", item="#146", debtor="Claudebot",
+                        owes="a next step on #146",
+                        observed="PR #146: no CI result, no merge verdict, no QA pass, not merged")
+        channel._test_table[1].save_all([legacy])
+        self.sweep(channel, {"146": {"pr": 146, "head": "c166987", "ci": "green"}})
+        open_now = {row.id: row for row in rows(channel) if row.is_open}
+        self.assertIn("progress:#146@next:Claudebot", open_now)     # the row that flags it
+        self.assertIn("no next actor", open_now["progress:#146@next:Claudebot"].flag)
+        retired = [row for row in rows(channel) if row.id == "progress:#146:Claudebot"][0]
+        self.assertFalse(retired.is_open)
+        self.assertIn("superseded", retired.closed_by)
+
     def test_roles_come_from_the_roster(self):
         channel = self.channel()
         channel.owed_roles = lambda: {}
