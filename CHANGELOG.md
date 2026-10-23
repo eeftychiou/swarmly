@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A full busy queue **holds** a message instead of dropping it (`#184`): past
+  `limits.busy_queue_max` the message goes to the durable inbox and is taken, oldest first, as
+  each turn ends, so every message is answered in arrival order. The topic is told once per
+  window that the bot is behind, with the depth, and `stats.busy_held` counts what used to be
+  silently dropped.
+
 ### Added
 
 - The head under review is frozen (`#183`): a message that claims a PR's head is checked against

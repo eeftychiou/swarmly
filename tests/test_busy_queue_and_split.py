@@ -32,7 +32,8 @@ async def _settle(rounds: int = 10) -> None:
         await asyncio.sleep(0)
 
 
-def hold_and_send(channel, adapter, texts, *, cancel_index=None, thread_id=None):
+def hold_and_send(channel, adapter, texts, *, cancel_index=None, thread_id=None,
+                  drain=False):
     """Hold a turn open, send ``texts`` while it runs, then release and collect everything."""
 
     async def scenario():
@@ -49,6 +50,15 @@ def hold_and_send(channel, adapter, texts, *, cancel_index=None, thread_id=None)
             await _settle()
         adapter.release.set()
         results = await asyncio.gather(first, *waiting, return_exceptions=True)
+        if drain:
+            # #184: a held message runs as its own task when the queue drains. Wait for it
+            # inside this loop: a task still pending when `run()` closes the loop is cancelled,
+            # and the test would read "never answered" instead of "answered a moment later".
+            for _ in range(60):
+                if not channel._held_overflow():
+                    await _settle(5)
+                    break
+                await _settle(5)
         return snapshot, results
 
     return run(scenario())
@@ -84,14 +94,31 @@ class TestBusyQueue(unittest.TestCase):
         self.assertEqual(where, sorted(where))
         self.assertIn("arrived while your last turn ran", reply)
 
-    def test_the_queue_is_bounded_and_overflow_is_dropped_and_counted(self):
+    def test_a_full_queue_holds_the_overflow_and_every_message_is_answered(self):
+        """#184's acceptance: overfill the queue and see every message answered, in order.
+
+        Before: past `busy_queue_max` the message was dropped with "its queue is full" (live,
+        22 Oct, twice) -- a hand-off nobody saw again.
+        """
         channel, adapter = gated(busy_queue_max=2)
         with self.assertLogs("swarmly.telegram", level="WARNING") as captured:
-            _, results = hold_and_send(channel, adapter, self.TEXTS)
-        self.assertEqual(adapter.calls, 3, "the running turn plus two queued")
-        self.assertEqual(channel.stats.busy_queued, 2)
-        self.assertEqual(channel.stats.busy_dropped, 1)
+            _, results = hold_and_send(channel, adapter, self.TEXTS, drain=True)
+        self.assertEqual(channel.stats.busy_queued, 2, "two waited in memory")
+        self.assertEqual(channel.stats.busy_held, 1, "the third was held, not dropped")
+        self.assertEqual(channel.stats.busy_dropped, 0)
+        self.assertEqual(adapter.calls, 4, "the running turn plus all three answered")
+        # The call that overflowed returned None: its message did not run *there*, it ran as a
+        # held turn of its own once the queue drained -- which is what `adapter.calls` shows.
         self.assertIsNone(results[3])
+        replies = [sent["text"] for sent in channel._test_sender.sent]
+        order = [next(i for i, text in enumerate(self.TEXTS) if text.split(": ")[1] in reply)
+                 for reply in replies[1:] if any(text.split(": ")[1] in reply
+                                                for text in self.TEXTS)]
+        self.assertEqual(order, [0, 1, 2], f"arrival order, not completion order: {replies}")
+        # And the topic is told once that the bot is behind, with the depth -- not that the
+        # message was thrown away.
+        self.assertTrue(any("behind by" in reply and "kept" in reply for reply in replies),
+                        replies)
         self.assertTrue(any("busy queue" in record.getMessage() for record in captured.records))
 
     def test_a_queued_peer_message_waits_out_the_turn_cooldown_instead_of_being_dropped(self):

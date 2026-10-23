@@ -422,6 +422,7 @@ class ChannelStats:
     last_error: str = ""
     busy_dropped: int = 0                                # #9: addressed msgs dropped while a turn was in flight
     busy_queued: int = 0                                 # addressed msgs held and run after the turn in flight
+    busy_held: int = 0                                   # #184: overflowed to the durable inbox, not dropped
     stopped: int = 0                                     # turns cancelled with /stop
 
 
@@ -6170,6 +6171,54 @@ class AgentChannel:
         if self._inbox.record(event):
             _INBOX_KEYS.get().append((event.chat_id, event.message_id))
 
+    def _held_overflow(self) -> List[ChannelEvent]:
+        """The messages held past the in-memory limit, oldest first (#184)."""
+        held = getattr(self, "_overflow", None)
+        if held is None:
+            held = self._overflow = []
+        return held
+
+    def _hold_overflow(self, event: ChannelEvent, *, key: Any = None) -> int:
+        """Keep a message the in-memory queue has no room for, instead of dropping it (#184).
+
+        Live, 22 Oct: "⚠️ … is busy and its queue is full" dropped a coordinator hand-off at
+        18:01 and a DeepSeek one at 19:31 -- a stall nobody sees. The message joins the held
+        queue **and** is recorded in the durable inbox, so a restart still replays it; the held
+        queue keeps the order, and :meth:`_drain_overflow` takes one as each turn ends.
+
+        Returns the queue's depth, for the one notice the topic gets.
+        """
+        self._held_overflow().append(event)
+        try:
+            self._inbox.record(event)          # durable: a restart replays what is held
+            self.stats.busy_held += 1
+        except Exception:                      # noqa: BLE001 - never lose the turn over it
+            logger.warning("busy queue: could not keep the overflowed message from @%s",
+                           event.author_username, exc_info=True)
+        return len(self._held_overflow())
+
+    def _drain_overflow(self) -> None:
+        """Start the oldest held message when the queue has room (#184), one per turn end.
+
+        The record is removed from the inbox before it runs: this turn carries it, and the
+        restart path must not replay a message that is already running. Nothing drains while
+        another turn holds the lock, so held work goes in arrival order.
+        """
+        if self._turn_running():
+            return
+        held = self._held_overflow()
+        if not held:
+            return
+        event = held.pop(0)
+        try:
+            self._inbox.done(event.chat_id, event.message_id)
+        except Exception:                      # noqa: BLE001 - a record is not the turn
+            logger.debug("busy queue: could not clear the held record", exc_info=True)
+        try:
+            asyncio.get_running_loop().create_task(self.handle_event(event))
+        except RuntimeError:                   # no loop: leave it held for the next one
+            held.insert(0, event)
+
     def replay_interrupted(self) -> int:
         """Resume what a restart cut off -- **once** -- and report what could not be finished.
 
@@ -6615,8 +6664,12 @@ class AgentChannel:
                         "default", window)
                     window = 900.0
             self.stats.ignored += 1
-            self.stats.busy_dropped += 1
-            self._busy_drops_since_notice += 1
+            if busy_behavior != "queue":
+                # A queue holds its overflow instead of dropping it (#184), and counts it as
+                # `busy_held`; a drop counter that also counted a held message would hide the
+                # difference this item is about.
+                self.stats.busy_dropped += 1
+                self._busy_drops_since_notice += 1
             if busy_behavior == "notice":
                 now = self._clock()
                 if now - self._busy_notice_at >= window:
@@ -6628,19 +6681,25 @@ class AgentChannel:
                         "⚠️ [%s] busy: %d addressed msg(s) from @%s dropped (turn in progress)",
                         self.config.identity.alias, dropped, event.author_username)
             elif busy_behavior == "queue":
-                logger.warning("busy queue for %s is full (%d waiting); dropped message from @%s",
-                               self.config.identity.alias,
-                               self._busy_waiting if self._turn_slots is None
-                               else self._busy_waiting_by.get(busy_key, 0),
-                               event.author_username)
-                # Say so in the chat, once per window: the drop used to be silent (live test).
+                # #184: past the in-memory limit the message is *held*, not dropped -- it goes
+                # to the durable inbox and is taken, oldest first, as the queue drains.
+                waiting_now = (self._busy_waiting if self._turn_slots is None
+                               else self._busy_waiting_by.get(busy_key, 0))
+                depth = self._hold_overflow(event, key=busy_key)
+                logger.warning("busy queue for %s is full (%d waiting); holding message from "
+                               "@%s for later (%d held)",
+                               self.config.identity.alias, waiting_now,
+                               event.author_username, depth)
+                # Say so in the chat, once per window, with the depth: being behind is news,
+                # a dropped hand-off was a stall nobody saw.
                 now = self._clock()
                 if now - self._queue_full_noticed >= 300:
                     self._queue_full_noticed = now
                     await self.send(
-                        f"⚠️ {self.config.identity.alias} is busy and its queue is full; it "
-                        f"dropped this message from {event.author_username or 'someone'}. "
-                        "Send it again once it has answered.",
+                        f"⚠️ {self.config.identity.alias} is busy and behind by "
+                        f"{depth + waiting_now} message(s); this one from "
+                        f"{event.author_username or 'someone'} is kept and will be answered "
+                        "in order.",
                         reply_to_message_id=event.message_id, chat_id=event.chat_id,
                         thread_id=event.thread_id, silent=True, notice=True)
             else:
@@ -6805,6 +6864,12 @@ class AgentChannel:
         if self._turn_slots is not None:
             self._turn_slots.release()
         lock.release()
+        # #184: the queue has room now, so a message held past the in-memory limit is taken --
+        # after the release, so the drained turn measures its own wait from this one ending.
+        try:
+            asyncio.get_running_loop().call_soon(self._drain_overflow)
+        except RuntimeError:
+            pass                                   # no loop: nothing to drain into
         if self._pause_pending:
             asyncio.get_running_loop().call_soon(
                 lambda: asyncio.ensure_future(self._finish_pause()))
@@ -6873,10 +6938,12 @@ class AgentChannel:
         wait from that turn: held peer turns stay a cooldown apart."""
         waiting = self._cooldown_waiting.get(key, 0)
         if waiting >= getattr(self.config.limits, "busy_queue_max", 5):
-            logger.warning("cooldown queue for %s is full (%d waiting); dropped message from @%s",
-                           self.config.identity.alias, waiting, event.author_username)
+            # #184: held, not dropped -- the same rule as the busy queue above.
+            held = self._hold_overflow(event, key=key)
+            logger.warning("cooldown queue for %s is full (%d waiting); holding message from "
+                           "@%s for later (%d held)",
+                           self.config.identity.alias, waiting, event.author_username, held)
             self.stats.ignored += 1
-            self.stats.busy_dropped += 1
             return None
         self._cooldown_waiting[key] = waiting + 1
         gate = self._hold_gates.get(key)
