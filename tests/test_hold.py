@@ -44,6 +44,15 @@ class HoldTests(unittest.TestCase):
         self.assertFalse(coordinator.held())
         self.assertEqual(coordinator._hold_note(), "")
 
+    def test_a_named_hold_still_holds_every_bot(self):
+        """#218 review (Reasonix): /hold@bot picks who answers, not who is held."""
+        channel = self.channel(coordinator=False)
+        self.assertEqual(channel._handle_hold(self.admin("/hold@OtherBot drill")), "")
+        self.assertTrue(channel.held())
+        self.assertIn("on hold", channel._handle_hold(self.admin("/hold@HermesBot drill")))
+        self.assertEqual(channel._handle_hold(self.admin("/release@OtherBot")), "")
+        self.assertFalse(channel.held())
+
     def test_only_the_admin_holds(self):
         channel = self.channel()
         self.assertEqual(channel._handle_hold(event("/hold", author_id=77, is_bot=True)), "")

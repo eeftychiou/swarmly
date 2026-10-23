@@ -6735,18 +6735,20 @@ class AgentChannel:
 
     def _handle_hold(self, event: ChannelEvent) -> Optional[str]:
         """``/hold [reason]`` and ``/release`` from the admin reach every bot. Held, a bot
-        still answers, but the hand-off reminders, the stall ladder and the
-        owed wakes stay quiet, and every turn is told to start nothing. Only the coordinator answers in
-        the chat (or the bot named with /hold@bot), so five bots don't say it five times."""
+        still answers, but the hand-off reminders, the stall ladder and the owed wakes stay
+        quiet, and every turn is told to start nothing. Every bot applies it; only the
+        coordinator answers in the chat (or the bot named with /hold@bot), so five bots don't
+        say it five times."""
         parsed = parse_command(event.text or "")
         if not parsed or parsed[0] not in ("hold", "release"):
             return None
         command, target = parsed
-        if target and target.lstrip("@").lower() != self.config.identity.name.lstrip(
-                "@").lower():
-            return ""
+        # A hold is a swarm-wide safety control (#218 review, Reasonix): every bot applies it,
+        # and /hold@bot only chooses who answers. Holding one bot is what /pause@bot is for.
+        mine = bool(target) and target.lstrip("@").lower() == self.config.identity.name.lstrip(
+            "@").lower()
         if not self.config.is_admin(event.author_id):
-            named = bool(target) or self.mentions_me(event.text or "")
+            named = mine or (not target and self.mentions_me(event.text or ""))
             return ("⛔ only the admin can hold or release the swarm"
                     if named and not event.author_is_bot else "")
         was = self.held()
@@ -6760,7 +6762,8 @@ class AgentChannel:
             text = ("▶ The swarm is released: work goes on." if was
                     else "▶ The swarm was not on hold.")
         logger.info("%s: /%s from the admin", self.config.identity.alias, command)
-        return text if (target or self.is_coordinator()) else ""
+        speaks = mine if target else self.is_coordinator()
+        return text if speaks else ""
 
     def _handle_pause(self, event: ChannelEvent) -> Optional[str]:
         """``/pause`` and ``/resume`` from the admin: a bare one reaches every bot, and
