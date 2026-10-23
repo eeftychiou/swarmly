@@ -1344,9 +1344,11 @@ class AgentChannel:
             result += f" {self.presence_line()}"
             # #234 review: `/status` shows this bot's own hold too, not only the peers' -- a
             # held bot's line must say so even when no peer has been heard from yet.
+            # #245 review (Reasonix): the reason is free text, so it is quoted -- otherwise
+            # `held=until the drill is done` reads as if the rest of the line were the reason.
             if self._hold:
-                why = str(self._hold.get("reason") or "").strip()
-                result += f" held={why or 'yes'}"
+                why = str(self._hold.get("reason") or "").strip().replace('"', "'")
+                result += f' held="{why}"' if why else " held=_"
             if self.config.identity.role:
                 result += f" role={self._role_name()}"
             if self.replies is not None:
