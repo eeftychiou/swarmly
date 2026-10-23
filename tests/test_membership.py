@@ -709,6 +709,24 @@ class TrustTests(unittest.TestCase):
             self.assertEqual(m.state.role, "developer")
             self.assertFalse(m.is_coordinator())
 
+    def test_an_acting_coordinator_keeps_its_own_role_when_the_admin_fails_back(self):
+        """#143 drill: Reasonix, a reviewer holding the lease after a failover, came out of
+        ``/role @claudebot coordinator`` as a developer. It yields the lease and stays a
+        reviewer."""
+        with tempfile.TemporaryDirectory() as folder:
+            channel = joined(make_channel(config_at(folder, peers={"Codex": "codex_x_bot"},
+                                                    role="reviewer")), role="reviewer")
+            m = channel.membership
+            yielded = []
+            channel.is_coordinator = lambda: True          # it holds the lease
+            channel._on_demoted_from_coordinator = lambda: yielded.append(True)
+            run(channel.handle_event(event("/role @codex_x_bot coordinator", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            self.assertEqual(m.state.role, "reviewer")
+            self.assertEqual(channel.config.identity.role, "reviewer")
+            self.assertEqual(yielded, [True])
+            self.assertEqual(channel.config.peer_roles["Codex"], "coordinator")
+
     def test_a_working_bus_moves_only_with_an_addressed_bus_command(self):
         with tempfile.TemporaryDirectory() as folder:
             channel = dynamic(joined(make_channel(config_at(folder))))
