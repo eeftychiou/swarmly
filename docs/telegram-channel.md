@@ -741,7 +741,10 @@ to that topic, with a "↪ moved this to" link where it was asked, so work that 
 wrong topic follows its items instead of staying put. A number no topic is about yet (a new
 issue) neither holds the reply nor moves it, and is learned in the topic the reply went to. A
 reply that also names an item of its own topic, items of two other topics, or only new
-numbers, stays. When an item was learned in the wrong topic,
+numbers, stays. **A person's question is the exception: it is answered where it was asked**,
+even when the answer is only about another topic's items (the move is for traffic between
+bots). Ask in the topic the work lives in, or move the item with `/topic`. When an item was
+learned in the wrong topic,
 the admin's `/topic #164 #165` inside the right one moves it there for every bot. A
 summary sent back with `REPORT_BACK:` has its @mentions defused, and a peer bot's message
 that names this bot only inside a list of three or more bots is not taken as addressing it. Set it to
@@ -939,6 +942,14 @@ to N topics run a turn at the same time.
   finishes and posts its answer, then the bot takes no more turns, from Telegram or the bus,
   and says "paused". The hold survives restarts. `/resume` (or `/resume@<bot>`) lifts it.
   Use it to stop a run at its budget without killing processes.
+- `/hold [reason]` from the admin holds the **whole swarm** (`/hold@<bot>` too: the mention only
+  picks which bot answers; holding one bot is what `/pause@<bot>` is for). Unlike `/pause`,
+  nobody stops taking turns: the bots still answer what they are asked, but they start
+  nothing — no owed wake, no stall ladder, no hand-off reminder — and every turn is told to
+  start no work, merge nothing, open no pull request and hand nothing off. The hold survives
+  restarts. `/release` (or `/release@<bot>`) lifts it, swarm-wide in the same way. Each bot
+  keeps the hold itself and no machine line carries it, so a bot that was down when `/hold`
+  was sent, or joins later, is not held: send `/hold` again once it is up.
 - On start, the transport clears any webhook left on the bot so long polling can take over,
   keeping pending updates.
 

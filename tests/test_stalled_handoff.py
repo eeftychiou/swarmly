@@ -84,6 +84,13 @@ class TestStalledHandoff(unittest.TestCase):
         channel = handed_off(handoff_nudge_minutes=0)
         self.assertEqual(tick(channel, 60), [])
 
+    def test_a_held_swarm_is_not_nudged(self):
+        """#218 review: the hold promises the hand-off reminders stay quiet."""
+        channel = handed_off()
+        channel._hold = {"held": True, "reason": "", "at": 0.0}
+        self.assertEqual(tick(channel, 21), [])
+        self.assertIn((GROUP, 307, "Codex"), channel._pending_handoffs)   # kept for /release
+
     def test_only_the_coordinator_nudges(self):
         # Round 2: every bot reminded every other one; the rule is one nudge, by the
         # coordinator. Another bot decides about its own hand-off, silently.

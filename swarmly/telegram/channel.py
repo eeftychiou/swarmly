@@ -6309,6 +6309,8 @@ class AgentChannel:
                                    chat_id=event.chat_id, thread_id=event.thread_id,
                                    allow_when_frozen=True)
 
+        # /hold before /pause: a message is only ever one command, so the order is not a
+        # precedence, just where the hold's own reply is decided.
         hold_reply = self._handle_hold(event)
         if hold_reply == "":
             return None
@@ -6734,11 +6736,12 @@ class AgentChannel:
                 "pull request and hand nothing off until the admin sends /release.]")
 
     def _handle_hold(self, event: ChannelEvent) -> Optional[str]:
-        """``/hold [reason]`` and ``/release`` from the admin reach every bot. Held, a bot
-        still answers, but the hand-off reminders, the stall ladder and the owed wakes stay
-        quiet, and every turn is told to start nothing. Every bot applies it; only the
-        coordinator answers in the chat (or the bot named with /hold@bot), so five bots don't
-        say it five times."""
+        """``/hold [reason]`` and ``/release`` from the admin are broadcast: every bot applies
+        either one, with or without a mention, and the mention only picks who answers (else the
+        coordinator), so five bots don't say it five times. Held, a bot still answers, but the
+        hand-off reminders, the stall ladder and the owed wakes stay quiet, and every turn is
+        told to start nothing. The hold is this bot's own state, carried by no machine line: a
+        bot that was down when /hold was sent, or joins later, is not held (#218 review)."""
         parsed = parse_command(event.text or "")
         if not parsed or parsed[0] not in ("hold", "release"):
             return None
@@ -7590,10 +7593,11 @@ class AgentChannel:
         """The topic a reply in another topic belongs in, when it is only about items that
         topic is about.
 
-        A bot answers where it was asked, so work that starts in the wrong topic stays there
-        however often it is told to move (live, 22 Oct: round 5.5 items were worked on in the
-        Round 5 topic for hours). The reply goes where its items live, and the next message
-        follows it. Conservative: every issue or PR the reply names that a topic is about must
+        A bot answers where it was asked, so work between bots that starts in the wrong topic
+        stays there however often it is told to move (live, 22 Oct: round 5.5 items were worked
+        on in the Round 5 topic for hours). The reply goes where its items live, and the next
+        message follows it. A person's question is never moved: it is answered where it was
+        asked (#223); /topic is the way to move an item for a person. Conservative: every issue or PR the reply names that a topic is about must
         map to the same other topic; a reply naming one of this topic's items, items of two
         other topics, or only numbers no topic knows, stays."""
         home = self.config.identity.home_channel_id
