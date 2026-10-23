@@ -738,11 +738,23 @@ class TrustTests(unittest.TestCase):
             for alias, user, uid in (("Codex", "codex_x_bot", 402), ("Gem", "gem_x_bot", 404),
                                      ("Rex", "rex_x_bot", 405)):
                 channel.membership._add_peer(alias, user, uid, "developer")
-            run(channel.handle_event(event("@HermesBot fill the gaps", author_id=ADMIN_ID,
-                                           username="alice", is_bot=False)))
+            with self.assertLogs("swarmly.telegram.membership", level="WARNING") as logs:
+                run(channel.handle_event(event("@HermesBot fill the gaps", author_id=ADMIN_ID,
+                                               username="alice", is_bot=False)))
             roles = channel.config.peer_roles
             self.assertEqual((roles["Codex"], roles["Gem"], roles["Rex"]),
                              ("reviewer", "qa-tester", "developer"))
+            # #216: the line past the cap switched nothing, so it is not in the prose either,
+            # and the warning names the peer whose line was dropped.
+            texts = [r["text"] for r in channel._test_sender.sent]
+            self.assertFalse(any("ROLE: @rex_x_bot" in t for t in texts))
+            self.assertIn("rex_x_bot", "\n".join(logs.output))
+            self.assertTrue(any("intent=ROLE ref=reviewer" in t for t in texts))
+            self.assertTrue(any("intent=ROLE ref=qa-tester" in t for t in texts))
+            # The reply was three ROLE lines and nothing else: with all of them taken out
+            # there is nothing to post, so the turn stays silent rather than sending an empty
+            # message. The two role notices are the only things that went out.
+            self.assertFalse(any("ROLE: @" in t for t in texts))
 
     def test_a_peers_role_line_switches_nothing(self):
         with tempfile.TemporaryDirectory() as folder:
