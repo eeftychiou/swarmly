@@ -158,7 +158,8 @@ limits:
   multi_mention: first                 # a person names several bots: only the first acts ("all": each acts)
   strangers: ignore                    # people and bots outside the swarm start no turns ("answer": they do)
   busy_behavior: queue                 # message during a running turn: queue (run it next), drop, or notice
-  busy_queue_max: 12                   # queue: at most this many messages wait behind a turn (per topic when parallel)
+  busy_queue_max: 12                   # queue: at most this many messages wait behind a turn (per topic when parallel); more are held
+  busy_held_max: 50                    # queue: ceiling for messages held past that limit; at it the newest is dropped, the oldest kept
   max_parallel_turns: 1                # forum topics: up to this many topics run a turn at once (1-8); above 1, send pacing is per topic
   allow_shared_cwd: false              # parallel topics share adapter.cwd; must be true when max_parallel_turns > 1
   max_peer_turns_per_topic: 8          # peer-started turns in a row per forum topic without progress (a new issue/PR/commit, a merge) until a human posts (0 = no cap)

@@ -422,6 +422,7 @@ class ChannelStats:
     last_error: str = ""
     busy_dropped: int = 0                                # #9: addressed msgs dropped while a turn was in flight
     busy_queued: int = 0                                 # addressed msgs held and run after the turn in flight
+    busy_held: int = 0                                   # #184: overflowed to the durable inbox, not dropped
     stopped: int = 0                                     # turns cancelled with /stop
 
 
@@ -555,6 +556,11 @@ class AgentChannel:
         self._pause_pending = False
         self._pause_where: Tuple[Optional[int], Optional[int]] = (None, None)
         self._queue_full_noticed = float("-inf")
+        #: #184 review: when the held queue is at its ceiling the *drop* is news too, and it
+        #: must not be swallowed by the "kept" notice that just went out in the same window --
+        #: a silent drop is exactly the bug this item fixes. Its own window, so the first drop
+        #: after any hold is always reported.
+        self._queue_refused_noticed = float("-inf")
         self._ref_topics: Dict[str, Tuple[int, int]] = {}     # "#12" -> the topic about it
         # Kept across restarts (round 2 export: two restarts emptied it, and #34 and #37 each
         # got a new topic though one was already about them). "#12" -> wall-clock last seen.
@@ -6170,6 +6176,78 @@ class AgentChannel:
         if self._inbox.record(event):
             _INBOX_KEYS.get().append((event.chat_id, event.message_id))
 
+    def _held_overflow(self) -> List[ChannelEvent]:
+        """The messages held past the in-memory limit, oldest first (#184)."""
+        held = getattr(self, "_overflow", None)
+        if held is None:
+            held = self._overflow = []
+        return held
+
+    def _hold_overflow(self, event: ChannelEvent) -> Optional[int]:
+        """Keep a message the in-memory queue has no room for, instead of dropping it (#184).
+
+        Live, 22 Oct: "⚠️ … is busy and its queue is full" dropped a coordinator hand-off at
+        18:01 and a DeepSeek one at 19:31 -- a stall nobody sees. The message joins the held
+        queue **and** is recorded in the durable inbox, so a restart still replays it; the held
+        queue keeps the order, and :meth:`_drain_overflow` takes one as each turn ends.
+
+        Returns the queue's depth, for the one notice the topic gets -- or ``None`` when the
+        held queue is at its own ceiling (``limits.busy_held_max``) and this arrival is the one
+        dropped. A second bound is not optional: "hold instead of drop" with no limit turns a
+        transport stuck for hours into unbounded memory and an inbox nobody can drain. The
+        oldest are kept, because oldest-first is the order they are answered in.
+        """
+        held = self._held_overflow()
+        ceiling = getattr(self.config.limits, "busy_held_max", 50)
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 1:
+            ceiling = 50                        # a host built before the field existed
+        if len(held) >= ceiling:
+            self.stats.busy_dropped += 1
+            logger.warning("busy queue: %d message(s) already held (ceiling %d); dropping "
+                           "message from @%s", len(held), ceiling, event.author_username)
+            return None
+        held.append(event)
+        try:
+            self._inbox.record(event)          # durable: a restart replays what is held
+            self.stats.busy_held += 1
+        except Exception:                      # noqa: BLE001 - never lose the turn over it
+            logger.warning("busy queue: could not keep the overflowed message from @%s",
+                           event.author_username, exc_info=True)
+        return len(held)
+
+    def _drain_overflow(self) -> None:
+        """Start the oldest held message when the queue has room (#184), one per turn end.
+
+        The task comes **first** and the inbox record goes second: this turn carries the
+        message, and the restart path must not replay one that is already running -- but a
+        message that could not be started at all (no running loop) is still held and still
+        recorded, so the one thing this item exists to keep is never the thing we drop.
+        Nothing drains while another turn holds the lock, so held work goes in arrival order.
+        """
+        if self._turn_running():
+            return
+        held = self._held_overflow()
+        if not held:
+            return
+        event = held[0]
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(self.handle_event(event))
+        except RuntimeError:                   # no loop: leave it held *and* recorded
+            return
+        except Exception:                      # noqa: BLE001 - one message, not the queue
+            logger.exception("busy queue: could not start the held message %s", event.message_id)
+            return
+        held.pop(0)
+        # Tracked like every other task this channel starts, so a stopping transport can see it
+        # and a finished one is not kept alive by the set.
+        self._self_tasks.add(task)
+        self._self_tasks = {t for t in self._self_tasks if not t.done()}
+        try:
+            self._inbox.done(event.chat_id, event.message_id)
+        except Exception:                      # noqa: BLE001 - a record is not the turn
+            logger.debug("busy queue: could not clear the held record", exc_info=True)
+
     def replay_interrupted(self) -> int:
         """Resume what a restart cut off -- **once** -- and report what could not be finished.
 
@@ -6615,8 +6693,12 @@ class AgentChannel:
                         "default", window)
                     window = 900.0
             self.stats.ignored += 1
-            self.stats.busy_dropped += 1
-            self._busy_drops_since_notice += 1
+            if busy_behavior != "queue":
+                # A queue holds its overflow instead of dropping it (#184), and counts it as
+                # `busy_held`; a drop counter that also counted a held message would hide the
+                # difference this item is about.
+                self.stats.busy_dropped += 1
+                self._busy_drops_since_notice += 1
             if busy_behavior == "notice":
                 now = self._clock()
                 if now - self._busy_notice_at >= window:
@@ -6628,21 +6710,46 @@ class AgentChannel:
                         "⚠️ [%s] busy: %d addressed msg(s) from @%s dropped (turn in progress)",
                         self.config.identity.alias, dropped, event.author_username)
             elif busy_behavior == "queue":
-                logger.warning("busy queue for %s is full (%d waiting); dropped message from @%s",
-                               self.config.identity.alias,
-                               self._busy_waiting if self._turn_slots is None
-                               else self._busy_waiting_by.get(busy_key, 0),
-                               event.author_username)
-                # Say so in the chat, once per window: the drop used to be silent (live test).
-                now = self._clock()
-                if now - self._queue_full_noticed >= 300:
-                    self._queue_full_noticed = now
-                    await self.send(
-                        f"⚠️ {self.config.identity.alias} is busy and its queue is full; it "
-                        f"dropped this message from {event.author_username or 'someone'}. "
-                        "Send it again once it has answered.",
-                        reply_to_message_id=event.message_id, chat_id=event.chat_id,
-                        thread_id=event.thread_id, silent=True, notice=True)
+                # #184: past the in-memory limit the message is *held*, not dropped -- it goes
+                # to the durable inbox and is taken, oldest first, as the queue drains.
+                waiting_now = (self._busy_waiting if self._turn_slots is None
+                               else self._busy_waiting_by.get(busy_key, 0))
+                depth = self._hold_overflow(event)
+                if depth is None:
+                    # The held queue is at its own ceiling: the oldest are kept and this arrival
+                    # is the one that goes. Say so -- a silent drop is the bug this item fixes,
+                    # so the refusal has its own window and is never hidden by a "kept" line.
+                    logger.warning("busy queue for %s is at its ceiling (%d waiting); could "
+                                   "not keep message from @%s",
+                                   self.config.identity.alias, waiting_now,
+                                   event.author_username)
+                    now = self._clock()
+                    if now - self._queue_refused_noticed >= 300:
+                        self._queue_refused_noticed = now
+                        await self.send(
+                            f"⚠️ {self.config.identity.alias} is busy and behind by "
+                            f"{waiting_now} message(s), and its held queue is full: this one "
+                            f"from {event.author_username or 'someone'} could not be kept -- "
+                            "please send it again when the bot is answering.",
+                            reply_to_message_id=event.message_id, chat_id=event.chat_id,
+                            thread_id=event.thread_id, silent=True, notice=True)
+                else:
+                    logger.warning("busy queue for %s is full (%d waiting); holding message "
+                                   "from @%s for later (%d held)",
+                                   self.config.identity.alias, waiting_now,
+                                   event.author_username, depth)
+                    # Being behind is news, once per window, with the depth: a dropped hand-off
+                    # was a stall nobody saw.
+                    now = self._clock()
+                    if now - self._queue_full_noticed >= 300:
+                        self._queue_full_noticed = now
+                        await self.send(
+                            f"⚠️ {self.config.identity.alias} is busy and behind by "
+                            f"{depth + waiting_now} message(s); this one from "
+                            f"{event.author_username or 'someone'} is kept and will be answered "
+                            "in order.",
+                            reply_to_message_id=event.message_id, chat_id=event.chat_id,
+                            thread_id=event.thread_id, silent=True, notice=True)
             else:
                 logger.warning("turn already in progress for %s; ignoring concurrent event from @%s",
                                self.config.identity.alias, event.author_username)
@@ -6805,6 +6912,12 @@ class AgentChannel:
         if self._turn_slots is not None:
             self._turn_slots.release()
         lock.release()
+        # #184: the queue has room now, so a message held past the in-memory limit is taken --
+        # after the release, so the drained turn measures its own wait from this one ending.
+        try:
+            asyncio.get_running_loop().call_soon(self._drain_overflow)
+        except RuntimeError:
+            pass                                   # no loop: nothing to drain into
         if self._pause_pending:
             asyncio.get_running_loop().call_soon(
                 lambda: asyncio.ensure_future(self._finish_pause()))
@@ -6873,10 +6986,17 @@ class AgentChannel:
         wait from that turn: held peer turns stay a cooldown apart."""
         waiting = self._cooldown_waiting.get(key, 0)
         if waiting >= getattr(self.config.limits, "busy_queue_max", 5):
-            logger.warning("cooldown queue for %s is full (%d waiting); dropped message from @%s",
-                           self.config.identity.alias, waiting, event.author_username)
+            # #184: held, not dropped -- the same rule as the busy queue above, its ceiling too.
+            held = self._hold_overflow(event)
+            if held is None:
+                logger.warning("cooldown queue for %s is at its ceiling (%d waiting); could not "
+                               "keep message from @%s",
+                               self.config.identity.alias, waiting, event.author_username)
+            else:
+                logger.warning("cooldown queue for %s is full (%d waiting); holding message from "
+                               "@%s for later (%d held)",
+                               self.config.identity.alias, waiting, event.author_username, held)
             self.stats.ignored += 1
-            self.stats.busy_dropped += 1
             return None
         self._cooldown_waiting[key] = waiting + 1
         gate = self._hold_gates.get(key)

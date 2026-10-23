@@ -381,7 +381,7 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual([m.text for m in gate.seen],
                          ["@HermesBot task", "@HermesBot p1", "@HermesBot p2", "@HermesBot p3"])
 
-    def test_only_busy_queue_max_messages_are_held_in_general(self):
+    def test_only_busy_queue_max_messages_wait_in_memory_in_general(self):
         channel, gate = self.channel(min_seconds_between_agent_turns=60,
                                      max_messages_per_minute=100, busy_queue_max=1)
 
@@ -414,7 +414,11 @@ class ChannelTests(unittest.TestCase):
         run(scenario())
         self.assertEqual([m.text for m in gate.seen],
                          ["@HermesBot task 1", "@HermesBot task 2", "@HermesBot p1"])
-        self.assertEqual(channel.stats.busy_dropped, 1)
+        # #184: the message past the cap is held for later, not dropped -- it runs when a turn
+        # ends in this topic (the loop closes here before a turn does, so `gate.seen` shows only
+        # the three that ran inside the scenario).
+        self.assertEqual(channel.stats.busy_dropped, 0, "held, not dropped")
+        self.assertEqual(channel.stats.busy_held, 1, "the one past the cap is still kept")
 
     def test_a_queued_hand_off_is_not_held(self):
         channel, gate = self.channel(min_seconds_between_agent_turns=60,
@@ -866,11 +870,13 @@ class ChannelTests(unittest.TestCase):
                 human(f"@HermesBot more {n}", thread_id=thread, message_id=n)))
                 for n, thread in ((3, 4), (4, 5), (5, 4))]
             await settle()
-            counts = (channel.stats.busy_queued, channel.stats.busy_dropped)
+            counts = (channel.stats.busy_queued, channel.stats.busy_dropped,
+                      channel.stats.busy_held)
             gate.release.set()
             await asyncio.gather(*turns, *more)
             return counts
-        self.assertEqual(run(scenario()), (2, 1))   # one waits in each topic; the extra drops
+        # #184: one waits in each topic, and the third is held for later -- not dropped.
+        self.assertEqual(run(scenario()), (2, 0, 1))
 
     def test_bus_deliveries_share_the_turn_admission(self):
         channel, gate = self.channel(parallel=2)

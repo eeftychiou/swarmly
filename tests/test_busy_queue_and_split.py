@@ -32,7 +32,8 @@ async def _settle(rounds: int = 10) -> None:
         await asyncio.sleep(0)
 
 
-def hold_and_send(channel, adapter, texts, *, cancel_index=None, thread_id=None):
+def hold_and_send(channel, adapter, texts, *, cancel_index=None, thread_id=None,
+                  drain=False):
     """Hold a turn open, send ``texts`` while it runs, then release and collect everything."""
 
     async def scenario():
@@ -49,6 +50,15 @@ def hold_and_send(channel, adapter, texts, *, cancel_index=None, thread_id=None)
             await _settle()
         adapter.release.set()
         results = await asyncio.gather(first, *waiting, return_exceptions=True)
+        if drain:
+            # #184: a held message runs as its own task when the queue drains. Wait for it
+            # inside this loop: a task still pending when `run()` closes the loop is cancelled,
+            # and the test would read "never answered" instead of "answered a moment later".
+            for _ in range(60):
+                if not channel._held_overflow():
+                    await _settle(5)
+                    break
+                await _settle(5)
         return snapshot, results
 
     return run(scenario())
@@ -84,15 +94,74 @@ class TestBusyQueue(unittest.TestCase):
         self.assertEqual(where, sorted(where))
         self.assertIn("arrived while your last turn ran", reply)
 
-    def test_the_queue_is_bounded_and_overflow_is_dropped_and_counted(self):
+    def test_a_full_queue_holds_the_overflow_and_every_message_is_answered(self):
+        """#184's acceptance: overfill the queue and see every message answered, in order.
+
+        Before: past `busy_queue_max` the message was dropped with "its queue is full" (live,
+        22 Oct, twice) -- a hand-off nobody saw again.
+        """
         channel, adapter = gated(busy_queue_max=2)
         with self.assertLogs("swarmly.telegram", level="WARNING") as captured:
-            _, results = hold_and_send(channel, adapter, self.TEXTS)
-        self.assertEqual(adapter.calls, 3, "the running turn plus two queued")
-        self.assertEqual(channel.stats.busy_queued, 2)
-        self.assertEqual(channel.stats.busy_dropped, 1)
+            _, results = hold_and_send(channel, adapter, self.TEXTS, drain=True)
+        self.assertEqual(channel.stats.busy_queued, 2, "two waited in memory")
+        self.assertEqual(channel.stats.busy_held, 1, "the third was held, not dropped")
+        self.assertEqual(channel.stats.busy_dropped, 0)
+        self.assertEqual(adapter.calls, 4, "the running turn plus all three answered")
+        # The call that overflowed returned None: its message did not run *there*, it ran as a
+        # held turn of its own once the queue drained -- which is what `adapter.calls` shows.
         self.assertIsNone(results[3])
+        replies = [sent["text"] for sent in channel._test_sender.sent]
+        order = [next(i for i, text in enumerate(self.TEXTS) if text.split(": ")[1] in reply)
+                 for reply in replies[1:] if any(text.split(": ")[1] in reply
+                                                for text in self.TEXTS)]
+        self.assertEqual(order, [0, 1, 2], f"arrival order, not completion order: {replies}")
+        # And the topic is told once that the bot is behind, with the depth -- not that the
+        # message was thrown away.
+        self.assertTrue(any("behind by" in reply and "kept" in reply for reply in replies),
+                        replies)
         self.assertTrue(any("busy queue" in record.getMessage() for record in captured.records))
+
+    def test_the_held_queue_has_its_own_ceiling_and_keeps_the_oldest(self):
+        """#184 review: holding without a bound is memory and an inbox nobody can drain.
+
+        Past ``limits.busy_held_max`` the *newest* arrival is the one dropped -- the oldest are
+        kept, because oldest-first is the order the queue is drained in -- and the topic is told
+        plainly that this one could not be kept, rather than being told it was.
+        """
+        channel, adapter = gated(busy_queue_max=1, busy_held_max=1)
+        texts = self.TEXTS + ("@HermesBot: and the changelog",)
+        with self.assertLogs("swarmly.telegram", level="WARNING") as captured:
+            hold_and_send(channel, adapter, texts, drain=True)
+        self.assertEqual(channel.stats.busy_queued, 1, "one waited in memory")
+        self.assertEqual(channel.stats.busy_held, 1, "one was held -- the ceiling is 1")
+        self.assertEqual(channel.stats.busy_dropped, 2, "the two arrivals past the ceiling")
+        replies = [sent["text"] for sent in channel._test_sender.sent]
+        answered = [text for text in texts
+                    if any(text.split(": ")[1] in reply for reply in replies)]
+        self.assertEqual(answered, list(texts[:2]), f"the oldest are kept: {replies}")
+        # The refusal is said out loud -- a silent drop is the bug this item fixes -- and it is
+        # not disguised as a hold; one line per window, not one per message.
+        refused = [reply for reply in replies if "could not be kept" in reply]
+        self.assertEqual(len(refused), 1, replies)
+        self.assertIn("held queue is full", refused[0])
+        self.assertTrue(any("already held (ceiling 1)" in record.getMessage()
+                            for record in captured.records), captured.output)
+
+    def test_a_held_message_that_cannot_start_stays_held_and_recorded(self):
+        """#184 review: the record goes only once the held turn exists.
+
+        `_drain_overflow` used to pop the message, clear its inbox record, and *then* try to
+        start a task -- so the no-loop path put the event back in memory, but the message was
+        already gone from the inbox, which is the one loss this item exists to prevent.
+        """
+        channel, _ = gated()
+        held = event("@HermesBot: hold me", message_id=77)
+        channel._hold_overflow(held)
+        self.assertIn((held.chat_id, held.message_id), channel._inbox)
+        channel._drain_overflow()               # no running loop here: nothing can start
+        self.assertEqual(channel._held_overflow(), [held], "still held for the next turn end")
+        self.assertIn((held.chat_id, held.message_id), channel._inbox,
+                      "a message that never started must still be there for a restart")
 
     def test_a_queued_peer_message_waits_out_the_turn_cooldown_instead_of_being_dropped(self):
         channel, adapter = gated(min_seconds_between_agent_turns=60)
@@ -119,10 +188,12 @@ class TestBusyQueue(unittest.TestCase):
 
     def test_queue_settings_are_validated_at_load(self):
         for bad in ({"busy_queue_max": 0}, {"busy_queue_max": "many"},
+                    {"busy_held_max": 0}, {"busy_held_max": "many"},
                     {"max_reply_parts": 0}, {"max_reply_parts": -2}):
             with self.assertRaises(ConfigError, msg=bad):
                 make_config(limits=bad)
         self.assertEqual(ChannelLimits().max_reply_parts, 4)
+        self.assertEqual(ChannelLimits().busy_held_max, 50)   # the held queue's own ceiling
 
     def test_max_reply_parts_is_clamped_to_the_protocol_cap(self):
         """Review of #29: the sender and the receiver share one cap, so a configured value above
