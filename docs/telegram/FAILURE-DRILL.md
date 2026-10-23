@@ -48,20 +48,18 @@ built on `tests/swarm_group.py`); this file is the human one.
 ## 2. Bring the coordinator back
 
 1. Start the killed bot again. It posts a HELLO, then reads the lease.
-2. It does **not** resume leading: `/swarm` still names the acting coordinator, and the
-   returned bot answers as a peer. Its first message in the topic says it is back; it does not
-   claim the role.
-3. Give it a small piece of work; it does it as a peer.
-4. Hand the role back deliberately:
+2. It does **not** grab the role on arrival: for its first minutes `/swarm` still names the
+   acting coordinator, and the returned bot answers as a peer.
+3. **Nothing to do here: the fail-back is automatic.** Once the configured coordinator has
+   been up and idle for `limits.coordinator_reclaim_idle_seconds` (3 minutes), it claims term
+   N+2 and posts the reclaim line; the acting coordinator yields at its next fetch and keeps its
+   own role (#211). The admin's `/role @<coordinator_handle> coordinator` does the same at
+   once, and is only needed when you do not want to wait.
+4. A stand-in that was short of a role during the outage is put back the same way: the
+   coordinator's `ROLE: @<bot> <role>` line, not the admin.
 
-   ```
-   /role @<coordinator_handle> coordinator
-   ```
-
-   All bots apply the same command, so they agree. The returned bot writes a new term (N+2) and
-   the previous acting coordinator yields; `/swarm` names one coordinator again.
-
-**Expected**: no double merge at any point, one coordinator before and after `/role`.
+**Expected**: no double merge at any point, one coordinator before and after the reclaim, and
+every bot back on the role it was configured with.
 
 ## 2b. Move the lease deliberately: hand-over and fail-back (#154)
 
