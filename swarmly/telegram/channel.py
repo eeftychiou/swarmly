@@ -7527,6 +7527,11 @@ class AgentChannel:
                 or event.thread_id is None or int(event.chat_id) != int(home) \
                 or is_command_reply(body) or parse_report_back(body) is not None:
             return None
+        if not event.author_is_bot:
+            # A person's question is answered where it was asked (live, 23 Oct: the admin asked
+            # in Round 5 what /hold is; the answer named #218, so it went to Round 5.5, and the
+            # follow-up there was answered with none of the conversation it belonged to).
+            return None
         refs = issue_refs(body)
         if not refs:
             return None
