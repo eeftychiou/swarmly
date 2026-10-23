@@ -85,6 +85,9 @@ _ONBOARD_MARK = "You have joined"
 _DECIDE_FOR = re.compile(re.escape(_DECIDE_MARK) + r" ([A-Za-z0-9_-]{1,32}) \(@([A-Za-z0-9_]{5,32})\)")
 #: Roles handed out, in order, when nobody decides one: the gaps a working team fills first.
 DEFAULT_ROLE_ORDER = ("developer", "reviewer", "qa-tester", "researcher")
+#: Role switches one coordinator reply may make: a turn that rewrites the whole roster is a
+#: mistake, not a plan (review on #212).
+ROLE_LINES_PER_REPLY = 2
 #: ``ROLE: @handle role`` in a coordinator's reply.
 _ROLE_LINE = re.compile(r"(?im)^\W*ROLE:\s*@([A-Za-z0-9_]{5,32})\s+([a-z][a-z0-9_-]{0,39})\b")
 #: ``key: value`` lines of a JOIN or PRESENT body.
@@ -754,8 +757,7 @@ class Membership:
         target, role = envelope.to or "", str(envelope.ref or "")
         if not sender or not _ROLE_NAME(role):
             return
-        coordinator = self.state.coordinator
-        if coordinator is None or sender.lower() != coordinator.lower():
+        if not self._coordinates(sender):
             logger.warning("membership: ROLE from %s ignored: it is not the coordinator",
                            sender)
             return
@@ -776,6 +778,18 @@ class Membership:
         if current == role:
             return
         self.apply_role(target, role, by=sender)
+
+    def _coordinates(self, sender: str) -> bool:
+        """Whether *sender* is the coordinator: the one the admin named, or the bot that holds
+        the lease now (a failover's acting coordinator switches roles too; review on #212)."""
+        names = [self.state.coordinator or ""]
+        current = getattr(self.ch, "current_coordinator", None)
+        if callable(current):
+            try:
+                names.append(str(current() or ""))
+            except Exception:                    # noqa: BLE001 - no lease answer: the named one
+                logger.warning("membership: no lease answer for a ROLE", exc_info=True)
+        return any(n and n.lower() == sender.lower() for n in names)
 
     def apply_role(self, target: str, role: str, by: str) -> None:
         """Record that *target* (an alias) now has *role*."""
@@ -1068,12 +1082,17 @@ class Membership:
         if event.self_task and (event.text or "").startswith(MEMBERSHIP_MARK):
             return body                   # a newcomer's role turn: on_reply reads that line
         kept: List[str] = []
+        switched = 0
         for line in body.splitlines():
             found = _ROLE_LINE.match(line)
-            if found is not None:
+            if found is not None and switched >= ROLE_LINES_PER_REPLY:
+                logger.warning("membership: more than %d ROLE lines in one reply; the rest "
+                               "switch nothing", ROLE_LINES_PER_REPLY)
+            elif found is not None:
                 handle, role = found.group(1), found.group(2).lower()
                 reason = " ".join(line[found.end():].strip(" :-—–").split())[:200]
                 if await self.assign(handle, role, reason=reason):
+                    switched += 1
                     continue
             kept.append(line)
         return "\n".join(kept)
