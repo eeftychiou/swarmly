@@ -7354,6 +7354,7 @@ class AgentChannel:
                              time.monotonic() - started)
             raise
         finally:
+            adapter.acting_coordinator = False         # the rights last one turn (#208 review)
             self._turns.discard(turn)
             self._turn_keys.pop(turn, None)
             self._busy_since.pop(busy_topic, None)

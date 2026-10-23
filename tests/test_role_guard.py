@@ -141,12 +141,11 @@ class TestAdapterEnvironment(unittest.TestCase):
             adapter.role_name, adapter.guard_dir = "reviewer", Path(tmp) / "g"
             adapter.acting_coordinator = True
             env = adapter.environment()
-            if env.get("SWARMLY_REAL_GIT") or env.get("SWARMLY_REAL_GH"):
-                self.assertEqual(env["SWARMLY_ROLE"], "coordinator")
+            if not (env.get("SWARMLY_REAL_GIT") or env.get("SWARMLY_REAL_GH")):
+                self.skipTest("neither git nor gh is on PATH: the guard is not installed")
+            self.assertEqual(env["SWARMLY_ROLE"], "coordinator")
             adapter.acting_coordinator = False          # the lease is gone: the role is back
-            env = adapter.environment()
-            if env.get("SWARMLY_REAL_GIT") or env.get("SWARMLY_REAL_GH"):
-                self.assertEqual(env["SWARMLY_ROLE"], "reviewer")
+            self.assertEqual(adapter.environment()["SWARMLY_ROLE"], "reviewer")
 
 
 class TestHoldsLease(unittest.TestCase):
@@ -179,6 +178,35 @@ class TestHoldsLease(unittest.TestCase):
 
         channel.lease_state = boom
         self.assertFalse(channel._holds_lease())
+
+
+class TestTheFlagLastsOneTurn(unittest.TestCase):
+    """#208 review (DeepSeek): the flag was set at turn start and never cleared, so between
+    turns the environment still said coordinator after the lease had moved."""
+
+    def test_the_flag_is_cleared_when_the_turn_ends(self):
+        import asyncio
+        from types import SimpleNamespace
+        from swarmly.telegram.adapters.base import AdapterReply
+        from tests.test_telegram_channel import event, make_channel, make_config
+
+        channel = make_channel(make_config())
+        seen = []
+
+        class Adapter:
+            acting_coordinator = False
+
+            async def respond(self, incoming):
+                seen.append(self.acting_coordinator)
+                return AdapterReply(text="ok")
+
+        adapter = Adapter()
+        channel._adapter_for = lambda chat, thread: adapter
+        channel._holds_lease = lambda: True
+        incoming = SimpleNamespace(author_alias="admin", context_id="c", text="hi")
+        asyncio.run(channel._respond(incoming, event("hi")))
+        self.assertEqual(seen, [True])
+        self.assertFalse(adapter.acting_coordinator)
 
 
 if __name__ == "__main__":
