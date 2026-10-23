@@ -17,7 +17,8 @@ from html import escape
 
 from swarmly.telegram.config import ChannelLimits, ConfigError
 from swarmly.telegram.wire import Envelope, MessageType, format_message, parse_message, utf16_length
-from tests.test_telegram_channel import ADMIN_ID, _GatedAdapter, event, make_channel, make_config, run
+from tests.test_telegram_channel import (ADMIN_ID, _GatedAdapter, _token, event, make_channel,
+                                         make_config, run)
 
 
 def gated(**limits):
@@ -162,6 +163,79 @@ class TestBusyQueue(unittest.TestCase):
         self.assertEqual(channel._held_overflow(), [held], "still held for the next turn end")
         self.assertIn((held.chat_id, held.message_id), channel._inbox,
                       "a message that never started must still be there for a restart")
+
+    def test_diag_and_status_show_busy_held_next_to_busy_dropped(self):
+        """#204: a full queue holds work (#184), and neither /diag nor /status said so.
+
+        `busy_dropped=0` alone reads as "nothing was lost" while a message waits in the held
+        queue -- the exact reading a human watching a stalled transport must not get.
+        """
+        channel, adapter = gated(busy_queue_max=1)
+
+        async def scenario():
+            first = asyncio.create_task(channel.handle_event(
+                event("@HermesBot: hold the turn open", message_id=1)))
+            await adapter.entered.wait()
+            others = [asyncio.create_task(channel.handle_event(
+                event(text, message_id=10 + index)))
+                for index, text in enumerate(self.TEXTS[:2])]
+            await _settle()
+            # Commands are answered before the busy gate, so they see the counters mid-turn.
+            diag = await channel.handle_event(event("/diag@HermesBot", message_id=98))
+            status = await channel.handle_event(event("/status@HermesBot", message_id=99))
+            seen = (channel.stats.busy_held, channel.stats.busy_dropped,
+                    channel.stats.busy_queued)
+            adapter.release.set()
+            await asyncio.gather(first, *others)
+            for _ in range(60):                      # let the drained turn run inside the loop
+                if not channel._held_overflow():
+                    await _settle(5)
+                    break
+                await _settle(5)
+            return diag, status, seen
+
+        diag, status, seen = run(scenario())
+        self.assertEqual(seen, (1, 0, 1), "one waited in memory, one was held, none dropped")
+        # Pinned by value *and* cross-checked against the counters: a token hardcoded to
+        # `busy_held=1` would satisfy the first and fail the second once the numbers differ.
+        self.assertEqual(_token(diag, "busy_held"), 1, diag)
+        self.assertEqual(_token(diag, "busy_held"), channel.stats.busy_held)
+        self.assertEqual(_token(diag, "busy_dropped"), 0, diag)
+        self.assertEqual(_token(status, "busy_held"), 1, status)
+        self.assertEqual(_token(status, "busy_dropped"), 0, status)
+        # The token the #93(1) review pinned must still be there, on the same line.
+        self.assertIn("DIAG alias=Hermes", diag)
+        self.assertIn("STATUS Hermes", status)
+        self.assertEqual(len(diag.splitlines()), 1)
+        self.assertEqual(len(status.splitlines()), 1)
+
+    def test_diag_reports_a_drop_and_a_hold_apart(self):
+        """`busy_held` and `busy_dropped` are different facts and must not read as one."""
+        channel, adapter = gated(busy_queue_max=1, busy_held_max=1)
+
+        async def scenario():
+            first = asyncio.create_task(channel.handle_event(
+                event("@HermesBot: hold the turn open", message_id=1)))
+            await adapter.entered.wait()
+            others = [asyncio.create_task(channel.handle_event(
+                event(text, message_id=10 + index)))
+                for index, text in enumerate(self.TEXTS[:3])]   # 1 queued, 1 held, 1 past the cap
+            await _settle()
+            diag = await channel.handle_event(event("/diag@HermesBot", message_id=98))
+            seen = (channel.stats.busy_held, channel.stats.busy_dropped)
+            adapter.release.set()
+            await asyncio.gather(first, *others)
+            for _ in range(60):
+                if not channel._held_overflow():
+                    await _settle(5)
+                    break
+                await _settle(5)
+            return diag, seen
+
+        diag, seen = run(scenario())
+        self.assertEqual(seen, (1, 1), "one held, and one dropped past the held ceiling")
+        self.assertEqual(_token(diag, "busy_held"), 1, diag)
+        self.assertEqual(_token(diag, "busy_dropped"), 1, diag)
 
     def test_a_queued_peer_message_waits_out_the_turn_cooldown_instead_of_being_dropped(self):
         channel, adapter = gated(min_seconds_between_agent_turns=60)

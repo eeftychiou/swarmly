@@ -2096,7 +2096,13 @@ class TestBusyDropVisibility(unittest.TestCase):
         # (#164 review): it came from a process-global set (#126) that any earlier suite folding
         # a lease claim against a fake clock could fill, so the fixture clears it and keeps the
         # plain assertion. A bound that skips the token that drifts is not a bound.
-        self.assertLess(len(status), 200)
+        #
+        # 220, not 200: #204 added `busy_held=` beside `busy_dropped=` (a deliberate token, ~13
+        # characters), and this fixture's line was 188. The bound moves with the token set -- it
+        # still catches an explosion, which is all it ever claimed.
+        self.assertLess(len(status), 220)
+        self.assertEqual(_token(status, "busy_held"), channel.stats.busy_held,
+                         "#204: the held counter is on the same line as the dropped one")
 
     def test_diag_reports_the_drop_as_its_own_token_inside_seen(self):
         """A busy drop is inside `seen` (it bumps `ignored`, which `seen` sums) *and* is its own

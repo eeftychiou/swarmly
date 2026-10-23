@@ -18,6 +18,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `/diag` and `/status` report `busy_held=<n>` next to `busy_dropped=<n>` (`#204`): since `#184`
+  a full queue holds more than it drops, so `busy_dropped=0` alone reads as "nothing was lost"
+  while a message waits in the held queue. The `/status` line grows by one token, and the test
+  that bounds its length moves with the token set.
+
 - The head under review is frozen (`#183`): a message that claims a PR's head is checked against
   the PR's `headRefOid` and a mismatch is one notice, never a closed row; a verdict still open on
   a head the item no longer has is flagged once as a rewrite under review (the #173 case, where a
