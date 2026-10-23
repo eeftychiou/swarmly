@@ -683,10 +683,88 @@ class TrustTests(unittest.TestCase):
             run(channel.handle_event(hello("ROLE", "developer", "", "claude_x_bot", 401,
                                            to="Hermes")))
             self.assertEqual(m.state.role, "developer")
-            # A role is given once: changing it is the admin's.
-            run(channel.handle_event(hello("ROLE", "researcher", "", "claude_x_bot", 401,
+            # The coordinator switches it later too (#189: the swarm heals itself).
+            run(channel.handle_event(hello("ROLE", "reviewer", "", "claude_x_bot", 401,
                                            to="Hermes")))
-            self.assertEqual(m.state.role, "developer")
+            self.assertEqual(m.state.role, "reviewer")
+            # Never the coordinator's own role.
+            run(channel.handle_event(hello("ROLE", "developer", "", "claude_x_bot", 401,
+                                           to="Claude")))
+            self.assertEqual(channel.config.peer_roles["Claude"], "coordinator")
+
+    def test_the_coordinator_switches_a_role_from_any_reply(self):
+        """23 Oct: the reviewer slot was empty after the drill and only the admin could fill
+        it. A ROLE line in any coordinator reply now does, and the line is not posted."""
+        with tempfile.TemporaryDirectory() as folder:
+            channel = self.coordinator(folder, adapter=_Scripted(
+                "#209 has no reviewer.\nROLE: @codex_x_bot reviewer: the reviewer is frozen\n"
+                "Codex, please review #209."))
+            run(channel.handle_event(event("@HermesBot who reviews #209?", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            self.assertEqual(channel.config.peer_roles["Codex"], "reviewer")
+            texts = [r["text"] for r in channel._test_sender.sent]
+            change = next(t for t in texts if "intent=ROLE" in t)
+            self.assertIn("HELLO to=Codex intent=ROLE ref=reviewer", change)
+            self.assertIn("the reviewer is frozen", change)
+            self.assertFalse(any("ROLE: @codex_x_bot" in t for t in texts))
+            self.assertTrue(any("please review #209" in t for t in texts))
+
+    def test_the_acting_coordinator_switches_roles_too(self):
+        """Review on #212: the named coordinator is down and another bot holds the lease; its
+        ROLE must land, or the two bots disagree about the roster."""
+        with tempfile.TemporaryDirectory() as folder:
+            channel = dynamic(make_channel(config_at(folder, peers={
+                "Claude": "claude_x_bot", "Reasonix": "reasonix_x_bot"})))
+            m = channel.membership
+            m.state.bus, m.state.bus_ready, m.state.role = "https://x/bus.git", True, "developer"
+            m._set_peer_role("Claude", "coordinator", coordinator=True)
+            m._set_peer_role("Reasonix", "reviewer")
+            channel.current_coordinator = lambda now=None: "Reasonix"
+            run(channel.handle_event(hello("ROLE", "reviewer", "", "reasonix_x_bot", 403,
+                                           to="Hermes")))
+            self.assertEqual(m.state.role, "reviewer")
+            channel.current_coordinator = lambda now=None: "Claude"
+            run(channel.handle_event(hello("ROLE", "researcher", "", "reasonix_x_bot", 403,
+                                           to="Hermes")))
+            self.assertEqual(m.state.role, "reviewer")   # no lease, not named: ignored
+
+    def test_one_reply_switches_at_most_two_roles(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = make_channel(config_at(folder, peers={
+                "Codex": "codex_x_bot", "Gem": "gem_x_bot", "Rex": "rex_x_bot"}),
+                adapter=_Scripted("ROLE: @codex_x_bot reviewer\nROLE: @gem_x_bot qa-tester\n"
+                                  "ROLE: @rex_x_bot researcher"))
+            joined(channel)
+            for alias, user, uid in (("Codex", "codex_x_bot", 402), ("Gem", "gem_x_bot", 404),
+                                     ("Rex", "rex_x_bot", 405)):
+                channel.membership._add_peer(alias, user, uid, "developer")
+            run(channel.handle_event(event("@HermesBot fill the gaps", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            roles = channel.config.peer_roles
+            self.assertEqual((roles["Codex"], roles["Gem"], roles["Rex"]),
+                             ("reviewer", "qa-tester", "developer"))
+
+    def test_a_peers_role_line_switches_nothing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = make_channel(config_at(folder, peers={"Codex": "codex_x_bot"}),
+                                   adapter=_Scripted("ROLE: @codex_x_bot researcher"))
+            joined(channel, role="developer")
+            channel.membership.state.coordinator = "Claude"
+            channel.membership._add_peer("Codex", "codex_x_bot", 402, "developer")
+            run(channel.handle_event(event("@HermesBot hi", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            self.assertEqual(channel.config.peer_roles["Codex"], "developer")
+            self.assertFalse(any("intent=ROLE" in r["text"] for r in channel._test_sender.sent))
+
+    def test_the_coordinator_cannot_switch_the_coordinator_role(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = self.coordinator(folder, adapter=_Scripted(
+                "ROLE: @codex_x_bot coordinator\nROLE: @HermesBot developer"))
+            run(channel.handle_event(event("@HermesBot hi", author_id=ADMIN_ID,
+                                           username="alice", is_bot=False)))
+            self.assertEqual(channel.config.peer_roles["Codex"], "developer")
+            self.assertEqual(channel.membership.state.role, "coordinator")
+            self.assertFalse(any("intent=ROLE" in r["text"] for r in channel._test_sender.sent))
 
     def test_a_hand_written_config_never_joins_by_itself(self):
         with tempfile.TemporaryDirectory() as folder:

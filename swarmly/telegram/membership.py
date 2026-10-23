@@ -25,9 +25,11 @@ its bot, the group and the maintainer; everything else is agreed in the group:
    prompt from then on) and asks it to introduce itself to the coordinator and ask for its
    first task, which the coordinator then hands it like any other work.
 
-Trust: a role comes from the coordinator's bot, once, for an agent that has none, and never
-the coordinator role; the admin overrides any role and is the only one who moves the
-coordinator. What an agent says about itself (online notice, JOIN, PRESENT) is recorded but
+Trust: a role comes from the coordinator's bot, never the coordinator role, and never for the
+coordinator itself. The coordinator gives a newcomer its first role and switches a peer's role
+later, when a role is left without a working bot or a bot does not perform: a
+``ROLE: @bot <role>`` line in any of its replies (the swarm heals itself; the admin should not
+have to). The admin overrides any role and is the only one who moves the coordinator. What an agent says about itself (online notice, JOIN, PRESENT) is recorded but
 never makes it the coordinator, except that a newcomer still joining takes the coordinator
 from the answer of the agent that says it is one. Only an agent the launcher started
 (``dynamic``) joins by itself; one set up by hand only answers newcomers.
@@ -83,6 +85,9 @@ _ONBOARD_MARK = "You have joined"
 _DECIDE_FOR = re.compile(re.escape(_DECIDE_MARK) + r" ([A-Za-z0-9_-]{1,32}) \(@([A-Za-z0-9_]{5,32})\)")
 #: Roles handed out, in order, when nobody decides one: the gaps a working team fills first.
 DEFAULT_ROLE_ORDER = ("developer", "reviewer", "qa-tester", "researcher")
+#: Role switches one coordinator reply may make: a turn that rewrites the whole roster is a
+#: mistake, not a plan (review on #212).
+ROLE_LINES_PER_REPLY = 2
 #: ``ROLE: @handle role`` in a coordinator's reply.
 _ROLE_LINE = re.compile(r"(?im)^\W*ROLE:\s*@([A-Za-z0-9_]{5,32})\s+([a-z][a-z0-9_-]{0,39})\b")
 #: ``key: value`` lines of a JOIN or PRESENT body.
@@ -752,8 +757,7 @@ class Membership:
         target, role = envelope.to or "", str(envelope.ref or "")
         if not sender or not _ROLE_NAME(role):
             return
-        coordinator = self.state.coordinator
-        if coordinator is None or sender.lower() != coordinator.lower():
+        if not self._coordinates(sender):
             logger.warning("membership: ROLE from %s ignored: it is not the coordinator",
                            sender)
             return
@@ -767,11 +771,25 @@ class Membership:
         else:
             current = next((r for a, r in self.cfg.peer_roles.items()
                             if a.lower() == target.lower()), None)
-        if current:
-            logger.info("membership: ROLE %s for %s ignored: it has the role %s; only the "
-                        "admin changes a role", role, target, current)
+        if current == "coordinator":
+            logger.warning("membership: ROLE %s for %s ignored: only the admin moves the "
+                           "coordinator", role, target)
+            return
+        if current == role:
             return
         self.apply_role(target, role, by=sender)
+
+    def _coordinates(self, sender: str) -> bool:
+        """Whether *sender* is the coordinator: the one the admin named, or the bot that holds
+        the lease now (a failover's acting coordinator switches roles too; review on #212)."""
+        names = [self.state.coordinator or ""]
+        current = getattr(self.ch, "current_coordinator", None)
+        if callable(current):
+            try:
+                names.append(str(current() or ""))
+            except Exception:                    # noqa: BLE001 - no lease answer: the named one
+                logger.warning("membership: no lease answer for a ROLE", exc_info=True)
+        return any(n and n.lower() == sender.lower() for n in names)
 
     def apply_role(self, target: str, role: str, by: str) -> None:
         """Record that *target* (an alias) now has *role*."""
@@ -1054,6 +1072,35 @@ class Membership:
         taken = {r for a, r in self.team().items() if r and a != alias}
         return next((r for r in DEFAULT_ROLE_ORDER if r not in taken), DEFAULT_ROLE_ORDER[0])
 
+    async def apply_role_lines(self, body: str, event: "ChannelEvent") -> str:
+        """The coordinator's ``ROLE: @bot <role> <reason>`` lines in any reply: switch that
+        peer's role, and take the line out of the prose.
+
+        Live, 23 Oct: after the failover drill Reasonix was left a developer, Codex was frozen
+        and Antigravity paused, so two PRs had no reviewer and only the admin could fix it.
+        The coordinator now fills the gap itself. A line naming no peer, an unknown role or the
+        coordinator role stays in the reply as written and assigns nothing.
+        """
+        if "ROLE:" not in (body or "").upper() or not self.is_coordinator():
+            return body
+        if event.self_task and (event.text or "").startswith(MEMBERSHIP_MARK):
+            return body                   # a newcomer's role turn: on_reply reads that line
+        kept: List[str] = []
+        switched = 0
+        for line in body.splitlines():
+            found = _ROLE_LINE.match(line)
+            if found is not None and switched >= ROLE_LINES_PER_REPLY:
+                logger.warning("membership: more than %d ROLE lines in one reply; the rest "
+                               "switch nothing", ROLE_LINES_PER_REPLY)
+            elif found is not None:
+                handle, role = found.group(1), found.group(2).lower()
+                reason = " ".join(line[found.end():].strip(" :-—–").split())[:200]
+                if await self.assign(handle, role, reason=reason):
+                    switched += 1
+                    continue
+            kept.append(line)
+        return "\n".join(kept)
+
     async def assign(self, handle: str, role: str, reason: str = "") -> bool:
         """Give the agent with Telegram *handle* the *role*, as the coordinator."""
         if role not in self._role_names() or role == "coordinator" \
@@ -1061,7 +1108,13 @@ class Membership:
             logger.warning("membership: cannot give @%s the role %r", handle, role)
             return False
         alias = self.cfg.peer_alias_for(handle)
-        if alias is None or not self._set_peer_role(alias, role):
+        if alias is None:
+            return False
+        if (self.cfg.peer_roles.get(alias) or "") == "coordinator" \
+                or (self.state.coordinator or "").lower() == alias.lower():
+            logger.warning("membership: %s is the coordinator; only the admin moves it", alias)
+            return False
+        if not self._set_peer_role(alias, role):
             return False
         self._save()
         # The newcomer's introduction comes right after this turn: let it past the
