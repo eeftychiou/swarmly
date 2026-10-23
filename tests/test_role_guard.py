@@ -376,5 +376,66 @@ class TestTheFlagLastsOneTurn(unittest.TestCase):
         self.assertFalse(adapter.acting_coordinator)
 
 
+class TestTheReviewOnTwoThreeTwo(unittest.TestCase):
+    """#232 (review of #229): the merge attribution has to hold where the command shape varies.
+
+    Three things a reviewer found: the identity came from the caller's environment (so
+    ``SWARMLY_ALIAS=someone-else gh pr merge`` posted a comment naming another bot), a
+    ``--match-head-commit`` SHA was read as the PR number, and ``gh -R owner/repo pr merge 5``
+    was not recognised as a merge at all.
+    """
+
+    def test_who_it_speaks_for_is_baked_into_the_wrapper(self):
+        from swarmly.telegram.guard import ALIAS_ENV, TERM_ENV
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "guard"
+            env = prepare(folder, "coordinator", {"PATH": os.environ.get("PATH", "")},
+                          alias="DeepSeek", term=4)
+            if not env.get("SWARMLY_REAL_GH"):
+                self.skipTest("gh is not on PATH: the wrapper is not installed")
+            sh = (folder / "gh").read_text(encoding="utf-8")
+            self.assertIn(f"{ALIAS_ENV}=DeepSeek", sh)
+            self.assertIn(f"{TERM_ENV}=4", sh)
+            # Windows gets the same, or the fix would hold on one OS only.
+            cmd = (folder / "gh.cmd").read_text(encoding="utf-8")
+            self.assertIn(f"set {ALIAS_ENV}=DeepSeek", cmd)
+            self.assertIn(f"set {TERM_ENV}=4", cmd)
+
+    def test_an_alias_with_a_space_stays_one_shell_word(self):
+        from swarmly.telegram.guard import _gh_wrapper, _sh_quote
+        self.assertEqual(_sh_quote("DeepSeek"), "DeepSeek")
+        self.assertEqual(_sh_quote("two words"), "'two words'")
+        self.assertIn("SWARMLY_ALIAS='two words'",
+                      _gh_wrapper('"/usr/bin/python" -I -S "guard.py"', "two words", 3))
+
+    def test_a_match_head_commit_sha_is_not_the_pull_request(self):
+        from swarmly.telegram.guard import _merge_pr
+        self.assertEqual(_merge_pr(["pr", "merge", "--squash",
+                                    "--match-head-commit", "1a2b3c4", "8"]), "8")
+        self.assertEqual(_merge_pr(["pr", "merge", "8", "--match-head-commit", "1a2b3c4"]), "8")
+
+    def test_a_merge_behind_global_options_is_still_a_merge(self):
+        from swarmly.telegram.guard import refusal, split_gh
+        self.assertEqual(split_gh(["-R", "owner/repo", "pr", "merge", "5"])[1],
+                         ["pr", "merge", "5"])
+        self.assertIn("does not merge",
+                      refusal("developer", "gh", ["-R", "owner/repo", "pr", "merge", "5"]))
+        self.assertIn("does not merge", refusal("developer", "gh", ["--repo=o/r", "pr", "merge"]))
+        self.assertIsNone(refusal("coordinator", "gh", ["-R", "owner/repo", "pr", "merge", "5"]))
+
+    def test_the_comment_follows_a_merge_behind_global_options(self):
+        from swarmly.telegram.guard import comment_merge
+        calls = []
+
+        def run(argv):
+            calls.append(list(argv))
+            return (0, "9f8e7d6\n") if "view" in argv else (0, "")
+
+        body = comment_merge("/bin/gh", ["pr", "merge", "5", "--match-head-commit", "1a2b3c4"],
+                             {"SWARMLY_ALIAS": "DeepSeek", "SWARMLY_LEASE_TERM": "4"}, run)
+        self.assertEqual(body, "Merged by DeepSeek (lease term 4) at 9f8e7d6")
+        self.assertEqual(calls[0][1:4], ["pr", "view", "5"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- The merge attribution holds where the command shape varies (`#232`, review of `#229`). Who
+  the guard speaks for is now **baked into the `gh` wrapper** `prepare()` writes
+  (`SWARMLY_ALIAS=… SWARMLY_LEASE_TERM=… exec … gh "$@"`, and the `.cmd` twin), instead of
+  being read only from the environment the caller can overwrite — so
+  `SWARMLY_ALIAS=someone-else gh pr merge 5` can no longer post a comment naming another bot.
+  `--match-head-commit` joins the value-taking options, so its SHA is no longer read as the
+  pull request, and `pr merge` is found after leading global options (`gh -R owner/repo pr
+  merge 5`) the way `split_git` finds `git`'s subcommand, so that merge is both refused for a
+  role that may not merge and followed by its comment.
+
 - `/hold` now reaches a bot that was offline when the admin sent it (`#234`). The hold was each
   bot's own state and no machine line carried it, so a bot that was down at that moment — or
   that joined later — started work while the rest of the swarm was held, and nothing showed it.
