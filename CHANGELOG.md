@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `/hold` now reaches a bot that was offline when the admin sent it (`#234`). The hold was each
+  bot's own state and no machine line carried it, so a bot that was down at that moment — or
+  that joined later — started work while the rest of the swarm was held, and nothing showed it.
+  The pulse carries `held` (`{at, reason}`, absent when the bot is not held) and, after a
+  `/release`, its `released_at`; a bot whose own last `/hold`/`/release` is older than a peer's
+  adopts the peer's, on the bus plane and on Telegram, so the latest admin action wins and a
+  stale hold cannot come back over a newer release. The release's time is kept in the state
+  file rather than the file being deleted, so a restart still knows it, and `/status` shows
+  `held=` for this bot and `+held` per peer.
+
 - A promise that says when it wants looking at is now looked at then (`#213` review). `WAKE` rows
   carry their `in=` as the row's own `deadline`, but the stall ladder measured only `updated_at`:
   a bot told "look again in ten minutes" was first reminded at `limits.stall_minutes` (thirty by
