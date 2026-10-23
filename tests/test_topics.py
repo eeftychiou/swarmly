@@ -20,6 +20,15 @@ from swarmly.telegram.topics import TopicMap, context_for, name_from_message, to
 from tests.test_telegram_channel import ADMIN_ID, GROUP, event, make_channel, make_config, run
 
 
+def asked(message):
+    """What the person or peer asked, without the note a queued message gets about the reply
+    posted while it waited (#233): these tests are about hold and order, not that note."""
+    text = message.text or ""
+    if text.startswith("[While this message waited"):
+        return text.split("]\n\n", 1)[1]
+    return text
+
+
 def human(text, **kw):
     return event(text, author_id=ADMIN_ID, username="alice", is_bot=False, **kw)
 
@@ -346,7 +355,7 @@ class ChannelTests(unittest.TestCase):
             return during
         during = run(scenario())
         self.assertEqual(during, ["@HermesBot one", "@HermesBot are you there?"])
-        self.assertEqual(gate.seen[-1].text, "@HermesBot two")
+        self.assertEqual(asked(gate.seen[-1]), "@HermesBot two")
 
     def test_held_peer_messages_keep_their_order(self):
         # Held messages share one deadline, and a real event loop may wake them in any
@@ -384,7 +393,7 @@ class ChannelTests(unittest.TestCase):
                     break
             await asyncio.wait_for(asyncio.gather(*tasks), timeout=30)
         run(scenario())
-        self.assertEqual([m.text for m in gate.seen],
+        self.assertEqual([asked(m) for m in gate.seen],
                          ["@HermesBot task", "@HermesBot p1", "@HermesBot p2", "@HermesBot p3"])
 
     def test_only_busy_queue_max_messages_wait_in_memory_in_general(self):
@@ -418,7 +427,7 @@ class ChannelTests(unittest.TestCase):
             hold.set()
             await asyncio.gather(p1, p2)
         run(scenario())
-        self.assertEqual([m.text for m in gate.seen],
+        self.assertEqual([asked(m) for m in gate.seen],
                          ["@HermesBot task 1", "@HermesBot task 2", "@HermesBot p1"])
         # #184: the message past the cap is held for later, not dropped -- it runs when a turn
         # ends in this topic (the loop closes here before a turn does, so `gate.seen` shows only
@@ -445,7 +454,7 @@ class ChannelTests(unittest.TestCase):
             gate.release.set()
             await asyncio.gather(busy, handoff)
         run(scenario())
-        self.assertEqual(gate.seen[-1].text, "@HermesBot built, please review")
+        self.assertEqual(asked(gate.seen[-1]), "@HermesBot built, please review")
         self.assertFalse([s for s in channel._test_slept if s >= 59])
 
     def _hold_behind_a_turn(self, channel, gate, during_hold):
@@ -483,7 +492,7 @@ class ChannelTests(unittest.TestCase):
             channel._last_turn_at[(GROUP, None)] = channel._clock() + 30   # a later turn ended
         holds, _ = self._hold_behind_a_turn(channel, gate, a_person_keeps_talking)
         self.assertEqual(len(holds), 1)
-        self.assertEqual(gate.seen[-1].text, "@HermesBot two")
+        self.assertEqual(asked(gate.seen[-1]), "@HermesBot two")
 
     def test_held_peer_messages_stay_a_cooldown_apart(self):
         # The second held message measures its one wait from the end of the first one's
@@ -514,7 +523,7 @@ class ChannelTests(unittest.TestCase):
             gate.release.set()
             await asyncio.gather(*held)
         run(scenario())
-        self.assertEqual([m.text for m in gate.seen],
+        self.assertEqual([asked(m) for m in gate.seen],
                          ["@HermesBot task", "@HermesBot p1", "@HermesBot p2"])
         self.assertEqual(waits, [60, 60])
 

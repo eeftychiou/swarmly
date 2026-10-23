@@ -4994,6 +4994,10 @@ class AgentChannel:
         # name the ones no row owes -- #146 at 09:13, where nothing said the round was stuck.
         open_items: List[Any] = []
         heads: Dict[str, str] = {}
+        # An item is tracked under its issue (#227) but its rows are often written under its
+        # PR (#230: "WAIT merge #230 at <sha>"). The facts are said under both, or a merged PR
+        # keeps "Reasonix owes a merge" open for ever (round 5.5, 23 Oct).
+        pr_labels: Dict[str, str] = {}
         for key in keys:
             try:
                 state = rounds.load(key)
@@ -5007,6 +5011,9 @@ class AgentChannel:
                 if not item:
                     continue
                 label = f"#{item_key}"
+                pr = str(item.get("pr") or "").strip().lstrip("#")
+                if pr.isdigit() and f"#{pr}" != label:
+                    pr_labels[label] = f"#{pr}"
                 head = str(item.get("head") or "").strip().lower()
                 if head:
                     heads[label] = head
@@ -5104,6 +5111,8 @@ class AgentChannel:
         for row in fresh:
             learn(row)
         closed: List[Row] = []
+        facts = facts + [dataclasses.replace(fact, item=pr_labels[fact.item])
+                         for fact in facts if fact.item in pr_labels]
         for fact in facts:
             closed.extend(settle(list(table.values()), fact))
         # #164's orphan invariant, on the table **as the facts leave it**: a CI row this very
@@ -6528,6 +6537,7 @@ class AgentChannel:
         busy = lock.locked() or (self._turn_slots is not None and self._turn_slots.locked())
         queued = False
         queue_seq = 0
+        queued_at = 0.0
         busy_key = topic_key
         if busy and self.replies is None and self._may_queue(busy_key):
             # Ported from ductor's per-chat queue: hold the message and run it as soon as the
@@ -6539,6 +6549,7 @@ class AgentChannel:
             logger.info("turn in progress for %s; queued message from @%s (%d waiting)",
                         self.config.identity.alias, event.author_username, self._busy_waiting)
             queue_seq = self._queue_seq[busy_key] = self._queue_seq.get(busy_key, 0) + 1
+            queued_at = self._clock()
             await self._busy_notice(event, busy_key)
         elif busy and self.replies is None:
             # #9: with busy_behavior drop/notice, or a full queue, an addressed message that
@@ -6731,6 +6742,8 @@ class AgentChannel:
                             event.author_username)
                 return None
             incoming = self._with_folded(incoming, busy_key)
+            if queued:
+                incoming = self._with_answered_note(incoming, event, queued_at)
             # A queued peer message still inside the bot-to-bot cooldown waits it out once,
             # without holding the turn: other messages and topics go on meanwhile. It then
             # runs even if turns ran in between, so a busy chat cannot starve it.
@@ -7968,6 +7981,28 @@ class AgentChannel:
     def _log_topic(self, chat_id: int, thread_id: Optional[int], who: str, text: str,
                    message_id: Optional[int]) -> None:
         self._topic_memory.record(chat_id, thread_id, who, text, message_id)
+        if who == self.config.identity.alias:
+            self.__dict__.setdefault("_own_last", {})[(chat_id, thread_id)] = (
+                self._clock(), text or "")
+
+    def _with_answered_note(self, incoming: IncomingMessage, event: ChannelEvent,
+                            queued_at: float) -> IncomingMessage:
+        """A message that waited behind a turn whose reply was posted *after* it arrived: show
+        that reply, and let the bot stay silent when it already answers.
+
+        Round 5.5 (23 Oct): about a third of the topic was second answers. The waiting
+        message's prompt was built before the turn ahead of it posted, so a fresh session never
+        saw its own reply and said it again ("already fixed -- your note predates the push")."""
+        last = self.__dict__.get("_own_last", {}).get((event.chat_id, event.thread_id))
+        if not last or last[0] < queued_at or not last[1].strip():
+            return incoming
+        lead = ("[While this message waited, you already posted in this discussion:\n> "
+                + last[1].strip()[:1500].replace("\n", "\n> ")
+                + "\nIf that reply already answers everything below, output exactly NO_REPLY. "
+                "Otherwise answer only what it does not cover.]\n\n")
+        return dataclasses.replace(
+            incoming, text=lead + (incoming.text or ""),
+            fresh_text=lead + incoming.fresh_text if incoming.fresh_text else None)
 
     def _topic_recap(self, event: ChannelEvent) -> str:
         """What the discussion is about, before the new message. A runtime that starts every

@@ -346,6 +346,30 @@ class GitHubClient:
             logger.warning("failed to parse pr_checks json: %s", exc)
             return None
 
+    def open_pr_checks(self, repo: str, limit: int = 30) -> Optional[List[PRChecks]]:
+        """The checks of every open pull request's head in *repo*, in one call, or ``None``
+        when gh cannot say (``gh pr list --json ...statusCheckRollup``)."""
+        fields = "number,title,url,headRefOid,statusCheckRollup"
+        code, out, err = self._run(["pr", "list", "--repo", repo, "--state", "open",
+                                    "--limit", str(int(limit)), "--json", fields])
+        if code != 0:
+            logger.warning("open_pr_checks(%s) failed (code %d): %s", repo, code, err.strip())
+            return None
+        try:
+            data = json.loads(out)
+        except ValueError as exc:
+            logger.warning("failed to parse open_pr_checks json: %s", exc)
+            return None
+        found: List[PRChecks] = []
+        for entry in data if isinstance(data, list) else []:
+            if not isinstance(entry, dict) or not entry.get("number"):
+                continue
+            found.append(checks_from_rollup(
+                number=int(entry["number"]), head_sha=str(entry.get("headRefOid") or ""),
+                url=str(entry.get("url") or ""), title=str(entry.get("title") or ""),
+                rollup=entry.get("statusCheckRollup") or [], pr_state="OPEN"))
+        return found
+
     def notifications(self, repo: Optional[str] = None) -> List[Notification]:
         """Fetch the token owner's unread notifications, optionally scoped to a repository.
 
