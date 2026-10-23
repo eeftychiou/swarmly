@@ -132,6 +132,85 @@ class TestAdapterEnvironment(unittest.TestCase):
                 self.assertEqual(env["SWARMLY_ROLE"], "reviewer")
                 self.assertTrue(env["PATH"].startswith(str(Path(tmp) / "g")))
 
+    def test_the_lease_holder_is_guarded_as_the_coordinator(self):
+        """#143 drill: a reviewer that took the lease over must be able to merge the round."""
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        from swarmly.telegram.config import AdapterSettings
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = ClaudeAdapter("Claude", AdapterSettings(type="claude"))
+            adapter.role_name, adapter.guard_dir = "reviewer", Path(tmp) / "g"
+            adapter.acting_coordinator = True
+            env = adapter.environment()
+            if not (env.get("SWARMLY_REAL_GIT") or env.get("SWARMLY_REAL_GH")):
+                self.skipTest("neither git nor gh is on PATH: the guard is not installed")
+            self.assertEqual(env["SWARMLY_ROLE"], "coordinator")
+            adapter.acting_coordinator = False          # the lease is gone: the role is back
+            self.assertEqual(adapter.environment()["SWARMLY_ROLE"], "reviewer")
+
+
+class TestHoldsLease(unittest.TestCase):
+    """The channel tells the adapter, each turn, whether this bot holds the lease."""
+
+    def channel(self):
+        from tests.test_telegram_channel import make_channel, make_config
+        return make_channel(make_config())
+
+    def test_only_a_live_lease_of_its_own_counts(self):
+        from swarmly.telegram.lease import LeaseState
+        channel = self.channel()
+        own = channel.config.identity.alias
+        far = channel._lease_clock() + 600.0
+        channel.lease_state = lambda now=None: LeaseState(
+            status="ok", term=11, holder=own, expires_at=far)
+        self.assertTrue(channel._holds_lease())
+        channel.lease_state = lambda now=None: LeaseState(
+            status="ok", term=11, holder="Claudebot", expires_at=far)
+        self.assertFalse(channel._holds_lease())
+        channel.lease_state = lambda now=None: LeaseState(
+            status="ok", term=11, holder=own, expires_at=channel._lease_clock() - 1.0)
+        self.assertFalse(channel._holds_lease())         # lapsed: no coordinator rights
+
+    def test_an_unreadable_lease_grants_nothing(self):
+        channel = self.channel()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("the bus is gone")
+
+        channel.lease_state = boom
+        self.assertFalse(channel._holds_lease())
+
+
+class TestTheFlagLastsOneTurn(unittest.TestCase):
+    """#208 review (DeepSeek): the flag was set at turn start and never cleared, so between
+    turns the environment still said coordinator after the lease had moved."""
+
+    def test_the_flag_is_cleared_when_the_turn_ends(self):
+        import asyncio
+        from types import SimpleNamespace
+        from swarmly.telegram.adapters.base import AdapterReply
+        from tests.test_telegram_channel import event, make_channel, make_config
+
+        channel = make_channel(make_config())
+        seen = []
+
+        class Adapter:
+            acting_coordinator = False
+
+            async def respond(self, incoming):
+                seen.append(self.acting_coordinator)
+                return AdapterReply(text="ok")
+
+        adapter = Adapter()
+        channel._adapter_for = lambda chat, thread: adapter
+
+        async def holding() -> bool:            # the turn runs with the coordinator's rights
+            return True
+        channel._acting_coordinator = holding
+        incoming = SimpleNamespace(author_alias="admin", context_id="c", text="hi")
+        asyncio.run(channel._respond(incoming, event("hi")))
+        self.assertEqual(seen, [True])
+        self.assertFalse(adapter.acting_coordinator)
+
 
 if __name__ == "__main__":
     unittest.main()
