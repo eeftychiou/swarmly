@@ -147,6 +147,9 @@ class TestTheTransportSaysItOnce(unittest.TestCase):
     def test_a_claimed_head_that_is_not_the_pr_head_is_said_once(self):
         channel = self.channel({"173": {"head": "a7b0355"}})
         channel.owed_store().save_all([verdict_row(head="a7b0355", topic=channel._test_topic)])
+        # The PR's own head is read to confirm a suspected mismatch: here it agrees with the
+        # round state, so the claim is wrong and one notice goes out.
+        channel.wake_subject_reader = _pr_head("a7b0355")
         said = channel._check_head_claims("#173 is at 621722f, review it.",
                                          9600, 5122)
         self.assertEqual(len(said), 1)
@@ -177,6 +180,15 @@ class TestTheTransportSaysItOnce(unittest.TestCase):
         channel.owed_sweep(now=1060.0)                          # said once, not every beat
         self.assertEqual(len(channel._test_notices), 1)
 
+    def test_a_stale_round_head_does_not_flag_a_correct_claim(self):
+        """The review's point: the round state can lag the PR, so the PR decides (#183)."""
+        channel = self.channel({"173": {"head": "a7b0355"}})     # the round state is behind
+        channel.wake_subject_reader = _pr_head("621722f")         # the PR itself
+        said = channel._check_head_claims("#173 is at 621722f", 9600, 5122)
+        self.assertEqual(said, [])                               # the claim was right
+        self.assertEqual(channel._test_notices, [])
+        self.assertEqual(channel._head_cache[1]["#173"]["head"], "621722f")  # corrected
+
     def test_an_item_called_ready_is_checked_against_the_facts(self):
         """#183's third rule, wired: "ready" is a claim like a SHA is."""
         channel = self.channel({"173": {"head": "18f5f0e"}})
@@ -190,6 +202,13 @@ class TestTheTransportSaysItOnce(unittest.TestCase):
         said = channel._check_head_claims("#173 is ready", 9600, 5122)
         self.assertEqual(len(said), 1)
         self.assertIn("conflicts with main", channel._test_notices[-1][0])
+
+
+def _pr_head(head, *, state="OPEN"):
+    """A `gh pr view` stand-in: (state, headRefOid) as the PR itself reports it."""
+    async def reader(_subject, cwd=None):
+        return (state, head)
+    return reader
 
 
 class _Rounds:

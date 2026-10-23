@@ -5533,29 +5533,75 @@ class AgentChannel:
             logger.info("head freeze: %s", "; ".join(done[:8]))
         return done
 
+    async def _confirm_claim(self, mismatch: Any, chat_id: int,
+                            thread_id: Optional[int]) -> List[str]:
+        """Check a suspected wrong claim against **the PR itself** before saying anything.
+
+        The round state's head is what the table is built from, and it can lag the PR by a
+        report: a claim that disagrees with it may be right. On a suspected mismatch the PR's
+        own ``headRefOid`` decides -- one ``gh`` read, only when there is something to confirm
+        -- and the round cache is corrected from it, so the next claim is checked against the
+        head the PR really has (#183 review).
+        """
+        from swarmly.telegram.head_freeze import Mismatch, claim_notice
+        from swarmly.telegram.owed_wake import same_head
+        from swarmly.telegram.wake import subject_state_async
+        reader = self.wake_subject_reader or subject_state_async
+        actual = ""
+        try:
+            current = await reader(("pr", str(mismatch.item).lstrip("#"), ""),
+                                   cwd=self._workdir_for(chat_id, thread_id))
+            if current is not None:
+                actual = str(current[1] or "").strip()
+        except Exception:                          # noqa: BLE001 - unreadable is not a claim
+            logger.debug("head freeze: the PR could not be read for %s", mismatch.item,
+                         exc_info=True)
+        if actual:
+            facts = dict((getattr(self, "_head_cache", None) or (0.0, {}))[1])
+            facts[mismatch.item] = {"head": actual,
+                                    "mergeable": facts.get(mismatch.item, {}).get(
+                                        "mergeable", "")}
+            self._head_cache = (self._clock(), facts)
+            if same_head(mismatch.claimed, actual):
+                return []                          # the claim was right: the state was behind
+            mismatch = Mismatch(item=mismatch.item, claimed=mismatch.claimed, actual=actual)
+        seen = self.head_freeze_seen()
+        key = f"claim:{mismatch.item}:{mismatch.claimed}:{mismatch.actual}"
+        if not seen.first(key):
+            return []
+        self._post_notice(claim_notice(mismatch), int(chat_id), thread_id)
+        return [f"{mismatch.item}: claimed {mismatch.claimed}, head is {mismatch.actual}"]
+
     def _check_head_claims(self, text: str, chat_id: int, thread_id: Optional[int]) -> List[str]:
         """Check a claimed PR head against the PR's head, and say so once (#183).
 
         The live case: a bot reported `621722f` while #173 was at `a7b0355`, and the review that
-        followed read code the PR did not have. One notice per (item, claimed, actual); the
-        claim never closes a row -- the facts decide, not the claim (#164).
+        followed read code the PR did not have. A suspected mismatch is confirmed against the
+        PR's own head before a notice goes out, so a round state that lagged the PR cannot flag
+        a correct claim. One notice per (item, claimed, actual); the claim never closes a row --
+        the facts decide, not the claim (#164).
         """
-        from swarmly.telegram.head_freeze import (claim_notice, claims, mismatches,
-                                                  ready_blockers, ready_claims, ready_notice)
+        from swarmly.telegram.head_freeze import (claims, mismatches, ready_blockers,
+                                                  ready_claims, ready_notice)
         facts = self._round_facts()
         heads = {label: values["head"] for label, values in facts.items() if values["head"]}
         if not heads:
             return []
-        seen = self.head_freeze_seen()
         done: List[str] = []
         for mismatch in mismatches(claims(text, heads), heads=heads):
-            key = f"claim:{mismatch.item}:{mismatch.claimed}:{mismatch.actual}"
-            if not seen.first(key):
-                continue
-            self._post_notice(claim_notice(mismatch), int(chat_id), thread_id)
-            done.append(f"{mismatch.item}: claimed {mismatch.claimed}, head is "
-                        f"{mismatch.actual}")
-        # #183: and an item called ready is checked against the facts that decide it.
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is None:                       # a unit test, or a call with no loop
+                done.extend(asyncio.run(self._confirm_claim(mismatch, chat_id, thread_id)))
+            else:
+                self._self_tasks.add(asyncio.create_task(
+                    self._confirm_claim(mismatch, chat_id, thread_id)))
+                done.append(f"{mismatch.item}: claim {mismatch.claimed} being checked")
+        # #183: and an item called ready is checked against the facts that decide it -- the PR's
+        # conflicts and the head its verdicts were given on.
+        seen = self.head_freeze_seen()
         for item in ready_claims(text, heads):
             blockers = ready_blockers({"head": heads.get(item, "")},
                                       mergeable=facts.get(item, {}).get("mergeable"),
