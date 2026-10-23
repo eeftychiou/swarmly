@@ -74,6 +74,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- The transport says **who merged** (round 5.5 `#228`): right after a merge the role guard ran
+  (`gh` wrapper, `swarmly/telegram/guard.py`), it posts one comment on the pull request —
+  `Merged by DeepSeek (lease term 4) at 1a2b3c4` — with the alias and the lease term taken from
+  the environment the turn runs in (`SWARMLY_ALIAS`, `SWARMLY_LEASE_TERM`, both written by
+  `guard.prepare`), never from the reply, so a bot cannot claim a merge it did not make. A term
+  or commit it could not read is left out, never guessed; a merge that failed, a queued
+  `--auto` merge, an unguarded run, or a merge by the admin by hand leaves no comment, which is
+  how a person's merge is told apart. The reviewer and QA role prompts now require the
+  `— <alias>` signature on every verdict and say plainly that a formal GitHub review state is
+  refused for the shared login, and `docs/telegram-channel.md` has a "Who did what" note.
 - The `WAIT` line (round 5.5 `#165`, first slice): a reply says what it waits on — `WAIT review
   #133 head 38f1977 from Reasonix`, `WAIT ci #173 head 9fb2f21`, `WAIT answer on the Drive
   credentials` — and the transport opens the matching row (verdict, CI, merge, progress, the
