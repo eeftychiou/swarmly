@@ -63,6 +63,27 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- A **parent issue closes with its last slice** (round 5.5 `#227`): the poller reads the same
+  refs a tracking issue's body lists — the checklist, or "split into #a, #b" — and once every
+  one of them is merged (a pull request) or closed (an issue) it closes the parent itself, with
+  one line naming the slices (`GitHubClient.close_issue`, comment first). The state of each
+  slice decides, never a ticked box: a checklist ticked over an unmerged PR keeps the parent
+  open, and an item `gh` could not answer for counts as not landed. The close is a round end
+  like a hand close, so the same poll queues the coordinator's report turn, and a parent the
+  transport closed is not closed twice. The refs must be **stated, not mentioned**: a
+  checklist or a "split into #a, #b" line closes the parent, while a body that only names
+  numbers in prose (`#189`'s own shape) closes nothing — that reading would have closed #189
+  with #228 and #226 still open. The line is posted once; a close that keeps failing is
+  retried without re-posting it. Item states are read with `ref_state` — one `gh api`
+  call for an issue *or* a pull request — because this now runs once per poll rather than only
+  when an issue closes.
+
+- **Only the lease holder dispatches** (round 5.5 `#227`): the reviewer, developer, QA and
+  researcher role texts now say they never brief or assign another bot — they report to the
+  coordinator, and the coordinator hands the work out — and the coordinator's text says it is
+  the one dispatcher. The 22 Oct cases were a reviewer sending a peer to a PR and a developer
+  posting a wake that pinged three bots. `docs/ROLES.md` carries both rules.
+
 - `WAKE` no longer arms a timer (round 5.5 `#165`, second slice). A `WAKE` line is read as the
   row that replaces it — the bot owes itself a look at what the check watched, with the check
   and the action written down and the item the check named, so the guard's ladder (`#164`) and

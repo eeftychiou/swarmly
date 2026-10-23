@@ -111,6 +111,31 @@ class TestPrompt(unittest.TestCase):
             self.assertEqual(build_adapter(config(tmp)).role_text, "")
 
 
+class TestOnlyTheLeaseHolderDispatches(unittest.TestCase):
+    """#227 item 1: a peer reports to the coordinator; only the coordinator hands work out.
+
+    The 22 Oct cases: a reviewer sent another reviewer to a PR, and a developer posted a wake
+    that pinged three bots. A prompt cannot stop a model, but the role texts are what every
+    turn is framed with, so the rule has to be in them — and tested there.
+    """
+
+    def test_every_other_role_says_it_does_not_dispatch(self):
+        from swarmly.telegram.roles import BUILTIN_ROLES, load_role
+        for name in BUILTIN_ROLES:
+            if name == "coordinator":
+                continue
+            with self.subTest(role=name):
+                text = load_role(name).instructions
+                self.assertIn("never brief or assign another bot", text)
+                self.assertIn("coordinator", text)
+
+    def test_the_coordinator_is_the_one_dispatcher(self):
+        from swarmly.telegram.roles import load_role
+        text = load_role("coordinator").instructions
+        self.assertIn("You are the one dispatcher", text)
+        self.assertNotIn("never brief or assign another bot", text)   # it does dispatch
+
+
 class TestChannelSurfaces(unittest.TestCase):
     def test_role_command_status_and_online_notice(self):
         from swarmly.telegram.channel import AgentChannel

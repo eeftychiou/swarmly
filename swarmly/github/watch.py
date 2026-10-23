@@ -70,6 +70,10 @@ def tracking_item_refs(body: str, own: int) -> List[int]:
     The checklist is the list when the body has one -- a ticked box is not proof, the state
     of the item it names decides -- and otherwise every ``#N`` in the body counts. The
     tracking issue's own number never does.
+
+    This is the **broad** reading, for refusing a close: `#189` mentions eight issues in prose
+    and every one of them may be checked. A close nobody asked for is recoverable ("reopen
+    it"); :func:`listed_item_refs` is the narrow one that closing needs.
     """
     text = body or ""
     boxes = _CHECKBOX_LINE.findall(text)
@@ -81,6 +85,50 @@ def tracking_item_refs(body: str, own: int) -> List[int]:
             if number != int(own) and number not in refs:
                 refs.append(number)
     return refs
+
+
+#: A line that *states* its slices rather than mentioning them: ``split into #65, #68``,
+#: ``slices: #65 #68``, ``sub-issues - #65``. The phrase leads the line, so prose that merely
+#: mentions a number ("#117 stayed open after all its slices (#133…) merged", from #189's own
+#: body) is a mention, not a listing.
+_LISTED_LINE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:"
+    r"split\s+(?:in)?to\s+|split\s+as\s+"                       # "split into #65, #68"
+    r"|(?:slices?|sub-?issues?|children|parts)\s*(?:[:=\-—]\s*|of\s+)"   # "slices: #65"
+    r")", re.I)
+
+
+def listed_item_refs(body: str, own: int) -> Tuple[List[int], bool]:
+    """``(refs, listed)`` — the slices a parent names, and whether it names them at all.
+
+    #227 item 2 closes a parent that is **finished**, so it may only act on a body that
+    states its slices: a task-list line, or a line that opens with what the list is
+    (``split into #a, #b``, ``slices: #a``). A body that only mentions numbers in prose lists
+    nothing — closing on that reading is how #189 would have closed with #228 and #226 still
+    open, which is the failure #227 exists to prevent, inverted.
+    """
+    text = body or ""
+    own = int(own)
+
+    def refs_in(chunk: str) -> List[int]:
+        found: List[int] = []
+        for match in _ISSUE_REF.finditer(chunk):
+            number = int(match.group(1))
+            if number != own and number not in found:
+                found.append(number)
+        return found
+
+    boxes = _CHECKBOX_LINE.findall(text)
+    if boxes:
+        refs: List[int] = []
+        for chunk in boxes:
+            refs.extend(number for number in refs_in(chunk) if number not in refs)
+        return refs, bool(refs)
+    refs = []
+    for line in text.splitlines():
+        if _LISTED_LINE.match(line):
+            refs.extend(number for number in refs_in(line) if number not in refs)
+    return refs, bool(refs)
 
 
 def item_blocker(state: Optional[str], *, is_pr: bool = False) -> Optional[str]:
@@ -130,6 +178,11 @@ class NotificationState:
     #: "repo#number" -> when a refused close was reported. Stops a still-closed issue from
     #: re-announcing its refusal on every poll; a reopen clears it.
     blocked_reported: Dict[str, str] = field(default_factory=dict)
+    #: "repo#number" -> when the transport posted its "every listed slice has landed" line on
+    #: a parent (#227 review). A close that keeps failing (a locked issue, a token that lost
+    #: `issues: write`) must not re-post the same comment on every poll: the note goes once,
+    #: the close is retried silently.
+    parent_notes: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Optional[Path]) -> "NotificationState":
@@ -184,10 +237,15 @@ class NotificationState:
             raw_reported = data.get("blocked_reported")
             if isinstance(raw_reported, dict):
                 blocked_reported = {str(k): str(v) for k, v in raw_reported.items()}
+            parent_notes: Dict[str, str] = {}
+            raw_notes = data.get("parent_notes")
+            if isinstance(raw_notes, dict):
+                parent_notes = {str(k): str(v) for k, v in raw_notes.items()}
             return cls(processed_ids=processed, last_poll=data.get("last_poll"),
                        failures=failures, tracking_open=tracking_open,
                        round_reports=round_reports, pending_reports=pending_reports,
-                       blocked_closes=blocked_closes, blocked_reported=blocked_reported)
+                       blocked_closes=blocked_closes, blocked_reported=blocked_reported,
+                       parent_notes=parent_notes)
         except Exception as exc:
             logger.warning("could not load notification state from %s: %s", path, exc)
             return cls()
@@ -206,6 +264,7 @@ class NotificationState:
                 "pending_reports": self.pending_reports,
                 "blocked_closes": self.blocked_closes,
                 "blocked_reported": self.blocked_reported,
+                "parent_notes": self.parent_notes,
             }
             tmp = path.with_suffix(f".tmp-{os.getpid()}-{int(time.time())}")
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -532,33 +591,94 @@ class GitHubWatcher:
         finally:
             await adapter.close()
 
-    def _open_items(self, repo: str, issue: Any) -> List[str]:
-        """The items of a tracking issue that still block its close (#65), as ``#12 open``.
+    def _item_states(self, repo: str, issue: Any,
+                     refs: Optional[List[int]] = None) -> List[Tuple[int, Optional[str]]]:
+        """``(number, why it blocks)`` for every item the issue's body lists (#65, #227).
 
-        Every item the body lists has its own state read: a pull request has to be *merged*
-        (a closed one never landed), an issue *closed*. Reading it is a `gh` call per item,
-        which is why this runs only when a tracking issue actually closes.
+        ``refs`` is the list to read; the default is the broad reading
+        (:func:`tracking_item_refs`) the round-end refusal uses. The parent close passes the
+        narrow one (:func:`listed_item_refs`), because closing acts on what a body *states*.
+
+        One ``gh api`` call per item answers for an issue *or* a pull request at once, so the
+        parent check costs one call per slice rather than the two a ``pr view`` that falls
+        back to ``issue view`` costs — it runs once per poll for every open parent (#227).
+        ``closed`` is the one ambiguous word (a closed issue is done, a closed pull request
+        never landed), and only that word pays for a second call to learn which it is.
         """
-        blockers: List[str] = []
-        for number in tracking_item_refs(getattr(issue, "body", "") or "",
-                                         int(getattr(issue, "number", 0) or 0)):
-            state: Optional[str] = None
-            is_pr = False
+        states: List[Tuple[int, Optional[str]]] = []
+        if refs is None:
+            refs = tracking_item_refs(getattr(issue, "body", "") or "",
+                                      int(getattr(issue, "number", 0) or 0))
+        for number in refs:
             try:
-                pr = self.client.pr_view(repo, number)
-                if pr is not None:
-                    is_pr = True
-                    state = str(getattr(pr, "state", "") or "")
-                else:
-                    item = self.client.issue_view(repo, number)
-                    state = str(getattr(item, "state", "") or "") if item is not None else ""
+                state = str(self.client.ref_state(repo, number) or "")
+                if state.lower() == "closed":
+                    is_pr = self.client.pr_view(repo, number) is not None
+                    states.append((number, item_blocker("CLOSED", is_pr=is_pr)))
+                    continue
+                states.append((number, item_blocker(state.upper())))
             except GitHubError as exc:
                 logger.warning("could not read item #%s of %s: %s", number, repo, exc)
-                state = ""
-            reason = item_blocker(state, is_pr=is_pr)
-            if reason:
-                blockers.append(f"#{number} {reason}")
-        return blockers
+                states.append((number, "unchecked"))
+        return states
+
+    def _open_items(self, repo: str, issue: Any) -> List[str]:
+        """The items of a tracking issue that still block its close (#65), as ``#12 open``."""
+        return [f"#{number} {why}" for number, why in self._item_states(repo, issue) if why]
+
+    def _close_finished_parent(self, repo: str, issue: Any,
+                               outcome: GitHubPollOutcome) -> bool:
+        """Close a parent issue whose every listed slice has landed (#227 item 2).
+
+        A parent states its slices as a checklist or as a "split into #a, #b" line, and it is
+        closed once every one of them is merged (a pull request) or closed (an issue). A body
+        that only *mentions* numbers states nothing, so it is never closed from here. One line
+        says which slices landed, and **the state of each item decides, never a ticked box**: a
+        tick says the coordinator believes it landed, and the close is the transport's, so it
+        checks. An item GitHub could not answer for stays open, because a wrong close is a
+        round ended early and a late close is only late.
+
+        Returns whether it closed the issue, and leaves the caller's ``issue`` marked CLOSED
+        so the same poll sees the round end rather than one poll later.
+        """
+        if str(getattr(issue, "state", "")).upper() == "CLOSED":
+            return False
+        number = int(getattr(issue, "number", 0) or 0)
+        key = f"{repo}#{number}"
+        if key in self.state.round_reports or key in self.state.pending_reports:
+            # Closed already and its round end queued: a GitHub that still answers OPEN for a
+            # moment must not earn a second comment.
+            return False
+        refs, listed = listed_item_refs(getattr(issue, "body", "") or "", number)
+        if not listed:
+            # The body mentions numbers; it does not state its slices. Closing on a mention is
+            # how #189 would close with two of its own items still open (#227 review).
+            logger.debug("parent %s#%s states no slices (a mention is not a listing); left open",
+                         repo, number)
+            return False
+        states = self._item_states(repo, issue, refs)
+        if not states:
+            return False                              # nothing to read: not a parent
+        blockers = [(item, why) for item, why in states if why]
+        if blockers:
+            logger.debug("parent %s#%s stays open: %s", repo, number,
+                         ", ".join(f"#{item} {why}" for item, why in blockers))
+            return False
+        landed = ", ".join(f"#{item}" for item, _why in states)
+        said = self.state.parent_notes.get(key)
+        comment = "" if said else (f"Every listed slice has landed ({landed}), so this parent "
+                                  f"closes itself. — the transport")
+        if not self.client.close_issue(repo, number, comment):
+            # The line went out once, on the first attempt: a close that keeps failing is
+            # retried without re-posting the same comment on every poll (#227 review).
+            if comment:
+                self.state.parent_notes[key] = _utc()
+            outcome.errors.append(f"{repo}#{number}: could not close a finished parent issue")
+            return False
+        issue.state = "CLOSED"
+        self.state.parent_notes.pop(key, None)
+        logger.info("parent %s#%s closed: every listed item landed (%s)", repo, number, landed)
+        return True
 
     async def _wake_on_tracking_close(self, project: ProjectSettings, chat_id: int,
                                       thread_id: Optional[int], outcome: GitHubPollOutcome,
@@ -584,10 +704,22 @@ class GitHubWatcher:
             outcome.errors.append(f"{repo}: {exc}")
             return
 
+        # #227 item 2: a parent whose every listed slice has landed closes itself, before the
+        # open/closed split below -- so the close this poll makes is the round end this poll
+        # reports, not one a later poll notices. A parent the transport closed counts as one
+        # that was open before this poll: its close is still the round end it earns.
+        closed_by_us = set()
+        for issue in list(issues):
+            try:
+                if self._close_finished_parent(repo, issue, outcome):
+                    closed_by_us.add(int(getattr(issue, "number", 0) or 0))
+            except GitHubError as exc:
+                outcome.errors.append(f"{repo}#{getattr(issue, 'number', '?')}: {exc}")
+
         open_now = sorted({int(i.number) for i in issues if str(i.state).upper() != "CLOSED"})
         closed_now = {int(i.number): i for i in issues
                       if str(i.state).upper() == "CLOSED"}
-        previously_open = set(self.state.tracking_open.get(repo) or [])
+        previously_open = set(self.state.tracking_open.get(repo) or []) | closed_by_us
         for number in open_now:
             # Reopened: the round runs again, so its next closure earns its own report.
             report_key = f"{repo}#{number}"

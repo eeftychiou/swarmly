@@ -464,6 +464,22 @@ class GitHubClient:
             return False
         return True
 
+    def close_issue(self, repo: str, number: int, comment: str = "") -> bool:
+        """Close an issue, with the reason as a comment first (#227 item 2).
+
+        A close is never silent: the comment names what landed, and it goes in before the
+        close so a failed close leaves the reason behind rather than a closed issue nobody
+        can account for.
+        """
+        if comment and not self.comment(repo, number, comment):
+            return False
+        code, _out, err = self._run(["issue", "close", str(number), "--repo", repo])
+        if code != 0:
+            logger.warning("close_issue(%s, %s) failed (code %d): %s", repo, number, code,
+                           err.strip())
+            return False
+        return True
+
     def create_issue(
         self,
         repo: str,
