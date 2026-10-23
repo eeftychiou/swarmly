@@ -242,6 +242,19 @@ class DeletingFormTests(CleanupCase):
         self.ask(cleanup, "confirm", self.code_in(ask))
         self.assertEqual(sorted(host.deleted_topics), [42, 44])
 
+    def test_topics_all_and_done_spare_the_pulse_topic(self):
+        """Live, 23 Oct: nothing kept "📡 Swarm pulse", so ``topics all`` would have deleted the
+        topic the heartbeat posts to. The host names it; no config is needed."""
+        host = FakeHost([topic(42, "a", refs=("#1",), states={"#1": "closed"}),
+                         topic(3418, "📡 Swarm pulse", refs=("#1",), states={"#1": "closed"})])
+        host.cleanup_protected_topics = lambda: {3418}
+        cleanup = self.cleanup(host)
+        self.assertNotIn("3418", self.ask(cleanup, "topics", "done").split("delete")[-1])
+        ask = self.ask(cleanup, "topics", "all")
+        self.assertIn("will delete 1 topic(s)", ask)
+        self.ask(cleanup, "confirm", self.code_in(ask))
+        self.assertEqual(host.deleted_topics, [42])
+
     def test_topic_deletes_one_named_topic(self):
         host = FakeHost([topic(42, "a"), topic(43, "b")])
         cleanup = self.cleanup(host)
@@ -349,6 +362,8 @@ class FakeBot:
 
     async def delete_forum_topic(self, chat_id=None, message_thread_id=None):
         self.topics.append((chat_id, message_thread_id))
+        if getattr(self, "gone", False):
+            raise RuntimeError("Telegram server says - Bad Request: TOPIC_ID_INVALID")
         if self.fail:
             raise RuntimeError("Bad Request: not enough rights")
 
@@ -455,6 +470,18 @@ class ChannelCase(unittest.TestCase):
     def make_channel_from(self, config) -> AgentChannel:
         return AgentChannel(config, adapter=EchoAdapter("Hermes"), sender=self.sender,
                             clock=lambda: 1000.0, sleeper=lambda seconds: None)
+
+    def test_a_topic_already_gone_is_forgotten_not_failed(self):
+        """Live, 23 Oct: Round 3 had been deleted in Telegram; /cleanup said it "could not be
+        deleted" and kept listing it."""
+        self.prompt()
+        self.channel.bot.gone = True
+        ask = self.admin_command("/cleanup@HermesBot topic 42")
+        code = re.search(r"confirm ([0-9a-f]+)", ask).group(1)
+        done = self.admin_command(f"/cleanup@HermesBot confirm {code}", message_id=502)
+        self.assertIn("deleted 1 topic(s): #42", done)
+        self.assertNotIn("could not be deleted", done)
+        self.assertIsNone(self.channel.topics.name(GROUP, 42))
 
     def test_confirming_deletes_the_topic_and_announces_topic_gone(self):
         self.prompt()

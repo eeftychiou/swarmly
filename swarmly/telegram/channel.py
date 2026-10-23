@@ -1812,6 +1812,11 @@ class AgentChannel:
         if notice:
             self.ledger.note_notice(int(chat_id), int(message_id))
 
+    def cleanup_protected_topics(self) -> Set[int]:
+        """Topics /cleanup never offers in bulk: the pulse topic the heartbeat posts to."""
+        pulse = self._pulse_topic()
+        return {int(pulse)} if pulse else set()
+
     def cleanup_home_chat(self) -> Optional[int]:
         home = self.config.identity.home_channel_id
         return int(home) if home is not None else None
@@ -1910,6 +1915,13 @@ class AgentChannel:
             await self.bot.delete_forum_topic(chat_id=int(chat_id),
                                               message_thread_id=int(thread_id))
         except Exception as exc:                           # noqa: BLE001 - report it
+            if any(marker in str(exc).lower() for marker in
+                   ("topic_id_invalid", "topic_deleted", "message thread not found")):
+                # Already deleted (the admin removed it in Telegram): the goal is met, so it is
+                # forgotten like a deleted one, not reported as a failure (live, 23 Oct: Round 3
+                # was long gone and /cleanup said "could not be deleted").
+                logger.info("topic %s is already gone (%s); forgetting it", thread_id, exc)
+                return True
             logger.warning("could not delete topic %s: %s", thread_id, exc)
             return False
         logger.info("deleted topic %s in chat %s", thread_id, chat_id)
