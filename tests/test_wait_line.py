@@ -57,6 +57,31 @@ class TestAKindEach(unittest.TestCase):
                 self.assertTrue(wl.parse_line(line, at=1000.0).is_open)
 
 
+class TestTwoQuestionsAreTwoDebts(unittest.TestCase):
+    """An admin row has no item, so it is keyed by the question -- two questions, two rows.
+
+    Without the key both rows write the id ``admin:-:admin`` and the table keeps one: the second
+    question the bot said it waits on is never owed (#209 review).
+    """
+
+    def test_two_questions_in_one_topic_key_apart(self):
+        first = wl.parse_line("WAIT answer on the Drive credentials", topic="tg-3556", at=1000.0)
+        second = wl.parse_line("WAIT answer on the CT100 network", topic="tg-3556", at=1000.0)
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(len(ow.fold([first, second])), 2)
+
+    def test_the_same_question_asked_again_is_one_debt(self):
+        said = "WAIT answer on the Drive credentials"
+        self.assertEqual(wl.parse_line(said, topic="tg-3556", at=1000.0).id,
+                         wl.parse_line(said, topic="tg-3556", at=2000.0).id)
+
+    def test_the_admin_still_settles_it_by_answering(self):
+        row = wl.parse_line("WAIT answer on the Drive credentials", topic="tg-3556", at=1000.0)
+        closed = ow.settle([row], ow.Fact(kind="reply", item="tg-3556", who=ow.ADMIN),
+                           now=2000.0)
+        self.assertEqual(len(closed), 1)                     # the key does not trap the row
+
+
 class TestARefusalSaysWhy(unittest.TestCase):
     """A line that cannot become a row is refused with the shape that would work."""
 
@@ -165,6 +190,15 @@ class TestTheTransportRecordsIt(unittest.TestCase):
         self.assertEqual(channel._test_table[1].load(), [])
         self.assertIn("WAIT refused", said)
         self.assertIn("needs the head", said)
+
+    def test_two_questions_to_the_admin_are_two_rows(self):
+        channel = self.channel()
+        channel.apply_wait_lines(
+            "Two things I need.\nWAIT answer on the Drive credentials\n"
+            "WAIT answer on the CT100 network", self.event())
+        rows = channel._test_table[1].load()
+        said = sorted(row.owes for row in rows)
+        self.assertEqual(len(rows), 2, said)                 # one row per question, not one
 
     def test_a_reply_with_no_wait_line_is_untouched(self):
         channel = self.channel()

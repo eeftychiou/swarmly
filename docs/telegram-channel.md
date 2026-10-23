@@ -1225,11 +1225,14 @@ coordinator's, `progress` an owner's, and `answer` the admin's. A head-bound kin
 `head <sha>` is refused, a verdict/merge/progress without `from <alias>` is refused, `ci` may
 not name a bot as its debtor, and an unknown kind is refused with the list — every refusal is
 said back into the reply, and the line is removed either way (a WAIT the bot believes it made
-is a promise the ladder (#164) and the wakes (#163) both act on). The line leaves the reply
-like a `WAKE` does, so the prose is what the swarm reads and the row is what the transport
-reads. Arming a `WAKE` still works on this release; retiring it, the coordinator watchdog and
-the separate hand-off reminders is the rest of #165, once the rows are what the swarm actually
-relies on.
+is a promise the ladder (#164) and the wakes (#163) both act on). An `answer` row is keyed by
+the question it asks (the way `owed.admin_row` keys it), so two questions to the admin in one
+topic are two debts and the second is not swallowed by the first; the same question asked again
+updates the one row, and the admin answering in that topic settles it either way. The line
+leaves the reply like a `WAKE` does, so the prose is what the swarm reads and the row is what
+the transport reads. Arming a `WAKE` still works on this release; retiring it, the coordinator
+watchdog and the separate hand-off reminders is the rest of #165, once the rows are what the
+swarm actually relies on.
 
 **Self-wake timers (issue #81).** A reply can arm a timer the transport fires without a model
 turn: `WAKE in=10m every=5m until=2h check="gh pr checks 75" then="merge it"`. The line is
