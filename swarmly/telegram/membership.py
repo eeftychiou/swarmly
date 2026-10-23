@@ -873,7 +873,11 @@ class Membership:
             if role == "coordinator" and alias.lower() != but.lower():
                 self._set_peer_role(alias, demoted)
         if was_coord and self.alias.lower() != but.lower():
-            self.set_own_role(demoted, by="admin: a new coordinator")
+            # Only a bot whose *role* is coordinator becomes a developer. One that merely held
+            # the lease (a successor acting after a failover) keeps its own role and just yields
+            # (#143 drill: Reasonix, a reviewer, came out of the fail-back as a developer).
+            if (self.state.role or "") == "coordinator":
+                self.set_own_role(demoted, by="admin: a new coordinator")
             if hasattr(self.ch, "_on_demoted_from_coordinator"):
                 self.ch._on_demoted_from_coordinator()
 
