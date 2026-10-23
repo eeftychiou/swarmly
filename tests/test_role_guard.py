@@ -398,14 +398,20 @@ class TestTheReviewOnTwoThreeTwo(unittest.TestCase):
             self.assertIn(f"{TERM_ENV}=4", sh)
             # Windows gets the same, or the fix would hold on one OS only.
             cmd = (folder / "gh.cmd").read_text(encoding="utf-8")
-            self.assertIn(f'set {ALIAS_ENV}="DeepSeek"', cmd)
-            self.assertIn(f"set {TERM_ENV}=4", cmd)
+            self.assertIn(f'set "{ALIAS_ENV}=DeepSeek"', cmd)
+            self.assertIn(f'set "{TERM_ENV}=4"', cmd)
 
-    def test_the_cmd_wrapper_quotes_and_doubles_percent(self):
-        """#245 review (nit): a `.cmd` line is expanded before `set` runs, so `%` doubles."""
+    def test_the_cmd_wrapper_quotes_the_assignment_and_doubles_percent(self):
+        """#245 review: `set VAR="x"` keeps the quotes in the value; `set "VAR=x"` does not.
+
+        And a `.cmd` line is expanded before `set` runs, so `%` doubles.
+        """
         from swarmly.telegram.guard import _cmd_quote, _gh_wrapper_cmd
-        self.assertEqual(_cmd_quote("a%b"), '"a%%b"')
-        self.assertIn('set SWARMLY_ALIAS="a%%b"', _gh_wrapper_cmd("run", "a%b", 2))
+        self.assertEqual(_cmd_quote("a%b"), "a%%b")
+        line = _gh_wrapper_cmd("run", "a%b", 2)
+        self.assertIn('set "SWARMLY_ALIAS=a%%b"', line)
+        self.assertNotIn('="a%%b"', line)
+        self.assertIn('set "SWARMLY_LEASE_TERM=2"', line)
 
     def test_an_alias_with_a_space_stays_one_shell_word(self):
         from swarmly.telegram.guard import _gh_wrapper, _sh_quote

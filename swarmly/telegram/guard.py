@@ -347,18 +347,19 @@ def _gh_wrapper(run: str, alias: str, term: int) -> str:
 
 
 def _cmd_quote(value: str) -> str:
-    """*value* for a ``.cmd`` ``set`` line: quoted, with ``%`` doubled (#245 review).
+    """*value* as the right-hand side of a **quoted** ``set`` assignment (#245 review).
 
-    A batch file expands ``%NAME%`` before ``set`` ever runs, and ``&`` would end the line,
-    so the POSIX side's quoting has a Windows twin rather than a raw interpolation.
+    The quotes belong around ``NAME=value`` -- ``set "VAR=x"`` is the form cmd strips, while
+    ``set VAR="x"`` stores the quotes and the comment would read ``Merged by "DeepSeek"``.
+    ``%`` is doubled because a batch file expands it before ``set`` ever runs.
     """
-    return '"' + str(value or "").replace("%", "%%").replace('"', '""') + '"'
+    return str(value or "").replace("%", "%%")
 
 
 def _gh_wrapper_cmd(run: str, alias: str, term: int) -> str:
     """The ``.cmd`` twin of :func:`_gh_wrapper`, for a Windows turn (#232)."""
-    return (f"@set {ALIAS_ENV}={_cmd_quote(alias)}\r\n"
-            f"@set {TERM_ENV}={int(term or 0)}\r\n"
+    return (f'@set "{ALIAS_ENV}={_cmd_quote(alias)}"\r\n'
+            f'@set "{TERM_ENV}={int(term or 0)}"\r\n'
             f"@{run} gh %*\r\n")
 
 
