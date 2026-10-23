@@ -4835,11 +4835,13 @@ class AgentChannel:
         notes: List[str] = []
         if memory is not None:
             saved, said = self.lessons.save(memory)
-            notes.append(("MEMORY: " if saved else "MEMORY refused: ") + said)
+            # Not "MEMORY: ..." -- that is the marker `extract_block` opens on, and a reply
+            # that is nothing but notes would be read as a second block (review of #231).
+            notes.append(("Memory updated: " if saved else "Memory refused: ") + said)
             logger.info("memory %s this turn (%d bytes)", "updated" if saved else "refused",
                         len(memory.encode("utf-8")))
         if reason:
-            notes.append(f"MEMORY: {reason}")
+            notes.append(f"Memory: {reason}")
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
 
@@ -7449,11 +7451,14 @@ class AgentChannel:
         body = self.apply_wake_lines(reply.text or "", event)
         # Round 5.5 (#165): a WAIT line is a row, taken out of the reply the same way.
         body = self.apply_wait_lines(body, event)
-        # Round 5.5 (#226): a MEMORY: block is this bot's lessons, never posted.
-        body = self.apply_memory_block(body, event)
         # The coordinator switches a peer's role with a ROLE line in any reply (#189).
         body = await self.membership.apply_role_lines(body, event)
         body = self.apply_round_block(body, event).strip()
+        # Round 5.5 (#226): a MEMORY: block is this bot's lessons, never posted. Read **last**:
+        # with no END MEMORY the block runs to the end of the reply, so it must come after
+        # everything that strips an ordered line -- otherwise a ROLE or ROUND_STATE line
+        # written under it is swallowed as a lesson (#226 review).
+        body = self.apply_memory_block(body, event)
         if event.self_task:
             body = self._unaddress_self(body)
         body = drop_stray_silence(body)

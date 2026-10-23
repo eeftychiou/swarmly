@@ -33,6 +33,20 @@ def config_in(tmp: str, **limits) -> AgentConfig:
     return AgentConfig.from_dict(data, source_path=Path(tmp) / "config.yaml")
 
 
+def _reply_with(text: str):
+    """An echo adapter that answers with exactly ``text`` (the framing is not echoed back)."""
+    from swarmly.telegram.adapters import EchoAdapter
+    from swarmly.telegram.adapters.base import AdapterReply
+
+    class _Replies(EchoAdapter):
+        def __init__(self):
+            super().__init__("Hermes")
+
+        async def respond(self, message):
+            return AdapterReply(text=text)
+    return _Replies()
+
+
 class TestTheFile(unittest.TestCase):
 
     def test_it_lives_beside_the_topic_state_not_in_the_repo(self):
@@ -99,6 +113,16 @@ class TestTheBlockInTheReply(unittest.TestCase):
         self.assertEqual(body, "PR is up.")
         self.assertEqual(block, LESSON)
 
+    def test_the_transports_own_note_is_not_read_as_a_block(self):
+        """#226 review nit: the note must not open a block, or a notes-only reply re-opens one."""
+        for note in ("Memory updated: memory updated (68 bytes)",
+                     "Memory refused: your memory is unchanged: that block is 283 bytes "
+                     "and the cap is 100."):
+            with self.subTest(note=note[:20]):
+                whole = chr(10).join(["PR is up.", "", note])
+                body, block, reason = extract_block(whole)
+                self.assertEqual((body, block, reason), (whole, None, None))
+
     def test_a_reply_without_a_block_is_untouched(self):
         text = "PR is up. Nothing learned this time."
         self.assertEqual(extract_block(text), (text, None, None))
@@ -125,8 +149,8 @@ class TestTheBlockInTheReply(unittest.TestCase):
 class TestTheTurnPrompt(unittest.TestCase):
     """The acceptance list that matters in a turn: read every time, asked for every N."""
 
-    def channel(self, tmp, **limits):
-        return make_channel(config_in(tmp, **limits))
+    def channel(self, tmp, adapter=None, **limits):
+        return make_channel(config_in(tmp, **limits), adapter=adapter)
 
     def test_the_memory_is_in_every_turn(self):
         with TemporaryDirectory() as tmp:
@@ -169,9 +193,34 @@ class TestTheTurnPrompt(unittest.TestCase):
                 f"PR #229 is up.\n\nMEMORY:\n" + "\n".join([LESSON] * 4) + f"\n{END_MARKER}",
                 event("@HermesBot: ship it"))
             self.assertIn("PR #229 is up.", body)
-            self.assertIn("MEMORY refused", body)
+            self.assertIn("Memory refused", body)
             self.assertNotIn(LESSON, body)
             self.assertEqual(channel.lessons.text(), LESSON)   # the old memory stands
+
+    def test_a_memory_block_does_not_eat_the_lines_that_follow_it(self):
+        """#226 review: with no END MEMORY the block runs to the end of the reply.
+
+        So it is read **last**: a `ROLE:` line written under it is an assignment the
+        coordinator made, not a lesson, and a transport that read the block first dropped the
+        assignment silently and refused the memory for being over the cap besides.
+        """
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, adapter=_reply_with(chr(10).join([
+                "PR #231 is up.", "", "MEMORY:", LESSON,
+                "ROLE: @CodexBot reviewer because Reasonix is frozen",
+            ])))
+            assigned = []
+
+            async def assign(handle, role, reason=""):
+                assigned.append((handle, role))
+                return True
+            channel.is_coordinator = lambda *args, **kwargs: True
+            channel.membership.assign = assign
+            reply = run(channel.handle_event(event("@HermesBot: ship it")))
+        self.assertEqual(assigned, [("CodexBot", "reviewer")])    # the line reached review
+        self.assertEqual(channel.lessons.text(), LESSON)          # and was not a lesson
+        self.assertNotIn("ROLE:", reply)
+        self.assertNotIn("ROLE:", channel.lessons.text())
 
     def test_a_good_block_is_saved_and_the_reply_keeps_its_point(self):
         with TemporaryDirectory() as tmp:
@@ -180,7 +229,7 @@ class TestTheTurnPrompt(unittest.TestCase):
                 f"Review is in.\n\nMEMORY:\n{LESSON}\n{END_MARKER}", event("hi"))
             self.assertEqual(body.splitlines()[0], "Review is in.")
             self.assertNotIn(LESSON, body)
-            self.assertIn("MEMORY: memory updated", body)
+            self.assertIn("Memory updated", body)
             self.assertEqual(channel.lessons.text(), LESSON)
 
 
