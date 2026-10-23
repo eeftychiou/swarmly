@@ -669,14 +669,10 @@ class ChannelLimits:
     #: before posting. A six-item round with heads and verdicts is ~2,000 characters, so the
     #: ceiling is generous by design: too small a value silently refuses a real round.
     round_state_chars: int = 8000
-    #: Issue #81: how many self-wake timers one bot may have armed at once, and how many a
-    #: single reply may arm (a reply that arms ten is refused, not silently trimmed).
-    wake_max: int = 10
+    #: Round 5.5 (#215): how many `WAKE` lines one reply may carry. The lines no longer arm
+    #: timers -- each becomes a row -- so this bounds the work one reply can add, not a timer
+    #: count. `wake_max`, `wake_tick_seconds` and `wake_check_seconds` are gone with the timers.
     wake_max_per_reply: int = 3
-    #: How often the transport looks for due timers.
-    wake_tick_seconds: float = 15.0
-    #: A check's own budget; past it the process group is killed and the turn says so.
-    wake_check_seconds: float = 120.0
     #: Round 5.5 (#161): a running turn whose CLI has written nothing for this many minutes is
     #: reported as `stuck (silent Nm)` by the snapshot and the pulse. Liveness only: 0 turns
     #: the report off, and nothing here ever starts a turn.
@@ -684,9 +680,6 @@ class ChannelLimits:
     #: ... and once it has been silent this many minutes the turn is killed through the /stop
     #: path, with one line in its topic. 0 (the default) never kills on silence.
     turn_silence_kill_minutes: float = 0.0
-    #: How many firings one timer may have before it gives up with a turn that says so. 0
-    #: leaves the bound to `until` alone.
-    wake_max_attempts: int = 50
     #: Round 5.5 (#164): how long an owed row may go without a fact changing it before its
     #: stall ladder starts -- a reminder to the debtor, then one coordinator turn, then the
     #: admin. 0 turns the ladder off.
@@ -720,15 +713,6 @@ class ChannelLimits:
     #: How long the folded coordinator lease is cached before the bus is read again (#83). 0
     #: reads on every question, which is what a test wants and what a bus under load does not.
     lease_cache_seconds: float = 5.0
-    #: How long a claim must be visible on the bus before its writer may fire it. Two pushes
-    #: that overlap can otherwise each read "no claims" and both fire; waiting one settle
-    #: window makes the second read see both claims, and the lowest alias wins for everyone.
-    wake_claim_settle_seconds: float = 30.0
-    #: The argv prefixes a WAKE check may start with. `gh` and `git` are allowed only through
-    #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate. Since
-    #: #165 no WAKE arms a timer (the line becomes a row and the check never runs), so this
-    #: gates only the timers that were armed before the migration.
-    wake_check_allow: List[str] = field(default_factory=lambda: ["gh", "git"])
     #: Issue #116: how long `/cli` may run one native command before it is killed. It exists so
     #: a passthrough cannot hold a topic's session open, not to give a long command more room.
     native_timeout_seconds: float = 20.0
@@ -777,15 +761,6 @@ class ChannelLimits:
             raise ConfigError(
                 f"limits.multi_mention must be one of {list(MULTI_MENTIONS)} "
                 f"(got {self.multi_mention!r}).")
-        for key in ("wake_check_seconds", "wake_tick_seconds", "wake_claim_settle_seconds"):
-            value = getattr(self, key)
-            if (isinstance(value, bool) or not isinstance(value, (int, float))
-                    or not math.isfinite(value) or value < 0):
-                raise ConfigError(f"limits.{key} must be a number of seconds, 0 or more "
-                                  f"(got {value!r}).")
-        if self.wake_check_seconds <= 0:
-            raise ConfigError("limits.wake_check_seconds must be more than 0 seconds; a check "
-                              f"that may not finish is not a check (got {self.wake_check_seconds!r}).")
         attachment_mb = self.max_attachment_mb
         if (isinstance(attachment_mb, bool) or not isinstance(attachment_mb, (int, float))
                 or not math.isfinite(attachment_mb) or attachment_mb <= 0):
@@ -813,7 +788,7 @@ class ChannelLimits:
                               f"max_group_messages_per_minute (got {rate!r}).")
         for key in ("busy_queue_max", "busy_held_max", "max_reply_parts", "max_parallel_turns",
                     "reply_chars", "max_group_messages_per_minute", "round_state_chars",
-                    "wake_max", "wake_max_per_reply", "wake_max_attempts"):
+                    "wake_max_per_reply"):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ConfigError(f"limits.{key} must be a whole number of at least 1 "

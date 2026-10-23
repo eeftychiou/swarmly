@@ -675,7 +675,6 @@ class AgentChannel:
         #: Issue #64: the timer that deletes this transport's own expired notices in General.
         self._ephemeral_task: Optional[asyncio.Task] = None
         #: Issue #81: the timer that fires this bot's own WAKE timers, with no model turn.
-        self._wake_task: Optional[asyncio.Task] = None
         from swarmly.telegram.selftest import PeerSelfTest
         self.selftest = PeerSelfTest(self)       # startup check that the bots see each other
         from swarmly.telegram.roster import Roster
@@ -1325,10 +1324,6 @@ class AgentChannel:
             # so `busy_dropped` alone reads as "nothing was lost" when work is in fact waiting.
             result += (f" busy_dropped={self.stats.busy_dropped}"
                        f" busy_held={self.stats.busy_held}")
-            try:                              # issue #81: how many timers this bot holds
-                result += f" wakes={self.wake_store().live_count}"
-            except Exception:                          # noqa: BLE001 - /status must answer
-                result += " wakes=?"
             try:
                 result += f" {self.lease_store().state().describe()}"
             except Exception:                          # noqa: BLE001 - /status must answer
@@ -1605,7 +1600,7 @@ class AgentChannel:
         if command == "round":
             return self._round_summary(event)
         if command == "wakes":
-            return self._wakes_command(event)
+            return WAKES_RETIRED
         if command == "owed":
             return self._owed_command(event)
         if command == "usage":
@@ -2741,14 +2736,6 @@ class AgentChannel:
             since = float(self._state_since.setdefault(state, moment))
         queue = int(self._busy_waiting) + sum(self._cooldown_waiting.values())
 
-        wakes: List[Tuple[str, float]] = []
-        try:
-            wakes = [(timer.id, float(timer.next_at))
-                     for timer in self.wake_store().load()
-                     if timer.live and timer.next_at > moment - WAKE_STALE_SECONDS][:20]
-        except Exception:                              # noqa: BLE001 - no timer list, no fun
-            logger.debug("snapshot: no wake timers this beat", exc_info=True)
-
         term, lease_ends = 0, 0.0
         try:
             lease = self.lease_state(now=moment)
@@ -2771,7 +2758,7 @@ class AgentChannel:
             alias=self.config.identity.alias, state=state, since=since, at=moment,
             every=every, topic=str(topic), turn_elapsed=elapsed, turn_timeout=turn_timeout,
             silent=silent,
-            queue=queue, wakes=tuple(wakes),
+            queue=queue, wakes=(),                  # #215: no timers left to report
             model=str(model or ""), effort=str(effort or ""),
             rev=str(self._running_revision or ""),
             uptime=max(0.0, self._clock() - self._booted_at), restarts=max(0, self._boots - 1),
@@ -3278,12 +3265,6 @@ class AgentChannel:
             # its roles in the bus repository must be able to pick them (review, #153).
             names = sorted(known_roles(role_dirs(self.config.bus.repo)))
             return [(name, name) for name in names][:12]
-        if action == "bot.wake":
-            now = time.time()
-            timers = [timer for timer in self.wake_store().load() if timer.live]
-            return [(f"cancel {timer.id} "
-                     f"({max(0, int(timer.next_at - now)) // 60}m)", timer.id)
-                    for timer in sorted(timers, key=lambda row: row.next_at)][:10]
         return []
 
     async def _offer_picker(self, action: str, target: str = "") -> str:
@@ -3379,7 +3360,7 @@ class AgentChannel:
         if action == "bot.effort":
             return self._reasoning_command(self._control_event("reasoning", value))
         if action == "bot.wake":
-            return self._wakes_command(self._control_event("wakes", f"cancel {value}"))
+            return WAKES_RETIRED
         if action == "swarm.lease":
             return await self.hand_over_lease(value, presser=presser)
         if action == "swarm.role":
@@ -3399,7 +3380,7 @@ class AgentChannel:
         if action == "bot.effort":
             return self._reasoning_command(self._control_event("reasoning"))
         if action == "bot.wake":
-            return self._wakes_command(None)
+            return WAKES_RETIRED
         if action == "bot.cli":
             return self._cli_report()
         return None
@@ -4688,23 +4669,6 @@ class AgentChannel:
 
     # -- self-wake timers (issue #81) ---------------------------------------------------
 
-    def wake_store(self) -> Any:
-        """This bot's timers: a local file keeps the schedule, the bus carries the claims.
-
-        One store per bus root, kept for the life of the channel. On a git bus a claim's
-        settle window starts at the confirmation the store keeps in memory (the bus gives an
-        arrival *rank*, not a time), so a store built afresh every tick forgot it each time
-        and answered "wait" forever: no WAKE on a git bus ever fired (live, round 4)."""
-        from swarmly.telegram.wake import WakeStore, wake_dir_for
-        root = self._gitbus_root()
-        cached = getattr(self, "_wake_store_cache", None)
-        if cached is not None and cached[0] == root:
-            return cached[1]
-        store = WakeStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
-                          transport=self.bus_transport(root), root=root, clock=time.time)
-        self._wake_store_cache = (root, store)
-        return store
-
     def apply_wake_lines(self, text: str, event: ChannelEvent) -> str:
         """Read the ``WAKE`` lines in a reply as rows, and strip them from it (#165).
 
@@ -4787,287 +4751,6 @@ class AgentChannel:
         notes.extend(f"WAIT refused: {reason}" for reason in reasons)
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
-
-    async def _wake_loop(self) -> None:
-        """Fire due timers: one check, one action, for as long as this bot runs."""
-        last: List[str] = []
-        while True:                                  # cancelled by stop(), like the others
-            try:
-                done = await self._wake_tick()
-                if done and done != last:            # what each timer did, once per change:
-                    logger.info("wake: %s", "; ".join(done))   # a stuck timer must show
-                last = done or []
-            except asyncio.CancelledError:
-                raise
-            except Exception:                          # noqa: BLE001 - the loop must survive
-                logger.exception("wake: a tick failed; the next one carries on")
-            await asyncio.sleep(max(1.0, float(self.config.limits.wake_tick_seconds)))
-
-    @staticmethod
-    def _wake_persist(store: Any, timer: Any, done: List[str]) -> None:
-        """Save a timer, and report a state the bus would not take instead of hiding it."""
-        from swarmly.telegram.wake import WakePushError
-        try:
-            store.replace(timer)
-        except WakePushError as exc:
-            # The local record moved on; the bus still shows the old state, so a successor
-            # could adopt a timer this bot has finished. Say so in the tick's own result.
-            done.append(f"{timer.id}: state not on the bus ({exc})")
-
-    async def _wake_tick(self, *, now: Optional[float] = None) -> List[str]:
-        """One pass over the due timers. Returns what it did, so a test can read it."""
-        from swarmly.telegram.wake import (WakeAction, decide, run_check_async, subject_of,
-                                           subject_state_async)
-        moment = time.time() if now is None else now
-        if self._frozen or getattr(self, "_pause_pending", False):
-            # The same gate that holds turns: paused is paused, for checks too (#92 S3).
-            return ["paused: no check runs while this bot is paused"]
-        store = self.wake_store()
-        done: List[str] = []
-        # The lease fences *adoption*: only the coordinator takes over a dead bot's timers.
-        # A bot's own timers are its own promises and fire whatever its role; fencing them too
-        # meant no developer's or reviewer's WAKE ever fired (live, round 4).
-        coordinator = await asyncio.to_thread(self.lease_fence)   # a fresh fetch: off the loop
-        own = self.config.identity.alias
-        if coordinator:
-            try:                                     # a dead bot's armed timers are promises
-                for adopted in await asyncio.to_thread(
-                        store.adopt, max_timers=max(1, int(self.config.limits.wake_max)),
-                        allow=tuple(self.config.limits.wake_check_allow or ()),
-                        skip=self._peers_not_down(moment)):
-                    done.append(f"{adopted.id}: adopted from the bus")
-            except Exception:                        # noqa: BLE001 - adoption is best effort
-                logger.warning("wake: adoption failed; carrying on", exc_info=True)
-        else:
-            logger.debug("wake: not the coordinator; adopting no timers this tick")
-
-        def mine(timer: Any) -> bool:
-            return coordinator or not timer.alias or timer.alias == own
-
-        # Round 5.5 (#171): topics that started a turn during *this* pass. _busy_since is only
-        # set when the turn actually starts (a task later in the loop), so two timers for one
-        # topic due in the same tick would otherwise both fire and queue a turn behind a turn.
-        fired_topics: set = set()
-
-        for pending in store.pending_firings():
-            if not mine(pending):
-                done.append(f"{pending.id}: adopted, held while this bot is not the coordinator")
-                continue
-            # A ready turn that was written down but not started (a crash in that window).
-            # Replayed at most once: exactly-once across a crash is not available to an agent
-            # that cannot commit its side effects, so this is at-least-once, and the replay
-            # says so to the bot that receives it.
-            if pending.replays:
-                pending.state, pending.pending = "done", ""
-                self._wake_persist(store, pending, done)
-                done.append(f"{pending.id}: interrupted turn not replayed again")
-                continue
-            replay = ("This firing was interrupted by a restart. If you already acted on it, "
-                      "do nothing; otherwise act now.\n\n" + pending.pending)
-            self._run_own_task(replay, pending.chat_id, pending.thread_id,
-                               pending.topic or None)
-            pending.replays += 1
-            pending.state, pending.pending = "done", ""
-            self._wake_persist(store, pending, done)
-            fired_topics.add((pending.chat_id, pending.thread_id))
-            done.append(f"{pending.id}: replayed after a restart")
-        settle = float(self.config.limits.wake_claim_settle_seconds)
-        alive = {alias.lower() for alias in self._peers_not_down(moment)}
-        for timer in store.due(moment):
-            if timer.adopted_from and timer.adopted_from.strip().lower() in alive:
-                # Its owner is up again and keeps its own promise: two holders only ever race.
-                timer.state = "done"
-                store.write(timer)
-                done.append(f"{timer.id}: handed back to {timer.adopted_from}")
-                continue
-            topic_key = (timer.chat_id, timer.thread_id)
-            if mine(timer) and (topic_key in self._busy_since or topic_key in fired_topics):
-                # A turn already running in this topic very often settles the same item, so a
-                # second turn queued behind it is a paid "nothing changed" (round 5, 22 Oct:
-                # the standing check woke the coordinator behind its own running turn). The
-                # timer stays armed and unclaimed, and is evaluated -- expiry included -- on
-                # the first tick after that topic's turn ends: nothing is lost, nothing is
-                # extended. That includes a turn started earlier in this same pass (#171):
-                # _busy_since only knows about it once it has begun to run.
-                done.append(f"{timer.id}: held: turn running")
-                continue
-            workdir = self._workdir_for(timer.chat_id, timer.thread_id)
-            subject = subject_of(timer.argv)
-            current = None
-            if subject is not None and mine(timer):
-                # The PR or issue itself, read fresh: a timer whose `then` names a head kept
-                # acting on PRs that had moved on or merged (live, 22 Oct: corrected six times).
-                reader = self.wake_subject_reader or subject_state_async
-                current = await reader(subject, cwd=workdir)
-                if current is not None and current[0] in ("MERGED", "CLOSED"):
-                    timer.state = "done"
-                    self._wake_persist(store, timer, done)
-                    done.append(f"{timer.id}: retired: {subject[0]} #{subject[1]} is "
-                                f"{current[0].lower()}")
-                    continue
-            if timer.expires_at and moment >= timer.expires_at:
-                late = moment - timer.expires_at
-                timer.state = "expired"
-                if timer.seen_digest and not timer.adopted_from and mine(timer) \
-                        and late < WAKE_STALE_SECONDS:
-                    # Acted on once already: an expiry turn is only worth it if something moved.
-                    result = await run_check_async(
-                        timer.argv, cwd=workdir,
-                        timeout=float(self.config.limits.wake_check_seconds))
-                    if len(result) > 2 and result[2] and result[2] == timer.seen_digest:
-                        self._wake_persist(store, timer, done)
-                        done.append(f"{timer.id}: retired at its until=, nothing changed")
-                        continue
-                    timer.last_exit, timer.last_tail = result[0], result[1]
-                if not timer.adopted_from and mine(timer) and late < WAKE_STALE_SECONDS:
-                    self._wake_persist(store, timer, done)
-                    self._run_own_task(self._wake_prompt(
-                        WakeAction("expire", timer, reason="its until= passed"),
-                        expired=True, current=self._subject_line(subject, current)),
-                        timer.chat_id, timer.thread_id, timer.topic or None)
-                    fired_topics.add(topic_key)      # an expiry turn is a turn here too (#171)
-                    done.append(f"{timer.id}: expired")
-                else:
-                    # Long past its deadline (a restart, a claim that kept losing): a turn now
-                    # would act on a world that has moved on, so it is retired quietly, and
-                    # locally: a bus push per stale copy is noise nobody reads.
-                    store.write(timer)
-                    done.append(f"{timer.id}: retired, expired {int(late // 60)}m ago")
-                continue
-            if not mine(timer):
-                done.append(f"{timer.id}: adopted, held while this bot is not the coordinator")
-                continue
-            claim = await asyncio.to_thread(store.claim_state, timer, settle_seconds=settle)
-            if claim == "taken":
-                # Another bot holds this firing and acts on it. Keeping our copy armed would
-                # retry the lost claim every tick and count against wake_max forever (live,
-                # round 5: ten such copies refused the WAKE that would have merged a PR).
-                timer.state = "done"
-                store.write(timer)
-                done.append(f"{timer.id}: another bot claimed this firing; copy retired")
-                continue
-            if claim != "won":
-                done.append(f"{timer.id}: "
-                            + ("claim written, firing after the settle window"
-                               if claim == "wait" else "claim not confirmed on the bus"))
-                continue
-            result = await run_check_async(
-                timer.argv, cwd=workdir,
-                timeout=float(self.config.limits.wake_check_seconds))
-            code, tail = result[0], result[1]
-            action = decide(timer, code, now=moment,
-                            max_attempts=int(self.config.limits.wake_max_attempts),
-                            digest=result[2] if len(result) > 2 else "")
-            timer.last_exit, timer.last_tail = code, tail
-            done.append(f"{timer.id}: {action.kind}")
-            if action.kind == "fire":
-                # Write the turn down before starting it, and count the launch *before* it
-                # starts: a crash after the launch must not replay the turn, so the record
-                # already says this firing was launched.
-                timer.pending = self._wake_prompt(
-                    action, current=self._subject_line(subject, current))
-                timer.replays += 1
-                self._wake_persist(store, timer, done)
-                self._run_own_task(timer.pending, timer.chat_id, timer.thread_id,
-                                   timer.topic or None)
-                fired_topics.add(topic_key)
-                timer.state, timer.pending = "done", ""
-                self._wake_persist(store, timer, done)
-            elif action.kind in ("error", "expire"):
-                self._wake_persist(store, action.timer, done)
-                fired_topics.add(topic_key)
-                self._run_own_task(
-                    self._wake_prompt(action, failed=action.kind == "error",
-                                      expired=action.kind == "expire",
-                                      current=self._subject_line(subject, current)),
-                    timer.chat_id, timer.thread_id, timer.topic or None)
-            else:
-                self._wake_persist(store, action.timer, done)
-        return done
-
-    def _peers_not_down(self, now: float) -> Tuple[str, ...]:
-        """Peers presence has heard from and that are not DOWN: their timers are theirs to keep.
-
-        Empty when heartbeats are off, because then nobody can tell, and adoption works as before.
-        """
-        try:
-            if self.down_after_seconds() == float("inf"):
-                return ()
-            table = self.presence()
-            return tuple(sorted(alias for alias in table.peers
-                                if not table.is_down(alias, now)))
-        except Exception:                          # noqa: BLE001 - adoption decides alone
-            logger.debug("wake: presence unreadable; adopting as before", exc_info=True)
-            return ()
-
-    @staticmethod
-    def _subject_line(subject: Any, current: Any) -> str:
-        """"PR #173 is open at 8356114", for a wake turn: the head as it is now."""
-        if subject is None or current is None:
-            return ""
-        kind = "PR" if subject[0] == "pr" else "Issue"
-        head = f" at {current[1][:7]}" if current[1] else ""
-        return (f"{kind} #{subject[1]} is {current[0].lower()}{head} now. A head named in "
-                "Then may be stale: act on this one.")
-
-    @staticmethod
-    def _wake_prompt(action: Any, *, failed: bool = False, expired: bool = False,
-                     current: str = "") -> str:
-        """The turn a fired timer starts: what to do, and the check's own output."""
-        timer = action.timer
-        if expired:
-            head = (f"WAKE {timer.id} expired: {action.reason}. The wait is over; decide "
-                    "whether to escalate or re-arm, and say which.")
-        elif failed:
-            head = (f"WAKE {timer.id} failed: {action.reason}. The check itself is broken; "
-                    "decide whether to fix, re-arm or escalate.")
-        else:
-            head = f"WAKE {timer.id} is ready: `{timer.check}` exited 0."
-        parts = [head, f"Then: {timer.then}"]
-        if current:
-            parts.append(current)
-        if action.reason and not (failed or expired):
-            parts.append(action.reason)
-        if timer.last_tail:
-            parts.append("Last output:\n" + timer.last_tail)
-        parts.append("Act in this turn: do not promise to act later. A WAKE on the same "
-                     "PR or issue replaces this one, fires only when its output changes, and "
-                     "ends by itself when the PR merges or closes. If "
-                     "nothing changed and nobody needs telling, answer NO_REPLY: a post "
-                     "saying so costs the topic a message.")
-        return "\n\n".join(parts)
-
-    def _wakes_command(self, event: Optional[ChannelEvent]) -> str:
-        """``/wakes`` lists the timers; ``/wakes cancel <id>`` drops one (admin only)."""
-        args = command_args(event.text or "") if event is not None else []
-        if not args or args[0].lower() != "cancel":
-            return self.wake_summary()
-        if not args[1:]:
-            return "wakes: /wakes cancel <id> needs an id (see /wakes)"
-        is_admin = bool(event is not None and self.config.is_admin(event.author_id))
-        if not is_admin:
-            return "wakes: only the admin cancels a timer; ask them, or let it expire"
-        timer_id = args[1].lstrip("#")
-        from swarmly.telegram.wake import WakePushError
-        try:
-            cancelled = self.wake_store().cancel(timer_id)
-        except WakePushError as exc:
-            return f"wakes: cancelled {timer_id} locally only ({exc})"
-        if cancelled:
-            return f"wakes: cancelled {timer_id}"
-        return f"wakes: no live timer {timer_id}"
-
-    def wake_summary(self) -> str:
-        """``/wakes``: the timers this bot holds, or that it holds none."""
-        from swarmly.telegram.wake import format_duration
-        timers = [timer for timer in self.wake_store().load() if timer.live]
-        if not timers:
-            return "wakes: none armed"
-        rows = []
-        for timer in sorted(timers, key=lambda row: row.next_at)[:10]:
-            wait = format_duration(max(0, int(timer.next_at - time.time())))
-            rows.append(f"{timer.id} in {wait} `{timer.check}` tries={timer.attempts}")
-        return "wakes=" + str(len(timers)) + ": " + "; ".join(rows)
 
     def _round_summary(self, event: Optional[ChannelEvent]) -> str:
         """``/round[@bot] [issue]``: what the round waits on, and how old the state is."""
@@ -9220,8 +8903,6 @@ class AgentChannel:
             self._lease_task = asyncio.create_task(self._lease_tick())
         if self._github_task is None and self.config.github and self.config.github.poll_minutes > 0:
             self._github_task = asyncio.create_task(self._github_tick())
-        if self._wake_task is None and self.config.limits.wake_tick_seconds > 0:
-            self._wake_task = asyncio.create_task(self._wake_loop())
         if self._heartbeat_task is None and self.heartbeat_seconds() > 0:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         replayed = self.replay_interrupted()      # what the last run accepted and never finished
@@ -9275,9 +8956,6 @@ class AgentChannel:
             if self._ephemeral_task is not None:
                 self._ephemeral_task.cancel()
                 self._ephemeral_task = None
-            if self._wake_task is not None:
-                self._wake_task.cancel()
-                self._wake_task = None
             if self._heartbeat_task is not None:
                 self._heartbeat_task.cancel()
                 self._heartbeat_task = None
@@ -9591,9 +9269,10 @@ REASSIGN_NOTE = ("{alias} has not answered your hand-off in this topic for {minu
 #: How long a turn will wait for the lease before it is guarded by its configured role (#208).
 LEASE_READ_SECONDS = 5.0
 
-#: A WAKE timer overdue by more than this is not a live promise: it is not counted as one, and
-#: past its until= it is retired without a turn (live, round 5: ten day-old copies blocked a merge).
-WAKE_STALE_SECONDS = 3600.0
+#: `/wakes` and the picker's own wake control, after #215 retired the timer path: the command
+#: stays as a pointer, so a habit formed over five rounds lands on the rows it became.
+WAKES_RETIRED = ("wakes: retired (#215) -- no timer is armed and none is fired. A promise is a "
+                 "row now: write `WAIT ...`, and `/owed` says who owes what.")
 
 #: Run when a hand-off went to a peer that is frozen (quota or pause).
 FROZEN_REASSIGN_NOTE = ("{alias} is frozen and cannot answer your hand-off in this topic. "

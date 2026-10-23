@@ -1138,7 +1138,7 @@ button's own callback data, `ctl:<action>:<target>:<value>`. Nothing is kept on 
 press that arrives after a restart still means what the button said, and the value is capped
 so the data always fits Telegram's 64 bytes. A picked value *always* asks for the second tap,
 whatever the bare control's rule is, and it is applied by the same function the typed command
-runs — `/model <name>`, `/reasoning <level>`, `/wakes cancel <id>` — so a picked value has the
+runs — `/model <name>`, `/reasoning <level>` — so a picked value has the
 same validation and the same words back as a typed one. A control joins the pickers only when
 its choices can be read in code: listing them costs no model turn. Reassigning a role needs
 **two** values, so it picks twice: the bot goes in the target slot (`ctl:swarm.role:Codex`) and
@@ -1237,84 +1237,27 @@ the transport reads. Arming a `WAKE` still works on this release; retiring it, t
 watchdog and the separate hand-off reminders is the rest of #165, once the rows are what the
 swarm actually relies on.
 
-**Self-wake timers (issue #81) — retired by `WAIT` (#165).** A `WAKE` line no longer arms
-anything. The transport reads it as the row that replaces it: the bot owes itself a look at what
-the check watched, with the check and the action written down (the item the check named, when it
-named one), and the guard's ladder (#164) and the wakes (#163) carry it from there, on facts. The
-ack says what row it became and names the `WAIT` line to write next time. Timers armed **before**
-this release still fire until they expire — the firing machinery, `/wakes`, the adoption rules and
-are removed in the next slice of #165, so nothing new enters that path (`check_coordinator_watch`
-is gone already: see "Nothing wakes a coordinator on a clock").
+**Self-wake timers (issue #81) — retired (#165, finished in #215).** A `WAKE` line no longer
+arms anything, and nothing fires a timer: the loop, the store, the claims, the adoption rules
+and `/wakes cancel` are gone. A `WAKE` line is read as the row that replaces it — the bot owes
+itself a look at what the check watched, with the check and the action written down — and the
+ack names the `WAIT` line to write next time. `every=` and `until=` are refused with a pointer,
+because a row is opened once, never repeats and never expires. `/wakes` still answers, as a
+pointer to `/owed`; `/status` carries no `wakes=` any more.
 
-Three things the migration changes about the promise itself:
+So the only things that wake a bot are facts: a row whose observation changed (#163), a hand-off
+nobody answered, an orphaned item whose next actor cannot be derived (#164), and the stall
+ladder's rungs. `limits.wake_max`, `wake_tick_seconds`, `wake_check_seconds`,
+`wake_max_attempts`, `wake_claim_settle_seconds` and `wake_check_allow` went with the machinery;
+`limits.wake_max_per_reply` stays, as the bound on how many `WAKE` lines one reply may carry
+before the rest are refused.
 
-- **`in=` is the row's own deadline**, and the guard's ladder honours it (#213 review). The first
-  reminder is due when that moment passes, not at `limits.stall_minutes`; and `stall_minutes: 0`,
-  which turns the ladder's own clock off, still fires the moment a row named — a promise the swarm
-  was told was recorded cannot be one nothing acts on. A deadline is spent once its rung fires, so
-  one old deadline does not climb three rungs in three beats.
-  **With the ladder off, that one rung is the end of it:** a spent deadline leaves the row with no
-  clock, so it is reminded once and not chased to the coordinator or the admin. That is what
-  "ladder off" means — the swarm still gets the reminder the bot asked for itself — and it is a
-  choice, not an omission (#213 review). `in=` is required by the `WAKE` grammar, so every row
-  opened this way has a moment; there is no deadline-less case to flag.
-- **`every=` and `until=` are refused, with a pointer.** A row is opened once and then woken by
-  facts, with the ladder as the backstop: nothing repeats, and nothing expires. A repeating check
-  is told to write one `WAIT` per thing it watches; an `until=` is told the same, because a row
-  that stops itself is a rule nothing would carry out. Both are refused where `every=` already
-  was, rather than one of them being dropped quietly (#213 review).
-- **Two rows can name one item.** The WAKE row is keyed per check
-  (`progress:#209@wake#<digest>:DeepSeek`) while the round sweep opens `progress:#209:DeepSeek`
-  for the same item, and `/owed` shows both. They say different things — one per check, one per
-  unticked item — and neither closes the other; a `progress` row of the check kind is settled by
-  the bot acting, not by the item moving.
-
-*While a timer armed before the migration lasts*, it behaves as before, and this is what it
-did: the check was parsed with `shlex`, run without a shell in the checkout the topic uses, and
-could only start with a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|list|status|diff`,
-`gh run view|list`, `gh api` GET only, `gh issue view`, `gh search`, and
-`git status|log|diff|show|rev-parse` — never `git fetch` or `git ls-remote`, whose `ext::`
-remotes run a command); `-X`/`--method`/`-f`/`--input`/`--output`, shell
-metacharacters and anything not on `PATH` are refused, and the refusal is posted in place of the
-line. Times are absolute, so a restart resumes the schedule instead of re-arming it.
-**One standing check per PR or issue, per topic:** arming another check on the same PR or issue
-(however it is worded: `gh pr view 173`, `gh pr checks 173`, `gh api repos/o/r/pulls/173`) in
-the same topic replaces the armed timer (the ack says `replaces <id>`) instead of adding one. A
-check that exits 0 with the same output the bot last acted on re-arms silently instead of
-starting a turn; durations and timestamps in the output (`2m3s`, `about 1 hour ago`) do not
-count as a change. Before each firing the transport reads the PR or issue itself: a merged or
-closed one ends the timer with no turn, and the turn for an open PR names its head as it is
-now, because a head written into `then=` goes stale. An expiry with nothing new since the last
-firing retires quietly. So a standing `gh issue view` costs a turn only when the issue changed
-(live, round 5 and 22 Oct: copies filled the cap and each firing posted "nothing changed"). **A due timer waits out a turn.** When a timer
-comes due for a topic that already has a turn running, the tick neither claims nor runs it — a
-running turn often settles the same item, and a second turn queued behind it is a paid "nothing
-changed". It stays armed and unclaimed, and is evaluated — expiry included — on the first tick
-after that topic's turn ends; the tick reports `held: turn running`. Limits:
-
-| `limits.` | default | what it bounds |
-|---|---|---|
-| `wake_max` | 10 | live timers one bot may hold |
-| `wake_max_per_reply` | 3 | timers one reply may arm (the overflow is refused, not trimmed) |
-| `wake_tick_seconds` | 15 | how often the transport looks for due timers; `0` disables the loop |
-| `wake_check_seconds` | 120 | a check's own budget; past it the process group is killed |
-| `wake_max_attempts` | 50 | firings of one timer before it gives up with a turn saying so |
-| `wake_claim_settle_seconds` | 30 | how long a claim must be visible before its writer may fire it, so two overlapping pushes cannot both fire |
-| `wake_check_allow` | `["gh", "git"]` | the outer gate on which binary a check may start with — only for timers armed before `WAIT` (nothing new is armed) |
-
-The check is parsed token by token and every flag is normalized first, so an attached value
-(`-XPOST`, `--field=body=x`, `--output=/path`) cannot smuggle a write past the allowlist; `gh api`
-carries only read flags (`--jq`, `--paginate`, `--slurp`, `-i`, `-H`). `check=` and `then=` must be
-quoted — an unquoted `then` would silently keep only its first word.
-
-A timer whose state the bus refuses is still armed (the local schedule stands) but the ack says
-`⚠️ WAKE armed locally only: …`, because the swarm cannot adopt a promise the bus does not have.
-
-`/wakes@<bot>` lists the live timers with their next time, check and attempt count;
-`/wakes@<bot> cancel <id>` drops one (admin only); `/status@<bot>` carries `wakes=N`. A frozen
-bot runs no check, and neither does a paused one. The fire claims live on the bus under
-`.agents/wakes/<alias>/`, one per timer per firing, so an acting
-coordinator (#83) can see a timer a dead bot left armed, and two bots cannot fire it twice.
+*What a timer did, for a reader of the history:* it ran one read-only `gh`/`git` command with no
+model turn, decided on the exit code, and started a turn only when the answer changed; it named
+the PR's head as it was at that moment, because a head written into `then=` goes stale, and it
+waited out a turn already running rather than queuing a second one behind it. The rule that
+survives is the reason it was worth building: a wake carries **news**. That rule is what
+`owed_wake` enforces now, on observations instead of command output.
 
 **The expectations table — `/owed` (issue #162).** Facts open and close rows; a model's word
 never does. Each row names who owes what (a bot, `CI`, or `admin`), on which item and head,

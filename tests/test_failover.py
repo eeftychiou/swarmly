@@ -259,70 +259,20 @@ class TestOnlyTheReviewerIsFrozen(GroupCase):
 
 @needs_swarm
 class TestEveryBotDiesAndRestarts(GroupCase):
-    """6. Every bot dies and restarts: the schedule and the round state come back."""
+    """6. Every bot dies and restarts: the round state comes back (#215: no schedule to keep).
 
-    def test_timers_and_round_state_survive_a_full_outage(self):
-        group = self.group
-        store = group.get("DeepSeek").channel.wake_store()
-        timer = wk.WakeTimer(argv=("git", "status"), then="continue #85",
-                             next_at=group.clock.now() + 3600,
-                             expires_at=group.clock.now() + 7200, every_seconds=300,
-                             chat_id=GROUP, alias="DeepSeek", topic="Round 4")
-        store.add(timer, max_timers=10)
-        terms = self.lease_state().term
-
-        for alias in ROLES:
-            group.kill(alias)
-        group.advance(60)
-        for alias in ROLES:
-            group.restart(alias)
-
-        recovered = group.get("DeepSeek").channel.wake_store().load()
-        self.assertEqual([row.id for row in recovered], [timer.id])
-        self.assertEqual(recovered[0].then, "continue #85")
-        self.assertTrue(recovered[0].live)
-        self.assertEqual(self.lease_state().term, terms)   # the lease did not go backwards
-
-
-@needs_swarm
-class TestAWakeThatKeepsFailing(GroupCase):
-    """7. A WAKE check keeps failing: it re-arms until `until`, escalates once, and stops.
-
-    The coordinator's own timer, fired through the harness tick: waking is every bot's promise
-    whatever its role (#96), and the harness tick is the path a drill actually takes -- so the
-    wake pass must read the group clock, not real time, for advancing the clock to fire it.
+    The timers this drill used to carry are gone with the timer path; what a restart must still
+    bring back is the round state and the lease term, which is what is asserted here.
     """
 
-    def test_a_pending_check_rearms_then_escalates_once(self):
-        group = self.group
-        bot = group.get("Claudebot")
-        now = group.clock.now()
-        timer = wk.WakeTimer(argv=("gh", "pr", "checks", "109"), then="merge it if green",
-                             next_at=now + 10, expires_at=now + 150, every_seconds=60,
-                             chat_id=GROUP, alias="Claudebot", topic="Round 4")
-        bot.channel.wake_store().add(timer, max_timers=10)
-        group.github.open_pr(109, checks={"lint": "pass", "unittest": "pending"})
-
-        started = []
-        bot.channel._run_own_task = lambda text, chat, thread, name: started.append(text)
-
-        async def pending_check(argv, *, cwd, timeout):
-            return group.github.check_returncode(argv), "unittest: pending"
-
-        with mock.patch("swarmly.telegram.wake.run_check_async", pending_check):
-            done = []
-            for _ in range(8):
-                # Through the harness tick, on the group clock -- the path a drill uses, and
-                # the one that must not read real time out from under an advanced clock.
-                out = group.tick(60, wakes=True)
-                done.extend(out["wake"]["Claudebot"])
-
-        actions = [line.split(": ", 1)[1] for line in done if line.startswith(timer.id)]
-        self.assertIn("rearm", actions)
-        self.assertIn("expire", actions)
-        self.assertEqual(started and len(started), 1)          # one escalation turn, not a chain
-        self.assertIn("expired", started[0])
-        self.assertEqual(bot.channel.wake_store().live_count, 0)
+    def test_the_round_state_survives_a_full_outage(self):
+        terms = self.lease_state().term
+        for alias in ROLES:
+            self.group.kill(alias)
+        self.group.advance(60)
+        for alias in ROLES:
+            self.group.restart(alias)
+        self.assertEqual(self.lease_state().term, terms)   # the lease did not go backwards
 
 
 @needs_swarm

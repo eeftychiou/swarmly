@@ -38,6 +38,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Removed
 
+- The **WAKE timer path** (`#215`, the last of `#165`): `_wake_loop`, `_wake_tick`, the per-timer
+  store, the per-firing claims and settlement window, adoption and replays, `WakeStore`,
+  `WakeTimer`, `make_timer`, `decide`, `run_check`, `classify` and `_kill_group`. No turn starts
+  from a clock any more: a `WAKE` line becomes a row (`wait_line.from_wake`) and a wake comes only
+  from a fact — a row's observation changing (`#163`), a hand-off nobody answered, an orphaned item
+  whose next actor cannot be derived (`#164`) — with the stall ladder as the backstop. `/wakes`
+  stays as a pointer to `/owed`, `/status` drops `wakes=`, and `limits.wake_max`,
+  `wake_tick_seconds`, `wake_check_seconds`, `wake_max_attempts`, `wake_claim_settle_seconds` and
+  `wake_check_allow` are gone (`wake_max_per_reply` stays, as the bound on `WAKE` lines per reply).
+  The timer tests went with the code — `tests/test_wake.py` keeps the parsing, allowlist and
+  migration coverage (21, from 133) — and the drill steps only a timer could exercise are dropped
+  while `test_failover` keeps the round-state half of the full-outage drill.
+
 - The coordinator's watchdog (`#165`). `check_coordinator_watch` gave an idle coordinator a turn
   because *time had passed* — the one remaining turn started by a clock rather than a fact. It is
   gone, together with `_note_turn_for_watch`, its `coordinator-watch` state file and

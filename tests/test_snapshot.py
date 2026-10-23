@@ -135,27 +135,10 @@ class TestOnTheChannel(unittest.TestCase):
         channel._cooldown_waiting[(GROUP, 307)] = 2
         self.assertEqual(channel.status_snapshot(NOW).queue, 5)
 
-    def test_armed_wakes_are_listed_with_their_next_fire(self):
-        """The timers this bot has promised to fire, with when: read from its own store."""
-        from swarmly.telegram import wake as wk
-
+    def test_no_timers_are_reported_because_none_exist(self):
+        """#215: the snapshot keeps its `wakes` field for older readers, and it is always empty."""
         channel = live_channel()
-        live = wk.WakeTimer(argv=("git", "status"), then="continue", next_at=NOW + 600,
-                            expires_at=NOW + 3600, every_seconds=300, chat_id=GROUP,
-                            alias="Hermes")
-        done = wk.WakeTimer(argv=("git", "status"), then="done", next_at=NOW - 60,
-                            expires_at=NOW + 3600, every_seconds=0, chat_id=GROUP,
-                            alias="Hermes")
-        done.state = "done"
-
-        class Store:
-            def load(self):
-                return [live, done]
-
-        channel.wake_store = lambda: Store()          # a store of its own: nothing is written
-        snap = channel.status_snapshot(NOW)
-        self.assertEqual(snap.wakes, ((live.id, NOW + 600),))
-
+        self.assertEqual(channel.status_snapshot(NOW).wakes, ())
     def test_a_bot_without_the_lease_reports_no_term(self):
         channel = live_channel()
         snap = channel.status_snapshot(NOW)

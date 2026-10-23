@@ -15,7 +15,6 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 from swarmly.telegram.children import Child, ChildRegistry, kill_pid, reap_orphans
-from swarmly.telegram.wake import _kill_group
 
 
 class TestProcessSignalingSafety(unittest.TestCase):
@@ -94,26 +93,6 @@ class TestProcessSignalingSafety(unittest.TestCase):
             self.assertEqual(
                 signaled, [], "Must never signal child of a live transport"
             )
-
-    def test_wake_kill_group_only_targets_its_own_process_object(self) -> None:
-        """_kill_group in wake.py only signals the PID belonging to the process it spawned."""
-        fake_proc = MagicMock(spec=subprocess.Popen)
-        fake_proc.pid = 98765
-
-        if os.name == "nt":
-            with patch("subprocess.run") as mock_run:
-                _kill_group(fake_proc)
-                mock_run.assert_called_once()
-                args = mock_run.call_args[0][0]
-                self.assertIn("taskkill", args[0].lower())
-                self.assertIn(str(fake_proc.pid), args)
-        else:
-            with (
-                patch("os.killpg", create=True) as mock_killpg,
-                patch("os.getpgid", return_value=98765),
-            ):
-                _kill_group(fake_proc)
-                mock_killpg.assert_called_once_with(98765, signal.SIGKILL)
 
     def test_kill_pid_rejects_non_positive_and_invalid_pids(self) -> None:
         """kill_pid must cleanly refuse zero, negative, or invalid PID inputs."""

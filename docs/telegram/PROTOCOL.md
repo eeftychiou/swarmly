@@ -467,75 +467,32 @@ written without a token cannot be attributed to a reply, so it is not joined —
 alone and its continuations start no turn. A peer that needs the full text of a long
 handoff should still read it from the durable record (`bus=`).
 
-### Self-wake timers (issue #81) — retired by `WAIT` (#165)
+### Self-wake timers (issue #81) — retired (#165, finished in #215)
 
-A bot that must act later **declares what it waits on**; `WAIT` (§ "The WAIT line") opens the row
-and the transport wakes it on the fact that answers it. A `WAKE` line no longer arms a timer: it
-is read as that row and answered with the `WAIT` to write instead (`docs/telegram-channel.md`).
-Timers armed before this release still fire until they expire, so the timer's own rules are kept
-here, in the past tense, until the firing machinery is removed (next slice of `#165`).
+A bot that must act later **declares what it waits on**; `WAIT` opens the row and the transport
+wakes it on the fact that answers it. Nothing else wakes it: the timer path is gone — the loop,
+`WakeStore`, the per-firing claims, adoption and `/wakes cancel` were removed in `#215`, and
+`limits.wake_max`, `wake_tick_seconds`, `wake_check_seconds`, `wake_max_attempts`,
+`wake_claim_settle_seconds` and `wake_check_allow` went with them.
 
-A bot that must act later used to arm its own timer. It was a machine line in the reply, stripped
-before posting like the other directives:
+A `WAKE` line still parses, and is now read as the row that replaces it: the bot owes itself a
+look at what the check watched, with the check and the action written down, and the ack names the
+`WAIT` to write instead. `every=` and `until=` are refused with a pointer — a row is opened once,
+never repeats and never expires. `/wakes` answers as a pointer to `/owed`; `/status` carries no
+`wakes=`.
 
-```
-WAKE in=10m every=5m until=120m check="gh pr checks 75 --required" then="merge it if review and QA still hold"
-```
+The rule the timer was built for survives, and is now enforced on observations rather than on a
+command's output: **a wake carries news.** `owed_wake` wakes a debtor only when the row's observed
+value changed, once per change, with the coordinator's own wakes budgeted per round; the guard's
+ladder (#164) is the backstop when nothing changes at all. The history below is kept because the
+questions it answered — claims, settle windows, replays, adoption — are the questions any
+future mechanism will have to answer too.
 
-`in=` is when the first check runs, `every=` re-arms a check that is not ready yet (optional),
-`until=` is when the wait expires, `check` is the command and `then` is what the bot should do
-when it is ready. The transport runs the check **itself**, with no model turn, and decides on the
-exit code:
-
-| exit | meaning | what happens |
-|---|---|---|
-| 0 | ready | one turn carrying `then` and the last 20 lines of output; the timer is done |
-| the command's documented *pending* code (8 for `gh pr checks`) | not yet | re-arm at `every`, silently, until `until` |
-| anything else, or a timeout | the check itself failed | one turn, with the tail, so the bot decides. Not re-armed |
-| past `until` | the wait expired | one turn saying so, so the bot escalates or re-arms |
-
-**The check is a read-only command, matched argv-to-argv.** `check` is untrusted model output
-running outside a turn, so it may only start with one of the read-only prefixes in
-`swarmly.telegram.wake.ALLOWED_ARGV` (`gh pr checks|view|list|status|diff`, `gh run view|list`,
-`gh api` with GET only, `gh issue view`, `gh search`, `git status|log|diff|show|rev-parse` —
-`git fetch` and `git ls-remote` are deliberately not allowed: both take a repository argument that
-accepts `ext::<command>`, which git runs as a remote helper).
-It is parsed with `shlex` and run without a shell, so shell metacharacters are refused, as are
-`-X`/`--method`/`-f`/`--input` and anything not on `PATH`. A refused line is stripped from the
-reply and the refusal is posted in its place.
-
-**A fire is claimed before it happens, and the claim must settle.** Timers live one file per timer under `wake-<alias>/` in the
-state dir, so a restart resumes the schedule (times are absolute: `next_at` and `expires_at`, never
-`in=` re-derived) and two parallel turns cannot rewrite each other's schedule. Each firing writes an
-append-only claim to `.agents/wakes/<alias>/<timer>-<firing>-<alias>.json` on the bus *before* the
-turn starts (the claim carries the whole timer, so a successor can adopt it) — keyed on the firing's scheduled time, so a stale claim from an earlier firing (or from
-a bot that has since died) never blocks the next one. The claims for that firing are **re-read
-after the push**, and ordered by **where each claim sits in the bus's history** — how many commits landed after the one
-that added the file (`git rev-list --count <commit>..<ref>`), ties by lowest alias. Nothing inside
-the file decides it: a timestamp a bot writes is advisory, and so is a commit date, because both
-are set before the push; a push that loses the race is replayed onto the tip, which puts its claim
-*after* everything that landed while it was in flight. A claim is not honoured the tick it
-is written: with `limits.wake_claim_settle_seconds` (default 30) the writer waits one window
-**measured from when the bus first had its claim**, so a claim still in flight cannot be overtaken
-and every bot folds the same winner. A claim whose own write cannot be confirmed, or that
-cannot be pushed, or whose fetch failed, does not fire: a stale or broken bus is not "I am the
-only one".
-
-**A ready firing is written down before its turn starts.** The timer records the turn text and
-moves to `firing`; the transport starts it and then retires the timer. A crash in between replays
-that one turn on the next tick instead of losing it, at most once, and the replay tells the bot
-it may already have acted: exactly-once is not available to an agent that cannot commit its side
-effects, and losing the turn is worse than repeating it with a warning. A successor also adopts an armed timer it
-finds on the bus (`adopt()`), because a timer is a promise to the swarm, not to one bot: each
-transition publishes a state record (`<id>-state.json`), a successor adopts only the **newest**
-record per timer, and never one that has finished, expired or been cancelled. An adopted record
-is **untrusted input** — anyone who can push to the bus writes one — so its argv goes through the
-same allowlist and the bot's `limits.wake_check_allow` before it is written or run.
-`attempts` is persisted and bounded by `limits.wake_max_attempts`.
-
-**Commands.** `/wakes` lists the live timers with their next time, check and attempt count;
-`/wakes cancel <id>` drops one (admin only); `/status` carries `wakes=N`. A bot runs no check while
-it is frozen.
+*History:* a timer ran one read-only `gh`/`git` command with no model turn, decided on the exit
+code, wrote an append-only claim to `.agents/wakes/<alias>/` on the bus before firing, waited one
+settle window so a claim still in flight could not be overtaken, ordered claims by where they sat
+in the bus's history, wrote a ready turn down before starting it so a crash replayed rather than
+lost it, and let a successor adopt an armed timer whose owner had died.
 
 **No silent promises.** A promise to act later is a `WAIT` in the same turn, not a sentence. The
 coordinator role says so: for a PR blocked only on CI, the coordinator declares `WAIT ci #<n>
