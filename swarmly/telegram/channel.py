@@ -5129,6 +5129,7 @@ class AgentChannel:
         # Round 5.5 (#164): the items this round still has open, so the orphan invariant can
         # name the ones no row owes -- #146 at 09:13, where nothing said the round was stuck.
         open_items: List[Any] = []
+        heads: Dict[str, str] = {}
         for key in keys:
             try:
                 state = rounds.load(key)
@@ -5143,6 +5144,8 @@ class AgentChannel:
                     continue
                 label = f"#{item_key}"
                 head = str(item.get("head") or "").strip().lower()
+                if head:
+                    heads[label] = head
                 if str(item.get("state") or "").strip().lower() in ("merged", "closed", "done"):
                     facts.append(Fact(kind="merge", item=label, head=head))
                     continue
@@ -5187,6 +5190,14 @@ class AgentChannel:
                     fresh.append(admin_row(
                         question=str(item.get("note") or f"waiting on the admin on {label}"),
                         item=label, at=moment))
+        # #183, and **before** the closing facts: a verdict still open on a head its item has
+        # moved off is a rewrite under review -- and `settle` below closes exactly those rows,
+        # so a check after it could never fire (review). Read from the table as loaded.
+        rewrite_lines: List[str] = []
+        try:
+            rewrite_lines = self._note_rewrites(heads=heads, now=moment)
+        except Exception:                          # noqa: BLE001 - a sweep must survive it
+            logger.debug("head freeze: could not check for a rewrite", exc_info=True)
         # A snapshot, not the objects themselves: settling mutates the rows in `table`, and a
         # comparison against the same objects would always say "unchanged".
         seen = {row.id: row.to_dict() for row in rows}
@@ -5272,7 +5283,7 @@ class AgentChannel:
 
         writes = [row for row in table.values()
                   if row.id not in seen or differs(seen[row.id], row)]
-        done: List[str] = []
+        done: List[str] = list(rewrite_lines)          # a rewrite flags on this beat's log too
         if writes:
             try:
                 store.save_all(writes)
@@ -5424,6 +5435,206 @@ class AgentChannel:
                                exc_info=True)
         if done:
             logger.info("owed wake: %s", "; ".join(done[:8]))
+        return done
+
+    # -- the frozen head (issue #183) ----------------------------------------------------
+
+    def _post_notice(self, text: str, chat_id: int, thread_id: Optional[int]) -> None:
+        """Post a machine notice without starting a turn, scheduled like every other task.
+
+        Separated so the checks above stay testable without an event loop: a claim check runs on
+        the message path, and the notice is a message, never a turn (#183).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:                       # no loop (a unit test, a short-lived call)
+            logger.info("head freeze: %s", text)
+            return
+        self._self_tasks.add(asyncio.create_task(
+            self.send(text, chat_id=int(chat_id), thread_id=thread_id, notice=True)))
+        logger.debug("head freeze: posted a notice via %s", loop)
+
+    def _round_facts(self) -> Dict[str, Dict[str, str]]:
+        """``{"#173": {"head": "<sha>", "mergeable": "..."}}``, briefly cached.
+
+        The head is what #183 turns on, and the round state carries it. ``mergeable`` is the
+        fact #165's PR polling will write; until then it is empty here, and a ready claim is
+        checked against the head alone rather than against a fact nobody read.
+        """
+        moment = self._clock()
+        cache = getattr(self, "_head_cache", None)
+        if cache and moment - cache[0] < 60.0:
+            return {label: dict(facts) for label, facts in cache[1].items()}
+        facts: Dict[str, Dict[str, str]] = {}
+        try:
+            store = self.round_store()
+            for key in store.rounds():
+                state = store.load(key)
+                if str(getattr(state, "status", "") or "") != "ok":
+                    continue
+                for item_key in (state.items or {}):
+                    item = state.items.get(item_key) or {}
+                    given: Dict[str, str] = {}
+                    for kind in ("review", "qa"):
+                        entry = item.get(kind)
+                        if isinstance(entry, dict):
+                            sha = str(entry.get("sha") or entry.get("head") or "").strip()
+                            if sha:
+                                given[kind] = sha
+                    facts[f"#{str(item_key).lstrip('#')}"] = {
+                        "head": str(item.get("head") or "").strip(),
+                        "mergeable": str(item.get("mergeable") or "").strip(),
+                        "review": given.get("review", ""),
+                        "qa": given.get("qa", ""),
+                    }
+        except Exception:                          # noqa: BLE001 - a fact we may not have
+            logger.debug("head freeze: no round state to read facts from", exc_info=True)
+        self._head_cache = (moment, {label: dict(values) for label, values in facts.items()})
+        return facts
+
+    def _round_heads(self) -> Dict[str, str]:
+        """``{"#173": "<head>"}`` for every item the round state knows."""
+        return {label: values.get("head", "")
+                for label, values in self._round_facts().items() if values.get("head")}
+
+    def head_freeze_seen(self) -> Any:
+        """What this bot has already said about a claimed or a moved head (#183)."""
+        from swarmly.telegram.head_freeze import FreezeSeen
+        from swarmly.telegram.wake import wake_dir_for
+        state = wake_dir_for(self.config)
+        path = None if state is None else Path(state) / "head-freeze-seen.json"
+        return FreezeSeen(path, clock=self._clock)
+
+    def _note_rewrites(self, *, heads: Dict[str, str], now: float) -> List[str]:
+        """Flag a head that moved while a verdict was open on the old one (#183).
+
+        Called by :meth:`owed_sweep` **before** the closing facts, because the sweep closes
+        exactly the rows this reads: a verdict row is pinned to a head, so an open verdict whose
+        item has moved on is a branch rebuilt under review, and a check after the settle would
+        find nothing (review). Said once per (item, old head, new head) in the discussion the
+        debt lives in; the row is left alone -- the verdict on that head is still owed, and that
+        is the loss #173 took when a rebuild dropped a fix.
+        """
+        from swarmly.telegram.head_freeze import rewrite_notice, rewrites
+        if not heads:
+            return []
+        try:
+            rows = self.owed_store().load()
+        except Exception:                          # noqa: BLE001 - a beat must survive
+            logger.warning("head freeze: the table could not be read", exc_info=True)
+            return []
+        found = rewrites([row for row in rows if row.is_open], heads=heads)
+        if not found:
+            return []
+        by_id = {row.id: row for row in rows}
+        seen = self.head_freeze_seen()
+        done: List[str] = []
+        for rewrite in found:
+            key = f"{rewrite.item}:{rewrite.head}:{rewrite.now}"
+            if not seen.first(key, now=now):
+                continue
+            target = self._place_target(getattr(by_id.get(rewrite.row), "topic", ""))
+            if target is None:
+                done.append(f"{rewrite.row}: held: nowhere to say it")
+                continue
+            self._post_notice(rewrite_notice(rewrite), target[0], target[1])
+            done.append(f"{rewrite.row}: flagged: head moved under review")
+        if done:
+            logger.info("head freeze: %s", "; ".join(done[:8]))
+        return done
+
+    async def _confirm_claim(self, mismatch: Any, chat_id: int,
+                            thread_id: Optional[int]) -> List[str]:
+        """Check a suspected wrong claim against **the PR itself** before saying anything.
+
+        The round state's head is what the table is built from, and it can lag the PR by a
+        report: a claim that disagrees with it may be right. On a suspected mismatch the PR's
+        own ``headRefOid`` decides -- one ``gh`` read, only when there is something to confirm
+        -- and the round cache is corrected from it, so the next claim is checked against the
+        head the PR really has (#183 review).
+        """
+        from swarmly.telegram.head_freeze import Mismatch, claim_notice
+        from swarmly.telegram.owed_wake import same_head
+        from swarmly.telegram.wake import subject_state_async
+        reader = self.wake_subject_reader or subject_state_async
+        actual = ""
+        try:
+            current = await reader(("pr", str(mismatch.item).lstrip("#"), ""),
+                                   cwd=self._workdir_for(chat_id, thread_id))
+            if current is not None:
+                actual = str(current[1] or "").strip()
+        except Exception:                          # noqa: BLE001 - unreadable is not a claim
+            logger.debug("head freeze: the PR could not be read for %s", mismatch.item,
+                         exc_info=True)
+        if actual:
+            facts = dict((getattr(self, "_head_cache", None) or (0.0, {}))[1])
+            facts[mismatch.item] = {"head": actual,
+                                    "mergeable": facts.get(mismatch.item, {}).get(
+                                        "mergeable", "")}
+            self._head_cache = (self._clock(), facts)
+            if same_head(mismatch.claimed, actual):
+                return []                          # the claim was right: the state was behind
+            mismatch = Mismatch(item=mismatch.item, claimed=mismatch.claimed, actual=actual)
+        seen = self.head_freeze_seen()
+        key = f"claim:{mismatch.item}:{mismatch.claimed}:{mismatch.actual}"
+        if not seen.first(key):
+            return []
+        self._post_notice(claim_notice(mismatch), int(chat_id), thread_id)
+        return [f"{mismatch.item}: claimed {mismatch.claimed}, head is {mismatch.actual}"]
+
+    def _check_head_claims(self, text: str, chat_id: int, thread_id: Optional[int]) -> List[str]:
+        """Check a claimed PR head against the PR's head, and say so once (#183).
+
+        The live case: a bot reported `621722f` while #173 was at `a7b0355`, and the review that
+        followed read code the PR did not have. A suspected mismatch is confirmed against the
+        PR's own head before a notice goes out, so a round state that lagged the PR cannot flag
+        a correct claim. One notice per (item, claimed, actual); the claim never closes a row --
+        the facts decide, not the claim (#164).
+        """
+        from swarmly.telegram.head_freeze import (claims, mismatches, ready_blockers,
+                                                  ready_claims, ready_notice)
+        # Nothing to check unless the message names an item: without this every outgoing
+        # message read the round state, and that read is a `git fetch` on the message path
+        # (cli-passthrough saw one where it expects none -- #183 review).
+        if not re.search(r"#\d+", str(text or "")):
+            return []
+        facts = self._round_facts()
+        heads = {label: values["head"] for label, values in facts.items() if values["head"]}
+        if not heads:
+            return []
+        done: List[str] = []
+        for mismatch in mismatches(claims(text, heads), heads=heads):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is None:                       # a unit test, or a call with no loop
+                done.extend(asyncio.run(self._confirm_claim(mismatch, chat_id, thread_id)))
+            else:
+                self._self_tasks.add(asyncio.create_task(
+                    self._confirm_claim(mismatch, chat_id, thread_id)))
+                done.append(f"{mismatch.item}: claim {mismatch.claimed} being checked")
+        # #183: and an item called ready is checked against the facts that decide it -- the PR's
+        # conflicts and the head its verdicts were given on.
+        seen = self.head_freeze_seen()
+        for item in ready_claims(text, heads):
+            values = facts.get(item, {})
+            # The head each verdict was **given on**, against the head the item is on: the head
+            # the item is on compared with itself can only ever pass (#183 review).
+            given = {kind: values.get(kind, "") for kind in ("review", "qa")
+                     if values.get(kind)}
+            blockers = ready_blockers({"head": values.get("head", "")},
+                                      mergeable=values.get("mergeable"),
+                                      verdict_heads=given, item_key=item.lstrip("#"))
+            if not blockers:
+                continue
+            key = f"ready:{item}:{blockers[0]}"
+            if not seen.first(key):
+                continue
+            self._post_notice(ready_notice(blockers), int(chat_id), thread_id)
+            done.append(f"{item}: called ready, {blockers[0]}")
+        if done:
+            logger.info("head freeze: %s", "; ".join(done[:8]))
         return done
 
     # -- invariants, deadlines and the budget (issue #164) -------------------------------
@@ -7598,6 +7809,11 @@ class AgentChannel:
         agents never did it themselves (live test), and Telegram can drop a message (busy
         queue, cooldown). A receiver that already took the Telegram copy skips the mirror;
         one that missed it gets the work from the bus on its next poll."""
+        # #183: a message that claims a PR's head is checked against the PR's head, once.
+        try:
+            self._check_head_claims(body, chat_id, thread_id)
+        except Exception:                          # noqa: BLE001 - a claim check is not a turn
+            logger.debug("head freeze: could not check a claim", exc_info=True)
         named = self.assigned_peers(body)
         peers = named
         if asker:

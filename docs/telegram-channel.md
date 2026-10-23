@@ -1329,6 +1329,23 @@ settings are validated with the rest of `limits` (`stall_minutes`, `round_wake_b
 means the ladder off and no cap). The wake budget replaces the per-tick cap for coordinators;
 the tick's own two-turn bound stands.
 
+**The head under review is frozen (#183).** Three rules, on the facts the round state already
+carries. **A claim is checked**: when a message names a SHA as a PR's head ("#173 is at 840f8b0",
+"pushed 840f8b0 to #173") and the PR's `headRefOid` is another commit, the transport posts one
+notice in that discussion and nothing closes — the PR's head decides, not the claim (a bare SHA,
+or a SHA in another sentence, is not a claim). **A rewrite under review is flagged**: a verdict
+row is pinned to a head, so an open verdict whose item has moved on is a branch rebuilt under
+review; the transport says so once per (item, old head, new head), in the row's own discussion,
+and the row stays open — the verdict on that head is still owed, and nits go to follow-up issues
+instead of a new head. **"Ready" means mergeable**: `head_freeze.ready_blockers()` answers a
+ready claim with GitHub's `mergeable` fact (a `CONFLICTING` PR is not ready) and with the head
+the verdicts were given on. Both checks are said once and remembered in
+`.agents/state/head-freeze-seen.json`, so a restart and a quiet beat repeat nothing. The head
+every check compares against is the **round state's** (`items[*].head`, which is the PR's
+`headRefOid` once the transport reads it), not a live GitHub call — and the rewrite check runs
+**inside the sweep, before the closing facts**, because `settle` closes exactly the stale
+verdict rows it reads.
+
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt
 failures. Each transport deletes **its own** notices from General once they are older than
