@@ -200,8 +200,25 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
         self.assertTrue(any("#41 waits" in t for t in self._sent_in(channel, 88)))
         self.assertEqual(self._sent_in(channel, 77), [])
 
-    def test_a_reply_with_an_unknown_or_no_number_stays(self):
-        for reply in ("#37 and #99 are done.", "All quiet here."):
+    def test_a_new_number_does_not_hold_a_reply_about_another_topics_item(self):
+        # Live, 22 Oct: "@DeepSeek take #181 next" kept a post about four round 5.5 items in
+        # Round 5, because nobody had talked about #181 yet.
+        channel = self._channel("#37 passed QA; @CodexBot take #99 next.")
+        run(channel.handle_event(ask("@HermesBot status?", thread_id=88, message_id=5)))
+        self.assertTrue(any("take #99 next" in t for t in self._sent_in(channel, 77)))
+        self.assertEqual(channel.topic_for_text("#99"), (GROUP, 77))   # learned where it went
+
+    def test_a_moved_reply_never_takes_another_topics_live_item(self):
+        # Learning where a reply went must not re-point an item a third topic is about.
+        channel = self._channel("#37 passed QA; #41 waits; @CodexBot take #99 next.")
+        channel._learn_topic_refs(GROUP, 99, "#55 tracking")
+        run(channel._post_in_known_topic(ask("x", thread_id=99, message_id=5),
+                                         "#37 and #55 and #99", (GROUP, 77)))
+        self.assertEqual(channel.topic_for_text("#55"), (GROUP, 99))
+        self.assertEqual(channel.topic_for_text("#99"), (GROUP, 77))
+
+    def test_a_reply_with_only_unknown_or_no_numbers_stays(self):
+        for reply in ("#98 and #99 are done.", "All quiet here."):
             channel = self._channel(reply)
             run(channel.handle_event(ask("@HermesBot status?", thread_id=88, message_id=5)))
             self.assertTrue(any(reply in t for t in self._sent_in(channel, 88)), reply)

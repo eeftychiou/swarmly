@@ -702,8 +702,10 @@ answer to bus mail whose hand-off names no topic is posted in the topic about it
 when there is one, else in General. Short answers stay in General. The same holds between
 topics: a reply posted in one topic that names only issues or PRs another topic is about goes
 to that topic, with a "↪ moved this to" link where it was asked, so work that started in the
-wrong topic follows its items instead of staying put. A reply that also names an item of its
-own topic, or a number no topic is about, stays. When an item was learned in the wrong topic,
+wrong topic follows its items instead of staying put. A number no topic is about yet (a new
+issue) neither holds the reply nor moves it, and is learned in the topic the reply went to. A
+reply that also names an item of its own topic, items of two other topics, or only new
+numbers, stays. When an item was learned in the wrong topic,
 the admin's `/topic #164 #165` inside the right one moves it there for every bot. A
 summary sent back with `REPORT_BACK:` has its @mentions defused, and a peer bot's message
 that names this bot only inside a list of three or more bots is not taken as addressing it. Set it to
