@@ -182,6 +182,13 @@ class TestChannelWiring(unittest.TestCase):
         self.assertIn("retired", said)
         self.assertIn("/owed", said)
 
+    def test_the_menu_does_not_promise_timers(self):
+        """#220 review: the one place a person reads what a command does must not lie."""
+        from swarmly.telegram.commands import MENU_COMMANDS
+        said = dict(MENU_COMMANDS)
+        self.assertIn("owed", said["wakes"].lower())
+        self.assertNotIn("armed", said["wakes"].lower())
+
     def test_status_no_longer_counts_timers(self):
         channel, _event = self.channel()
         self.assertNotIn("wakes=", channel._command_reply("status"))
