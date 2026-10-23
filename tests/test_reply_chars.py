@@ -316,3 +316,21 @@ class TestTheStateIsThrowaway(unittest.TestCase):
         from swarmly.telegram.poll import transport_state_root
         checkout = Path(__file__).resolve().parents[1]
         self.assertNotEqual(transport_state_root(isolated_config()).resolve(), checkout)
+
+    def test_the_channels_turn_file_is_throwaway_too(self):
+        """#73: the leak arrives through the *channel*, not through the helper.
+
+        ``_state_file`` returns None unless ``source_path`` is set, so a config with no
+        ``bus.repo`` reads ``<checkout>/.agents/state/topic-turns-<alias>.json`` and a live
+        run's "paused" entry reaches ``_paused_topics``. This file's configs are isolated,
+        but that was a convention: one ``make_config()`` added here would bring the leak
+        back. Pin the channel's own path so the convention cannot slip.
+        """
+        config = isolated_config()
+        config.source_path = _STATE_ROOT / "config.yaml"     # what makes a state file exist
+        channel, _adapter = receiver(config)
+        self.assertIsNotNone(channel._turns_path)
+        self.assertEqual(channel._turns_path.resolve().parent,
+                         (_STATE_ROOT / ".agents" / "state").resolve())
+        self.assertNotEqual(channel._turns_path.resolve().parent,
+                            Path(__file__).resolve().parents[1] / ".agents" / "state")
