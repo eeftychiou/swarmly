@@ -183,13 +183,19 @@ def ready_claims(text: str, items: Iterable[str]) -> List[str]:
 
 
 def ready_blockers(item: Mapping[str, object], *, mergeable: Optional[str] = None,
-                   heads: Optional[Mapping[str, str]] = None, item_key: str = "") -> List[str]:
+                   verdict_heads: Optional[Mapping[str, str]] = None,
+                   item_key: str = "") -> List[str]:
     """Why this item is not ready to merge, for an item somebody has called ready.
 
-    Two facts, and only the ones the caller has: ``mergeable`` from GitHub (``CONFLICTING`` is
-    the case #173 hit when it was called ready while it still conflicted with main), and the
-    head the item is on against the head any verdict was given on. An empty list means nothing
-    the facts know about stands in the way -- never "it is ready".
+    Two facts, and each compares two *different* things -- the mistake this rule made once is
+    comparing the item's head with itself, which can only ever pass (#183 review):
+
+    * ``mergeable`` from GitHub: ``CONFLICTING`` is the case #173 hit when it was called ready
+      while it still conflicted with main;
+    * the head each verdict was **given on** against the head the item is on now: a verdict on
+      older code does not make this code ready.
+
+    An empty list means nothing the caller's facts stand in the way of -- never "it is ready".
     """
     label = item_key or str(item.get("key") or "")
     where = f"#{str(label).lstrip('#')}" if label else "the item"
@@ -198,9 +204,12 @@ def ready_blockers(item: Mapping[str, object], *, mergeable: Optional[str] = Non
     if state == "CONFLICTING":
         out.append(f"{where} conflicts with main, so it is not ready whatever the message says")
     head = str(item.get("head") or "").strip()
-    want = str((heads or {}).get(where, "") or "").strip()
-    if head and want and not same_head(head, want):
-        out.append(f"{where} is at {want[:7]}, not the head {head[:7]} the verdicts were given on")
+    if head:
+        for kind, given in (verdict_heads or {}).items():
+            given = str(given or "").strip()
+            if given and not same_head(given, head):
+                out.append(f"{where} is at {head[:7]}, but its {kind} verdict was given on "
+                           f"{given[:7]}")
     return out
 
 

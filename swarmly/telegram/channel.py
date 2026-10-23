@@ -5193,8 +5193,9 @@ class AgentChannel:
         # #183, and **before** the closing facts: a verdict still open on a head its item has
         # moved off is a rewrite under review -- and `settle` below closes exactly those rows,
         # so a check after it could never fire (review). Read from the table as loaded.
+        rewrite_lines: List[str] = []
         try:
-            self._note_rewrites(heads=heads, now=moment)
+            rewrite_lines = self._note_rewrites(heads=heads, now=moment)
         except Exception:                          # noqa: BLE001 - a sweep must survive it
             logger.debug("head freeze: could not check for a rewrite", exc_info=True)
         # A snapshot, not the objects themselves: settling mutates the rows in `table`, and a
@@ -5282,7 +5283,7 @@ class AgentChannel:
 
         writes = [row for row in table.values()
                   if row.id not in seen or differs(seen[row.id], row)]
-        done: List[str] = []
+        done: List[str] = list(rewrite_lines)          # a rewrite flags on this beat's log too
         if writes:
             try:
                 store.save_all(writes)
@@ -5473,9 +5474,18 @@ class AgentChannel:
                     continue
                 for item_key in (state.items or {}):
                     item = state.items.get(item_key) or {}
+                    given: Dict[str, str] = {}
+                    for kind in ("review", "qa"):
+                        entry = item.get(kind)
+                        if isinstance(entry, dict):
+                            sha = str(entry.get("sha") or entry.get("head") or "").strip()
+                            if sha:
+                                given[kind] = sha
                     facts[f"#{str(item_key).lstrip('#')}"] = {
                         "head": str(item.get("head") or "").strip(),
                         "mergeable": str(item.get("mergeable") or "").strip(),
+                        "review": given.get("review", ""),
+                        "qa": given.get("qa", ""),
                     }
         except Exception:                          # noqa: BLE001 - a fact we may not have
             logger.debug("head freeze: no round state to read facts from", exc_info=True)
@@ -5603,9 +5613,14 @@ class AgentChannel:
         # conflicts and the head its verdicts were given on.
         seen = self.head_freeze_seen()
         for item in ready_claims(text, heads):
-            blockers = ready_blockers({"head": heads.get(item, "")},
-                                      mergeable=facts.get(item, {}).get("mergeable"),
-                                      heads=heads, item_key=item.lstrip("#"))
+            values = facts.get(item, {})
+            # The head each verdict was **given on**, against the head the item is on: the head
+            # the item is on compared with itself can only ever pass (#183 review).
+            given = {kind: values.get(kind, "") for kind in ("review", "qa")
+                     if values.get(kind)}
+            blockers = ready_blockers({"head": values.get("head", "")},
+                                      mergeable=values.get("mergeable"),
+                                      verdict_heads=given, item_key=item.lstrip("#"))
             if not blockers:
                 continue
             key = f"ready:{item}:{blockers[0]}"

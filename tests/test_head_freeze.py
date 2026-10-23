@@ -101,11 +101,19 @@ class TestReadyMeansMergeable(unittest.TestCase):
         self.assertEqual(hf.ready_blockers({"head": CURRENT}, mergeable="MERGEABLE",
                                            item_key="173"), [])
 
-    def test_a_head_older_than_the_verdicts_is_a_blocker(self):
-        blockers = hf.ready_blockers({"head": "a7b0355"}, mergeable="MERGEABLE",
-                                     heads={"#173": "18f5f0e"}, item_key="173")
-        self.assertEqual(len(blockers), 1)
-        self.assertIn("not the head", blockers[0])
+    def test_a_verdict_given_on_older_code_is_a_blocker(self):
+        """The review's finding: the head compared with itself can only ever pass."""
+        blockers = hf.ready_blockers({"head": "18f5f0e"}, mergeable="MERGEABLE",
+                                     verdict_heads={"review": "a7b0355", "qa": "18f5f0e"},
+                                     item_key="173")
+        self.assertEqual(len(blockers), 1)                  # only the review's head is stale
+        self.assertIn("review verdict was given on a7b0355", blockers[0])
+        self.assertIn("#173 is at 18f5f0e", blockers[0])
+
+    def test_a_verdict_on_the_same_head_blocks_nothing(self):
+        self.assertEqual(hf.ready_blockers({"head": "18f5f0e"},
+                                           verdict_heads={"review": "18f5f0e"}, item_key="173"),
+                         [])
 
 
 if __name__ == "__main__":                       # pragma: no cover
@@ -169,8 +177,11 @@ class TestTheTransportSaysItOnce(unittest.TestCase):
         channel = self.channel({"173": {"pr": 173, "head": "18f5f0e"}})
         store = channel.owed_store()
         store.save_all([verdict_row(head="a7b0355", topic=channel._test_topic)])
-        channel.owed_sweep(now=1000.0)
+        done = channel.owed_sweep(now=1000.0)
         self.assertEqual(len(channel._test_notices), 1)
+        # And the beat's own log says so: a flagged rewrite that only a notification knows
+        # about is a flag nobody reading the sweep can see (#183 review).
+        self.assertIn("flagged: head moved under review", " ".join(done))
         text, chat, thread = channel._test_notices[0]
         self.assertIn("head moved while a verdict was open", text)
         self.assertEqual((chat, thread), (GROUP, 5122))        # the row's own discussion
@@ -202,6 +213,13 @@ class TestTheTransportSaysItOnce(unittest.TestCase):
         said = channel._check_head_claims("#173 is ready", 9600, 5122)
         self.assertEqual(len(said), 1)
         self.assertIn("conflicts with main", channel._test_notices[-1][0])
+        # ... and the head half compares the verdict's head with the item's, two facts.
+        channel._test_notices.clear()
+        channel._round_facts = lambda: {"#173": {"head": "18f5f0e", "mergeable": "MERGEABLE",
+                                                "review": "a7b0355"}}
+        said = channel._check_head_claims("#173 is ready to merge", 9600, 5122)
+        self.assertEqual(len(said), 1)
+        self.assertIn("review verdict was given on", channel._test_notices[-1][0])
 
 
 def _pr_head(head, *, state="OPEN"):
