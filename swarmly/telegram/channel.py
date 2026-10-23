@@ -716,6 +716,11 @@ class AgentChannel:
         self._inbox = Inbox(_state_file(config, "inbox"))
         self._inflight: Set[Tuple[Any, Any]] = set()
         self._shutting_down = False
+        # The admin's /hold (admin, 23 Oct): the swarm answers but starts nothing, and no
+        # timer, ladder or reminder makes work for it. Kept across restarts.
+        self._hold_path = _state_file(config, "hold")
+        held = load_state(self._hold_path, "hold")
+        self._hold: Dict[str, Any] = held if held.get("held") else {}
 
         self.bot: Any = None
         self.dispatcher: Any = None
@@ -5110,6 +5115,8 @@ class AgentChannel:
         """
         from swarmly.telegram.owed_guard import WakeBudget, budget_notice
         from swarmly.telegram.owed_wake import MAX_WAKES_PER_TICK, mark_woken, plan
+        if self.held():
+            return ["held: no owed wake while the swarm is on hold"]
         moment = time.time() if now is None else float(now)
         me = str(self.config.identity.alias or "").strip().lower()
         # Only the coordinator's own wakes are budgeted (#164), and the count belongs to the
@@ -5454,6 +5461,8 @@ class AgentChannel:
         """
         from swarmly.telegram.owed_guard import (STALL_ADMIN, STALL_REMINDER, advance, stalls)
         minutes = float(getattr(self.config.limits, "stall_minutes", 0) or 0)
+        if self.held():
+            return []                              # on hold, nothing is late
         moment = time.time() if now is None else float(now)
         try:
             store = self.owed_store()
@@ -6300,6 +6309,15 @@ class AgentChannel:
                                    chat_id=event.chat_id, thread_id=event.thread_id,
                                    allow_when_frozen=True)
 
+        hold_reply = self._handle_hold(event)
+        if hold_reply == "":
+            return None
+        if hold_reply is not None:
+            self.stats.handled += 1
+            return await self.send(hold_reply, reply_to_message_id=event.message_id,
+                                   chat_id=event.chat_id, thread_id=event.thread_id,
+                                   allow_when_frozen=True)
+
         # /pause and /resume hold and release every bot (or one, named) for the admin.
         pause_reply = self._handle_pause(event)
         if pause_reply == "":
@@ -6542,6 +6560,7 @@ class AgentChannel:
         if not event.author_is_bot and not is_admin_dm:     # peers can't see a DM
             text += self._waiting_note(event.text)
         text += self._frozen_peers_note()
+        text += self._hold_note()
         text += self._swarm_usage_note()
         if not event.self_task and asks_for_topic(event.text or ""):
             text += f"\n\n{TOPIC_ASKED_NOTE}"
@@ -6690,6 +6709,61 @@ class AgentChannel:
         chat_id, thread_id = self._pause_where
         await self.send(self._paused_notice(), chat_id=chat_id, thread_id=thread_id,
                         allow_when_frozen=True, silent=True, notice=True)
+
+    def held(self) -> bool:
+        """Whether the admin has put the swarm on hold (/hold, until /release)."""
+        return bool(self._hold)
+
+    def _set_hold(self, reason: Optional[str]) -> None:
+        self._hold = ({"held": True, "reason": reason or "", "at": self._wall()}
+                      if reason is not None else {})
+        if self._hold:
+            save_state(self._hold_path, self._hold, "hold")
+        elif self._hold_path is not None:
+            try:
+                self._hold_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("hold state could not be cleared: %s", exc)
+
+    def _hold_note(self) -> str:
+        if not self._hold:
+            return ""
+        why = str(self._hold.get("reason") or "").strip()
+        return ("\n\n[The admin has put the swarm on hold" + (f" ({why})" if why else "")
+                + ". Answer what you are asked, but start no new work, merge nothing, open no "
+                "pull request and hand nothing off until the admin sends /release.]")
+
+    def _handle_hold(self, event: ChannelEvent) -> Optional[str]:
+        """``/hold [reason]`` and ``/release`` from the admin reach every bot. Held, a bot
+        still answers, but the hand-off reminders, the stall ladder and the owed wakes stay
+        quiet, and every turn is told to start nothing. Every bot applies it; only the
+        coordinator answers in the chat (or the bot named with /hold@bot), so five bots don't
+        say it five times."""
+        parsed = parse_command(event.text or "")
+        if not parsed or parsed[0] not in ("hold", "release"):
+            return None
+        command, target = parsed
+        # A hold is a swarm-wide safety control (#218 review, Reasonix): every bot applies it,
+        # and /hold@bot only chooses who answers. Holding one bot is what /pause@bot is for.
+        mine = bool(target) and target.lstrip("@").lower() == self.config.identity.name.lstrip(
+            "@").lower()
+        if not self.config.is_admin(event.author_id):
+            named = mine or (not target and self.mentions_me(event.text or ""))
+            return ("⛔ only the admin can hold or release the swarm"
+                    if named and not event.author_is_bot else "")
+        was = self.held()
+        if command == "hold":
+            reason = " ".join((event.text or "").split()[1:]).strip()
+            self._set_hold(reason)
+            text = ("⏸ The swarm is on hold" + (f": {reason}" if reason else "") + ". Bots "
+                    "answer, but start nothing and nothing nudges them. /release to go on.")
+        else:
+            self._set_hold(None)
+            text = ("▶ The swarm is released: work goes on." if was
+                    else "▶ The swarm was not on hold.")
+        logger.info("%s: /%s from the admin", self.config.identity.alias, command)
+        speaks = mine if target else self.is_coordinator()
+        return text if speaks else ""
 
     def _handle_pause(self, event: ChannelEvent) -> Optional[str]:
         """``/pause`` and ``/resume`` from the admin: a bare one reaches every bot, and
@@ -7851,7 +7925,7 @@ class AgentChannel:
         that, one notice for the people (live test: a hand-off sat for 20 minutes until a
         person noticed). Decided by the clock, not by the model remembering to follow up."""
         minutes = float(getattr(self.config.limits, "handoff_nudge_minutes", 0) or 0)
-        if minutes <= 0 or not self._pending_handoffs:
+        if minutes <= 0 or not self._pending_handoffs or self.held():
             return
         now, wait = self._clock(), minutes * 60.0
         frozen = self.frozen_peers()

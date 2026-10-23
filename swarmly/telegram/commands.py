@@ -41,6 +41,8 @@ MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("stop", "Admin: stop this bot's running turn"),
     ("pause", "Admin: pause this bot"),
     ("resume", "Admin: resume a paused bot"),
+    ("hold", "Admin: hold the swarm: answer, but start nothing"),
+    ("release", "Admin: release a held swarm"),
     ("cli", "Admin: run a native CLI command, no tokens"),
     ("topic", "Admin: these issues or PRs live in this topic"),
     ("cleanup", "Admin: tidy finished topics"),
