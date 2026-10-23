@@ -132,6 +132,54 @@ class TestAdapterEnvironment(unittest.TestCase):
                 self.assertEqual(env["SWARMLY_ROLE"], "reviewer")
                 self.assertTrue(env["PATH"].startswith(str(Path(tmp) / "g")))
 
+    def test_the_lease_holder_is_guarded_as_the_coordinator(self):
+        """#143 drill: a reviewer that took the lease over must be able to merge the round."""
+        from swarmly.telegram.adapters.claude import ClaudeAdapter
+        from swarmly.telegram.config import AdapterSettings
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = ClaudeAdapter("Claude", AdapterSettings(type="claude"))
+            adapter.role_name, adapter.guard_dir = "reviewer", Path(tmp) / "g"
+            adapter.acting_coordinator = True
+            env = adapter.environment()
+            if env.get("SWARMLY_REAL_GIT") or env.get("SWARMLY_REAL_GH"):
+                self.assertEqual(env["SWARMLY_ROLE"], "coordinator")
+            adapter.acting_coordinator = False          # the lease is gone: the role is back
+            env = adapter.environment()
+            if env.get("SWARMLY_REAL_GIT") or env.get("SWARMLY_REAL_GH"):
+                self.assertEqual(env["SWARMLY_ROLE"], "reviewer")
+
+
+class TestHoldsLease(unittest.TestCase):
+    """The channel tells the adapter, each turn, whether this bot holds the lease."""
+
+    def channel(self):
+        from tests.test_telegram_channel import make_channel, make_config
+        return make_channel(make_config())
+
+    def test_only_a_live_lease_of_its_own_counts(self):
+        from swarmly.telegram.lease import LeaseState
+        channel = self.channel()
+        own = channel.config.identity.alias
+        far = channel._lease_clock() + 600.0
+        channel.lease_state = lambda now=None: LeaseState(
+            status="ok", term=11, holder=own, expires_at=far)
+        self.assertTrue(channel._holds_lease())
+        channel.lease_state = lambda now=None: LeaseState(
+            status="ok", term=11, holder="Claudebot", expires_at=far)
+        self.assertFalse(channel._holds_lease())
+        channel.lease_state = lambda now=None: LeaseState(
+            status="ok", term=11, holder=own, expires_at=channel._lease_clock() - 1.0)
+        self.assertFalse(channel._holds_lease())         # lapsed: no coordinator rights
+
+    def test_an_unreadable_lease_grants_nothing(self):
+        channel = self.channel()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("the bus is gone")
+
+        channel.lease_state = boom
+        self.assertFalse(channel._holds_lease())
+
 
 if __name__ == "__main__":
     unittest.main()

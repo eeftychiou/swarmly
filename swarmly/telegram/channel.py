@@ -4331,6 +4331,17 @@ class AgentChannel:
             return False
         return state.holds(self.config.identity.alias, moment)
 
+    def _holds_lease(self) -> bool:
+        """Whether this bot holds the coordinator lease now. While it does, the role guard
+        treats it as the coordinator, so a successor can finish the round it took over (#143
+        drill: Reasonix, a reviewer, held the lease and was refused the merge). The rights end
+        with the lease: the next turn after a yield or a lapse is guarded by the configured role."""
+        try:
+            moment = self._lease_clock()
+            return bool(self.lease_state(now=moment).holds(self.config.identity.alias, moment))
+        except Exception:                              # noqa: BLE001 - no answer is no authority
+            return False
+
     def _forget_lease_cache(self) -> None:
         """Drop the cached fold: after this bot writes a claim, its own view must not be stale."""
         self.__dict__["_cached_lease_state"] = None
@@ -7278,6 +7289,7 @@ class AgentChannel:
                        event: ChannelEvent) -> Optional[AdapterReply]:
         """Run the adapter as a cancellable task, with a typing indicator while it works."""
         adapter = self._adapter_for(event.chat_id, event.thread_id)
+        adapter.acting_coordinator = await asyncio.to_thread(self._holds_lease)
         turn = asyncio.ensure_future(adapter.respond(incoming))
         self._current_turn = turn
         self._turns.add(turn)
