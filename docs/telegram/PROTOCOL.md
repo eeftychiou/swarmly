@@ -178,8 +178,8 @@ from a loop.
 the bot, not for the Telegram account.
 
 **`/status@<bot>`** → one line: current task, last result, blockers, and the channel counters
-(`machine=`; `busy_dropped=` when addressed messages were dropped mid-turn — `/diag` carries the
-full token set).
+(`machine=`; `busy_dropped=` when addressed messages were dropped mid-turn and `busy_held=` when a
+full queue kept them for later instead (#184, #204) — `/diag` carries the full token set).
 
 **`/role@<bot>`** → this agent's role (`agent.role`) with its one-line description, and the
 team's roles from `peers` ([ROLES.md](../ROLES.md)).
@@ -200,6 +200,9 @@ group=<-100…> admin=true|false b2b=on|off|unknown seen=<n> msgs last_in=<ts> l
 
 Sent in a forum topic, `session=` is that topic's own session (each topic is its own
 discussion) and `context=` names the discussion; in General there is no `context=`.
+
+The channel appends the busy counters to that line: `busy_dropped=<n>` (addressed messages
+dropped mid-turn) and `busy_held=<n>` (a full queue kept them for later instead — #184, #204).
 
 `b2b=unknown` is the honest answer for the Hermes side: Bot-to-Bot mode is a BotFather setting
 with no API. Diagnostics report what is *checkable* and label the rest.

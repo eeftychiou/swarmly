@@ -1327,7 +1327,10 @@ class AgentChannel:
             # #93(1): busy drops are counted inside `seen` (they bump `ignored`, which /diag sums
             # into it) and additionally surfaced here as their own `busy_dropped=` token. /status is
             # the lighter surface where a loss anomaly is first noticed, so it must not hide it.
-            result += f" busy_dropped={self.stats.busy_dropped}"
+            # #204: and `busy_held=` beside it -- since #184 a full queue holds more than it drops,
+            # so `busy_dropped` alone reads as "nothing was lost" when work is in fact waiting.
+            result += (f" busy_dropped={self.stats.busy_dropped}"
+                       f" busy_held={self.stats.busy_held}")
             try:                              # issue #81: how many timers this bot holds
                 result += f" wakes={self.wake_store().live_count}"
             except Exception:                          # noqa: BLE001 - /status must answer
@@ -1400,8 +1403,11 @@ class AgentChannel:
         # #9: a busy drop is inside `seen` — it bumps `ignored`, which the sum above counts — and is
         # also surfaced as its own `busy_dropped=` token. The separate token is the property to pin,
         # since `seen` alone cannot tell a drop apart from any other ignored message.
+        # #204: `busy_held` sits next to it. A held message is *not* a drop, so `busy_dropped=0`
+        # with work waiting is exactly the reading this token exists to make impossible to miss.
         topic = f" context={context}" if context else ""
-        return f"{diag} busy_dropped={self.stats.busy_dropped}{topic}"
+        return (f"{diag} busy_dropped={self.stats.busy_dropped}"
+                f" busy_held={self.stats.busy_held}{topic}")
 
     def _session_label(self, context_id: Optional[str], event: Optional[ChannelEvent] = None) -> Optional[str]:
         """The adapter session a turn in this discussion resumes, when the adapter keeps one
