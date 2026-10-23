@@ -4043,8 +4043,11 @@ class AgentChannel:
                 await self._heartbeat_tick()
             except asyncio.CancelledError:
                 raise
-            except Exception:                          # noqa: BLE001 - the loop must survive
-                logger.exception("heartbeat: a pulse failed; the next one carries on")
+            except Exception as exc:                   # noqa: BLE001 - the loop must survive
+                # A Telegram 502 or timeout is routine: one line, not a traceback.
+                logger.warning("heartbeat: a pulse failed (%s: %s); the next one carries on",
+                               type(exc).__name__, exc)
+                logger.debug("heartbeat: pulse failure detail", exc_info=True)
             await asyncio.sleep(max(1.0, self.heartbeat_seconds()))
 
     # Machine-class envelope kinds recorded as state without waking the adapter (token
