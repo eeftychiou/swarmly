@@ -20,6 +20,7 @@ the line is refused.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -93,6 +94,17 @@ def _owes(kind: str, words: Sequence[str], head: str, item: str) -> str:
     }.get(kind, "something")
 
 
+def _question_key(owes: str) -> str:
+    """The question, keyed the way ``owed.admin_row`` keys it: two questions, two debts.
+
+    A row's id is ``<kind>:<item>[@<head>][@<key_extra>]:<debtor>``, and an admin row usually
+    has no item -- so without a key two questions to the admin in one topic write the same id
+    and the second is never owed (#209 review). The question is what differs, so it is what
+    keys the row; the same question asked again updates the one row.
+    """
+    return hashlib.sha1(owes.encode("utf-8")).hexdigest()[:7]
+
+
 def parse_line(line: str, *, topic: str = "", place: str = "",
                at: Optional[float] = None) -> Row:
     """One ``WAIT`` line as a row. Raises :class:`WaitError` with the reason it cannot be one."""
@@ -119,11 +131,17 @@ def parse_line(line: str, *, topic: str = "", place: str = "",
         raise WaitError("WAIT ci is owed by the transport, not a bot: drop "
                         f"'from {debtor}'")
     owes = _owes(kind, words, head, item)
+    row_kind = KINDS[kind]
+    if row_kind == "handoff":
+        extra = place
+    elif row_kind == "admin":
+        extra = f"{topic or '-'}#q{_question_key(owes)}"
+    else:
+        extra = ""
     try:
-        return Row(kind=KINDS[kind], item=item, debtor=debtor or (CI if KINDS[kind] == "ci"
-                                                                 else ADMIN),
+        return Row(kind=row_kind, item=item, debtor=debtor or (CI if row_kind == "ci" else ADMIN),
                    owes=f"a {kind} {owes}" if kind in ("review", "qa") else owes,
-                   head=head, topic=topic, key_extra=place if KINDS[kind] == "handoff" else "",
+                   head=head, topic=topic, key_extra=extra,
                    opened_by=f"WAIT line in {topic or 'a discussion'}",
                    created_at=moment, updated_at=moment)
     except OwedError as exc:
