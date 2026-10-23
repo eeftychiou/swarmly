@@ -31,6 +31,11 @@ STALL_STEPS: Tuple[str, ...] = (STALL_REMINDER, STALL_COORDINATOR, STALL_ADMIN)
 #: The item states that mean "no debt here any more".
 FINISHED = ("merged", "closed", "done")
 
+#: The ``key_extra`` an orphan row carries: it is the sweep's own "nobody has the next step on
+#: this item" row, distinct from the owner's progress row for the same item (#195 review), and
+#: it is what lets the sweep retire the row it opened when the item finds its actor.
+NEXT_ACTOR_KEY = "next"
+
 #: The CI values that count as a result.
 RESULTS = ("green", "pass", "passed", "ok", "fail", "failed", "red", "error")
 
@@ -130,9 +135,10 @@ def orphans(items: Iterable[Tuple[str, Mapping[str, Any]]], rows: Sequence[Row],
         # to assign -- but it says so, so `/owed` shows a PR nobody is on instead of quietly
         # looking like one more coordinator debt.
         flagged = "" if actor or roles is None else (
-            f"no next actor: the roles name nobody for {gap(item, key=key)}")
+            "no next actor: no role in the roster holds the next step")
         out.append(Row(kind="progress", item=label, debtor=debtor,
                        owes=f"a next step on {label}", observed=gap(item, key=key),
+                       key_extra=NEXT_ACTOR_KEY,
                        waiting_on=lead if debtor.lower() != lead.lower() else "",
                        opened_by=(f"the item is open and {debtor} has the next step"
                                   if actor else "the item is open and nothing owes it"),

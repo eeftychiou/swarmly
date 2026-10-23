@@ -404,6 +404,56 @@ class TestTheRoundStateSweep(unittest.TestCase):
         self.assertEqual(writes, [])                       # no beat, no bus commit
         self.assertEqual({row.id: row.created_at for row in rows(channel)}, created)
 
+    def test_an_item_only_ci_speaks_for_is_flagged(self):
+        """#195 review: the CI row this pass opens *and closes* still counted as live.
+
+        With no owner and nobody holding a role, an item whose CI is already green owed nothing
+        to anyone -- and the sweep said so quietly, as one more coordinator debt.
+        """
+        channel = self.channel()
+        channel.owed_roles = lambda: {"coordinator": "Claudebot"}
+        self.sweep(channel, {"146": {"pr": 146, "head": "c166987", "ci": "green"}})
+        open_now = {row.id: row for row in rows(channel) if row.is_open}
+        flagged = open_now["progress:#146@next:Claudebot"]
+        self.assertIn("no next actor", flagged.flag)
+
+    def test_the_flag_clears_when_the_item_finds_its_actor(self):
+        """#195 review: left open, the row kept saying nobody could act on it for ever."""
+        channel = self.channel()
+        channel.owed_roles = lambda: {"coordinator": "Claudebot"}
+        item = {"pr": 146, "head": "c166987", "ci": "green"}
+        self.sweep(channel, {"146": dict(item)})
+        self.assertTrue([row for row in rows(channel) if row.is_open and row.flag])
+        # The roster gains a reviewer: the item now has a next actor.
+        channel.owed_roles = lambda: {"coordinator": "Claudebot", "review": "Reasonix",
+                                      "qa": "Antigravity"}
+        self.sweep(channel, {"146": dict(item)})
+        self.assertEqual([row.id for row in rows(channel) if row.is_open and row.flag], [])
+        retired = [row for row in rows(channel)
+                   if row.kind == "progress" and not row.is_open and row.item == "#146"]
+        self.assertTrue(retired)
+        self.assertIn("next actor is decided", retired[0].closed_by)
+
+    def test_a_row_held_by_the_facts_is_refreshed_not_frozen(self):
+        """The same debt, a new gap: ``observed`` moves with the item (#195 review).
+
+        A fix-first verdict answers its own row and opens no fix row when no developer holds
+        the role, so the item is left with the orphan -- and its gap changes as QA moves.
+        """
+        channel = self.channel()
+        channel.owed_roles = lambda: {"coordinator": "Claudebot"}
+        fixed = {"pr": 146, "head": "c166987", "ci": "green",
+                 "review": {"verdict": "fix-first", "sha": "c166987"}}
+        self.sweep(channel, {"146": dict(fixed)})
+        before = [row for row in rows(channel) if row.is_open][0]
+        self.assertIn("no QA pass", before.observed)
+        fixed["qa"] = {"verdict": "pass", "sha": "c166987"}
+        self.sweep(channel, {"146": dict(fixed)})
+        after = [row for row in rows(channel) if row.is_open][0]
+        self.assertEqual(after.id, before.id)                     # the same debt, one row
+        self.assertIn("QA pass", after.observed)
+        self.assertNotIn("no QA pass", after.observed)
+
     def test_roles_come_from_the_roster(self):
         channel = self.channel()
         channel.owed_roles = lambda: {}
