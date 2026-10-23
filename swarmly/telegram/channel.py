@@ -84,6 +84,7 @@ from swarmly.telegram.topic_open import (GENERAL_PEER_REPLY_CHARS, GENERAL_REPLY
                                          hands_over, issue_refs, parse_new_topic,
                                          parse_report_back, strip_report_marker, title_from,
                                          topic_link, topic_name)
+from swarmly.telegram.lessons import Lessons, describe as describe_memory
 from swarmly.telegram.topic_memory import TopicMemory
 from swarmly.telegram.topics import TopicMap, name_from_message
 from swarmly.telegram.wire import (Envelope, MessageType, addressed, format_message,
@@ -501,6 +502,9 @@ class AgentChannel:
         self._topic_memory = TopicMemory(
             _state_file(config, "topic-memory"),
             tuple(str(handle) for handle in config.peers.values()))
+        # This bot's own lessons (#226): `memory-<alias>.md` beside `topics-<alias>.json`,
+        # read into every turn's prompt and written on an update turn.
+        self.lessons = Lessons(config)
         self._pause_reminded: Dict[Any, float] = {}
 
         # conversational turn state & concurrency guard. With limits.max_parallel_turns 1
@@ -1478,6 +1482,27 @@ class AgentChannel:
         logger.info("/reasoning: %s now reasons at %s in %s", alias, level, key)
         return f"{alias} reasons at {level} here from the next turn."
 
+    def _memory_command(self, event: ChannelEvent) -> str:
+        """``/memory`` shows this bot's ``memory.md``; ``/memory clear`` empties it. Admin only.
+
+        Issue #226: it is the bot's own file — nothing else reads it — so showing it is the
+        admin's business, and clearing it is the one way to take a wrong lesson out of every
+        future turn.
+        """
+        alias = self.config.identity.alias
+        if not self.config.is_admin(event.author_id):
+            logger.warning("/memory from @%s ignored: only the admin reads it",
+                           event.author_username)
+            return f"{alias}: only the admin can read or clear my memory."
+        args = command_args(event.text or "")
+        if not args:
+            return describe_memory(self.lessons.text(), max_bytes=self.lessons.max_bytes)
+        if len(args) > 1 or args[0].lower() != "clear":
+            return f"{alias}: /memory shows it; /memory clear empties it."
+        said = self.lessons.clear()
+        logger.info("/memory clear from the admin: %s", said)
+        return f"{alias}: {said}"
+
     def _model_command(self, event: ChannelEvent) -> str:
         """``/model`` shows the discussion's model; ``/model <name>`` (admin only) switches it
         from the next turn, keeping the session; ``/model default`` returns to adapter.model."""
@@ -1590,7 +1615,7 @@ class AgentChannel:
         if command == "effort":
             command = "reasoning"
         if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes",
-                            "owed", "usage"):
+                            "owed", "usage", "memory"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1610,6 +1635,8 @@ class AgentChannel:
             return self._owed_command(event)
         if command == "usage":
             return self.usage_text(event)
+        if command == "memory":
+            return self._memory_command(event)
         return self._command_reply(command, event)
 
     # ------------------------------------------------------------------------------
@@ -2921,6 +2948,30 @@ class AgentChannel:
             lines.append(f"- {row['alias']}: " + ", ".join(parts))
         return ("Swarm usage today (UTC), from each bot's own ledger and heartbeat; a number a "
                 "CLI does not report is left out:\n" + "\n".join(lines))
+
+    def _memory_note(self) -> str:
+        """This bot's own lessons, and — every ``limits.memory_every_turns`` turns — the one
+        instruction to update them (#226).
+
+        The lessons ride in the *message*, not the system prompt: the system prompt is cached
+        and fixed, and this file changes when the bot writes it. The counter is kept beside
+        the file, so a restart does not restart the count.
+        """
+        try:
+            block = self.lessons.block()
+            if not self.lessons.note_turn():
+                return f"\n\n[{block}]" if block else ""
+            instruction = self.lessons_update_instruction()
+            parts = [part for part in (block, instruction) if part]
+            return "\n\n[" + "\n".join(parts) + "]"
+        except Exception:                              # noqa: BLE001 - a turn without the note
+            logger.debug("no memory note this turn", exc_info=True)
+            return ""
+
+    def lessons_update_instruction(self) -> str:
+        """The one instruction an update turn carries. Overridable for tests, not configured."""
+        from swarmly.telegram.lessons import UPDATE_INSTRUCTION
+        return UPDATE_INSTRUCTION
 
     def _swarm_usage_note(self) -> str:
         """For the coordinator only: the swarm's usage, so a report needs no search."""
@@ -4779,6 +4830,31 @@ class AgentChannel:
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
 
+    def apply_memory_block(self, text: str, event: ChannelEvent) -> str:
+        """Take a ``MEMORY:`` block out of a reply and save it as this bot's lessons (#226).
+
+        The block is removed in every case — a memory block is never posted, and one that is
+        over the cap must not appear in the channel as prose either. A refusal (too large, or
+        empty) keeps the old memory and says why *in the reply*, because a bot that believes
+        its lessons were saved stops carrying them.
+        """
+        from swarmly.telegram.lessons import extract_block
+        body, memory, reason = extract_block(text or "")
+        if memory is None and reason is None:
+            return text
+        notes: List[str] = []
+        if memory is not None:
+            saved, said = self.lessons.save(memory)
+            # Not "MEMORY: ..." -- that is the marker `extract_block` opens on, and a reply
+            # that is nothing but notes would be read as a second block (review of #231).
+            notes.append(("Memory updated: " if saved else "Memory refused: ") + said)
+            logger.info("memory %s this turn (%d bytes)", "updated" if saved else "refused",
+                        len(memory.encode("utf-8")))
+        if reason:
+            notes.append(f"Memory: {reason}")
+        joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
+        return joined
+
     def _round_summary(self, event: Optional[ChannelEvent]) -> str:
         """``/round[@bot] [issue]``: what the round waits on, and how old the state is."""
         from swarmly.telegram.rounds import RoundStore
@@ -6586,6 +6662,7 @@ class AgentChannel:
         text += self._frozen_peers_note()
         text += self._hold_note()
         text += self._swarm_usage_note()
+        text += self._memory_note()
         if not event.self_task and asks_for_topic(event.text or ""):
             text += f"\n\n{TOPIC_ASKED_NOTE}"
         incoming = IncomingMessage(
@@ -7390,6 +7467,11 @@ class AgentChannel:
         # The coordinator switches a peer's role with a ROLE line in any reply (#189).
         body = await self.membership.apply_role_lines(body, event)
         body = self.apply_round_block(body, event).strip()
+        # Round 5.5 (#226): a MEMORY: block is this bot's lessons, never posted. Read **last**:
+        # with no END MEMORY the block runs to the end of the reply, so it must come after
+        # everything that strips an ordered line -- otherwise a ROLE or ROUND_STATE line
+        # written under it is swallowed as a lesson (#226 review).
+        body = self.apply_memory_block(body, event)
         if event.self_task:
             body = self._unaddress_self(body)
         body = drop_stray_silence(body)

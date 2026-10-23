@@ -680,6 +680,14 @@ class ChannelLimits:
     #: ... and once it has been silent this many minutes the turn is killed through the /stop
     #: path, with one line in its topic. 0 (the default) never kills on silence.
     turn_silence_kill_minutes: float = 0.0
+    #: Round 5.5 (#226): how often the transport asks a bot to update its ``memory.md`` — one
+    #: instruction on every Nth turn, with a ``MEMORY:`` block in the reply that is stripped
+    #: before posting. Each bot's lessons then ride in every turn's prompt.
+    memory_every_turns: int = 10
+    #: ... and the cap on that file, in UTF-8 bytes. A block past it is **refused** (the old
+    #: memory stays and the bot is told the size), never truncated: a half-cut lesson reads
+    #: as a whole one.
+    memory_max_bytes: int = 2048
     #: Round 5.5 (#164): how long an owed row may go without a fact changing it before its
     #: stall ladder starts -- a reminder to the debtor, then one coordinator turn, then the
     #: admin. 0 turns the ladder off.

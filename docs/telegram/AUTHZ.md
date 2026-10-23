@@ -5,6 +5,7 @@ This inventory covers commands and directives that Swarmly acts on. “Admin” 
 | Command / directive | Plane | Who may trigger it | Check location | Refusal test |
 |---|---|---|---|---|
 | `/ping`, `/status`, `/diag`, `/where`, `/role`, `/round`, `/wakes`, `/usage` (read only) | Telegram | Any member, addressed to this bot | `channel.AgentChannel._handle_command` | Addressing/filtering cases in `tests/test_telegram_channel.py`; wake mutation refusal in `tests/test_wake.py::test_only_the_admin_cancels` |
+| `/memory`, `/memory clear` | Telegram | Admin only | `channel.AgentChannel._memory_command` | `tests/test_lessons.py::TestTheMemoryCommand::test_anyone_else_is_refused` |
 | `/model <name>`, `/reasoning <level>` | Telegram | Admin to change; anyone may read | `channel.AgentChannel._model_command`, `_reasoning_command` | `tests/test_model_switch.py::test_only_the_admin_switches`; `tests/test_reasoning_command.py::test_only_the_admin_sets_it` |
 | `/cli[!] COMMAND` | Telegram | Admin only, addressed to this bot | `channel.AgentChannel._handle_native`; command allowlist and confirmation in `native.plan` | `tests/test_cli_passthrough.py::test_a_peer_who_is_not_the_admin_is_refused`; unsafe/confirmation cases in `tests/test_native.py` |
 | `/cleanup` | Telegram | Admin only; explicit confirmation for deletion | `channel.AgentChannel._handle_cleanup`; `cleanup.Cleanup.handle_args` | `tests/test_cleanup.py` non-admin and confirmation cases |

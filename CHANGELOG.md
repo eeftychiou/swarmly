@@ -84,6 +84,17 @@ All notable changes to this project are documented here. The format follows
   how a person's merge is told apart. The reviewer and QA role prompts now require the
   `— <alias>` signature on every verdict and say plainly that a formal GitHub review state is
   refused for the shared login, and `docs/telegram-channel.md` has a "Who did what" note.
+
+- Each bot keeps its **own lessons** in `memory-<alias>.md` (`#226`): the transport reads the
+  file into every turn's prompt as a short *Your lessons so far* block, and every
+  `limits.memory_every_turns` turns (default 10, counted across restarts) puts one instruction
+  in the turn asking the bot to update it. The bot answers with a `MEMORY:` block that is
+  stripped from the reply — it is never posted — and saved. `limits.memory_max_bytes` (default
+  2048, UTF-8 bytes) is enforced in code: a block past it is **refused**, the old memory stays
+  and the bot is told the size and asked to compress, never truncated silently. `/memory@bot`
+  shows the file and `/memory@bot clear` empties it, admin only, with a row in
+  `docs/telegram/AUTHZ.md`; the file is the bot's own — never in the repository, never on the
+  bus.
 - The `WAIT` line (round 5.5 `#165`, first slice): a reply says what it waits on — `WAIT review
   #133 head 38f1977 from Reasonix`, `WAIT ci #173 head 9fb2f21`, `WAIT answer on the Drive
   credentials` — and the transport opens the matching row (verdict, CI, merge, progress, the
