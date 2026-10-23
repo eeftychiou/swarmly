@@ -54,6 +54,126 @@ class TestRefusal(unittest.TestCase):
 GIT_ENV = dict(TEST_IDENTITY, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
 
 
+class TestMergeAttribution(unittest.TestCase):
+    """#228: the transport, not the model, says who merged, at which term and at which commit.
+
+    The bots share one GitHub login, so GitHub shows the same ``mergedBy`` for every one of
+    them and refuses their formal reviews (403). The comment the guard posts after a merge is
+    the attribution: a merge without one is a merge no bot made through the guard.
+    """
+
+    def test_the_comment_names_who_the_term_and_the_commit(self):
+        from swarmly.telegram.guard import attribution
+        self.assertEqual(attribution("DeepSeek", 4, "1a2b3c4"),
+                         "Merged by DeepSeek (lease term 4) at 1a2b3c4")
+
+    def test_what_it_could_not_read_it_leaves_out(self):
+        from swarmly.telegram.guard import attribution
+        self.assertEqual(attribution("DeepSeek", 0, "1a2b3c4"),
+                         "Merged by DeepSeek at 1a2b3c4")
+        self.assertEqual(attribution("DeepSeek", 4, ""), "Merged by DeepSeek (lease term 4)")
+        self.assertEqual(attribution("", 0, ""), "Merged by an unnamed bot")
+
+    def test_the_pull_request_is_read_from_the_merge_arguments(self):
+        from swarmly.telegram.guard import _merge_pr
+        self.assertEqual(_merge_pr(["pr", "merge", "8", "--squash"]), "8")
+        self.assertEqual(_merge_pr(["pr", "merge", "--merge", "8"]), "8")
+        self.assertEqual(_merge_pr(["pr", "merge", "8", "--body", "landed"]), "8")
+        self.assertEqual(_merge_pr(["pr", "merge", "8", "-t", "a subject"]), "8")
+        self.assertEqual(_merge_pr(["pr", "merge", "--auto"]), "")      # the branch's own PR
+
+    def test_a_merge_is_followed_by_one_comment(self):
+        from swarmly.telegram.guard import comment_merge
+        calls = []
+
+        def run(argv):
+            calls.append(list(argv))
+            return (0, "9f8e7d6\n") if "view" in argv else (0, "")
+
+        body = comment_merge("/bin/gh", ["pr", "merge", "8", "--squash"],
+                             {"SWARMLY_ALIAS": "DeepSeek", "SWARMLY_LEASE_TERM": "4"}, run)
+        self.assertEqual(body, "Merged by DeepSeek (lease term 4) at 9f8e7d6")
+        self.assertEqual([call[1:3] for call in calls], [["pr", "view"], ["pr", "comment"]])
+        self.assertEqual(calls[-1][3:5], ["8", "--body"])
+        self.assertEqual(calls[-1][5], body)               # alias, term and SHA, as posted
+
+    def test_an_unguarded_merge_leaves_no_comment(self):
+        from swarmly.telegram.guard import comment_merge
+        calls = []
+        self.assertIsNone(comment_merge("/bin/gh", ["pr", "merge", "8"], {}, calls.append))
+        self.assertIsNone(comment_merge("/bin/gh", ["pr", "merge", "--merge"],
+                                        {"SWARMLY_ALIAS": "DeepSeek"}, calls.append))
+        self.assertEqual(calls, [])                        # the branch's PR: nothing to name
+
+    def test_a_queued_auto_merge_is_not_a_merge(self):
+        """`--auto` waits for the checks: it has not landed, so nothing is claimed."""
+        from swarmly.telegram.guard import comment_merge
+        calls = []
+        self.assertIsNone(comment_merge("/bin/gh", ["pr", "merge", "8", "--auto"],
+                                        {"SWARMLY_ALIAS": "DeepSeek"}, calls.append))
+        self.assertEqual(calls, [])
+
+    def test_a_failed_comment_never_fails_the_merge(self):
+        from swarmly.telegram.guard import comment_merge
+
+        def run(argv):
+            return (0, "abc123\n") if "view" in argv else (1, "could not comment")
+
+        self.assertIsNone(comment_merge("/bin/gh", ["pr", "merge", "8"],
+                                        {"SWARMLY_ALIAS": "DeepSeek"}, run))
+
+    def test_the_environment_carries_who_and_which_term(self):
+        from swarmly.telegram.guard import ALIAS_ENV, TERM_ENV, prepare
+        with tempfile.TemporaryDirectory() as tmp:
+            env = prepare(Path(tmp) / "guard", "coordinator",
+                          {"PATH": os.environ.get("PATH", "")}, alias="DeepSeek", term=4)
+            if not (env.get("SWARMLY_REAL_GIT") or env.get("SWARMLY_REAL_GH")):
+                self.skipTest("neither git nor gh is on PATH: the guard is not installed")
+            self.assertEqual(env[ALIAS_ENV], "DeepSeek")
+            self.assertEqual(env[TERM_ENV], "4")
+            # The adapter hands the turn's own lease term through, not a constant.
+            from swarmly.telegram.adapters.claude import ClaudeAdapter
+            from swarmly.telegram.config import AdapterSettings
+            adapter = ClaudeAdapter("DeepSeek", AdapterSettings(type="claude"))
+            adapter.role_name, adapter.guard_dir = "developer", Path(tmp) / "g2"
+            adapter.acting_coordinator, adapter.lease_term = True, 7
+            seen = adapter.environment()
+            if seen.get("SWARMLY_REAL_GH"):
+                self.assertEqual(seen[ALIAS_ENV], "DeepSeek")
+                self.assertEqual(seen[TERM_ENV], "7")
+
+
+@unittest.skipIf(os.name == "nt", "the POSIX wrapper is tested here")
+class TestTheMergeThroughTheGuardedPath(unittest.TestCase):
+    """End to end: `gh pr merge` run through the guard's wrapper is followed by the comment."""
+
+    def test_merge_then_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = Path(tmp) / "calls.log"
+            fake = bin_dir / "gh"
+            fake.write_text(
+                "#!/bin/sh\n"
+                'printf "%s\\n" "$*" >> "$GH_LOG"\n'
+                'case "$1 $2" in "pr view") echo 1a2b3c4 ;; esac\n'
+                "exit 0\n")
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            env = prepare(Path(tmp) / "guard", "coordinator",
+                          {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+                          alias="DeepSeek", term=4)
+            env = {**env, "GH_LOG": str(log)}
+            done = subprocess.run(["gh", "pr", "merge", "8", "--squash"], env=env,
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            calls = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(calls[0], "pr merge 8 --squash")
+            self.assertTrue(calls[1].startswith("pr view 8 "),
+                            calls[1])                            # the commit it landed at
+            self.assertEqual(calls[2], "pr comment 8 --body Merged by DeepSeek "
+                                       "(lease term 4) at 1a2b3c4")
+
+
 @unittest.skipIf(os.name == "nt", "the POSIX wrapper is tested here")
 class TestWrapper(unittest.TestCase):
 
@@ -178,6 +298,50 @@ class TestHoldsLease(unittest.TestCase):
 
         channel.lease_state = boom
         self.assertFalse(channel._holds_lease())
+
+    def test_the_read_keeps_the_term_for_the_merge_comment(self):
+        """#228: the term comes out of the one read the guard already takes, not a second one."""
+        from swarmly.telegram.lease import LeaseState
+        channel = self.channel()
+        own = channel.config.identity.alias
+        channel.lease_state = lambda now=None: LeaseState(
+            status="ok", term=11, holder=own, expires_at=channel._lease_clock() + 600.0)
+        self.assertTrue(channel._holds_lease())
+        self.assertEqual(channel._turn_term(), 11)
+        self.assertEqual(self.channel()._turn_term(), 0)     # nothing read yet: no term
+
+
+class TestTheTermReachesTheAdapter(unittest.TestCase):
+    """#228: who merged is only accountable if the merge says at which term it happened."""
+
+    def test_each_turn_hands_its_term_to_the_adapter(self):
+        import asyncio
+        from types import SimpleNamespace
+        from swarmly.telegram.adapters.base import AdapterReply
+        from tests.test_telegram_channel import event, make_channel, make_config
+
+        channel = make_channel(make_config())
+        seen = []
+
+        class Adapter:
+            acting_coordinator = False
+            lease_term = 0
+
+            async def respond(self, incoming):
+                seen.append((self.acting_coordinator, self.lease_term))
+                return AdapterReply(text="ok")
+
+        adapter = Adapter()
+        channel._adapter_for = lambda chat, thread: adapter
+
+        async def holding() -> bool:
+            return True
+        channel._acting_coordinator = holding
+        channel._turn_term = lambda: 11
+        incoming = SimpleNamespace(author_alias="admin", context_id="c", text="hi")
+        asyncio.run(channel._respond(incoming, event("hi")))
+        self.assertEqual(seen, [(True, 11)])         # the term the merge will report
+        self.assertEqual(adapter.lease_term, 0)      # and it does not outlive the turn
 
 
 class TestTheFlagLastsOneTurn(unittest.TestCase):

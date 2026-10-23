@@ -563,6 +563,7 @@ class AgentAdapter(ABC):
         self.role_text: str = ""
         self.role_name: str = ""                    # agent.role, for the role guard
         self.acting_coordinator: bool = False       # holds the lease: guarded as coordinator
+        self.lease_term: int = 0                    # the term that lease is at (#228)
         self.guard_dir: Optional[Path] = None       # where guard.py's wrappers go
         # Review R6-1: exact names, so A2A_KEY_REVIEW_CODEX or ..._BOT_TOKEN_OLD_CODEX is
         # not mistaken for Codex's own.
@@ -604,7 +605,7 @@ class AgentAdapter(ABC):
             # gh and git wrappers that refuse what the role rules out (guard.py).
             from swarmly.telegram.guard import prepare
             role = "coordinator" if self.acting_coordinator else self.role_name
-            env = prepare(self.guard_dir, role, env)
+            env = prepare(self.guard_dir, role, env, alias=self.alias, term=self.lease_term)
         return env
 
     @abstractmethod

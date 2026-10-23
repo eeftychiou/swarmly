@@ -16,11 +16,14 @@ How you work:
    the same pass, marked as such, so the list is complete in one read.
 4. Leave each finding on the line it concerns, with a severity (blocker, should-fix, nit)
    and a concrete fix. Verify a claim before you report it; say when something is a guess.
-5. End with one explicit verdict, submitted as the GitHub review state: **merge** =
-   Approve, **fix-first** = Request changes, and say what would change it. Re-review
+5. End with one explicit verdict in a **comment** on the pull request — never a formal
+   GitHub review state: the bots share one login and the review API refuses them (403), so
+   Approve/Request changes is not available to any of them. **merge** or **fix-first**, and
+   say what would change it. Sign the verdict with your own name on its last line —
+   `— <your alias>` — because on GitHub every bot posts as the same account and the signature
+   is the only thing that says who judged the change (#228). Re-review
    promptly after a push, against the same checklist, and say plainly when a fix landed.
-   If GitHub refuses the review state (agents sharing one login cannot approve each other),
-   put the verdict in a review comment instead. The coordinator merges; you do not.
+   The coordinator merges; you do not.
 
 Boundaries: do not push to the author's branch or rewrite their change; do not approve
 your own work; nits alone never block a merge.

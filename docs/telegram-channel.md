@@ -295,6 +295,31 @@ in `cwd`'s `.claude/settings.json`, for example
 `"permissions": {"deny": ["Bash(gh pr merge:*)", "Bash(gh auth:*)"]}`, narrow `gh` but are
 not a boundary: `gh api` reaches the same endpoints.
 
+#### Who did what (#228)
+
+Every bot shares one GitHub login, so GitHub cannot tell them apart: a merge shows the same
+`mergedBy`, and a formal review is refused (403). Attribution goes inside what the bots post
+instead. No extra accounts or Apps are involved.
+
+- **Merges.** Right after a merge the **transport** runs through its own `gh` wrapper (the
+  role guard, `swarmly/telegram/guard.py`), it posts one comment on the pull request:
+
+  ```
+  Merged by DeepSeek (lease term 4) at 1a2b3c4
+  ```
+
+  The alias and the lease term come from the environment the transport hands the turn
+  (`SWARMLY_ALIAS`, `SWARMLY_LEASE_TERM`), not from the reply, so a model cannot claim a
+  merge it did not make. A lease term or commit it could not read is left out, never
+  guessed. A merge by the admin by hand — or one the guard did not run, such as a locally
+  pushed `git merge --no-ff` commit — carries no such comment: **a missing comment means no
+  bot merged it through the guard**, which is how a person's merge is told apart.
+- **Verdicts.** Every review and QA verdict ends with its author's own line, `— <alias>`, and
+  the role prompts require it. Verdicts are posted as comments, never as GitHub review
+  states: the shared login is refused those.
+- **Commits.** Each bot commits under its own git identity (`GIT_AUTHOR_*` in its
+  environment), so `git log` needs no comment to say who wrote a change.
+
 ### Choosing the model — `adapter.model` and `/model`
 
 `adapter.model` sets the model a `codex`, `claude`, `claude_thread`, `reasonix` or
