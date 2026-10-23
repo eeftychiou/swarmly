@@ -1812,6 +1812,11 @@ class AgentChannel:
         if notice:
             self.ledger.note_notice(int(chat_id), int(message_id))
 
+    def cleanup_protected_topics(self) -> Set[int]:
+        """Topics /cleanup never offers in bulk: the pulse topic the heartbeat posts to."""
+        pulse = self._pulse_topic()
+        return {int(pulse)} if pulse else set()
+
     def cleanup_home_chat(self) -> Optional[int]:
         home = self.config.identity.home_channel_id
         return int(home) if home is not None else None

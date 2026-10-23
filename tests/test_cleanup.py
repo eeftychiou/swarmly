@@ -242,6 +242,19 @@ class DeletingFormTests(CleanupCase):
         self.ask(cleanup, "confirm", self.code_in(ask))
         self.assertEqual(sorted(host.deleted_topics), [42, 44])
 
+    def test_topics_all_and_done_spare_the_pulse_topic(self):
+        """Live, 23 Oct: nothing kept "📡 Swarm pulse", so ``topics all`` would have deleted the
+        topic the heartbeat posts to. The host names it; no config is needed."""
+        host = FakeHost([topic(42, "a", refs=("#1",), states={"#1": "closed"}),
+                         topic(3418, "📡 Swarm pulse", refs=("#1",), states={"#1": "closed"})])
+        host.cleanup_protected_topics = lambda: {3418}
+        cleanup = self.cleanup(host)
+        self.assertNotIn("3418", self.ask(cleanup, "topics", "done").split("delete")[-1])
+        ask = self.ask(cleanup, "topics", "all")
+        self.assertIn("will delete 1 topic(s)", ask)
+        self.ask(cleanup, "confirm", self.code_in(ask))
+        self.assertEqual(host.deleted_topics, [42])
+
     def test_topic_deletes_one_named_topic(self):
         host = FakeHost([topic(42, "a"), topic(43, "b")])
         cleanup = self.cleanup(host)

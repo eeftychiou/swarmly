@@ -375,7 +375,7 @@ class Cleanup:
                         "history, so those are yours to remove by hand")
         lines += ["", general]
         done = [topic for topic in topics if self._is_done(topic, moment)]
-        keep = sorted(self.keep)
+        keep = sorted(self._kept())
         lines += ["", "Then:"]
         lines.append(f"· /cleanup{self._at()} topics done -- {len(done)} topic(s) whose item is "
                      f"closed or merged and idle at least {self.idle_hours:g}h")
@@ -403,7 +403,7 @@ class Cleanup:
     async def _ask_all(self, chat_id: int) -> str:
         moment = self._clock()
         targets = [topic for topic in await self._topics_off_loop()
-                   if topic.thread_id not in self.keep]
+                   if topic.thread_id not in self._kept()]
         if not targets:
             return f"{self._me()}: no topic to delete (only General and the kept ones)."
         return self._ask("topics", chat_id, thread_ids=[t.thread_id for t in targets],
@@ -522,8 +522,20 @@ class Cleanup:
         topics = list(self.host.cleanup_topics() or [])
         return sorted(topics, key=lambda t: t.thread_id)
 
+    def _kept(self) -> set:
+        """``limits.cleanup_keep`` plus the topics the swarm cannot lose: the pulse topic
+        (live, 23 Oct: ``topics all`` would have deleted "📡 Swarm pulse", which nothing kept)."""
+        kept = set(self.keep)
+        protected = getattr(self.host, "cleanup_protected_topics", None)
+        if callable(protected):
+            try:
+                kept |= {int(t) for t in protected() or () if t}
+            except Exception:                         # noqa: BLE001 - keep what is configured
+                logger.warning("cleanup: could not read the protected topics", exc_info=True)
+        return kept
+
     def _is_done(self, topic: TopicInfo, now: float) -> bool:
-        if topic.thread_id in self.keep:
+        if topic.thread_id in self._kept():
             return False
         return topic.done and topic.idle_for(now) >= self.idle_hours * 3600
 
