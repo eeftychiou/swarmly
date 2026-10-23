@@ -69,6 +69,7 @@ class HoldTests(unittest.TestCase):
         channel = self.channel()
         channel._handle_hold(self.admin("/hold"))
         self.assertEqual(channel.owed_guard_tick(), [])
+        # The tick's own result, read only by tests (the caller drops it): not a notice.
         self.assertEqual(channel.owed_wake_tick(),
                          ["held: no owed wake while the swarm is on hold"])
         self.assertEqual(self.tasks, [])
