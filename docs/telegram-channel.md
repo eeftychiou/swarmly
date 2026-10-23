@@ -1242,6 +1242,25 @@ ack says what row it became and names the `WAIT` line to write next time. Timers
 this release still fire until they expire — the firing machinery, `/wakes`, the adoption rules and
 `check_coordinator_watch` are removed in the next slice of #165, so nothing new enters that path.
 
+Three things the migration changes about the promise itself:
+
+- **`in=` is the row's own deadline**, and the guard's ladder honours it (#213 review). The first
+  reminder is due when that moment passes, not at `limits.stall_minutes`; and `stall_minutes: 0`,
+  which turns the ladder's own clock off, still fires the moment a row named — a promise the swarm
+  was told was recorded cannot be one nothing acts on. A deadline is spent once its rung fires, so
+  one old deadline does not climb three rungs in three beats. A row with neither a deadline nor a
+  ladder is **flagged** in `/owed` (`no in=: only limits.stall_minutes can act on this`) instead
+  of looking kept.
+- **`every=` is refused, with a pointer.** A row is opened once and then woken by facts, with the
+  ladder as the backstop; nothing repeats, so a repeating check is told to write one `WAIT` per
+  thing it watches rather than promising a recurrence nothing performs. `until=` is written into
+  the row's `opened_by`, so the end of a wait is still on the record.
+- **Two rows can name one item.** The WAKE row is keyed per check
+  (`progress:#209@wake#<digest>:DeepSeek`) while the round sweep opens `progress:#209:DeepSeek`
+  for the same item, and `/owed` shows both. They say different things — one per check, one per
+  unticked item — and neither closes the other; a `progress` row of the check kind is settled by
+  the bot acting, not by the item moving.
+
 *While a timer armed before the migration lasts*, it behaves as before, and this is what it
 did: the check was parsed with `shlex`, run without a shell in the checkout the topic uses, and
 could only start with a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|list|status|diff`,
@@ -1273,7 +1292,7 @@ after that topic's turn ends; the tick reports `held: turn running`. Limits:
 | `wake_check_seconds` | 120 | a check's own budget; past it the process group is killed |
 | `wake_max_attempts` | 50 | firings of one timer before it gives up with a turn saying so |
 | `wake_claim_settle_seconds` | 30 | how long a claim must be visible before its writer may fire it, so two overlapping pushes cannot both fire |
-| `wake_check_allow` | `["gh", "git"]` | the outer gate on which binary a check may start with |
+| `wake_check_allow` | `["gh", "git"]` | the outer gate on which binary a check may start with — only for timers armed before `WAIT` (nothing new is armed) |
 
 The check is parsed token by token and every flag is normalized first, so an attached value
 (`-XPOST`, `--field=body=x`, `--output=/path`) cannot smuggle a write past the allowlist; `gh api`

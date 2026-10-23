@@ -171,14 +171,29 @@ def from_wake(spec: Any, *, alias: str, topic: str = "", at: Optional[float] = N
     item = f"#{number}" if number else ""
     then = str(getattr(spec, "then", "") or "").strip()
     in_seconds = float(getattr(spec, "in_seconds", 0.0) or 0.0)
+    every_seconds = float(getattr(spec, "every_seconds", 0.0) or 0.0)
+    until_seconds = float(getattr(spec, "until_seconds", 0.0) or 0.0)
     where = f" in {repo}" if repo else ""
     opened = (f"a WAKE line that checked `{check}`{where}"
-              + (f" then \"{then[:100]}\"" if then else ""))
+              + (f" then \"{then[:100]}\"" if then else "")
+              + (f", every {_minutes(every_seconds)}" if every_seconds else "")
+              + (f" until {_minutes(until_seconds)}" if until_seconds else ""))
+    deadline = (moment + in_seconds) if in_seconds else 0.0
     return Row(kind="progress", item=item, debtor=str(alias or "").strip(),
                owes=f"a look at `{check}`{where}",
                key_extra=f"wake#{_question_key(check)}", topic=topic,
-               opened_by=opened[:200], deadline=(moment + in_seconds) if in_seconds else 0.0,
-               created_at=moment, updated_at=moment)
+               opened_by=opened[:200], deadline=deadline, created_at=moment, updated_at=moment,
+               # A row nothing can act on is a promise nobody keeps (#213 review): with no
+               # `in=` the ladder's own clock is the only one left, and it may be off.
+               flag="" if deadline else "no in=: only limits.stall_minutes can act on this")
+
+
+def _minutes(seconds: float) -> str:
+    """Seconds as the line wrote them: minutes when they are whole ones, else seconds."""
+    value = float(seconds or 0.0)
+    if value >= 60 and value % 60 == 0:
+        return f"{int(value // 60)}m"
+    return f"{value:g}s"
 
 
 def extract_waits(text: str, *, topic: str = "", place: str = "",

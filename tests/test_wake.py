@@ -383,8 +383,7 @@ class TestChannelWiring(unittest.TestCase):
         """#165: the promise survives the timer. `WAKE in=10m check=… ` is progress owed."""
         channel, event = self.channel()
         body = channel.apply_wake_lines(
-            'merging once green\nWAKE in=10m every=5m until=2h check="gh pr checks 75" '
-            'then="merge it"',
+            'merging once green\nWAKE in=10m check="gh pr checks 75" then="merge it"',
             event("hi", username="ClaudeBot"))
         self.assertNotIn('check="gh pr checks 75"', body)   # the line itself is gone
         self.assertIn("merging once green", body)
@@ -397,6 +396,16 @@ class TestChannelWiring(unittest.TestCase):
         self.assertIn("merge it", rows[0].opened_by)
         # The row is due when the timer would first have fired (in=10m).
         self.assertAlmostEqual(rows[0].deadline - time.time(), 600.0, delta=30.0)
+
+    def test_a_repeating_check_is_refused_with_a_pointer(self):
+        """#213 review: `every=` promised a recurrence the rows do not perform."""
+        channel, event = self.channel()
+        body = channel.apply_wake_lines(
+            'x\nWAKE in=1m every=5m until=2h check="gh pr checks 209" then="merge it"',
+            event("hi", username="ClaudeBot"))
+        self.assertIn("repeating check has no row", body)
+        self.assertIn("second WAIT", body)
+        self.assertEqual(channel._test_table.load(), [])
 
     def test_a_refused_line_is_stripped_and_explained(self):
         channel, event = self.channel()

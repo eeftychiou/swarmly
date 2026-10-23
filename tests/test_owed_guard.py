@@ -159,6 +159,35 @@ class TestTheStallLadder(unittest.TestCase):
         rows[0].updated_at = 1000.0 + 32 * 60          # something happened
         self.assertEqual(guard.stalls(rows, now=1000.0 + 40 * 60, minutes=30), [])
 
+    def test_a_row_that_named_its_moment_climbs_then(self):
+        """#213 review: `WAIT`/`WAKE in=1m` means one minute, not `limits.stall_minutes`."""
+        rows = [row(kind="progress", debtor="DeepSeek", owes="a look at `gh pr checks 209`",
+                    updated_at=1000.0, created_at=1000.0, topic="tg-1", deadline=1060.0)]
+        self.assertEqual(guard.stalls(rows, now=1059.0, minutes=30), [])   # not yet
+        first = guard.stalls(rows, now=1060.0, minutes=30)                 # at its own minute
+        self.assertEqual([s.step for s in first], [guard.STALL_REMINDER])
+        self.assertIn("1 minute", first[0].text)
+
+    def test_a_deadline_is_spent_once_its_rung_fires(self):
+        """One old deadline must not climb three rungs in three beats."""
+        rows = [row(kind="progress", debtor="DeepSeek", owes="a look", updated_at=1000.0,
+                    created_at=1000.0, topic="tg-1", deadline=1060.0)]
+        first = guard.stalls(rows, now=1060.0, minutes=30)
+        guard.advance(rows, first, now=1060.0)
+        self.assertEqual(guard.stalls(rows, now=1060.0 + 1, minutes=30), [])   # nothing moved
+        self.assertEqual(len(guard.stalls(rows, now=1060.0 + 31 * 60, minutes=30)), 1)
+
+    def test_a_ladder_that_is_off_still_fires_the_moment_the_row_named(self):
+        """`stall_minutes: 0` turns the ladder's own clock off, not a promise it was given."""
+        rows = [row(kind="progress", debtor="DeepSeek", owes="a look", updated_at=1000.0,
+                    created_at=1000.0, topic="tg-1", deadline=1600.0)]
+        self.assertEqual(guard.stalls(rows, now=1599.0, minutes=0), [])
+        self.assertEqual([s.step for s in guard.stalls(rows, now=1600.0, minutes=0)],
+                         [guard.STALL_REMINDER])
+        # ... and with no deadline and no ladder, the row is left alone: nothing to act on.
+        plain = [row(updated_at=1000.0, created_at=1000.0, topic="tg-1")]
+        self.assertEqual(guard.stalls(plain, now=1000.0 + 999 * 60, minutes=0), [])
+
     def test_each_rung_says_something_different(self):
         rows = self.rows()
         texts = {guard.stall_text(rows[0], step, minutes=30) for step in guard.STALL_STEPS}

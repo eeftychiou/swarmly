@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A promise that says when it wants looking at is now looked at then (`#213` review). `WAKE` rows
+  carry their `in=` as the row's own `deadline`, but the stall ladder measured only `updated_at`:
+  a bot told "look again in ten minutes" was first reminded at `limits.stall_minutes` (thirty by
+  default) and, with `stall_minutes: 0`, never. `owed_guard.stalls` now takes the row's deadline
+  first — one rung when it passes, spent afterwards so a single old deadline cannot climb three
+  rungs in three beats — and a ladder that is off still fires the moment a row named. `every=` is
+  refused with a pointer (nothing repeats: write one `WAIT` per thing watched) instead of being
+  dropped silently, `until=` and the recurrence are written into the row, and a row with neither
+  a deadline nor a ladder is flagged in `/owed` rather than looking kept.
+
 - A round-state update that carried **only** a `repo` change wrote no segment at all (`#185`
   review): `fold` took `update.repo`, but `_unchanged` — the check that keeps a repeated turn
   from adding a commit to the bus — never compared it, so the field was folded when it arrived

@@ -725,7 +725,9 @@ class ChannelLimits:
     #: window makes the second read see both claims, and the lowest alias wins for everyone.
     wake_claim_settle_seconds: float = 30.0
     #: The argv prefixes a WAKE check may start with. `gh` and `git` are allowed only through
-    #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate.
+    #: the read-only prefixes in swarmly.telegram.wake; this list is the outer gate. Since
+    #: #165 no WAKE arms a timer (the line becomes a row and the check never runs), so this
+    #: gates only the timers that were armed before the migration.
     wake_check_allow: List[str] = field(default_factory=lambda: ["gh", "git"])
     #: Issue #116: how long `/cli` may run one native command before it is killed. It exists so
     #: a passthrough cannot hold a topic's session open, not to give a long command more room.

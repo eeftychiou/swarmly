@@ -157,9 +157,15 @@ class Stall:
     text: str
 
 
+def _wait_words(minutes: float) -> str:
+    """Minutes as a human says them: "1 minute", "30 minutes"."""
+    value = round(float(minutes or 0))
+    return f"{value:g} minute" if value == 1 else f"{value:g} minutes"
+
+
 def stall_text(row: Row, step: str, *, minutes: float) -> str:
     """What each rung says. A ladder that repeats itself is a ladder nobody reads."""
-    waited = f"nothing has moved for {minutes:g} minutes"
+    waited = f"nothing has moved for {_wait_words(minutes)}"
     if step == STALL_REMINDER:
         return (f"{row.debtor} owes {row.owes} on {row.subject} and {waited}. This is the "
                 f"reminder: act on it, or say in one line why not.")
@@ -170,30 +176,62 @@ def stall_text(row: Row, step: str, *, minutes: float) -> str:
             f"reminders have not moved it. The admin should decide.")
 
 
-def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float) -> List[Stall]:
-    """The rungs due now: a row that has not moved for *minutes*, one rung at a time.
+def moment_of(row: Row) -> float:
+    """The moment a row asked to be looked at (its ``deadline``), or 0 when it named none."""
+    try:
+        return float(row.deadline or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
-    "Has not moved" is measured on the row itself -- ``updated_at`` is touched only when a fact
-    changed it -- so a beat that rewrites nothing cannot keep a stalled row looking fresh. Each
-    rung happens once (:attr:`Row.stalls`), and the ladder stops at the admin.
+
+def overdue(row: Row, *, now: float, limit: float) -> Optional[float]:
+    """How long this row has been waiting, in seconds, or ``None`` when it is not due a rung.
+
+    Two clocks, and the row's own comes first (#213 review). A row may **name its moment** in
+    ``deadline`` -- that is what a ``WAIT`` line's ``in=`` becomes -- and the first rung is due
+    when that moment passes, however quiet the table is since: before this, a bot told "look
+    again in ten minutes" was not looked at until ``limits.stall_minutes`` (thirty by default),
+    and with the ladder turned off (``stall_minutes: 0``) not at all. A deadline is spent once
+    its rung has fired (``stalls`` counts them), so the ladder does not climb three rungs in
+    three beats off one old deadline.
+
+    With no deadline, or after it is spent, the row is overdue when it has not moved for
+    *limit* seconds -- unchanged, and measured on ``updated_at`` so a beat that rewrites nothing
+    cannot keep a stalled row looking fresh.
     """
-    if float(minutes or 0) <= 0:
-        return []
+    moved = float(row.updated_at or row.created_at or 0.0)
+    rung = int(row.stalls or 0)
+    if row.deadline and rung == 0 and moment_of(row) <= now:
+        return max(0.0, now - moved)
+    if limit > 0 and now - moved >= limit:
+        return max(0.0, now - moved)
+    return None
+
+
+def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float) -> List[Stall]:
+    """The rungs due now: a row that is overdue, one rung at a time.
+
+    Overdue is :func:`overdue`: the row's own ``deadline`` first, then ``updated_at`` plus
+    *minutes*. ``minutes: 0`` turns the ladder's **own** clock off, and a row that named its
+    moment still gets its first rung -- turning the ladder off must not turn a promise off
+    (#213 review). Each rung happens once (:attr:`Row.stalls`), and the ladder stops at the
+    admin.
+    """
     moment = time.time() if now is None else float(now)
-    limit = float(minutes) * 60.0
+    limit = max(0.0, float(minutes or 0)) * 60.0
     out: List[Stall] = []
     for row in sorted(rows, key=lambda item: item.id):
         if not row.is_open:
             continue
-        age = moment - float(row.updated_at or 0)
-        if age < limit:
-            continue
         rung = int(row.stalls or 0)
         if rung >= len(STALL_STEPS):
             continue                      # the ladder is done: nothing left to climb
+        waited = overdue(row, now=moment, limit=limit)
+        if waited is None:
+            continue
         step = STALL_STEPS[rung]
         out.append(Stall(row=row.id, step=step, debtor=row.debtor,
-                         text=stall_text(row, step, minutes=float(minutes))))
+                         text=stall_text(row, step, minutes=waited / 60.0)))
     return out
 
 
