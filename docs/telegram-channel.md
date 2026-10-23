@@ -1340,7 +1340,11 @@ and the row stays open — the verdict on that head is still owed, and nits go t
 instead of a new head. **"Ready" means mergeable**: `head_freeze.ready_blockers()` answers a
 ready claim with GitHub's `mergeable` fact (a `CONFLICTING` PR is not ready) and with the head
 the verdicts were given on. Both checks are said once and remembered in
-`.agents/state/head-freeze-seen.json`, so a restart and a quiet beat repeat nothing.
+`.agents/state/head-freeze-seen.json`, so a restart and a quiet beat repeat nothing. The head
+every check compares against is the **round state's** (`items[*].head`, which is the PR's
+`headRefOid` once the transport reads it), not a live GitHub call — and the rewrite check runs
+**inside the sweep, before the closing facts**, because `settle` closes exactly the stale
+verdict rows it reads.
 
 **Short-lived notices.** The same group fills with its own machinery: an ONLINE line every
 restart, SEEN answers, "busy", "paused", "moved this to …", hand-off reminders, receipt

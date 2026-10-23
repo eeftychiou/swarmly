@@ -134,8 +134,10 @@ class TestTheTransportSaysItOnce(unittest.TestCase):
         channel._test_table = (directory, store)
         channel.topics.remember(GROUP, 5122, "round 5.5")
         channel._test_topic = channel.topics.context(GROUP, 5122)
-        channel._head_cache = (channel._clock(), {f"#{key}": str(item.get("head") or "")
-                                                 for key, item in items.items()})
+        channel._head_cache = (channel._clock(), {
+            f"#{key}": {"head": str(item.get("head") or ""),
+                        "mergeable": str(item.get("mergeable") or "")}
+            for key, item in items.items()})
         notices = []
         channel._post_notice = lambda text, chat, thread: notices.append((text, chat, thread))
         channel._test_notices = notices
@@ -155,19 +157,39 @@ class TestTheTransportSaysItOnce(unittest.TestCase):
         self.assertEqual(channel._check_head_claims("#173 is at 621722f", 9600, 5122), [])
         self.assertEqual(len(channel._test_notices), 1)         # once, not every message
 
-    def test_a_rewrite_under_review_is_flagged_in_the_rows_topic_and_keeps_it_open(self):
-        channel = self.channel({"173": {"head": "18f5f0e"}})
+    def test_a_rewrite_under_review_is_flagged_by_the_sweep(self):
+        """The review's finding: `settle` closes exactly the rows the check reads.
+
+        So the check runs **inside the sweep, before the closing facts** -- driving it after the
+        sweep found nothing at all (#183 review).
+        """
+        channel = self.channel({"173": {"pr": 173, "head": "18f5f0e"}})
         store = channel.owed_store()
         store.save_all([verdict_row(head="a7b0355", topic=channel._test_topic)])
-        done = channel.head_freeze_tick(now=1000.0)
+        channel.owed_sweep(now=1000.0)
         self.assertEqual(len(channel._test_notices), 1)
         text, chat, thread = channel._test_notices[0]
         self.assertIn("head moved while a verdict was open", text)
         self.assertEqual((chat, thread), (GROUP, 5122))        # the row's own discussion
-        self.assertEqual(channel.head_freeze_tick(now=1060.0), [])   # said once
-        open_now = [row for row in store.load() if row.is_open]
-        self.assertEqual([row.id for row in open_now], ["verdict:#173@a7b0355:Reasonix"])
-        self.assertTrue(done)
+        # And the row the sweep then closes is closed by the fact, not by the notice.
+        closed = [row for row in store.load() if row.id == "verdict:#173@a7b0355:Reasonix"]
+        self.assertFalse(closed[0].is_open)
+        channel.owed_sweep(now=1060.0)                          # said once, not every beat
+        self.assertEqual(len(channel._test_notices), 1)
+
+    def test_an_item_called_ready_is_checked_against_the_facts(self):
+        """#183's third rule, wired: "ready" is a claim like a SHA is."""
+        channel = self.channel({"173": {"head": "18f5f0e"}})
+        said = channel._check_head_claims("#173 is ready to merge", 9600, 5122)
+        self.assertEqual(said, [])                              # nothing the facts know blocks it
+        self.assertEqual(channel._test_notices, [])
+        # A ready claim about a head the verdicts were not given on is blocked.
+        channel._head_cache = (channel._clock(), {"#173": {"head": "18f5f0e", "mergeable": ""}})
+        channel.owed_store().save_all([verdict_row(head="a7b0355")])
+        channel._round_facts = lambda: {"#173": {"head": "18f5f0e", "mergeable": "CONFLICTING"}}
+        said = channel._check_head_claims("#173 is ready", 9600, 5122)
+        self.assertEqual(len(said), 1)
+        self.assertIn("conflicts with main", channel._test_notices[-1][0])
 
 
 class _Rounds:

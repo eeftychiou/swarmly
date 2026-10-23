@@ -3836,12 +3836,6 @@ class AgentChannel:
             self.owed_guard_tick(now=moment)
         except Exception:                          # noqa: BLE001 - a beat must not fail on it
             logger.warning("owed: the stall ladder failed this beat", exc_info=True)
-        # Round 5.5 (#183): and a head that moved while a verdict was open on the old one is
-        # said once, in the discussion the debt lives in.
-        try:
-            self.head_freeze_tick(now=moment)
-        except Exception:                          # noqa: BLE001 - a beat must not fail on it
-            logger.warning("head freeze: the beat could not check a head", exc_info=True)
         # The pinned dashboard rides the beat, and only its holder edits it: every bot
         # refreshing one message would fight over it (#117).
         if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
@@ -5135,6 +5129,7 @@ class AgentChannel:
         # Round 5.5 (#164): the items this round still has open, so the orphan invariant can
         # name the ones no row owes -- #146 at 09:13, where nothing said the round was stuck.
         open_items: List[Any] = []
+        heads: Dict[str, str] = {}
         for key in keys:
             try:
                 state = rounds.load(key)
@@ -5149,6 +5144,8 @@ class AgentChannel:
                     continue
                 label = f"#{item_key}"
                 head = str(item.get("head") or "").strip().lower()
+                if head:
+                    heads[label] = head
                 if str(item.get("state") or "").strip().lower() in ("merged", "closed", "done"):
                     facts.append(Fact(kind="merge", item=label, head=head))
                     continue
@@ -5193,6 +5190,13 @@ class AgentChannel:
                     fresh.append(admin_row(
                         question=str(item.get("note") or f"waiting on the admin on {label}"),
                         item=label, at=moment))
+        # #183, and **before** the closing facts: a verdict still open on a head its item has
+        # moved off is a rewrite under review -- and `settle` below closes exactly those rows,
+        # so a check after it could never fire (review). Read from the table as loaded.
+        try:
+            self._note_rewrites(heads=heads, now=moment)
+        except Exception:                          # noqa: BLE001 - a sweep must survive it
+            logger.debug("head freeze: could not check for a rewrite", exc_info=True)
         # A snapshot, not the objects themselves: settling mutates the rows in `table`, and a
         # comparison against the same objects would always say "unchanged".
         seen = {row.id: row.to_dict() for row in rows}
@@ -5449,18 +5453,18 @@ class AgentChannel:
             self.send(text, chat_id=int(chat_id), thread_id=thread_id, notice=True)))
         logger.debug("head freeze: posted a notice via %s", loop)
 
-    def _round_heads(self) -> Dict[str, str]:
-        """``{"#173": "<head>"}`` for every item the round state knows, briefly cached.
+    def _round_facts(self) -> Dict[str, Dict[str, str]]:
+        """``{"#173": {"head": "<sha>", "mergeable": "..."}}``, briefly cached.
 
-        The head is the one fact #183 turns on, and it is on the round state already. Cached
-        for a minute because the callers are a message path and a beat, and reading the state
-        costs a bus fetch.
+        The head is what #183 turns on, and the round state carries it. ``mergeable`` is the
+        fact #165's PR polling will write; until then it is empty here, and a ready claim is
+        checked against the head alone rather than against a fact nobody read.
         """
         moment = self._clock()
         cache = getattr(self, "_head_cache", None)
         if cache and moment - cache[0] < 60.0:
-            return dict(cache[1])
-        heads: Dict[str, str] = {}
+            return {label: dict(facts) for label, facts in cache[1].items()}
+        facts: Dict[str, Dict[str, str]] = {}
         try:
             store = self.round_store()
             for key in store.rounds():
@@ -5468,14 +5472,20 @@ class AgentChannel:
                 if str(getattr(state, "status", "") or "") != "ok":
                     continue
                 for item_key in (state.items or {}):
-                    label = f"#{str(item_key).lstrip('#')}"
-                    head = str((state.items.get(item_key) or {}).get("head") or "").strip()
-                    if head:
-                        heads[label] = head
+                    item = state.items.get(item_key) or {}
+                    facts[f"#{str(item_key).lstrip('#')}"] = {
+                        "head": str(item.get("head") or "").strip(),
+                        "mergeable": str(item.get("mergeable") or "").strip(),
+                    }
         except Exception:                          # noqa: BLE001 - a fact we may not have
-            logger.debug("head freeze: no round state to read heads from", exc_info=True)
-        self._head_cache = (moment, dict(heads))
-        return heads
+            logger.debug("head freeze: no round state to read facts from", exc_info=True)
+        self._head_cache = (moment, {label: dict(values) for label, values in facts.items()})
+        return facts
+
+    def _round_heads(self) -> Dict[str, str]:
+        """``{"#173": "<head>"}`` for every item the round state knows."""
+        return {label: values.get("head", "")
+                for label, values in self._round_facts().items() if values.get("head")}
 
     def head_freeze_seen(self) -> Any:
         """What this bot has already said about a claimed or a moved head (#183)."""
@@ -5485,25 +5495,25 @@ class AgentChannel:
         path = None if state is None else Path(state) / "head-freeze-seen.json"
         return FreezeSeen(path, clock=self._clock)
 
-    def head_freeze_tick(self, *, now: Optional[float] = None) -> List[str]:
+    def _note_rewrites(self, *, heads: Dict[str, str], now: float) -> List[str]:
         """Flag a head that moved while a verdict was open on the old one (#183).
 
-        The row already pins a verdict to a head (a new head opens new rows), so the flag is
-        read off the table: an open verdict whose head the item no longer has is a rewrite
-        under review. Said once per (item, old head, new head) in the discussion the debt
-        lives in; the row stays open, because the verdict on that head is still owed.
+        Called by :meth:`owed_sweep` **before** the closing facts, because the sweep closes
+        exactly the rows this reads: a verdict row is pinned to a head, so an open verdict whose
+        item has moved on is a branch rebuilt under review, and a check after the settle would
+        find nothing (review). Said once per (item, old head, new head) in the discussion the
+        debt lives in; the row is left alone -- the verdict on that head is still owed, and that
+        is the loss #173 took when a rebuild dropped a fix.
         """
         from swarmly.telegram.head_freeze import rewrite_notice, rewrites
-        moment = time.time() if now is None else float(now)
-        heads = self._round_heads()
         if not heads:
             return []
         try:
-            rows = self.owed_store().open_rows(now=moment)
+            rows = self.owed_store().load()
         except Exception:                          # noqa: BLE001 - a beat must survive
             logger.warning("head freeze: the table could not be read", exc_info=True)
             return []
-        found = rewrites(rows, heads=heads)
+        found = rewrites([row for row in rows if row.is_open], heads=heads)
         if not found:
             return []
         by_id = {row.id: row for row in rows}
@@ -5511,7 +5521,7 @@ class AgentChannel:
         done: List[str] = []
         for rewrite in found:
             key = f"{rewrite.item}:{rewrite.head}:{rewrite.now}"
-            if not seen.first(key, now=moment):
+            if not seen.first(key, now=now):
                 continue
             target = self._place_target(getattr(by_id.get(rewrite.row), "topic", ""))
             if target is None:
@@ -5530,22 +5540,33 @@ class AgentChannel:
         followed read code the PR did not have. One notice per (item, claimed, actual); the
         claim never closes a row -- the facts decide, not the claim (#164).
         """
-        from swarmly.telegram.head_freeze import claim_notice, claims, mismatches
-        heads = self._round_heads()
+        from swarmly.telegram.head_freeze import (claim_notice, claims, mismatches,
+                                                  ready_blockers, ready_claims, ready_notice)
+        facts = self._round_facts()
+        heads = {label: values["head"] for label, values in facts.items() if values["head"]}
         if not heads:
-            return []
-        found = mismatches(claims(text, heads), heads=heads)
-        if not found:
             return []
         seen = self.head_freeze_seen()
         done: List[str] = []
-        for mismatch in found:
+        for mismatch in mismatches(claims(text, heads), heads=heads):
             key = f"claim:{mismatch.item}:{mismatch.claimed}:{mismatch.actual}"
             if not seen.first(key):
                 continue
             self._post_notice(claim_notice(mismatch), int(chat_id), thread_id)
             done.append(f"{mismatch.item}: claimed {mismatch.claimed}, head is "
                         f"{mismatch.actual}")
+        # #183: and an item called ready is checked against the facts that decide it.
+        for item in ready_claims(text, heads):
+            blockers = ready_blockers({"head": heads.get(item, "")},
+                                      mergeable=facts.get(item, {}).get("mergeable"),
+                                      heads=heads, item_key=item.lstrip("#"))
+            if not blockers:
+                continue
+            key = f"ready:{item}:{blockers[0]}"
+            if not seen.first(key):
+                continue
+            self._post_notice(ready_notice(blockers), int(chat_id), thread_id)
+            done.append(f"{item}: called ready, {blockers[0]}")
         if done:
             logger.info("head freeze: %s", "; ".join(done[:8]))
         return done

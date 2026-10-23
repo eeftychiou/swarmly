@@ -19,6 +19,12 @@ Three rules, and this is the pure half of all three:
 
 The transport decides where a notice goes and how it is remembered; this decides what is worth
 saying and in what words.
+
+**Where the head comes from, exactly.** Every check here compares against the head the *round
+state* carries (``RoundState.items[*].head``), which is the PR's ``headRefOid`` after the
+transport reads it -- today a head a bot reported to the round, and the PR's own value once
+#165's polling lands. That is the fact the table is built from, so it is the fact these rules
+use; naming it here so no reader thinks a claim is being checked against a live GitHub read.
 """
 
 from __future__ import annotations
@@ -153,6 +159,27 @@ def rewrite_notice(rewrite: Rewrite) -> str:
     return (f"⚑ {rewrite.item}'s head moved while a verdict was open: {rewrite.debtor} owes one "
             f"on {_short(rewrite.head)}, the PR is at {_short(rewrite.now)}. A rewrite under "
             f"review is a new review, not the old one moved -- nits go to follow-up issues.")
+
+
+#: An item somebody calls ready: "#173 is ready", "#173 ready to merge", "ready: #173".
+_READY = re.compile(r"#(\d+)[^\n.]{0,40}?\bready\b|\bready\b[^\n.]{0,20}?#(\d+)",
+                    re.IGNORECASE)
+
+
+def ready_claims(text: str, items: Iterable[str]) -> List[str]:
+    """Items *text* calls ready, in the order they are named.
+
+    "Ready" is a claim like a SHA is: #173 was called ready while it still conflicted with main,
+    and the swarm moved on it. Only items a round state knows are returned -- a ready claim about
+    something nobody tracks has no facts to check it against.
+    """
+    known = {f"#{str(item).strip().lstrip('#')}" for item in items or ()}
+    out: List[str] = []
+    for match in _READY.finditer(str(text or "")):
+        item = f"#{match.group(1) or match.group(2)}"
+        if item in known and item not in out:
+            out.append(item)
+    return out
 
 
 def ready_blockers(item: Mapping[str, object], *, mergeable: Optional[str] = None,
