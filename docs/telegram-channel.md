@@ -532,8 +532,10 @@ reading (`swarmly/telegram/handoff_split.py`): a bot has a request when its word
 politeness word, a question mark, or one of the verbs the swarm uses (`review`, `QA`, `push`,
 `fix`, `merge`, …) **in the first sentence after its handle** — a question two sentences on
 belongs to whoever that sentence is for. A line is split too, not just a message: two asks on
-one line (`@a: review it. @b: QA it.`) give each bot its own half, and a line that only
-*mentions* another bot is context both of them keep.
+one line (`@a: review it. @b: QA it.`) give each bot its own half, while a line that *opens*
+with a run of handles (`@a @b: review #195 and QA it today`) is one sentence shared whole by
+both — nothing is cut from it. A line that only *mentions* another bot is context every
+recipient keeps.
 
 **Loop brake:** a forum topic takes at most `limits.max_peer_turns_per_topic` (default 8; it was 3, which a round of questions to four bots tripped in a live test)
 turns in a row that a peer bot started, explicit mentions included. Visible progress resets

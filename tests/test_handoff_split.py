@@ -89,6 +89,14 @@ class TestTheSplit(unittest.TestCase):
         self.assertIn("QA it", agy)
         self.assertNotIn("review it", agy)
 
+    def test_an_opening_run_on_one_line_keeps_its_shared_sentence(self):
+        """#181 review: the first bot of an opening run kept a bare handle, no task."""
+        text = "@reasonix_dd_bot @agy_dd_bot: review #195 and QA it today."
+        for bot in ("reasonix_dd_bot", "agy_dd_bot"):
+            own = hs.own_brief(text, bot, BOTS)
+            self.assertIn("review #195", own, bot)
+            self.assertIn("QA it today", own, bot)              # the sentence is shared
+
     def test_one_recipient_is_not_split(self):
         text = "@Codex: review #195 please."
         self.assertEqual(hs.own_brief(text, "Codex", BOTS), text)

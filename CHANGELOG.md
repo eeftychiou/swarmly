@@ -11,8 +11,9 @@ All notable changes to this project are documented here. The format follows
 - A peer's message that asks several bots at once is one hand-off **per bot** (`#181`): each
   reads the shared context plus its own lines, and none of them refuses with "a peer asks
   another bot to hand this bot the work" -- the line that dropped a request eight times in
-  round 5. Two asks on one line are split within the line, a line that only mentions another
-  bot is context for everyone, and only the first sentence after a handle counts as its ask --
+  round 5. Two asks on one line are split within the line, a line that *opens* with a run of
+  handles is one shared sentence kept whole, a line that only mentions another bot is context
+  for everyone, and only the first sentence after a handle counts as its ask --
   a question two sentences later belongs to the bot it is addressed to. A message that asks one
   bot, and merely names another as who should get the work, is still that one bot's.
 - An open item whose next actor cannot be derived is **flagged** on its row (`⚑ no next actor: …`

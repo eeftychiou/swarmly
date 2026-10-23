@@ -59,6 +59,8 @@ def _known(handles: Iterable[str]) -> List[str]:
 #: The end of a sentence: a terminator followed by a space or the end of the text. The
 #: terminator itself is kept, so a question mark still counts as the ask it is.
 _SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+#: A line that opens with a run of handles ("@A @B: …"): those handles share its sentence.
+_OPENING = re.compile(r"^(?:\s*@\w+[:,]?)+")
 
 
 def _first_sentence(text: str) -> str:
@@ -149,9 +151,19 @@ def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
             continue
         asked = [_norm(name) for name in requests(line, known)]
         if mine in asked:
-            # My share of *this* line: the shared prefix when mine is its first handle, then
-            # my segment up to the next handle. Two asks on one line therefore give each bot
-            # its own, which is the shape Claudebot posts most (#181 review).
+            # A line that opens with a run of handles shares one sentence between them
+            # ("@A @B: review #195 and QA it today"), so there is nothing to cut: the whole
+            # line is every bot's brief. Cutting at the next handle left the first bot a bare
+            # handle and no task (#181 review).
+            opening = _OPENING.match(_LABEL.sub("", _BULLET.sub("", line)))
+            lead = ([_norm(raw) for raw in re.findall(r"@(\w+)", opening.group(0))]
+                    if opening else [])
+            if len([name for name in lead if name in known]) > 1 and mine in lead:
+                kept.append(line)
+                continue
+            # Otherwise my share of *this* line: the shared prefix when mine is its first
+            # handle, then my segment up to the next handle. Two asks on one line therefore
+            # give each bot its own, which is the shape Claudebot posts most (#181 review).
             segments = _segments(line, known)
             for index, (offset, name, _tail) in enumerate(segments):
                 if name != mine:
