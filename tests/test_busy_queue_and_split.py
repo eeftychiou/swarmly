@@ -121,6 +121,48 @@ class TestBusyQueue(unittest.TestCase):
                         replies)
         self.assertTrue(any("busy queue" in record.getMessage() for record in captured.records))
 
+    def test_the_held_queue_has_its_own_ceiling_and_keeps_the_oldest(self):
+        """#184 review: holding without a bound is memory and an inbox nobody can drain.
+
+        Past ``limits.busy_held_max`` the *newest* arrival is the one dropped -- the oldest are
+        kept, because oldest-first is the order the queue is drained in -- and the topic is told
+        plainly that this one could not be kept, rather than being told it was.
+        """
+        channel, adapter = gated(busy_queue_max=1, busy_held_max=1)
+        texts = self.TEXTS + ("@HermesBot: and the changelog",)
+        with self.assertLogs("swarmly.telegram", level="WARNING") as captured:
+            hold_and_send(channel, adapter, texts, drain=True)
+        self.assertEqual(channel.stats.busy_queued, 1, "one waited in memory")
+        self.assertEqual(channel.stats.busy_held, 1, "one was held -- the ceiling is 1")
+        self.assertEqual(channel.stats.busy_dropped, 2, "the two arrivals past the ceiling")
+        replies = [sent["text"] for sent in channel._test_sender.sent]
+        answered = [text for text in texts
+                    if any(text.split(": ")[1] in reply for reply in replies)]
+        self.assertEqual(answered, list(texts[:2]), f"the oldest are kept: {replies}")
+        # The refusal is said out loud -- a silent drop is the bug this item fixes -- and it is
+        # not disguised as a hold; one line per window, not one per message.
+        refused = [reply for reply in replies if "could not be kept" in reply]
+        self.assertEqual(len(refused), 1, replies)
+        self.assertIn("held queue is full", refused[0])
+        self.assertTrue(any("already held (ceiling 1)" in record.getMessage()
+                            for record in captured.records), captured.output)
+
+    def test_a_held_message_that_cannot_start_stays_held_and_recorded(self):
+        """#184 review: the record goes only once the held turn exists.
+
+        `_drain_overflow` used to pop the message, clear its inbox record, and *then* try to
+        start a task -- so the no-loop path put the event back in memory, but the message was
+        already gone from the inbox, which is the one loss this item exists to prevent.
+        """
+        channel, _ = gated()
+        held = event("@HermesBot: hold me", message_id=77)
+        channel._hold_overflow(held)
+        self.assertIn((held.chat_id, held.message_id), channel._inbox)
+        channel._drain_overflow()               # no running loop here: nothing can start
+        self.assertEqual(channel._held_overflow(), [held], "still held for the next turn end")
+        self.assertIn((held.chat_id, held.message_id), channel._inbox,
+                      "a message that never started must still be there for a restart")
+
     def test_a_queued_peer_message_waits_out_the_turn_cooldown_instead_of_being_dropped(self):
         channel, adapter = gated(min_seconds_between_agent_turns=60)
         hold_and_send(channel, adapter, self.TEXTS[:1])
@@ -146,10 +188,12 @@ class TestBusyQueue(unittest.TestCase):
 
     def test_queue_settings_are_validated_at_load(self):
         for bad in ({"busy_queue_max": 0}, {"busy_queue_max": "many"},
+                    {"busy_held_max": 0}, {"busy_held_max": "many"},
                     {"max_reply_parts": 0}, {"max_reply_parts": -2}):
             with self.assertRaises(ConfigError, msg=bad):
                 make_config(limits=bad)
         self.assertEqual(ChannelLimits().max_reply_parts, 4)
+        self.assertEqual(ChannelLimits().busy_held_max, 50)   # the held queue's own ceiling
 
     def test_max_reply_parts_is_clamped_to_the_protocol_cap(self):
         """Review of #29: the sender and the receiver share one cap, so a configured value above

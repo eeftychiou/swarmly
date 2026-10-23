@@ -546,6 +546,14 @@ told **once per window** that the bot is behind, with the depth -- `behind by N 
 one … is kept and will be answered in order` -- and `stats.busy_held` counts held messages while
 `stats.busy_dropped` goes back to meaning what it says.
 
+Holding needs a second bound, so it has one: `limits.busy_held_max: 50` (the inbox's own
+`MAX_ENTRIES`) caps the held queue. At that ceiling the **oldest are kept** — oldest-first is
+the order they run in — and the new arrival is the one dropped, `stats.busy_dropped` counts
+it, and the topic is told plainly that it *could not be kept*, on a window of its own so a
+"kept" line from the same window cannot swallow it. The inbox record is cleared only once the
+held turn actually exists: a message that could not be started (no running loop) stays held
+*and* recorded, so the restart path still replays it.
+
 **Loop brake:** a forum topic takes at most `limits.max_peer_turns_per_topic` (default 8; it was 3, which a round of questions to four bots tripped in a live test)
 turns in a row that a peer bot started, explicit mentions included. Visible progress resets
 the run: a swarm message naming an issue, PR or commit (a commit link or a short SHA such as
@@ -770,7 +778,8 @@ most 18 a minute (per topic when topics run in parallel; see **Running topics in
 - `busy_behavior: queue` (default), `drop` or `notice`: what happens to an addressed message that
   arrives while a turn is in flight. `queue` holds up to `busy_queue_max: 12` such messages (a developer on a five-minute turn collects several) and runs
   them in order as one turn when the turn ends (a held peer-bot message waits out the turn cooldown rather than
-  being dropped, and lets the person's messages and an awaited hand-off go first); `drop`
+  being dropped, and lets the person's messages and an awaited hand-off go first); past
+  `busy_queue_max` a message is *held* instead of dropped, up to `busy_held_max: 50` (`drop`
   discards them; `notice` discards them and logs one line per
   `busy_notice_window_seconds: 900`. The window is validated **at load**
   (finite, > 0) even when `busy_behavior: drop`, where it is never read — so an operator upgrading

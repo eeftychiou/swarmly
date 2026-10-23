@@ -12,7 +12,9 @@ All notable changes to this project are documented here. The format follows
   `limits.busy_queue_max` the message goes to the durable inbox and is taken, oldest first, as
   each turn ends, so every message is answered in arrival order. The topic is told once per
   window that the bot is behind, with the depth, and `stats.busy_held` counts what used to be
-  silently dropped.
+  silently dropped. Holding is bounded by `limits.busy_held_max` (default 50): at the ceiling
+  the oldest are kept and the new arrival is dropped with a word in the topic, and a held
+  message's inbox record is cleared only once its turn actually exists.
 
 ### Added
 

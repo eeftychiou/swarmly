@@ -652,7 +652,12 @@ class ChannelLimits:
     overdue_digest_threshold: int = 3                   # #49: one digest alert when this many tickets are open for one recipient
     busy_behavior: str = "queue"                        # addressed msg during an in-flight turn: "queue" (run it next), "drop" (silent) or "notice" (drop, one log line/window)
     busy_notice_window_seconds: float = 900.0           # #9: at most one busy-drop notice per window (15 min)
-    busy_queue_max: int = 12                            # "queue": messages waiting behind the current turn; more are dropped
+    busy_queue_max: int = 12                            # "queue": messages waiting behind the current turn; more are held
+    #: #184: the held queue's own ceiling. Overflow past ``busy_queue_max`` is *held* rather than
+    #: dropped, so it needs a second bound -- a transport stuck for hours must not grow its memory
+    #: and its inbox without limit. At the ceiling the oldest are kept and the new arrival is the
+    #: one dropped (with a word in the topic), which is the order the queue is drained in anyway.
+    busy_held_max: int = 50                             # matches the inbox's own MAX_ENTRIES
     max_parallel_turns: int = 1                         # forum topics running a turn at once
     allow_shared_cwd: bool = False                      # parallel topics share adapter.cwd
     max_peer_turns_per_topic: int = 8                   # peer turns in a row per forum topic
@@ -808,7 +813,7 @@ class ChannelLimits:
         if isinstance(rate, bool) or not isinstance(rate, int) or rate < 0:
             raise ConfigError("limits.max_messages_per_minute must be a whole number, 0 for "
                               f"max_group_messages_per_minute (got {rate!r}).")
-        for key in ("busy_queue_max", "max_reply_parts", "max_parallel_turns",
+        for key in ("busy_queue_max", "busy_held_max", "max_reply_parts", "max_parallel_turns",
                     "reply_chars", "max_group_messages_per_minute", "round_state_chars",
                     "wake_max", "wake_max_per_reply", "wake_max_attempts"):
             value = getattr(self, key)
