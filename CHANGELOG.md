@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A round-state update that carried **only** a `repo` change wrote no segment at all (`#185`
+  review): `fold` took `update.repo`, but `_unchanged` — the check that keeps a repeated turn
+  from adding a commit to the bus — never compared it, so the field was folded when it arrived
+  beside something else and dropped when it arrived alone. It is compared now, so a repo change
+  is written and reaches the bus.
+
 - A full busy queue **holds** a message instead of dropping it (`#184`): past
   `limits.busy_queue_max` the message goes to the durable inbox and is taken, oldest first, as
   each turn ends, so every message is answered in arrival order. The topic is told once per
