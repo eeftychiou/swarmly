@@ -334,8 +334,8 @@ class TestOneVerdictPerHead(unittest.TestCase):
                              authority=rs.Authority(alias="Claude"))
 
     def _merge(self, store, verdict, *, item="202", round_key="repo#202", **extra):
-        store.append(rs.RoundUpdate(round=round_key, writer="Claude",
-                                    items={item: {"review": dict(verdict)}}, **extra))
+        return store.append(rs.RoundUpdate(round=round_key, writer="Claude",
+                                           items={item: {"review": dict(verdict)}}, **extra))
 
     def test_a_repeated_verdict_is_suppressed_with_one_log_line(self):
         with TemporaryDirectory() as tmp:
@@ -376,6 +376,31 @@ class TestOneVerdictPerHead(unittest.TestCase):
             self.assertEqual(len(list(Path(tmp).rglob("*.json"))), 2)
             self.assertEqual(store.load("repo#202").verdict("202", "review",
                                                             head=HEAD_A).by, "Codex")
+
+    def test_a_repeat_plus_a_repo_change_is_still_written(self):
+        """#185 review, nit 2: `repo` is a field like any other -- a repeat must not swallow it."""
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._merge(store, self.VERDICT)
+            store.append(rs.RoundUpdate(round="repo#202", writer="Claude",
+                                        repo="owner/project",
+                                        items={"202": {"review": dict(self.VERDICT)}}))
+            self.assertEqual(len(list(Path(tmp).rglob("*.json"))), 2,
+                             "the repo change is not a repeat, so it gets a segment")
+            self.assertEqual(store.load("repo#202").repo, "owner/project")
+
+    def test_a_suppressed_repeat_returns_a_segment_path(self):
+        """#185 review, nit 1: `append` promises a segment path, so the no-write path must not
+        answer with a bare directory -- the fallback is only for a round with no segments."""
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            first = self._merge(store, self.VERDICT)
+            returned = self._merge(store, self.VERDICT)
+            self.assertEqual(first, returned, "the repeat answers with the segment already there")
+            self.assertTrue(returned.endswith(".json"), returned)
+            self.assertTrue(Path(returned).is_file(), returned)
+            # The documented fallback, and the only place a directory is the answer.
+            self.assertFalse(store._last_segment_path("repo#never-written").endswith(".json"))
 
     def test_a_repeat_riding_along_a_real_change_does_not_restate_the_verdict(self):
         """The repeat is dropped from the segment; the change alongside it is still written."""

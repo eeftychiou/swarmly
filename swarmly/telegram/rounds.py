@@ -615,6 +615,18 @@ class RoundStore:
     def directory(self, round_key: str) -> Path:
         return self.root / self.relpath / self.safe_key(round_key)
 
+    def _last_segment_path(self, round_key: str) -> str:
+        """The newest segment on this checkout, for an update that writes none (#185 review).
+
+        ``append`` promises a path, and a caller that gets one back may push it. When nothing
+        was written the honest answer is the segment the state already came from; only a round
+        with no segments at all (a first write that changed nothing, which cannot happen
+        against an absent state) falls back to its own directory.
+        """
+        folder = self.directory(round_key)
+        existing = sorted(folder.glob("*.json"))
+        return str(existing[-1]) if existing else str(folder)
+
     # -- reading ---------------------------------------------------------------------
     def _local_segments(self, round_key: str) -> List[Tuple[str, str]]:
         folder = self.directory(round_key)
@@ -762,6 +774,10 @@ class RoundStore:
                authority: Optional[Authority] = None) -> str:
         """Write one segment, then publish it. Returns the segment's bus path.
 
+        An update that writes nothing -- the same state again, or a verdict the round already
+        holds -- returns the path of the newest segment instead (the round's directory only
+        when it has none), so a caller always gets something it could read or push.
+
         Three rules, one purpose: no bot writes a round it cannot prove it holds.
 
         * **Fail closed.** If the bus cannot be read, the term and the seq this write would
@@ -836,17 +852,16 @@ class RoundStore:
                 if not update.items[key]:
                     update.items.pop(key, None)
             if repeats and not update.items and update.order is None \
-                    and update.blockers is None and update.timers is None and not update.note:
+                    and update.blockers is None and update.timers is None \
+                    and not update.note and not update.repo:
                 # Nothing but the repeat: no new segment for a fact the round already holds.
-                existing = sorted(self.directory(update.round).glob("*.json"))
-                return str(existing[-1]) if existing else str(self.directory(update.round))
+                return self._last_segment_path(update.round)
 
         if current.status == "ok" and _unchanged(update, current):
             # Nothing new: a turn that emits the same state again must not add a commit to
             # the bus's history (issue #86 review B7). Checked before the fence, so a no-op
             # from another bot returns the existing segment instead of raising.
-            existing = sorted(self.directory(update.round).glob("*.json"))
-            return str(existing[-1]) if existing else str(self.directory(update.round))
+            return self._last_segment_path(update.round)
 
         if auth is not None and auth.alias.strip():
             if auth.alias.strip().lower() != update.holder.strip().lower():
@@ -939,6 +954,10 @@ def _unchanged(update: RoundUpdate, state: RoundState) -> bool:
                                         for name, timer in update.timers.items()):
         return False
     if update.note and update.note != state.note:
+        return False
+    # #185 review: `repo` is state too -- `fold` takes it (`state.repo = update.repo or ...`),
+    # so an update carrying only a repo change is a change, not a no-op.
+    if update.repo and update.repo != state.repo:
         return False
     return True
 
