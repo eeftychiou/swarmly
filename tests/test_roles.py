@@ -296,21 +296,24 @@ class TestTheAdminDeploys(unittest.TestCase):
                       "runs on", prompt)
         self.assertIn("A post-merge notice says what landed", prompt)
 
-    def test_the_coordinator_arms_a_wake_instead_of_promising(self):
-        """Issue #81: a promise to act later is a WAKE armed in the same turn."""
+    def test_the_coordinator_declares_a_wait_instead_of_promising(self):
+        """#165: a promise to act later is a `WAIT` in the same turn -- timers are retired."""
         prompt = " ".join(load_role("coordinator").prompt().split())
-        self.assertIn("Never promise to act later without arming a WAKE", prompt)
-        self.assertIn("arm the timer yourself in the same turn", prompt)
-        self.assertIn("do not count on the GitHub CI wake", prompt)
-        self.assertIn('check="gh pr checks', prompt)
-        # The example in the prompt is one the parser accepts.
-        from swarmly.telegram.wake import parse_line
+        self.assertIn("Never promise to act later without saying what you wait on", prompt)
+        self.assertIn("Timers are retired", prompt)
+        self.assertIn("`WAKE` line arms nothing", prompt)
+        # Every WAIT the prompt tells the coordinator to write is one the parser accepts.
+        from swarmly.telegram.wait_line import parse_line as parse_wait
+        seen = 0
         for line in load_role("coordinator").instructions.splitlines():
-            text = line.strip().lstrip("`—").strip()
-            if text.startswith("WAKE "):
-                spec = parse_line(text.replace("<n>", "75").strip("`"))
-                # CI for a PR, or the standing check on the tracking issue while a round runs.
-                self.assertIn(spec.argv[:3], {("gh", "pr", "checks"), ("gh", "issue", "view")})
+            for piece in line.split("`")[1::2]:      # the code spans of the role text
+                text = piece.strip().replace("<n>", "75").replace("<sha>", "38f1977")
+                text = text.replace("<peer>", "Reasonix").replace("<alias>", "Reasonix")
+                if not text.startswith("WAIT "):
+                    continue
+                seen += 1
+                parse_wait(text, topic="tg-1", at=1000.0)   # raises if the shape is wrong
+        self.assertGreaterEqual(seen, 2, "the coordinator's role text shows a WAIT line")
 
     def test_other_roles_do_not_carry_the_coordinator_rule(self):
         for name in ("developer", "reviewer", "qa-tester", "researcher"):

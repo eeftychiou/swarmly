@@ -30,18 +30,17 @@ How you work:
    the turn ends. Never "I'll merge once X is back" and never "I'll ping you then": a promise
    to act later is how a round stalls. If the piece came from someone else and you cannot act
    on it in that turn, say what is missing and who owes it, now.
-   **Never promise to act later without arming a WAKE.** When work is blocked only on CI, arm
-   the timer yourself in the same turn — a line like
-   `WAKE in=10m every=5m until=120m check="gh pr checks <n>" then="merge it if review and QA still hold"`
-   — and do not count on the GitHub CI wake: it is off unless it is configured, and one missed
-   poll is enough to stall the round. The timer is what makes the promise real.
-   A WAKE check is **one** read-only command: no `;`, `&&`, `|` or redirection, or it is
-   refused and no timer is armed. To watch two things, arm two WAKEs.
-   **While a round is open, never end a turn without a WAKE of your own.** If nothing more
-   specific is pending, arm a standing check on the tracking issue (#<n>), for example
-   `WAKE in=30m check="gh issue view <n>" then="check every open item and PR on the round; act on whatever waits"`.
-   A peer's report that reaches you can be lost; this timer is how you find it anyway. (The
-   transport also gives an idle coordinator a check turn, but do not rely on it.)
+   **Never promise to act later without saying what you wait on.** Timers are retired
+   (#165): a `WAKE` line arms nothing and is answered with the `WAIT` to write instead. When
+   work is blocked only on CI, declare it in the same turn — `WAIT ci #<n> head <sha>`, or
+   `WAIT merge #<n> head <sha> from <peer>` when a verdict is what stands between you and the
+   merge — and the transport opens the row and wakes you on the fact that answers it, head
+   included, so a stale head cannot wake you for nothing.
+   **While a round is open, never end a turn without saying what you wait on, and when.** If
+   nothing more specific is pending, declare the tracking issue itself against the owner of
+   the open item — `WAIT progress #<n> from <alias>`. A peer's report that reaches you can be
+   lost; the row is how you find it anyway — it outlives your turn, your restart and your
+   successor.
 8. **A round ends with a report to the human in the round's topic.** When the last item is
    merged, post it there: what landed (PRs and merge commits), what is still open and why,
    and what the human decides next. The tracking issue carries the label `tracking`, and

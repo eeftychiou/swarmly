@@ -22,6 +22,17 @@ All notable changes to this project are documented here. The format follows
   the oldest are kept and the new arrival is dropped with a word in the topic, and a held
   message's inbox record is cleared only once its turn actually exists.
 
+### Changed
+
+- `WAKE` no longer arms a timer (round 5.5 `#165`, second slice). A `WAKE` line is read as the
+  row that replaces it — the bot owes itself a look at what the check watched, with the check
+  and the action written down and the item the check named, so the guard's ladder (`#164`) and
+  the wakes (`#163`) carry it on facts — and the ack names the `WAIT` line to write next time.
+  Nothing new enters the timer path; timers armed before this release still fire until they
+  expire, and the firing machinery, `/wakes`, the adoption rules and
+  `check_coordinator_watch` are removed in the next slice. The developer and coordinator role
+  texts now say to declare a `WAIT` where they used to say to arm a `WAKE`.
+
 ### Added
 
 - The `WAIT` line (round 5.5 `#165`, first slice): a reply says what it waits on — `WAIT review
@@ -30,8 +41,8 @@ All notable changes to this project are documented here. The format follows
   admin's answer) with no timer and no check. A malformed line is refused in the reply with the
   shape that would work, and the line is stripped either way. An `answer` row is keyed by the
   question it asks, so two questions to the admin in one topic are two debts rather than one
-  (`#209` review). `WAKE` still arms on this release; retiring it, the coordinator watchdog and
-  the separate reminders is the rest of `#165`.
+  (`#209` review, folded in here because the merge landed at `32205e1`). The coordinator
+  watchdog and the separate hand-off reminders are the rest of `#165`.
 - A verdict is kept **once per head** (`#185`): the round state already holds the fact, so a
   repeated `review`/`qa` verdict — same `verdict`, `sha` and `by`, even with a newer `at` — writes
   no new segment and is logged as suppressed instead of restated. A verdict on a new head, or

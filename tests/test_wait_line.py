@@ -149,6 +149,39 @@ class TestExtraction(unittest.TestCase):
         self.assertIn("recorded", said)
 
 
+class TestARetiredWakeBecomesARow(unittest.TestCase):
+    """#165: the timer goes, the promise stays -- a ``WAKE`` line is the row that replaces it."""
+
+    def spec(self, line):
+        from swarmly.telegram import wake as wk
+        return wk.parse_line(line)
+
+    def test_a_checks_wake_is_progress_on_that_pr(self):
+        row = wl.from_wake(self.spec('WAKE in=10m check="gh pr checks 209" then="merge it"'),
+                           alias="DeepSeek", topic="tg-3556", at=1000.0)
+        self.assertEqual((row.kind, row.item, row.debtor), ("progress", "#209", "DeepSeek"))
+        self.assertIn("gh pr checks 209", row.owes)          # the promise, still written down
+        self.assertIn("merge it", row.opened_by)
+        self.assertEqual(row.topic, "tg-3556")
+        self.assertEqual(row.deadline, 1600.0)               # when the timer would have fired
+
+    def test_a_check_on_nothing_is_progress_with_no_item(self):
+        row = wl.from_wake(self.spec('WAKE in=1m check="git status" then="go"'),
+                           alias="DeepSeek", at=1000.0)
+        self.assertEqual((row.kind, row.item), ("progress", ""))
+        self.assertEqual(row.deadline, 1060.0)
+
+    def test_two_checks_on_one_pr_are_two_promises(self):
+        same = wl.from_wake(self.spec('WAKE in=1m check="gh pr checks 209" then="go"'),
+                            alias="DeepSeek", at=1000.0)
+        again = wl.from_wake(self.spec('WAKE in=1m check="gh pr checks 209" then="go"'),
+                             alias="DeepSeek", at=2000.0)
+        other = wl.from_wake(self.spec('WAKE in=1m check="gh pr diff 209" then="go"'),
+                             alias="DeepSeek", at=1000.0)
+        self.assertEqual(same.id, again.id)                  # re-arming one check is one row
+        self.assertNotEqual(same.id, other.id)
+
+
 class TestTheTransportRecordsIt(unittest.TestCase):
     """`apply_wait_lines`: the row is saved, the ack is posted, the line never is."""
 

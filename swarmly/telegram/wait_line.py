@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from swarmly.telegram.owed import ADMIN, CI, OwedError, Row
 
@@ -146,6 +146,39 @@ def parse_line(line: str, *, topic: str = "", place: str = "",
                    created_at=moment, updated_at=moment)
     except OwedError as exc:
         raise WaitError(str(exc)) from exc
+
+
+def from_wake(spec: Any, *, alias: str, topic: str = "", at: Optional[float] = None) -> Row:
+    """A retired ``WAKE`` line as the row that replaces it (#165).
+
+    ``WAKE in=10m check="gh pr checks 209" then="merge it"`` was a promise to *look again* at
+    something in ten minutes. The step the migration removes is the timer, not the promise, so
+    the promise becomes a row: the bot owes itself progress on the item the check named, with
+    the check and the action written down, and the guard's ladder (#164) and the wakes (#163)
+    act on it. A check that names no item (``git status``) is progress with no item.
+
+    The check is part of the row's key: two checks on one PR are two promises, and re-arming
+    the same check updates the row instead of opening a second one -- which is what the old
+    "one standing check per PR or issue" rule did by replacing the timer.
+    """
+    moment = time.time() if at is None else float(at)
+    from swarmly.telegram.wake import subject_of
+
+    argv = tuple(getattr(spec, "argv", ()) or ())
+    check = " ".join(argv) or str(getattr(spec, "check", "") or "").strip()
+    subject = subject_of(argv) if argv else None
+    kind, number, repo = subject if subject else ("", "", "")
+    item = f"#{number}" if number else ""
+    then = str(getattr(spec, "then", "") or "").strip()
+    in_seconds = float(getattr(spec, "in_seconds", 0.0) or 0.0)
+    where = f" in {repo}" if repo else ""
+    opened = (f"a WAKE line that checked `{check}`{where}"
+              + (f" then \"{then[:100]}\"" if then else ""))
+    return Row(kind="progress", item=item, debtor=str(alias or "").strip(),
+               owes=f"a look at `{check}`{where}",
+               key_extra=f"wake#{_question_key(check)}", topic=topic,
+               opened_by=opened[:200], deadline=(moment + in_seconds) if in_seconds else 0.0,
+               created_at=moment, updated_at=moment)
 
 
 def extract_waits(text: str, *, topic: str = "", place: str = "",

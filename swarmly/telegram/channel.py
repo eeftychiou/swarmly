@@ -4680,47 +4680,46 @@ class AgentChannel:
         return store
 
     def apply_wake_lines(self, text: str, event: ChannelEvent) -> str:
-        """Arm the ``WAKE`` lines in a reply, and strip them from it.
+        """Read the ``WAKE`` lines in a reply as rows, and strip them from it (#165).
 
-        A line is removed in every case -- a refused one must not be posted as prose -- and
-        every refusal is said back into the reply, because a timer the bot believes it armed
-        is a promise the rest of the swarm counts on.
+        A ``WAKE`` used to arm a timer the transport fired on its own. That is the step the
+        migration removes: the promise is kept, the timer is not. Each line becomes the row
+        that says the same thing -- the bot owes itself a look at what the check watched --
+        and the guard's ladder (#164) and the wakes (#163) carry it from there, on facts.
+
+        A line is removed in every case, and every refusal is said back into the reply: a
+        timer the bot believes it armed is a promise the rest of the swarm counts on.
         """
-        from swarmly.telegram.wake import (WakeError, WakePushError, extract_wakes,
-                                           make_timer)
+        from swarmly.telegram.owed import OwedError, Row
+        from swarmly.telegram.wait_line import ack, from_wake
+        from swarmly.telegram.wake import extract_wakes
         body, specs, reasons = extract_wakes(text or "")
         if not specs and not reasons:
             return text
-        limits = self.config.limits
-        store = self.wake_store()
-        allowed = tuple(str(word) for word in (limits.wake_check_allow or ()))
-        per_reply = max(1, int(limits.wake_max_per_reply))
+        moment = time.time()
+        topic = self._topic_token(event.chat_id, event.thread_id)
+        per_reply = max(1, int(self.config.limits.wake_max_per_reply))
+        rows: List[Row] = []
         notes: List[str] = []
         for spec in specs[:per_reply]:
-            if allowed and spec.argv[0] not in allowed:
-                notes.append(f"WAKE refused: {spec.argv[0]} is not in "
-                             "limits.wake_check_allow")
-                continue
-            timer = make_timer(spec, alias=self.config.identity.alias, chat_id=event.chat_id,
-                               thread_id=event.thread_id,
-                               topic=self.topics.name(event.chat_id, event.thread_id) or "",
-                               now=time.time())
             try:
-                replaced = store.add(timer, max_timers=max(1, int(limits.wake_max)))
-            except WakePushError as exc:
-                # Armed here, but the bus did not take it: say so, loudly, rather than
-                # promise the swarm a timer only this checkout can see.
-                notes.append(timer.ack(now=time.time()))
-                notes.append(f"⚠️ WAKE armed locally only: {exc}")
-                continue
-            except WakeError as exc:
+                rows.append(from_wake(spec, alias=self.config.identity.alias, topic=topic,
+                                      at=moment))
+            except OwedError as exc:
                 notes.append(f"WAKE refused: {exc}")
-                continue
-            notes.append(timer.ack(now=time.time())
-                         + (f" (replaces {', '.join(replaced)})" if replaced else ""))
         if len(specs) > per_reply:
-            notes.append(f"WAKE refused: a reply may arm at most {per_reply} timers")
+            notes.append(f"WAKE refused: a reply may carry at most {per_reply} of them")
         notes.extend(f"WAKE refused: {reason}" for reason in reasons)
+        if rows:
+            try:
+                self.owed_store().save_all(rows)
+                said = [f"{ack(row)} — WAKE no longer arms a timer: write "
+                        f"`WAIT {row.kind} {row.subject} from {row.debtor}` next time"
+                        for row in rows]
+                notes.extend(said)
+            except Exception as exc:               # noqa: BLE001 - said back, not swallowed
+                logger.warning("WAKE: the rows could not be recorded", exc_info=True)
+                notes.extend(f"WAKE not recorded: {exc}" for _row in rows)
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
 

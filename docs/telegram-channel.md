@@ -1234,12 +1234,17 @@ the transport reads. Arming a `WAKE` still works on this release; retiring it, t
 watchdog and the separate hand-off reminders is the rest of #165, once the rows are what the
 swarm actually relies on.
 
-**Self-wake timers (issue #81).** A reply can arm a timer the transport fires without a model
-turn: `WAKE in=10m every=5m until=2h check="gh pr checks 75" then="merge it"`. The line is
-stripped like the other directives and answered with one line in the topic (`⏰ wake <id>: … at
-<first fire>, every 5m, until <expiry>`), so what will run and when is auditable. The check is
-parsed with `shlex`, run without a shell in the checkout the topic uses, and may only start with
-a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|list|status|diff`,
+**Self-wake timers (issue #81) — retired by `WAIT` (#165).** A `WAKE` line no longer arms
+anything. The transport reads it as the row that replaces it: the bot owes itself a look at what
+the check watched, with the check and the action written down (the item the check named, when it
+named one), and the guard's ladder (#164) and the wakes (#163) carry it from there, on facts. The
+ack says what row it became and names the `WAIT` line to write next time. Timers armed **before**
+this release still fire until they expire — the firing machinery, `/wakes`, the adoption rules and
+`check_coordinator_watch` are removed in the next slice of #165, so nothing new enters that path.
+
+*While a timer armed before the migration lasts*, it behaves as before, and this is what it
+did: the check was parsed with `shlex`, run without a shell in the checkout the topic uses, and
+could only start with a read-only prefix (`swarmly.telegram.wake.ALLOWED_ARGV`: `gh pr checks|view|list|status|diff`,
 `gh run view|list`, `gh api` GET only, `gh issue view`, `gh search`, and
 `git status|log|diff|show|rev-parse` — never `git fetch` or `git ls-remote`, whose `ext::`
 remotes run a command); `-X`/`--method`/`-f`/`--input`/`--output`, shell

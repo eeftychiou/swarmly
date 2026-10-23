@@ -467,10 +467,16 @@ written without a token cannot be attributed to a reply, so it is not joined —
 alone and its continuations start no turn. A peer that needs the full text of a long
 handoff should still read it from the durable record (`bus=`).
 
-### Self-wake timers (issue #81)
+### Self-wake timers (issue #81) — retired by `WAIT` (#165)
 
-A bot that must act later arms its own timer. It is a machine line in the reply, stripped before
-posting like the other directives:
+A bot that must act later **declares what it waits on**; `WAIT` (§ "The WAIT line") opens the row
+and the transport wakes it on the fact that answers it. A `WAKE` line no longer arms a timer: it
+is read as that row and answered with the `WAIT` to write instead (`docs/telegram-channel.md`).
+Timers armed before this release still fire until they expire, so the timer's own rules are kept
+here, in the past tense, until the firing machinery is removed (next slice of `#165`).
+
+A bot that must act later used to arm its own timer. It was a machine line in the reply, stripped
+before posting like the other directives:
 
 ```
 WAKE in=10m every=5m until=120m check="gh pr checks 75 --required" then="merge it if review and QA still hold"
@@ -531,9 +537,9 @@ same allowlist and the bot's `limits.wake_check_allow` before it is written or r
 `/wakes cancel <id>` drops one (admin only); `/status` carries `wakes=N`. A bot runs no check while
 it is frozen.
 
-**No silent promises.** A promise to act later is a WAKE armed in the same turn, not a sentence.
-The coordinator role says so: for a PR blocked only on CI, the coordinator arms the timer itself
-and does not count on an external CI wake.
+**No silent promises.** A promise to act later is a `WAIT` in the same turn, not a sentence. The
+coordinator role says so: for a PR blocked only on CI, the coordinator declares `WAIT ci #<n>
+head <sha>` itself and does not count on an external CI wake.
 
 ---
 
@@ -573,7 +579,7 @@ A participant conforms to v1.1 if it:
 - [ ] commits under its own identity
 - [ ] announces every escalation rung
 - [ ] carries its round state as a `ROUND_STATE` block that is stripped before posting (§7)
-- [ ] turns a promise to act later into a `WAKE` line in the same turn (§8)
+- [ ] turns a promise to act later into a `WAIT` line in the same turn (§8)
 
 ## Peer liveness: pulse and DOWN (issue #82)
 
