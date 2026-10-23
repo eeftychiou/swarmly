@@ -5159,10 +5159,18 @@ class AgentChannel:
                 return
             if not existing.is_open:
                 return
-            moved = (existing.observed != derived.observed
-                     or existing.flag != derived.flag)
-            existing.observed = derived.observed
-            existing.flag = derived.flag
+            moved = False
+            # ``observed`` is refreshed only where the sweep is the thing that observes: the
+            # gap it derives for a ``progress`` row (and for a row with nothing observed yet).
+            # Any other kind may be observed by another source -- #165's poll, a wake -- and a
+            # sweep that overwrote it would reset a live value to the one it opened with
+            # (#199 review).
+            if derived.observed and (derived.kind == "progress" or not existing.observed):
+                moved = existing.observed != derived.observed
+                existing.observed = derived.observed
+            if existing.flag != derived.flag:
+                moved = True
+                existing.flag = derived.flag
             existing.opened_by = derived.opened_by or existing.opened_by
             if moved:
                 existing.updated_at = moment
@@ -5186,11 +5194,15 @@ class AgentChannel:
         covered = {f"#{str(key).lstrip('#')}" for key, _item in open_items}
         for row in list(table.values()):
             if (row.kind == "progress" and row.key_extra == NEXT_ACTOR_KEY and row.is_open
-                    and row.item in covered and row.id not in keeping):
-                # The item found its actor (a new debtor, and a new row), or it gained a live
-                # row: the flag that says "nobody can act on it" is no longer true, and left
-                # open it would keep saying so for ever (#195 review).
-                row.state, row.closed_by = CLOSED, "the item's next actor is decided"
+                    and row.id not in keeping):
+                # The item found its actor (a new debtor, and a new row), gained a live row, or
+                # left the round: either way the flag that says "nobody can act on it" is no
+                # longer true, and left open it would keep saying so for ever (#195 review).
+                # An item that vanished or finished is exactly that case -- waiting for it to
+                # be "covered" again is waiting for ever (#199 review).
+                row.state = CLOSED
+                row.closed_by = ("the item's next actor is decided" if row.item in covered
+                                 else "the item is no longer open in the round")
                 row.updated_at = moment
                 closed.append(row)
         for row in orphaned:

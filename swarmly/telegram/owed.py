@@ -263,7 +263,9 @@ class Row:
         """
         text = f"{self.debtor} owes {self.owes}"
         if str(self.subject).lower() not in str(self.owes).lower():
-            text += f" on {self.subject}"
+            # "for", not a second "on": a verdict row read "owes a review verdict on 22e68c5
+            # on #170", two prepositions in one line (#199 review).
+            text += f" for {self.subject}"
         if self.waiting_on:
             text += f" ({self.waiting_on} waiting)"
         if self.observed:
