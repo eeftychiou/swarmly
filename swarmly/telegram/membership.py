@@ -1079,7 +1079,9 @@ class Membership:
         Live, 23 Oct: after the failover drill Reasonix was left a developer, Codex was frozen
         and Antigravity paused, so two PRs had no reviewer and only the admin could fix it.
         The coordinator now fills the gap itself. A line naming no peer, an unknown role or the
-        coordinator role stays in the reply as written and assigns nothing.
+        coordinator role stays in the reply as written and assigns nothing. A line past the
+        cap (``ROLE_LINES_PER_REPLY``) switches nothing either, so it is taken out of the
+        prose as well (#216): the group must not read an assignment that never landed.
         """
         if "ROLE:" not in (body or "").upper() or not self.is_coordinator():
             return body
@@ -1089,15 +1091,19 @@ class Membership:
         switched = 0
         for line in body.splitlines():
             found = _ROLE_LINE.match(line)
-            if found is not None and switched >= ROLE_LINES_PER_REPLY:
+            if found is None:
+                kept.append(line)
+                continue
+            if switched >= ROLE_LINES_PER_REPLY:
+                # #216: the line switched nothing, so it must not read as if it did.
                 logger.warning("membership: more than %d ROLE lines in one reply; the rest "
                                "switch nothing", ROLE_LINES_PER_REPLY)
-            elif found is not None:
-                handle, role = found.group(1), found.group(2).lower()
-                reason = " ".join(line[found.end():].strip(" :-—–").split())[:200]
-                if await self.assign(handle, role, reason=reason):
-                    switched += 1
-                    continue
+                continue
+            handle, role = found.group(1), found.group(2).lower()
+            reason = " ".join(line[found.end():].strip(" :-—–").split())[:200]
+            if await self.assign(handle, role, reason=reason):
+                switched += 1
+                continue
             kept.append(line)
         return "\n".join(kept)
 

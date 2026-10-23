@@ -743,6 +743,11 @@ class TrustTests(unittest.TestCase):
             roles = channel.config.peer_roles
             self.assertEqual((roles["Codex"], roles["Gem"], roles["Rex"]),
                              ("reviewer", "qa-tester", "developer"))
+            # #216: the line past the cap switched nothing, so it is not in the prose either.
+            texts = [r["text"] for r in channel._test_sender.sent]
+            self.assertFalse(any("ROLE: @rex_x_bot" in t for t in texts))
+            self.assertTrue(any("intent=ROLE ref=reviewer" in t for t in texts))
+            self.assertTrue(any("intent=ROLE ref=qa-tester" in t for t in texts))
 
     def test_a_peers_role_line_switches_nothing(self):
         with tempfile.TemporaryDirectory() as folder:
