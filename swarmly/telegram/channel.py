@@ -4342,6 +4342,27 @@ class AgentChannel:
         except Exception:                              # noqa: BLE001 - no answer is no authority
             return False
 
+    async def _acting_coordinator(self) -> bool:
+        """Whether this turn runs with the coordinator's rights (the lease, read off the loop).
+
+        The read can touch the bus, so it goes to a worker thread -- and it is **bounded**: a
+        bus that is gone must cost a turn nothing, so a slow read answers False ("no answer is
+        no authority", the same rule `_holds_lease` keeps). Without the bound, one wedged read
+        left every later turn waiting on the default executor: the CI jobs for #208 were
+        cancelled at 15 m with the last line on a cooldown hold.
+        """
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(self._holds_lease),
+                                          timeout=LEASE_READ_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("lease: the read took over %.0fs; this turn is guarded by %s",
+                           LEASE_READ_SECONDS, self.config.identity.role or "its role")
+            return False
+        except Exception:                          # noqa: BLE001 - no answer is no authority
+            logger.debug("lease: the read failed; this turn is guarded by the role",
+                         exc_info=True)
+            return False
+
     def _forget_lease_cache(self) -> None:
         """Drop the cached fold: after this bot writes a claim, its own view must not be stale."""
         self.__dict__["_cached_lease_state"] = None
@@ -7289,7 +7310,7 @@ class AgentChannel:
                        event: ChannelEvent) -> Optional[AdapterReply]:
         """Run the adapter as a cancellable task, with a typing indicator while it works."""
         adapter = self._adapter_for(event.chat_id, event.thread_id)
-        adapter.acting_coordinator = await asyncio.to_thread(self._holds_lease)
+        adapter.acting_coordinator = await self._acting_coordinator()
         turn = asyncio.ensure_future(adapter.respond(incoming))
         self._current_turn = turn
         self._turns.add(turn)
@@ -9567,6 +9588,9 @@ REASSIGN_NOTE = ("{alias} has not answered your hand-off in this topic for {minu
                  "has not said it is busy, so it may be down. Decide what happens to the work "
                  "now: hand it to another peer whose role fits, or do it yourself, and say so "
                  "here. If it can wait for {alias}, reply exactly NO_REPLY.")
+#: How long a turn will wait for the lease before it is guarded by its configured role (#208).
+LEASE_READ_SECONDS = 5.0
+
 #: A WAKE timer overdue by more than this is not a live promise: it is not counted as one, and
 #: past its until= it is retired without a turn (live, round 5: ten day-old copies blocked a merge).
 WAKE_STALE_SECONDS = 3600.0

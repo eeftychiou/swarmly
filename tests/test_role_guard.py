@@ -202,7 +202,10 @@ class TestTheFlagLastsOneTurn(unittest.TestCase):
 
         adapter = Adapter()
         channel._adapter_for = lambda chat, thread: adapter
-        channel._holds_lease = lambda: True
+
+        async def holding() -> bool:            # the turn runs with the coordinator's rights
+            return True
+        channel._acting_coordinator = holding
         incoming = SimpleNamespace(author_alias="admin", context_id="c", text="hi")
         asyncio.run(channel._respond(incoming, event("hi")))
         self.assertEqual(seen, [True])

@@ -118,6 +118,15 @@ def make_channel(config: AgentConfig = None, adapter=None, **kwargs):
         return None                    # never the real repo's PR state (#190 review)
 
     channel.wake_subject_reader = no_subject
+    # #208: the channel asks the lease, each turn, whether this bot acts as the coordinator.
+    # That read hops to a worker thread, which is one real thread wake-up inside every turn --
+    # and these tests drive concurrency with a virtual clock and a fixed number of loop
+    # turns, so a nondeterministic hop can leave a hold still waiting and the whole run
+    # hanging on the real cooldown (the CI jobs were cancelled at 15 m). The lease guard is
+    # not what any of them are about; the tests that are about it set this themselves.
+    async def no_lease() -> bool:
+        return False
+    channel._acting_coordinator = no_lease
     channel._test_slept = slept
     channel._test_clock = clock_state
     return channel

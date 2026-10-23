@@ -360,6 +360,12 @@ class ChannelTests(unittest.TestCase):
             sleeping.append((seconds, future))
             await future
 
+        # Before any message, not after: a hold that has already called the real
+        # ``asyncio.sleep(60)`` cannot be hurried by patching later, and on CI that was the
+        # difference between this test finishing and the whole job being cancelled at 15m
+        # (#208: the last log line was the cooldown hold).
+        channel._sleep = newest_first
+
         async def scenario():
             tasks = [asyncio.ensure_future(channel.handle_event(human("@HermesBot task")))]
             await settle()
@@ -367,16 +373,16 @@ class ChannelTests(unittest.TestCase):
                 tasks.append(asyncio.ensure_future(
                     channel.handle_event(event(f"@HermesBot p{n}", message_id=1 + n))))
                 await settle()
-            channel._sleep = newest_first
             gate.release.set()
-            for _ in range(20):
+            for _ in range(200):                 # until every held message has been woken
                 await settle()
                 pending = [(s, f) for s, f in sleeping if not f.done()]
-                if not pending:
+                if pending:
+                    channel._test_clock["t"] += max(s for s, _ in pending)
+                    pending[-1][1].set_result(None)
+                elif all(task.done() for task in tasks):
                     break
-                channel._test_clock["t"] += max(s for s, _ in pending)
-                pending[-1][1].set_result(None)
-            await asyncio.gather(*tasks)
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=30)
         run(scenario())
         self.assertEqual([m.text for m in gate.seen],
                          ["@HermesBot task", "@HermesBot p1", "@HermesBot p2", "@HermesBot p3"])
