@@ -521,6 +521,22 @@ starts a turn, and neither does a peer's message that opens with another bot's h
 names this bot only as whom to hand the work to ("@a_bot please hand @b_bot a task" addresses
 `a_bot`).
 
+**A message that asks several bots is one hand-off per bot (#181).** A peer's message naming two
+or more bots, each with a request of its own -- its own line or bullet, or an opening run of
+handles that shares one sentence ("@a @b: please review this") -- is split instead of refused.
+Every named bot reads the shared context plus the lines that name it, so it does its own share
+and no one else's; the others' asks are dropped from its brief, not from the message. The
+delegation above keeps its teeth: a message that asks **one** bot and mentions another only as
+who should receive the work is still that one bot's. The test is in code, not in a model's
+reading (`swarmly/telegram/handoff_split.py`): a bot has a request when its words carry a
+politeness word, a question mark, or one of the verbs the swarm uses (`review`, `QA`, `push`,
+`fix`, `merge`, …) **in the first sentence after its handle** — a question two sentences on
+belongs to whoever that sentence is for. A line is split too, not just a message: two asks on
+one line (`@a: review it. @b: QA it.`) give each bot its own half, while a line that *opens*
+with a run of handles (`@a @b: review #195 and QA it today`) is one sentence shared whole by
+both — nothing is cut from it. A line that only *mentions* another bot is context every
+recipient keeps.
+
 **Loop brake:** a forum topic takes at most `limits.max_peer_turns_per_topic` (default 8; it was 3, which a round of questions to four bots tripped in a live test)
 turns in a row that a peer bot started, explicit mentions included. Visible progress resets
 the run: a swarm message naming an issue, PR or commit (a commit link or a short SHA such as
