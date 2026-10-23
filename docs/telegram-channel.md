@@ -736,12 +736,14 @@ which issue or PR is kept in `topic-refs-<alias>.json` beside the other state, s
 a restart; an item nobody mentions for a week, or whose topic is closed, is let go. An agent's
 answer to bus mail whose hand-off names no topic is posted in the topic about its issue or PR
 when there is one, else in General. Short answers stay in General. The same holds between
-topics: a reply posted in one topic that names only issues or PRs another topic is about goes
+topics: a reply to another bot posted in one topic that names only issues or PRs another topic
+is about goes
 to that topic, with a "↪ moved this to" link where it was asked, so work that started in the
 wrong topic follows its items instead of staying put. A number no topic is about yet (a new
 issue) neither holds the reply nor moves it, and is learned in the topic the reply went to. A
 reply that also names an item of its own topic, items of two other topics, or only new
-numbers, stays. When an item was learned in the wrong topic,
+numbers, stays, and so does every answer to a person: a question is answered in the topic it
+was asked in. When an item was learned in the wrong topic,
 the admin's `/topic #164 #165` inside the right one moves it there for every bot. A
 summary sent back with `REPORT_BACK:` has its @mentions defused, and a peer bot's message
 that names this bot only inside a list of three or more bots is not taken as addressing it. Set it to

@@ -7521,8 +7521,15 @@ class AgentChannel:
         Round 5 topic for hours). The reply goes where its items live, and the next message
         follows it. Conservative: every issue or PR the reply names that a topic is about must
         map to the same other topic; a reply naming one of this topic's items, items of two
-        other topics, or only numbers no topic knows, stays."""
+        other topics, or only numbers no topic knows, stays.
+
+        Only work between bots moves. A person's question is answered where it was asked (the
+        admin, 23 Oct: "what is the difference between hold and pause?", asked in Round 5, was
+        answered in Round 5.5 because the answer named #218, and the bot there had none of the
+        conversation)."""
         home = self.config.identity.home_channel_id
+        if not event.author_is_bot:
+            return None
         if not getattr(self.config.limits, "work_in_topics", False) or home is None \
                 or event.thread_id is None or int(event.chat_id) != int(home) \
                 or is_command_reply(body) or parse_report_back(body) is not None:

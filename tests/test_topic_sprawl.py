@@ -18,6 +18,11 @@ from tests.test_telegram_channel import GROUP, event, make_channel, make_config,
 from tests.test_topic_open import Scripted, TopicBot, ask, drain
 
 
+def peer(text, **kw):
+    """A message from another bot: work between bots follows its topic."""
+    return event(text, **kw)
+
+
 class TestTheTopicMapSurvivesARestart(unittest.TestCase):
 
     def test_a_restarted_bot_still_knows_the_topic_about_a_pr(self):
@@ -186,9 +191,18 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
     def _sent_in(self, channel, thread_id):
         return [text for where, text in channel.sent_where if where == thread_id]
 
-    def test_a_reply_about_another_topics_item_moves_there(self):
+    def test_a_persons_question_is_answered_where_it_was_asked(self):
+        # The admin, 23 Oct: a question asked in Round 5 was answered in Round 5.5 because the
+        # answer named an item that lives there, and the bot there had none of the context.
         channel = self._channel("@CodexBot QA on #37 passed at abc1234, over to you.")
         run(channel.handle_event(ask("@HermesBot where is #37?", thread_id=88, message_id=5)))
+        self.assertTrue(any("QA on #37 passed" in t for t in self._sent_in(channel, 88)))
+        self.assertEqual(self._sent_in(channel, 77), [])
+        self.assertFalse(any(t.startswith("↪ moved") for t in self._sent_in(channel, 88)))
+
+    def test_a_reply_about_another_topics_item_moves_there(self):
+        channel = self._channel("@CodexBot QA on #37 passed at abc1234, over to you.")
+        run(channel.handle_event(peer("@HermesBot where is #37?", thread_id=88, message_id=5)))
         self.assertTrue(any("QA on #37 passed" in t for t in self._sent_in(channel, 77)))
         here = self._sent_in(channel, 88)
         self.assertTrue(any(t.startswith("↪ moved this to") for t in here), here)
@@ -196,7 +210,7 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
 
     def test_a_reply_naming_this_topics_item_too_stays(self):
         channel = self._channel("#37 passed QA, and #41 waits on the admin.")
-        run(channel.handle_event(ask("@HermesBot status?", thread_id=88, message_id=5)))
+        run(channel.handle_event(peer("@HermesBot status?", thread_id=88, message_id=5)))
         self.assertTrue(any("#41 waits" in t for t in self._sent_in(channel, 88)))
         self.assertEqual(self._sent_in(channel, 77), [])
 
@@ -204,7 +218,7 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
         # Live, 22 Oct: "@DeepSeek take #181 next" kept a post about four round 5.5 items in
         # Round 5, because nobody had talked about #181 yet.
         channel = self._channel("#37 passed QA; @CodexBot take #99 next.")
-        run(channel.handle_event(ask("@HermesBot status?", thread_id=88, message_id=5)))
+        run(channel.handle_event(peer("@HermesBot status?", thread_id=88, message_id=5)))
         self.assertTrue(any("take #99 next" in t for t in self._sent_in(channel, 77)))
         self.assertEqual(channel.topic_for_text("#99"), (GROUP, 77))   # learned where it went
 
@@ -212,7 +226,7 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
         # Learning where a reply went must not re-point an item a third topic is about.
         channel = self._channel("#37 passed QA; #41 waits; @CodexBot take #99 next.")
         channel._learn_topic_refs(GROUP, 99, "#55 tracking")
-        run(channel._post_in_known_topic(ask("x", thread_id=99, message_id=5),
+        run(channel._post_in_known_topic(peer("x", thread_id=99, message_id=5),
                                          "#37 and #55 and #99", (GROUP, 77)))
         self.assertEqual(channel.topic_for_text("#55"), (GROUP, 99))
         self.assertEqual(channel.topic_for_text("#99"), (GROUP, 77))
@@ -220,13 +234,13 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
     def test_a_reply_with_only_unknown_or_no_numbers_stays(self):
         for reply in ("#98 and #99 are done.", "All quiet here."):
             channel = self._channel(reply)
-            run(channel.handle_event(ask("@HermesBot status?", thread_id=88, message_id=5)))
+            run(channel.handle_event(peer("@HermesBot status?", thread_id=88, message_id=5)))
             self.assertTrue(any(reply in t for t in self._sent_in(channel, 88)), reply)
             self.assertEqual(self._sent_in(channel, 77), [])
 
     def test_a_reply_in_the_items_own_topic_stays(self):
         channel = self._channel("#37 passed QA.")
-        run(channel.handle_event(ask("@HermesBot status?", thread_id=77, message_id=5)))
+        run(channel.handle_event(peer("@HermesBot status?", thread_id=77, message_id=5)))
         here = self._sent_in(channel, 77)
         self.assertTrue(any("#37 passed QA." in t for t in here), here)
         self.assertFalse(any(t.startswith("↪") for t in here), here)
@@ -237,7 +251,7 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
         self.assertEqual(channel.topic_for_text("#37"), (GROUP, 88))
         self.assertTrue(any(t.startswith("📌 #37 live in this topic")
                             for t in self._sent_in(channel, 88)))
-        run(channel.handle_event(ask("@HermesBot status?", thread_id=77, message_id=5)))
+        run(channel.handle_event(peer("@HermesBot status?", thread_id=77, message_id=5)))
         self.assertTrue(any("#37 passed QA." in t for t in self._sent_in(channel, 88)))
 
     def test_only_the_admin_moves_items_and_other_bots_apply_it_silently(self):
