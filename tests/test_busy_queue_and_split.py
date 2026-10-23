@@ -21,6 +21,12 @@ from tests.test_telegram_channel import (ADMIN_ID, _GatedAdapter, _token, event,
                                          make_config, run)
 
 
+def own_part(reply):
+    """The reply without the quote of an earlier answer a waiting message is shown."""
+    marker = "Otherwise answer only what it does not cover.]"
+    return reply.rsplit(marker, 1)[1] if marker in reply else reply
+
+
 def gated(**limits):
     channel = make_channel(make_config(limits=limits) if limits else None)
     adapter = _GatedAdapter("Hermes")
@@ -81,7 +87,7 @@ class TestBusyQueue(unittest.TestCase):
     def test_queued_messages_run_in_arrival_order(self):
         channel, adapter = gated()
         hold_and_send(channel, adapter, self.TEXTS)
-        replies = [sent["text"] for sent in channel._test_sender.sent]
+        replies = [own_part(sent["text"]) for sent in channel._test_sender.sent]
         order = [next(i for i, text in enumerate(self.TEXTS) if text.split(": ")[1] in reply)
                  for reply in replies[1:]]
         self.assertEqual(order, [0, 1, 2])
@@ -94,6 +100,18 @@ class TestBusyQueue(unittest.TestCase):
         where = [reply.index(text.split(": ")[1]) for text in self.TEXTS]
         self.assertEqual(where, sorted(where))
         self.assertIn("arrived while your last turn ran", reply)
+
+    def test_a_queued_message_sees_the_reply_posted_while_it_waited(self):
+        """Round 5.5 (23 Oct): about a third of the topic was second answers -- the waiting
+        message was answered again by a bot that never saw its own reply. Now that reply is
+        quoted and the bot may answer NO_REPLY."""
+        channel, adapter = gated(max_peer_turns_per_topic=0)
+        hold_and_send(channel, adapter, self.TEXTS[:1], thread_id=4)
+        self.assertEqual(adapter.calls, 2)
+        follow_up = [sent["text"] for sent in channel._test_sender.sent][-1]
+        self.assertIn("you already posted in this discussion", follow_up)
+        self.assertIn("hold the turn open", follow_up)        # the earlier reply, quoted
+        self.assertIn("NO_REPLY", follow_up)
 
     def test_a_full_queue_holds_the_overflow_and_every_message_is_answered(self):
         """#184's acceptance: overfill the queue and see every message answered, in order.
@@ -111,7 +129,7 @@ class TestBusyQueue(unittest.TestCase):
         # The call that overflowed returned None: its message did not run *there*, it ran as a
         # held turn of its own once the queue drained -- which is what `adapter.calls` shows.
         self.assertIsNone(results[3])
-        replies = [sent["text"] for sent in channel._test_sender.sent]
+        replies = [own_part(sent["text"]) for sent in channel._test_sender.sent]
         order = [next(i for i, text in enumerate(self.TEXTS) if text.split(": ")[1] in reply)
                  for reply in replies[1:] if any(text.split(": ")[1] in reply
                                                 for text in self.TEXTS)]

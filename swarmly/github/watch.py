@@ -945,11 +945,24 @@ class GitHubWatcher:
                 else:
                     turn_text = f"GitHub notification ({notif.reason}): {user} on {repo}#{num}: {snippet}"
 
+                # The topic already about this issue or PR gets the turn, not the project's
+                # default (General when no topic is bound): live, round 5.5, a CI failure on
+                # #230 was answered in General while the PR's work ran in its round topic.
+                where = (chat_id, thread_id)
+                finder = getattr(self.channel, "topic_for_text", None)
+                if callable(finder) and num is not None:
+                    try:
+                        found = finder(f"#{num}")
+                        if isinstance(found, tuple) and len(found) == 2:
+                            where = (int(found[0]), found[1])
+                    except Exception:                       # noqa: BLE001 - keep the default
+                        logger.debug("github: no topic lookup for #%s", num, exc_info=True)
+                turn_chat, turn_thread = where
                 try:
-                    ctx_ok = self._run_turn_precheck(chat_id, thread_id, notif, outcome)
+                    ctx_ok = self._run_turn_precheck(turn_chat, turn_thread, notif, outcome)
                     if not ctx_ok:
                         continue
-                    reply = await self._run_turn(project, chat_id, thread_id, turn_text)
+                    reply = await self._run_turn(project, turn_chat, turn_thread, turn_text)
                     if not getattr(reply, "ok", True):
                         # The runtime failed the turn (2.12): the notification stays unread so
                         # the next poll retries it -- not marked read, not marked processed --
@@ -979,7 +992,7 @@ class GitHubWatcher:
                     if self.config.github.mark_read:
                         self.client.mark_notification_read(notif.id)
                     outcome.turns_queued += 1
-                    outcome.delivered_topics.append((chat_id, thread_id))
+                    outcome.delivered_topics.append((turn_chat, turn_thread))
                 except Exception as exc:
                     outcome.errors.append(f"notification {notif.id}: {exc}")
                     logger.exception("failed to process notification %s: %s", notif.id, exc)

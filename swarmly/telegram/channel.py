@@ -41,7 +41,7 @@ import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -4823,12 +4823,38 @@ class AgentChannel:
             try:
                 self.owed_store().save_all(rows)
                 notes.extend(ack(row) for row in rows)
+                self._watch_ci_rows(rows, event)
             except Exception as exc:               # noqa: BLE001 - said back, not swallowed
                 logger.warning("WAIT: the rows could not be recorded", exc_info=True)
                 notes.extend(f"WAIT not recorded: {exc}" for _row in rows)
         notes.extend(f"WAIT refused: {reason}" for reason in reasons)
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
+
+    def _watch_ci_rows(self, rows: Sequence[Any], event: ChannelEvent) -> None:
+        """A ``WAIT ci #n`` row is a wait on that PR's checks: watch them, so the bot that
+        wrote it gets a turn when they finish. Live, round 5.5 (23 Oct): the row said "CI owes
+        a result", CI is no bot, and the round's last merge waited an hour for a person. A bare
+        ``#n`` only watched in a topic bound to a project; the round topic was not."""
+        if not self.config.github or self.config.github.poll_minutes <= 0:
+            return
+        project = self.router.project_for(event.chat_id, event.thread_id)
+        if project is None and len(self.config.projects) == 1:
+            project = next(iter(self.config.projects.values()))    # the swarm's one repo
+        repo = getattr(project, "repo", "") if project is not None else ""
+        if not repo:
+            return
+        from swarmly.github.watch import register_ci_watch
+        for row in rows:
+            number = str(row.item or "").lstrip("#")
+            if row.kind != "ci" or not number.isdigit():
+                continue
+            try:
+                register_ci_watch(self.config, repo, int(number), int(event.chat_id),
+                                  event.thread_id, project=getattr(project, "key", None))
+            except Exception:                              # noqa: BLE001 - the row stands
+                logger.warning("WAIT: could not watch %s#%s for CI", repo, number,
+                               exc_info=True)
 
     def apply_memory_block(self, text: str, event: ChannelEvent) -> str:
         """Take a ``MEMORY:`` block out of a reply and save it as this bot's lessons (#226).
@@ -4994,6 +5020,10 @@ class AgentChannel:
         # name the ones no row owes -- #146 at 09:13, where nothing said the round was stuck.
         open_items: List[Any] = []
         heads: Dict[str, str] = {}
+        # An item is tracked under its issue (#227) but its rows are often written under its
+        # PR (#230: "WAIT merge #230 at <sha>"). The facts are said under both, or a merged PR
+        # keeps "Reasonix owes a merge" open for ever (round 5.5, 23 Oct).
+        pr_labels: Dict[str, str] = {}
         for key in keys:
             try:
                 state = rounds.load(key)
@@ -5007,6 +5037,9 @@ class AgentChannel:
                 if not item:
                     continue
                 label = f"#{item_key}"
+                pr = str(item.get("pr") or "").strip().lstrip("#")
+                if pr.isdigit() and f"#{pr}" != label:
+                    pr_labels[label] = f"#{pr}"
                 head = str(item.get("head") or "").strip().lower()
                 if head:
                     heads[label] = head
@@ -5104,6 +5137,8 @@ class AgentChannel:
         for row in fresh:
             learn(row)
         closed: List[Row] = []
+        facts = facts + [dataclasses.replace(fact, item=pr_labels[fact.item])
+                         for fact in facts if fact.item in pr_labels]
         for fact in facts:
             closed.extend(settle(list(table.values()), fact))
         # #164's orphan invariant, on the table **as the facts leave it**: a CI row this very
@@ -6528,6 +6563,7 @@ class AgentChannel:
         busy = lock.locked() or (self._turn_slots is not None and self._turn_slots.locked())
         queued = False
         queue_seq = 0
+        queued_at = 0.0
         busy_key = topic_key
         if busy and self.replies is None and self._may_queue(busy_key):
             # Ported from ductor's per-chat queue: hold the message and run it as soon as the
@@ -6539,6 +6575,7 @@ class AgentChannel:
             logger.info("turn in progress for %s; queued message from @%s (%d waiting)",
                         self.config.identity.alias, event.author_username, self._busy_waiting)
             queue_seq = self._queue_seq[busy_key] = self._queue_seq.get(busy_key, 0) + 1
+            queued_at = self._clock()
             await self._busy_notice(event, busy_key)
         elif busy and self.replies is None:
             # #9: with busy_behavior drop/notice, or a full queue, an addressed message that
@@ -6731,6 +6768,8 @@ class AgentChannel:
                             event.author_username)
                 return None
             incoming = self._with_folded(incoming, busy_key)
+            if queued:
+                incoming = self._with_answered_note(incoming, event, queued_at)
             # A queued peer message still inside the bot-to-bot cooldown waits it out once,
             # without holding the turn: other messages and topics go on meanwhile. It then
             # runs even if turns ran in between, so a busy chat cannot starve it.
@@ -7968,6 +8007,28 @@ class AgentChannel:
     def _log_topic(self, chat_id: int, thread_id: Optional[int], who: str, text: str,
                    message_id: Optional[int]) -> None:
         self._topic_memory.record(chat_id, thread_id, who, text, message_id)
+        if who == self.config.identity.alias:
+            self.__dict__.setdefault("_own_last", {})[(chat_id, thread_id)] = (
+                self._clock(), text or "")
+
+    def _with_answered_note(self, incoming: IncomingMessage, event: ChannelEvent,
+                            queued_at: float) -> IncomingMessage:
+        """A message that waited behind a turn whose reply was posted *after* it arrived: show
+        that reply, and let the bot stay silent when it already answers.
+
+        Round 5.5 (23 Oct): about a third of the topic was second answers. The waiting
+        message's prompt was built before the turn ahead of it posted, so a fresh session never
+        saw its own reply and said it again ("already fixed -- your note predates the push")."""
+        last = self.__dict__.get("_own_last", {}).get((event.chat_id, event.thread_id))
+        if not last or last[0] < queued_at or not last[1].strip():
+            return incoming
+        lead = ("[While this message waited, you already posted in this discussion:\n> "
+                + last[1].strip()[:1500].replace("\n", "\n> ")
+                + "\nIf that reply already answers everything below, output exactly NO_REPLY. "
+                "Otherwise answer only what it does not cover.]\n\n")
+        return dataclasses.replace(
+            incoming, text=lead + (incoming.text or ""),
+            fresh_text=lead + incoming.fresh_text if incoming.fresh_text else None)
 
     def _topic_recap(self, event: ChannelEvent) -> str:
         """What the discussion is about, before the new message. A runtime that starts every

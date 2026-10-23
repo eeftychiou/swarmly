@@ -228,6 +228,23 @@ class TestTheTransportRecordsIt(unittest.TestCase):
         self.assertNotIn("WAIT review", said)                 # never posted as prose
         self.assertIn("Reviewed the head.", said)
 
+    def test_a_ci_wait_watches_the_prs_checks(self):
+        """Live, round 5.5 (23 Oct): "CI owes a result" woke nobody when CI finished, and the
+        round's last merge waited an hour for a person. The row now registers a CI watch, so
+        the bot that wrote it gets a turn when the checks finish -- in an unbound topic too."""
+        from unittest import mock
+        from tests.test_telegram_channel import make_config
+        channel = self.channel()
+        configured = make_config(github={"login": "bot", "poll_minutes": 5},
+                                 projects={"swarmly": {"repo": "owner/swarmly"}})
+        channel.config.github = configured.github
+        channel.config.projects = configured.projects
+        with mock.patch("swarmly.github.watch.register_ci_watch") as watch:
+            channel.apply_wait_lines("Waiting.\nWAIT ci #230 head 474778a", self.event())
+        watch.assert_called_once()
+        repo, number, chat, thread = watch.call_args.args[1:5]
+        self.assertEqual((repo, number, chat, thread), ("owner/swarmly", 230, GROUP, 307))
+
     def test_a_refused_line_says_why_and_records_nothing(self):
         channel = self.channel()
         said = channel.apply_wait_lines("Here it is.\nWAIT review #191", self.event())

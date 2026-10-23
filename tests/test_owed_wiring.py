@@ -316,6 +316,16 @@ class TestTheRoundStateSweep(unittest.TestCase):
         self.sweep(channel, {"173": self.item(state="merged")})
         self.assertEqual([row for row in rows(channel) if row.is_open], [])
 
+    def test_a_merged_item_closes_the_rows_written_under_its_pr_number(self):
+        """Round 5.5 (23 Oct): #227 merged as PR #230, and "WAIT merge #230" stayed open --
+        the item is tracked under its issue, the WAIT line named the PR."""
+        channel = self.channel()
+        store = channel._test_table[1]
+        store.save_all([ow.Row(kind="merge", item="#230", head="474778a", debtor="Reasonix",
+                               owes="a merge", created_at=900.0, updated_at=900.0)])
+        self.sweep(channel, {"227": self.item(pr=230, head="474778a", state="merged")})
+        self.assertEqual([row.id for row in rows(channel) if row.is_open], [])
+
     def test_an_unreadable_round_opens_nothing(self):
         channel = self.channel()
         self.sweep(channel, {"173": self.item()}, status="unreadable")

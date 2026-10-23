@@ -228,6 +228,30 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
             reloaded = NotificationState.load(state_file)
             self.assertTrue(reloaded.is_processed("n42"))
 
+    async def test_a_notification_goes_to_the_topic_already_about_its_item(self):
+        """Round 5.5 (23 Oct): a CI failure on #230 was answered in the project's default
+        place while the PR's work ran in its round topic."""
+        with TemporaryDirectory() as tmp:
+            cfg = make_test_config(tmp, poll_minutes=5)
+            mock_client = MagicMock(spec=GitHubClient)
+            mock_client.notifications.return_value = [
+                Notification(id="n230", reason="ci_activity", repo="example-org/webapp",
+                             subject_title="CI failed", subject_type="Issue",
+                             subject_url="https://api.github.com/repos/example-org/webapp/issues/230",
+                             number=230, updated_at="2026-10-23T17:49:00Z")]
+            mock_client.issue_view.return_value = Issue(number=230, title="CI failed", body="x",
+                                                        author="bob", state="OPEN")
+            fake_channel = MagicMock()
+            fake_channel._adapter_for.return_value = FakeAdapter()
+            fake_channel.has_recent_ref.return_value = False
+            fake_channel.topic_for_text.return_value = (-1001234567890, 9400)
+            fake_channel.send = AsyncMock()
+            watcher = GitHubWatcher(cfg, client=mock_client, state_path=Path(tmp) / "s.json",
+                                    channel=fake_channel)
+            outcome = await watcher.poll_once()
+            fake_channel.topic_for_text.assert_called_with("#230")
+            self.assertEqual(outcome.delivered_topics, [(-1001234567890, 9400)])
+
     def test_channel_has_recent_ref_detection(self):
         with TemporaryDirectory() as tmp:
             cfg = make_test_config(tmp)
