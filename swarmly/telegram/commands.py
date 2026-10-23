@@ -35,6 +35,7 @@ MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("owed", "What is owed right now: the open rows"),
     ("model", "Show or set the model for this topic"),
     ("reasoning", "Show or set the reasoning effort for this topic"),
+    ("memory", "Admin: show this bot's memory.md, or clear it"),
     ("role", "Show or set a bot's role"),
     ("ping", "Check that the bot answers"),
     ("where", "Where this bot runs"),

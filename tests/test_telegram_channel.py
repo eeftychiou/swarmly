@@ -2434,7 +2434,11 @@ class TestTheCommandMenu(unittest.TestCase):
         self.assertEqual(run(channel._register_command_menu()), "registered")
         self.assertEqual(channel.bot.set_calls, [[name for name, _ in MENU_COMMANDS]])
         self.assertTrue(channel.bot.deleted)                # the scoped list that shadowed it
-        self.assertNotIn("memory", channel.bot.set_calls[0])
+        # #226: the menu is now swarmly's own, /memory included -- the stale description from
+        # another tool ("Show main memory") is gone, and /memory is ours.
+        self.assertNotIn("cron", channel.bot.set_calls[0])
+        self.assertIn("memory", channel.bot.set_calls[0])
+        self.assertIn(("memory", "Admin: show this bot's memory.md, or clear it"), MENU_COMMANDS)
 
     def test_an_unchanged_menu_is_left_alone(self):
         from swarmly.telegram.commands import MENU_COMMANDS

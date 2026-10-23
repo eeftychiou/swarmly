@@ -165,6 +165,8 @@ limits:
   max_peer_turns_per_topic: 8          # peer-started turns in a row per forum topic without progress (a new issue/PR/commit, a merge) until a human posts (0 = no cap)
   work_in_topics: true                 # General is for setup: bots' work there (and long answers) moves to its own topic
   handoff_nudge_minutes: 10            # a hand-off with no answer: remind its bot, then the admin at twice this; 0 = off
+  memory_every_turns: 10               # every this many turns, ask the bot to update its memory.md (its own lessons, read into every turn)
+  memory_max_bytes: 2048               # cap on that file, in UTF-8 bytes: a bigger block is refused (the old memory stays), never cut
   typing_indicator: true               # show "typing…" while a turn runs
   ack_reaction: true                   # react 👀 to a person's message when a turn starts on it
   max_attachment_mb: 20                # incoming files above this size are not downloaded

@@ -635,6 +635,33 @@ coordinator, then the admin — so an idle coordinator is woken by a **fact abou
 by a timer, and the wake names the item it is about. `limits.coordinator_watch_minutes` is
 removed; a config that still sets it gets an `unknown key, ignored` note from
 `swarmly-telegram check`, not a silent no-op.
+**Each bot keeps its own lessons — `memory.md` (#226).** Roles are dynamic and a round runs for
+weeks, so a bot that learns something keeps it: a small Markdown file per bot, written by the
+bot, read back into every turn.
+
+- **Where.** `memory-<alias>.md` in the transport's state folder, beside `topics-<alias>.json`.
+  It is the bot's own: private to that bot, never in the repository, never committed, never on
+  the bus.
+- **Read.** Its contents ride in the **per-turn** prompt as a short *Your lessons so far* block
+  (not the system prompt, which is cached and fixed, and this file changes).
+- **Written.** Every `limits.memory_every_turns` turns (default **10**, counted beside the file
+  so a restart does not restart the count) the turn carries one extra instruction: update the
+  memory, keep the lessons that held, add what was learned, drop what proved wrong. The bot
+  answers with a block that starts on a line `MEMORY:` and ends at `END MEMORY` (or at the end
+  of the reply). The transport takes the block **out of the reply** — like a `WAIT` line or a
+  `ROUND_STATE` block, it is never posted — and saves it.
+- **Cap, in code.** `limits.memory_max_bytes` (default **2048**, counted in UTF-8 bytes). A
+  block over it is **refused**: the old memory stays, and the bot is told the size it wrote and
+  the cap it must fit, with the refusal in its own reply so it knows to compress. Nothing is
+  ever truncated silently — a half-cut lesson reads as a whole one. A memory already over the
+  cap (because the cap was lowered) is shown cut to the cap with a line saying so, since the bot
+  cannot compress what it cannot see.
+- **Lessons, not logs.** The instruction says so: one line each, what happened and what to do
+  next time.
+- **The admin.** `/memory@bot` shows the file; `/memory@bot clear` empties it (admin only — see
+  [`telegram/AUTHZ.md`](telegram/AUTHZ.md)). Nothing else reads it: peers see a bot's lessons
+  only if that bot repeats them.
+
 **A bot that dies says nothing, so the swarm listens for its pulse.** Every transport writes one
 heartbeat every `limits.heartbeat_minutes` (default 2) carrying its revision, term, role and,
 while a turn is running, `busy_since`. It is a silent Telegram line (`limits.heartbeat_plane:
