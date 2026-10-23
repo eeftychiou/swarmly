@@ -24,6 +24,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- The `WAIT` line (round 5.5 `#165`, first slice): a reply says what it waits on — `WAIT review
+  #133 head 38f1977 from Reasonix`, `WAIT ci #173 head 9fb2f21`, `WAIT answer on the Drive
+  credentials` — and the transport opens the matching row (verdict, CI, merge, progress, the
+  admin's answer) with no timer and no check. A malformed line is refused in the reply with the
+  shape that would work, and the line is stripped either way. `WAKE` still arms on this release;
+  retiring it, the coordinator watchdog and the separate reminders is the rest of `#165`.
 - A verdict is kept **once per head** (`#185`): the round state already holds the fact, so a
   repeated `review`/`qa` verdict — same `verdict`, `sha` and `by`, even with a newer `at` — writes
   no new segment and is logged as suppressed instead of restated. A verdict on a new head, or

@@ -1209,6 +1209,28 @@ recorded while running: a per-chat ledger keeps them with their timestamps and p
 past 48 h, and the dry run says how many it can no longer reach. Older General messages stay
 the admin's to delete by hand.
 
+**The WAIT line (round 5.5, #165).** A reply can say what it is waiting for, and the transport
+turns it into a row — no timer, no check, nothing the model has to remember:
+
+```
+WAIT review #133 head 38f1977 from Reasonix
+WAIT ci #173 head 9fb2f21
+WAIT merge #173 head b40f3ae from Claudebot
+WAIT progress #166 from Antigravity
+WAIT answer on the Drive credentials
+```
+
+`review` and `qa` are verdict rows on that head, `ci` is the transport's own, `merge` the
+coordinator's, `progress` an owner's, and `answer` the admin's. A head-bound kind without a
+`head <sha>` is refused, a verdict/merge/progress without `from <alias>` is refused, `ci` may
+not name a bot as its debtor, and an unknown kind is refused with the list — every refusal is
+said back into the reply, and the line is removed either way (a WAIT the bot believes it made
+is a promise the ladder (#164) and the wakes (#163) both act on). The line leaves the reply
+like a `WAKE` does, so the prose is what the swarm reads and the row is what the transport
+reads. Arming a `WAKE` still works on this release; retiring it, the coordinator watchdog and
+the separate hand-off reminders is the rest of #165, once the rows are what the swarm actually
+relies on.
+
 **Self-wake timers (issue #81).** A reply can arm a timer the transport fires without a model
 turn: `WAKE in=10m every=5m until=2h check="gh pr checks 75" then="merge it"`. The line is
 stripped like the other directives and answered with one line in the topic (`⏰ wake <id>: … at
