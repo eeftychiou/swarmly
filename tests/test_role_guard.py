@@ -398,8 +398,14 @@ class TestTheReviewOnTwoThreeTwo(unittest.TestCase):
             self.assertIn(f"{TERM_ENV}=4", sh)
             # Windows gets the same, or the fix would hold on one OS only.
             cmd = (folder / "gh.cmd").read_text(encoding="utf-8")
-            self.assertIn(f"set {ALIAS_ENV}=DeepSeek", cmd)
+            self.assertIn(f'set {ALIAS_ENV}="DeepSeek"', cmd)
             self.assertIn(f"set {TERM_ENV}=4", cmd)
+
+    def test_the_cmd_wrapper_quotes_and_doubles_percent(self):
+        """#245 review (nit): a `.cmd` line is expanded before `set` runs, so `%` doubles."""
+        from swarmly.telegram.guard import _cmd_quote, _gh_wrapper_cmd
+        self.assertEqual(_cmd_quote("a%b"), '"a%%b"')
+        self.assertIn('set SWARMLY_ALIAS="a%%b"', _gh_wrapper_cmd("run", "a%b", 2))
 
     def test_an_alias_with_a_space_stays_one_shell_word(self):
         from swarmly.telegram.guard import _gh_wrapper, _sh_quote
@@ -424,17 +430,23 @@ class TestTheReviewOnTwoThreeTwo(unittest.TestCase):
         self.assertIsNone(refusal("coordinator", "gh", ["-R", "owner/repo", "pr", "merge", "5"]))
 
     def test_the_comment_follows_a_merge_behind_global_options(self):
-        from swarmly.telegram.guard import comment_merge
+        """#245 review (blocker): the `-R owner/repo` prefix must reach the calls the comment
+        makes, or the SHA and the comment name this checkout's repository."""
+        from swarmly.telegram.guard import comment_merge, split_gh
         calls = []
 
         def run(argv):
             calls.append(list(argv))
             return (0, "9f8e7d6\n") if "view" in argv else (0, "")
 
-        body = comment_merge("/bin/gh", ["pr", "merge", "5", "--match-head-commit", "1a2b3c4"],
-                             {"SWARMLY_ALIAS": "DeepSeek", "SWARMLY_LEASE_TERM": "4"}, run)
+        prefix, tail = split_gh(["-R", "other/repo", "pr", "merge", "5"])
+        self.assertEqual(prefix, ["-R", "other/repo"])
+        body = comment_merge("/bin/gh", tail, {"SWARMLY_ALIAS": "DeepSeek",
+                                               "SWARMLY_LEASE_TERM": "4"}, run,
+                             global_options=prefix)
         self.assertEqual(body, "Merged by DeepSeek (lease term 4) at 9f8e7d6")
-        self.assertEqual(calls[0][1:4], ["pr", "view", "5"])
+        self.assertEqual(calls[0][1:5], ["-R", "other/repo", "pr", "view"])
+        self.assertEqual(calls[1][1:7], ["-R", "other/repo", "pr", "comment", "5", "--body"])
 
 
 if __name__ == "__main__":
