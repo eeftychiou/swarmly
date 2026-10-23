@@ -31,7 +31,7 @@ MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("usage", "What this bot spent today; add 'all' for the swarm"),
     ("swarm", "The swarm: bus, coordinator and members"),
     ("round", "What the open round waits on"),
-    ("wakes", "This bot's armed WAKE timers"),
+    ("wakes", "Retired: a promise is a row now -- see /owed"),
     ("owed", "What is owed right now: the open rows"),
     ("model", "Show or set the model for this topic"),
     ("reasoning", "Show or set the reasoning effort for this topic"),
