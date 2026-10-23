@@ -735,10 +735,6 @@ class ChannelLimits:
     #: Issue #116: how often a running `/cli` session's screen is edited into its message, so a
     #: slash command that takes a few seconds is visibly working rather than silent.
     native_stream_seconds: float = 3.0
-    #: The coordinator's own watchdog: after this long with no turn while the swarm has been
-    #: active, it gets one turn to check the round and act on whatever waits, or say it is done.
-    #: Doubles after each quiet check, up to 8 hours; any other turn resets it. 0 = off.
-    coordinator_watch_minutes: float = 30.0
     #: Issue #83: how long without a renewal before successors take over the coordinator lease.
     takeover_minutes: float = 60.0
     #: How often the active coordinator renews its lease: every renewal is a commit pushed to
@@ -797,7 +793,7 @@ class ChannelLimits:
                               f"(got {attachment_mb!r}).")
         for key in ("min_seconds_between_messages", "min_seconds_between_agent_turns",
                     "handoff_nudge_minutes", "cleanup_idle_hours",
-                    "ephemeral_notices_minutes", "coordinator_watch_minutes",
+                    "ephemeral_notices_minutes",
                     "turn_silence_minutes", "turn_silence_kill_minutes",
                     "stall_minutes"):
             value = getattr(self, key)

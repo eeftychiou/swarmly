@@ -216,6 +216,12 @@ def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float) 
     moment still gets its first rung -- turning the ladder off must not turn a promise off
     (#213 review). Each rung happens once (:attr:`Row.stalls`), and the ladder stops at the
     admin.
+
+    **One gap, on purpose.** With the ladder off, a row whose one deadline has been spent has no
+    clock left: it gets its reminder and stops there, without the coordinator and admin rungs.
+    That is what "ladder off" means -- a swarm that does not want to be chased still gets the
+    one reminder it promised itself -- and it is written down in ``docs/telegram-channel.md``
+    rather than papered over (#213 review).
     """
     moment = time.time() if now is None else float(now)
     limit = max(0.0, float(minutes or 0)) * 60.0

@@ -627,11 +627,14 @@ dropped without a word. A restart that interrupted several turns resumes them on
 time, oldest first: each resumed turn claims the next when it finishes, so six cut-off turns
 never become six turns at once.
 
-**The coordinator checks in when nothing wakes it.** A coordinator that holds no WAKE and has
-had no turn for `limits.coordinator_watch_minutes` (default 30) gets one turn in the topic it
-last worked in, asking it to look at the round and act on whatever waits, or to answer
-`NO_REPLY`. The wait doubles after each check (up to 8 hours), any other turn resets it, and
-it stops a day after the last turn. `0` turns it off.
+**Nothing wakes a coordinator on a clock (retired, #165).** The watchdog
+(`check_coordinator_watch`) is gone: it started a turn because *time had passed*, which is the
+behaviour round 5.5 removes. What replaces it is the orphan invariant (#164) — an open item whose
+next actor cannot be derived is a row, and the guard's ladder reminds its debtor, then tells the
+coordinator, then the admin — so an idle coordinator is woken by a **fact about the work**, never
+by a timer, and the wake names the item it is about. `limits.coordinator_watch_minutes` is
+removed; a config that still sets it gets an `unknown key, ignored` note from
+`swarmly-telegram check`, not a silent no-op.
 **A bot that dies says nothing, so the swarm listens for its pulse.** Every transport writes one
 heartbeat every `limits.heartbeat_minutes` (default 2) carrying its revision, term, role and,
 while a turn is running, `busy_since`. It is a silent Telegram line (`limits.heartbeat_plane:
@@ -1240,7 +1243,8 @@ the check watched, with the check and the action written down (the item the chec
 named one), and the guard's ladder (#164) and the wakes (#163) carry it from there, on facts. The
 ack says what row it became and names the `WAIT` line to write next time. Timers armed **before**
 this release still fire until they expire — the firing machinery, `/wakes`, the adoption rules and
-`check_coordinator_watch` are removed in the next slice of #165, so nothing new enters that path.
+are removed in the next slice of #165, so nothing new enters that path (`check_coordinator_watch`
+is gone already: see "Nothing wakes a coordinator on a clock").
 
 Three things the migration changes about the promise itself:
 
@@ -1248,13 +1252,17 @@ Three things the migration changes about the promise itself:
   reminder is due when that moment passes, not at `limits.stall_minutes`; and `stall_minutes: 0`,
   which turns the ladder's own clock off, still fires the moment a row named — a promise the swarm
   was told was recorded cannot be one nothing acts on. A deadline is spent once its rung fires, so
-  one old deadline does not climb three rungs in three beats. A row with neither a deadline nor a
-  ladder is **flagged** in `/owed` (`no in=: only limits.stall_minutes can act on this`) instead
-  of looking kept.
-- **`every=` is refused, with a pointer.** A row is opened once and then woken by facts, with the
-  ladder as the backstop; nothing repeats, so a repeating check is told to write one `WAIT` per
-  thing it watches rather than promising a recurrence nothing performs. `until=` is written into
-  the row's `opened_by`, so the end of a wait is still on the record.
+  one old deadline does not climb three rungs in three beats.
+  **With the ladder off, that one rung is the end of it:** a spent deadline leaves the row with no
+  clock, so it is reminded once and not chased to the coordinator or the admin. That is what
+  "ladder off" means — the swarm still gets the reminder the bot asked for itself — and it is a
+  choice, not an omission (#213 review). `in=` is required by the `WAKE` grammar, so every row
+  opened this way has a moment; there is no deadline-less case to flag.
+- **`every=` and `until=` are refused, with a pointer.** A row is opened once and then woken by
+  facts, with the ladder as the backstop: nothing repeats, and nothing expires. A repeating check
+  is told to write one `WAIT` per thing it watches; an `until=` is told the same, because a row
+  that stops itself is a rule nothing would carry out. Both are refused where `every=` already
+  was, rather than one of them being dropped quietly (#213 review).
 - **Two rows can name one item.** The WAKE row is keyed per check
   (`progress:#209@wake#<digest>:DeepSeek`) while the round sweep opens `progress:#209:DeepSeek`
   for the same item, and `/owed` shows both. They say different things — one per check, one per

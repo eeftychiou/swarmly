@@ -717,12 +717,6 @@ class AgentChannel:
         self._inbox = Inbox(_state_file(config, "inbox"))
         self._inflight: Set[Tuple[Any, Any]] = set()
         self._shutting_down = False
-        # The coordinator's watchdog (check_coordinator_watch): where and when its last turn
-        # ran, kept across restarts so a coordinator that restarts into silence still checks.
-        self._watch_path = _state_file(config, "coordinator-watch")
-        saved = load_state(self._watch_path, "coordinator watch")
-        self._watch: Dict[str, Any] = saved if isinstance(saved.get("chat_id"), int) else {}
-        self._watch_backoff = 1
 
         self.bot: Any = None
         self.dispatcher: Any = None
@@ -4702,14 +4696,18 @@ class AgentChannel:
         rows: List[Row] = []
         notes: List[str] = []
         for spec in specs[:per_reply]:
-            if float(getattr(spec, "every_seconds", 0) or 0) > 0:
-                # Nothing repeats now: a row is opened once and then woken by facts, with the
-                # guard's ladder as the backstop. Accepting `every=` silently would promise a
-                # recurrence nothing performs (#213 review).
-                notes.append("WAKE refused: a repeating check has no row -- `every=` is not "
-                             "carried. Write one `WAIT`; the ladder (limits.stall_minutes) "
-                             "reminds you if it stalls. To watch a second thing, write a "
-                             "second WAIT")
+            repeats = float(getattr(spec, "every_seconds", 0) or 0) > 0
+            expires = bool(getattr(spec, "until_explicit", False))
+            if repeats or expires:
+                # Nothing repeats and nothing expires now: a row is opened once, then woken by
+                # facts, with the guard's ladder as the backstop. `every=` and `until=` promise
+                # a recurrence and an end that nothing performs, so both are refused rather
+                # than dropped quietly (#213 review: `until=` was the same bug one keyword
+                # over).
+                said = "`every=`" if repeats else "`until=`"
+                notes.append(f"WAKE refused: {said} is not carried -- a WAKE becomes a row, "
+                             "opened once and then woken by facts. Write one `WAIT`; the "
+                             "ladder (limits.stall_minutes) reminds you if it stalls")
                 continue
             try:
                 rows.append(from_wake(spec, alias=self.config.identity.alias, topic=topic,
@@ -4767,7 +4765,6 @@ class AgentChannel:
                 if done and done != last:            # what each timer did, once per change:
                     logger.info("wake: %s", "; ".join(done))   # a stuck timer must show
                 last = done or []
-                self.check_coordinator_watch()
             except asyncio.CancelledError:
                 raise
             except Exception:                          # noqa: BLE001 - the loop must survive
@@ -7461,7 +7458,6 @@ class AgentChannel:
         # Wall-clock start for the ledger (#125): the turn clock is monotonic, the ledger's rows
         # are read against days, so one is anchored here and the other derived from it.
         wall_started = time.time()
-        self._note_turn_for_watch(event)
         try:
             reply = await self._respond(incoming, event)
             self.record_turn(started=wall_started, ended=time.time(), event=event, reply=reply)
@@ -8129,58 +8125,6 @@ class AgentChannel:
             entry["nudged"] = True
         elif f"{alias} has not answered the hand-off above" in prose:
             self._pending_handoffs.pop(key, None)
-
-    def _note_turn_for_watch(self, event: ChannelEvent) -> None:
-        """Remember where and when this bot last took a turn, for the coordinator watchdog.
-        A turn that was not the watchdog's own resets its back-off."""
-        watch = event.self_task and (event.text or "").startswith("Coordinator check:")
-        if not watch:
-            self._watch_backoff = 1
-        self._watch = {"chat_id": int(event.chat_id), "thread_id": event.thread_id,
-                       "topic": self.topics.name(event.chat_id, event.thread_id),
-                       "at": time.time(), "backoff": self._watch_backoff}
-        save_state(self._watch_path, self._watch, "coordinator watch")
-
-    def check_coordinator_watch(self, *, now: Optional[float] = None) -> Optional[str]:
-        """Give an idle coordinator one turn to look at the round.
-
-        Live, round 4: a hand-off to the coordinator was lost and nothing else could wake it, so
-        the swarm waited all night. A coordinator that holds no WAKE and has had no turn for
-        ``limits.coordinator_watch_minutes`` gets one, in the topic it last worked in. The wait
-        doubles after each check (up to 8 hours) until another turn resets it, and stops a day
-        after the last turn, so a finished swarm costs a few turns, not one an hour. Returns
-        what it did, for tests."""
-        minutes = float(getattr(self.config.limits, "coordinator_watch_minutes", 0) or 0)
-        if minutes <= 0 or not self._watch or self._frozen or self._busy_waiting                 or any(not turn.done() for turn in self._turns):
-            return None                           # a turn is running or waiting: not idle
-        if not self.is_coordinator():
-            return None
-        try:
-            own = self.config.identity.alias
-            moment = time.time()
-            if any(timer.live and (not timer.alias or timer.alias == own)
-                   and timer.next_at > moment - WAKE_STALE_SECONDS
-                   for timer in self.wake_store().load()):
-                return None                       # it already promised itself a wake-up
-        except Exception:                         # noqa: BLE001 - the watchdog is best effort
-            logger.debug("coordinator watch: could not read the wake timers", exc_info=True)
-        moment = time.time() if now is None else now
-        last = float(self._watch.get("at", 0) or 0)
-        if moment - last > 24 * 3600:
-            return None                           # the swarm is idle: no turn to spend on it
-        backoff = int(self._watch.get("backoff", self._watch_backoff) or 1)
-        wait = min(minutes * backoff, 8 * 60.0)
-        if moment - last < wait * 60:
-            return None
-        self._watch_backoff = min(backoff * 2, 64)
-        self._watch = {**self._watch, "at": moment, "backoff": self._watch_backoff}
-        save_state(self._watch_path, self._watch, "coordinator watch")
-        logger.info("coordinator watch: no turn for %.0f min and no WAKE; checking the round",
-                    (moment - last) / 60)
-        self._run_own_task(WATCH_NOTE.format(minutes=round((moment - last) / 60)),
-                           self._watch["chat_id"], self._watch.get("thread_id"),
-                           self._watch.get("topic"))
-        return "checked"
 
     async def check_stalled_handoffs(self) -> None:
         """A hand-off its bot has not answered after ``limits.handoff_nudge_minutes`` gets one
@@ -9612,13 +9556,6 @@ REASSIGN_NOTE = ("{alias} has not answered your hand-off in this topic for {minu
 #: past its until= it is retired without a turn (live, round 5: ten day-old copies blocked a merge).
 WAKE_STALE_SECONDS = 3600.0
 
-#: The coordinator's watchdog turn (check_coordinator_watch): nothing woke it for a while.
-WATCH_NOTE = ("Coordinator check: you have had no turn for {minutes} minutes and hold no WAKE. "
-              "Look at the open tracking issue and every item and PR on it (gh issue view, "
-              "gh pr view, gh pr checks). Act now on whatever waits on you: merge what is ready, "
-              "follow up or reassign what has stalled, answer anything handed to you that got "
-              "no answer. Then arm a WAKE for what you are waiting on. If no round is open and "
-              "nothing waits, reply exactly NO_REPLY; the next check then comes later.")
 #: Run when a hand-off went to a peer that is frozen (quota or pause).
 FROZEN_REASSIGN_NOTE = ("{alias} is frozen and cannot answer your hand-off in this topic. "
                         "Decide what happens to the work now: hand it to another peer whose "

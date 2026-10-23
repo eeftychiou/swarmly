@@ -408,3 +408,26 @@ class TestTheBudgetNoticeComesBackTomorrow(unittest.TestCase):
         channel.owed_wake_tick(now=1000.0 + 86400)      # tomorrow: allowed, then capped again
         channel.owed_wake_tick(now=1000.0 + 86460.0)
         self.assertEqual(len(self.notices(channel, seen)), 1)
+
+class TestNothingWakesOnAClock(unittest.TestCase):
+    """#165: the coordinator's watchdog is retired -- the orphan invariant replaces it.
+
+    The watchdog gave an idle coordinator a turn because *time had passed*. What wakes it now is
+    a fact about the work: an open item whose next actor cannot be derived is a row, and the
+    row's debtor is who gets the turn.
+    """
+
+    def test_the_channel_has_no_watchdog(self):
+        from swarmly.telegram.channel import AgentChannel
+        self.assertFalse(hasattr(AgentChannel, "check_coordinator_watch"))
+        self.assertFalse(hasattr(AgentChannel, "_note_turn_for_watch"))
+
+    def test_the_watchdog_limit_is_gone_from_the_config(self):
+        from swarmly.telegram.config import ChannelLimits
+        self.assertFalse(hasattr(ChannelLimits(), "coordinator_watch_minutes"))
+
+    def test_an_orphaned_item_is_what_wakes_the_coordinator(self):
+        row = guard.orphans([("146", item())], [], coordinator="Claudebot", roles={},
+                            at=1000.0)[0]
+        self.assertEqual(row.debtor, "Claudebot")
+        self.assertIn("#146", f"{row.item} {row.owes} {row.opened_by}")

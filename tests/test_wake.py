@@ -401,11 +401,21 @@ class TestChannelWiring(unittest.TestCase):
         """#213 review: `every=` promised a recurrence the rows do not perform."""
         channel, event = self.channel()
         body = channel.apply_wake_lines(
-            'x\nWAKE in=1m every=5m until=2h check="gh pr checks 209" then="merge it"',
+            'x\nWAKE in=1m every=5m check="gh pr checks 209" then="merge it"',
             event("hi", username="ClaudeBot"))
-        self.assertIn("repeating check has no row", body)
-        self.assertIn("second WAIT", body)
+        self.assertIn("`every=` is not carried", body)
+        self.assertIn("Write one `WAIT`", body)
         self.assertEqual(channel._test_table.load(), [])
+
+    def test_until_is_refused_beside_every(self):
+        """#213 review: `until=` was the same bug one keyword over -- promised, then dropped."""
+        channel, event = self.channel()
+        body = channel.apply_wake_lines(
+            'x\nWAKE in=1m until=2h check="gh pr checks 209" then="merge it"',
+            event("hi", username="ClaudeBot"))
+        self.assertIn("`until=` is not carried", body)
+        self.assertNotIn('check="gh pr checks 209"', body)   # the line is still stripped
+        self.assertEqual(channel._test_table.load(), [])     # and no row was opened
 
     def test_a_refused_line_is_stripped_and_explained(self):
         channel, event = self.channel()
