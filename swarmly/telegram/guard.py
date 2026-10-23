@@ -25,13 +25,30 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 #: Branches only the coordinator updates directly (others push a branch and open a PR).
 PROTECTED = ("main", "master")
 #: Exit status of a refused command.
 REFUSED = 3
 TOOLS = ("gh", "git")
+
+#: Who merged, and at which lease term, ride in the environment ``prepare`` writes (#228):
+#: the bots share one GitHub login, so a merge shows the same ``mergedBy`` for all of them and
+#: only the transport can say which bot did it.
+ALIAS_ENV = "SWARMLY_ALIAS"
+TERM_ENV = "SWARMLY_LEASE_TERM"
+
+#: ``gh`` options that take a separate value, so the PR after ``gh pr merge`` is not confused
+#: with a flag's argument.
+_GH_VALUE_OPTIONS = ("-b", "--body", "-t", "--subject", "-R", "--repo", "-A", "--author-email")
+
+#: How long one ``gh`` call the guard makes on its own behalf may take.
+_GH_TIMEOUT = 20
+
+#: A ``gh`` runner: the argv to run, and its ``(exit code, output)``. Injected so a test
+#: never spawns a process to prove what the guard posts.
+Runner = Callable[[Sequence[str]], Tuple[int, str]]
 
 
 def _words(args: Sequence[str]) -> List[str]:
@@ -99,6 +116,75 @@ def _current_branch(real_git: str, global_options: Sequence[str] = ()) -> Option
     except (OSError, subprocess.SubprocessError):
         return None
     return done.stdout.strip() or None
+
+
+def _merge_pr(args: Sequence[str]) -> str:
+    """The pull request ``gh pr merge <pr>`` names: its first argument that is not a flag or
+    a flag's value. Empty when there is none (``gh pr merge`` can take the branch's PR)."""
+    rest = list(args)[2:]                       # drop ``pr merge``
+    i = 0
+    while i < len(rest):
+        word = rest[i]
+        if word.startswith("-"):
+            i += 2 if word in _GH_VALUE_OPTIONS else 1
+            continue
+        return word
+    return ""
+
+
+def attribution(alias: str, term: int, sha: str) -> str:
+    """The one comment a merge leaves behind: who merged, at which lease term, at which
+    commit (#228). A term or SHA the transport could not read is left out, never guessed."""
+    who = alias.strip() or "an unnamed bot"
+    lease = f" (lease term {int(term)})" if int(term) > 0 else ""
+    at = f" at {sha.strip()}" if sha.strip() else ""
+    return f"Merged by {who}{lease}{at}"
+
+
+def merge_sha(real: str, pr: str, run: "Runner") -> str:
+    """The commit the merge landed at: its merge commit, else the head it merged."""
+    code, out = run([real, "pr", "view", pr, "--json", "mergeCommit,headRefOid",
+                     "--jq", ".mergeCommit.oid // .headRefOid"])
+    return out.strip() if code == 0 else ""
+
+
+def comment_merge(real: str, args: Sequence[str], env: Mapping[str, str],
+                  run: "Runner") -> Optional[str]:
+    """Post the attribution comment after a merge this guard ran, or None when there is
+    nobody to attribute it to (an unguarded run) or no PR to comment on.
+
+    The transport does this, not the model: a merge by the admin by hand leaves no comment,
+    so a missing comment means no bot merged through the guard. A failure here is logged and
+    swallowed -- the merge already happened, and it stays merged.
+    """
+    alias = str(env.get(ALIAS_ENV) or "").strip()
+    pr = _merge_pr(args)
+    if not alias or not pr:
+        return None
+    if any(word in ("--auto",) for word in args):
+        # ``--auto`` only *queues* the merge: it has not landed, so claiming it did would be
+        # the very "I merged it" that cannot be checked (#228).
+        return None
+    try:
+        term = int(str(env.get(TERM_ENV) or "0").strip() or 0)
+    except ValueError:
+        term = 0
+    body = attribution(alias, term, merge_sha(real, pr, run))
+    code, out = run([real, "pr", "comment", pr, "--body", body])
+    if code != 0:
+        print(f"swarmly guard: merged, but the attribution comment on #{pr} failed: "
+              f"{out.strip()[:200]}", file=sys.stderr)
+        return None
+    return body
+
+
+def _gh_run(argv: Sequence[str]) -> "tuple[int, str]":
+    """Run one ``gh`` argv the guard keeps for itself; ``(exit code, output)``."""
+    try:
+        done = subprocess.run(list(argv), capture_output=True, text=True, timeout=_GH_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as err:
+        return 1, str(err)
+    return done.returncode, (done.stdout or "") + (done.stderr or "")
 
 
 def push_refusal(role: str, refs: Sequence[str]) -> Optional[str]:
@@ -175,7 +261,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if why:
         print(f"swarmly guard: refused `{tool} {' '.join(args)}`: {why}.", file=sys.stderr)
         return REFUSED
-    return subprocess.call([real, *args])
+    code = subprocess.call([real, *args])
+    if code == 0 and tool == "gh" and [w.lower() for w in _words(args)][:2] == ["pr", "merge"]:
+        # A merge this guard ran leaves one comment saying who merged it, at which term and
+        # commit (#228). After the merge, and never in place of its exit code.
+        try:
+            comment_merge(real, args, os.environ, _gh_run)
+        except Exception:                          # noqa: BLE001 - the merge stands
+            print("swarmly guard: the attribution comment failed", file=sys.stderr)
+    return code
 
 
 #: Hooks that pass through to the repository's own when the guard sets core.hooksPath.
@@ -196,9 +290,13 @@ def _pass_through(name: str) -> str:
             "exit 0\n")
 
 
-def prepare(folder: Path, role: str, env: Dict[str, str]) -> Dict[str, str]:
+def prepare(folder: Path, role: str, env: Dict[str, str], *, alias: str = "",
+            term: int = 0) -> Dict[str, str]:
     """Write the gh wrapper and the git hooks into ``folder`` and return ``env`` with them in
-    force, or ``env`` unchanged when they cannot be written."""
+    force, or ``env`` unchanged when they cannot be written.
+
+    ``alias`` and ``term`` say who this agent is and at which lease term it runs, so a merge
+    the guard runs can post its attribution comment (#228)."""
     path = env.get("PATH", os.environ.get("PATH", ""))
     real = {tool: shutil.which(tool, path=path) for tool in TOOLS}
     if not any(real.values()):
@@ -227,6 +325,10 @@ def prepare(folder: Path, role: str, env: Dict[str, str]) -> Dict[str, str]:
     if real["gh"]:
         out["PATH"] = os.pathsep.join([str(folder), path]) if path else str(folder)
     out["SWARMLY_ROLE"] = role
+    # #228: who the guard speaks for, so a merge it runs can say so on the PR. Written even
+    # when empty: an empty alias is what keeps an unguarded merge from being attributed.
+    out[ALIAS_ENV] = alias
+    out[TERM_ENV] = str(int(term or 0))
     for tool, found in real.items():
         if found:
             out[f"SWARMLY_REAL_{tool.upper()}"] = found

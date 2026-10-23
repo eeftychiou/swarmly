@@ -4387,9 +4387,19 @@ class AgentChannel:
         with the lease: the next turn after a yield or a lapse is guarded by the configured role."""
         try:
             moment = self._lease_clock()
-            return bool(self.lease_state(now=moment).holds(self.config.identity.alias, moment))
+            state = self.lease_state(now=moment)
+            # #228: the term this turn runs at, kept from the read the guard already needs, so
+            # a merge can name it without a second trip to the bus (#164: one tick, one turn).
+            self.__dict__["_turn_lease_term"] = int(getattr(state, "term", 0) or 0)
+            return bool(state.holds(self.config.identity.alias, moment))
         except Exception:                              # noqa: BLE001 - no answer is no authority
             return False
+
+    def _turn_term(self) -> int:
+        """The lease term the last lease read saw, 0 when it saw none. It rides into the
+        agent's environment with its role, so a merge the guard runs can say which term it
+        happened at (#228)."""
+        return int(self.__dict__.get("_turn_lease_term", 0) or 0)
 
     async def _acting_coordinator(self) -> bool:
         """Whether this turn runs with the coordinator's rights (the lease, read off the loop).
@@ -7159,7 +7169,9 @@ class AgentChannel:
                        event: ChannelEvent) -> Optional[AdapterReply]:
         """Run the adapter as a cancellable task, with a typing indicator while it works."""
         adapter = self._adapter_for(event.chat_id, event.thread_id)
+        self.__dict__["_turn_lease_term"] = 0            # never carry a last turn's term
         adapter.acting_coordinator = await self._acting_coordinator()
+        adapter.lease_term = self._turn_term()
         turn = asyncio.ensure_future(adapter.respond(incoming))
         self._current_turn = turn
         self._turns.add(turn)
@@ -7225,6 +7237,7 @@ class AgentChannel:
             raise
         finally:
             adapter.acting_coordinator = False         # the rights last one turn (#208 review)
+            adapter.lease_term = 0
             self._turns.discard(turn)
             self._turn_keys.pop(turn, None)
             self._busy_since.pop(busy_topic, None)
