@@ -2569,7 +2569,35 @@ class AgentChannel:
             self.record_violation("addressed_frozen_peer",
                                   f"addressed {alias} ({why}) in a reply",
                                   event.chat_id, event.thread_id)
+            self._tell_sender_undelivered(alias, why, cover, event)
         return body + ("\n\n" + "\n".join(notes) if notes else "")
+
+    #: One undelivered notice per peer and topic in this many seconds: a bot that keeps
+    #: addressing a frozen peer is charged every time, but not woken in a loop.
+    UNDELIVERED_REPEAT_SECONDS = 600.0
+
+    def _tell_sender_undelivered(self, alias: str, why: str, cover: Optional[Tuple[str, str]],
+                                 event: ChannelEvent) -> None:
+        """The refusal goes back into the sender's own token space as a turn (admin, 24 Oct):
+        the peer cannot take any message, so the sender is told at once and re-plans, instead
+        of waiting on a reply that cannot come."""
+        key = (event.chat_id, event.thread_id, alias)
+        told = self.__dict__.setdefault("_undelivered_told", {})
+        now = self._clock()
+        if now - told.get(key, float("-inf")) < self.UNDELIVERED_REPEAT_SECONDS:
+            return
+        told[key] = now
+        if cover:
+            role, who = cover
+            then = (f"Its {role} work was addressed to its stand-in {who} instead. Make sure "
+                    f"{who} has what it needs, and do not address {alias} until it is back.")
+        else:
+            then = ("No stand-in is free. Re-plan this work now: give it to an active peer, "
+                    "switch a role with a ROLE line, or tell the admin if nobody can do it.")
+        self._run_own_task(
+            f"[Transport notice] Your last message was NOT delivered to {alias}: it is {why} "
+            f"and cannot take any message. {then}", event.chat_id, event.thread_id,
+            self.topics.name(event.chat_id, event.thread_id))
 
     # -- peer liveness: the pulse, and DOWN (issue #82) -----------------------------------
 

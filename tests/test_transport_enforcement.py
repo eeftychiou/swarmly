@@ -154,8 +154,21 @@ class ChannelEnforcementTests(unittest.TestCase):
         self.assertIn("@ReasonixBot", posted)                       # the stand-in is
         self.assertEqual([r.kind for r in channel.drift.live()], ["addressed_frozen_peer"])
 
+    def test_the_sender_is_told_in_its_own_token_space_once(self):
+        """Admin, 24 Oct: the refusal reaches the sender as a turn, and it takes corrective
+        action -- but a sender that repeats itself is not woken in a loop."""
+        channel, _ = self.channel("@AntigravityBot please QA #245.")
+        briefs = []
+        channel._run_own_task = lambda text, chat, thread, name: briefs.append(text)
+        run(channel.handle_event(event("@HermesBot one", thread_id=9400, message_id=43)))
+        run(channel.handle_event(event("@HermesBot two", thread_id=9400, message_id=44)))
+        self.assertEqual(len(briefs), 1)
+        self.assertIn("NOT delivered to Antigravity: it is paused by the admin", briefs[0])
+        self.assertIn("stand-in Reasonix", briefs[0])
+
     def test_the_reminder_rides_the_next_turn_and_a_second_hard_violation_resets(self):
         channel, adapter = self.channel("@AntigravityBot please QA #245.")
+        channel._run_own_task = lambda *args: None          # the sender notice: own test
         run(channel.handle_event(event("@HermesBot one", thread_id=9400, message_id=41)))
         run(channel.handle_event(event("@HermesBot two", thread_id=9400, message_id=42)))
         self.assertIn("Rule reminder from the transport", adapter.prompts[1])
