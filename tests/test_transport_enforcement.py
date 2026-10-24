@@ -174,7 +174,7 @@ class ChannelEnforcementTests(unittest.TestCase):
                                        message_id=40)))
         posted = channel._test_sender.sent[-1]["text"]
         self.assertNotIn("@AntigravityBot", posted)                 # not woken
-        self.assertIn("⛔ Not delivered to Antigravity: paused by the admin.", posted)
+        self.assertIn("⛔ Not delivered to Antigravity: paused.", posted)
         self.assertIn("@ReasonixBot", posted)                       # the stand-in is
         self.assertEqual([r.kind for r in channel.drift.live()], ["addressed_frozen_peer"])
 
@@ -187,7 +187,7 @@ class ChannelEnforcementTests(unittest.TestCase):
         run(channel.handle_event(event("@HermesBot one", thread_id=9400, message_id=43)))
         run(channel.handle_event(event("@HermesBot two", thread_id=9400, message_id=44)))
         self.assertEqual(len(briefs), 1)
-        self.assertIn("NOT delivered to Antigravity: it is paused by the admin", briefs[0])
+        self.assertIn("NOT delivered to Antigravity: it is paused", briefs[0])
         self.assertIn("stand-in Reasonix", briefs[0])
 
     def test_the_reminder_rides_the_next_turn_and_a_second_hard_violation_resets(self):
@@ -267,6 +267,23 @@ class TheNightOf24OctTests(unittest.TestCase):
         self.assertEqual([v.kind for v in ledger.fold_inbox()], ["merge_gate_refused"])
         self.assertFalse(ledger.inbox.exists())
         self.assertFalse(list(ledger.path.parent.glob("*.draining-*")))
+
+    def test_one_answer_to_who_cannot_act(self):
+        """#247 review: the ladder, the WAIT parser and the reply check read one map."""
+        channel, _ = self.channel()
+        self.assertEqual(channel.blocked_peers(), {"antigravity": "paused"})
+        self.assertEqual(channel.away_reason("@Antigravity"), "paused")
+        self.assertEqual(channel.away_reason("Reasonix"), "")
+
+    def test_the_wait_refusal_is_structured_not_parsed(self):
+        """#247 review: the bounce reads who and why from the parser, not from its sentence."""
+        from swarmly.telegram.wait_line import extract_waits
+        cannot = []
+        _body, rows, reasons = extract_waits(
+            f"WAIT merge #245 head {HEAD[:7]} from @Antigravity", topic="tg-1", at=1000.0,
+            unable={"antigravity": "paused"}, cannot_act=cannot)
+        self.assertEqual((rows, cannot), ([], [("Antigravity", "paused")]))
+        self.assertEqual(len(reasons), 1)
 
     def test_the_gate_skips_option_values_when_it_looks_for_the_pr(self):
         self.assertEqual(mg.pr_target(["pr", "merge", "--match-head-commit", "1234567", "245"])

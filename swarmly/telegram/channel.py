@@ -2582,15 +2582,9 @@ class AgentChannel:
         name = str(alias or "").strip().lstrip("@").lower()
         if not name or name == str(self.config.identity.alias or "").strip().lower():
             return ""
-        for peer, entry in self.frozen_peers().items():
-            if str(peer).strip().lower() == name:
-                return {"quota": "out of quota", "pause": "paused by the admin"}.get(
-                    str((entry or {}).get("ref") or ""), "frozen")
-        try:
-            down = self.presence().down_peers(self.presence_clock())
-        except Exception:                                  # noqa: BLE001 - frozen is enough
-            down = []
-        return "DOWN" if any(str(peer).strip().lower() == name for peer in down) else ""
+        # One answer for the ladder, the WAIT parser, the reply check and the hand-off filter
+        # (#247 review): they must not disagree about who can act.
+        return self.blocked_peers().get(name, "")
 
     def _stand_in_for(self, alias: str) -> Tuple[str, str]:
         """``(role, stand-in alias)`` covering *alias*, or ``("", "")``."""
@@ -2605,12 +2599,9 @@ class AgentChannel:
         -- naming the stand-in, who is addressed instead when there is one. The sender is
         charged a violation (admin, 24 Oct: "the transport bus should refuse a message to a
         paused agent and reply in transport space")."""
-        frozen = self.frozen_peers()
-        try:
-            down = set(self.presence().down_peers(self.presence_clock()))
-        except Exception:                                  # noqa: BLE001
-            down = set()
-        unreachable = set(frozen) | down
+        blocked = self.blocked_peers()
+        unreachable = {alias for alias in self.config.peers
+                       if str(alias).strip().lower() in blocked}
         if not body or not unreachable:
             return body
         covers = self.stand_ins()
@@ -2624,9 +2615,7 @@ class AgentChannel:
             if not pattern.search(body):
                 continue
             body = pattern.sub(alias, body)                # named, not woken
-            why = ("DOWN" if alias in down and alias not in frozen else
-                   {"quota": "out of quota", "pause": "paused by the admin"}.get(
-                       str((frozen.get(alias) or {}).get("ref") or ""), "frozen"))
+            why = blocked[str(alias).strip().lower()]
             line = f"⛔ Not delivered to {alias}: {why}."
             cover = covers.get(alias)
             if cover:
@@ -5114,21 +5103,18 @@ class AgentChannel:
         (#163) both act on these rows.
         """
         from swarmly.telegram.wait_line import ack, extract_waits
+        cannot_act: List[Tuple[str, str]] = []
         body, rows, reasons = extract_waits(
             text or "", topic=self._topic_token(event.chat_id, event.thread_id),
             place=self._place_key(event.chat_id, event.thread_id),
-            unable=self.blocked_peers())
+            unable=self.blocked_peers(), cannot_act=cannot_act)
         if not rows and not reasons:
             return text
         # A WAIT on a peer that cannot act is refused by the parser (#248). The refusal is
         # also bounced back to this bot as a turn, like a message to that peer, so it re-plans
         # instead of reading its own reply (24 Oct: `WAIT merge #245 ... from Antigravity` on
         # a paused bot sat seven hours).
-        for reason in reasons:
-            found = re.match(r"^(\S+) is (.+): name a peer who can act$", reason)
-            if not found:
-                continue
-            debtor, why = found.group(1).lstrip("@"), found.group(2)
+        for debtor, why in cannot_act:
             self.record_violation("addressed_frozen_peer", f"WAIT from {debtor} ({why})",
                                   event.chat_id, event.thread_id)
             role, who = self._stand_in_for(debtor)

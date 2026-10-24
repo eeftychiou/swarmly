@@ -51,6 +51,16 @@ class WaitError(ValueError):
     """A line that cannot become a row: said back to the bot, never silently dropped."""
 
 
+class DebtorCannotAct(WaitError):
+    """A ``WAIT`` naming a debtor that cannot act now. Carries who and why, so the transport
+    can bounce the refusal to the sender without parsing the sentence (#247 review)."""
+
+    def __init__(self, debtor: str, why: str) -> None:
+        super().__init__(f"{debtor} is {why}: name a peer who can act")
+        self.debtor = debtor
+        self.why = why
+
+
 def _words(line: str) -> List[str]:
     return str(line or "").strip().split()
 
@@ -140,7 +150,7 @@ def parse_line(line: str, *, topic: str = "", place: str = "",
                         f"'from {debtor}'")
     cannot = str((unable or {}).get(str(debtor or "").strip().lower(), "") or "").strip()
     if debtor and cannot:
-        raise WaitError(f"{debtor} is {cannot}: name a peer who can act")
+        raise DebtorCannotAct(debtor.lstrip("@"), cannot)
     owes = _owes(kind, words, head, item)
     row_kind = KINDS[kind]
     if row_kind == "handoff":
@@ -198,7 +208,9 @@ def from_wake(spec: Any, *, alias: str, topic: str = "", at: Optional[float] = N
 
 def extract_waits(text: str, *, topic: str = "", place: str = "",
                   at: Optional[float] = None,
-                  unable: Optional[Mapping[str, str]] = None) -> Tuple[str, List[Row], List[str]]:
+                  unable: Optional[Mapping[str, str]] = None,
+                  cannot_act: Optional[List[Tuple[str, str]]] = None,
+                  ) -> Tuple[str, List[Row], List[str]]:
     """``(text, rows, reasons)``: every ``WAIT`` line turned into a row and removed.
 
     A line is stripped in every case -- a refused one is said back into the reply instead of
@@ -221,6 +233,8 @@ def extract_waits(text: str, *, topic: str = "", place: str = "",
             rows.append(parse_line(line, topic=topic, place=place, at=at, unable=unable))
         except WaitError as exc:
             reasons.append(str(exc))
+            if isinstance(exc, DebtorCannotAct) and cannot_act is not None:
+                cannot_act.append((exc.debtor, exc.why))
     return "\n".join(kept).strip(), rows, reasons
 
 
