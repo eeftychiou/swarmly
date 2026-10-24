@@ -5020,7 +5020,8 @@ class AgentChannel:
         loop = self.__dict__.get("_loop")
         if cached is None or cached.store is not store or cached.loop is not loop:
             cached = StoreLease(store, loop, alias=self.config.identity.alias,
-                                ttl_seconds=self._lease_ttl(), clock=self._lease_clock)
+                                ttl_seconds=self._lease_ttl(), clock=self._lease_clock,
+                                aliases=list(self.config.peers or {}))
             self.__dict__["_store_lease_obj"] = cached
         return cached
 
