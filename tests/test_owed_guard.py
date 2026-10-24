@@ -210,6 +210,16 @@ class TestTheStallLadder(unittest.TestCase):
                              unable={"antigravity": "paused"})
         self.assertEqual([s.step for s in after], [guard.STALL_ADMIN])
 
+    def test_a_row_past_its_reminder_does_not_claim_the_reminder_was_skipped(self):
+        """#248 review: a debtor paused *after* its reminder was delivered was not skipped."""
+        rows = [row(kind="verdict", debtor="Antigravity", owes="a QA verdict on #245",
+                    item="#245", updated_at=1000.0, topic="tg-1", stalls=1)]
+        stalled = guard.stalls(rows, now=1000.0 + 31 * 60, minutes=30,
+                               unable={"antigravity": "paused"})
+        self.assertEqual([s.step for s in stalled], [guard.STALL_COORDINATOR])
+        self.assertNotIn("skipped", stalled[0].text)
+        self.assertIn("cannot act (paused) any more", stalled[0].text)
+
     def test_a_debtor_that_can_act_keeps_its_reminder(self):
         rows = [row(kind="verdict", debtor="Antigravity", owes="a QA verdict on #245",
                     item="#245", updated_at=1000.0, topic="tg-1")]

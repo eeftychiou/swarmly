@@ -1301,7 +1301,11 @@ not name a bot as its debtor, **a bot that cannot act now is refused as a debtor
 out of quota, or DOWN — "Antigravity is paused: name a peer who can act"), and an unknown kind
 is refused with the list — every refusal is
 said back into the reply, and the line is removed either way (a WAIT the bot believes it made
-is a promise the ladder (#164) and the wakes (#163) both act on). An `answer` row is keyed by
+is a promise the ladder (#164) and the wakes (#163) both act on). **DOWN is the pulse's own
+threshold** (`limits.peer_down_after` silent heartbeats, six minutes by default), so a bot that
+has merely missed a couple of pulses is refused too: it is the same answer the ladder uses when
+it decides who cannot deliver a rung, and one rule is worth more than a tighter one that
+disagrees with itself. An `answer` row is keyed by
 the question it asks (the way `owed.admin_row` keys it), so two questions to the admin in one
 topic are two debts and the second is not swallowed by the first; the same question asked again
 updates the one row, and the admin answering in that topic settles it either way. The line

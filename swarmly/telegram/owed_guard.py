@@ -166,18 +166,27 @@ def _wait_words(minutes: float) -> str:
     return f"{value:g} minute" if value == 1 else f"{value:g} minutes"
 
 
-def stall_text(row: Row, step: str, *, minutes: float, unable: str = "") -> str:
+def stall_text(row: Row, step: str, *, minutes: float, unable: str = "",
+               skipped: bool = False) -> str:
     """What each rung says. A ladder that repeats itself is a ladder nobody reads.
 
     *unable* is why the debtor cannot take its own reminder (paused, frozen, down), when that
     is why this rung is the coordinator's: the fact belongs in the sentence, or the
     coordinator reads a reminder that was never delivered and wonders where it went (#246).
+    *skipped* says whether **this tick** is the one that skipped the reminder. A row already at
+    the coordinator rung whose debtor was paused afterwards was not skipped -- it was
+    delivered, and the debtor then stopped acting -- and saying otherwise is a false report
+    (#248 review).
     """
     waited = f"nothing has moved for {_wait_words(minutes)}"
     if unable and step != STALL_REMINDER:
-        return (f"{row.debtor} owes {row.owes} on {row.subject} and {waited}, but cannot act "
-                f"({unable}), so its reminder was skipped. Coordinator: reassign it or "
-                f"escalate it; the table says nobody else can.")
+        if skipped:
+            return (f"{row.debtor} owes {row.owes} on {row.subject} and {waited}, but cannot "
+                    f"act ({unable}), so its reminder was skipped. Coordinator: reassign it "
+                    f"or escalate it; the table says nobody else can.")
+        return (f"{row.debtor} owes {row.owes} on {row.subject} and {waited}, and cannot act "
+                f"({unable}) any more. Coordinator: reassign it or escalate it; the table "
+                f"says nobody else can.")
     if step == STALL_REMINDER:
         return (f"{row.debtor} owes {row.owes} on {row.subject} and {waited}. This is the "
                 f"reminder: act on it, or say in one line why not.")
@@ -260,7 +269,8 @@ def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float,
             continue
         cannot = stuck.get(str(row.debtor or "").strip().lower(), "")
         step_at = rung
-        if cannot and STALL_STEPS[step_at] == STALL_REMINDER:
+        skipped = bool(cannot and STALL_STEPS[step_at] == STALL_REMINDER)
+        if skipped:
             # The reminder is the debtor's own rung and nobody else may deliver it, so a
             # debtor that cannot act takes the row straight to the coordinator (#246). The
             # rungs above are the coordinator's and the admin's, and neither is skipped here.
@@ -269,7 +279,8 @@ def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float,
             continue
         step = STALL_STEPS[step_at]
         out.append(Stall(row=row.id, step=step, debtor=row.debtor,
-                         text=stall_text(row, step, minutes=waited / 60.0, unable=cannot),
+                         text=stall_text(row, step, minutes=waited / 60.0, unable=cannot,
+                                         skipped=skipped),
                          rung=step_at))
     return out
 
