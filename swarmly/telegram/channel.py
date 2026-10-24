@@ -595,11 +595,16 @@ class AgentChannel:
         #: How a WAKE firing reads its PR or issue (#178); None means `gh`. Tests stub it, so
         #: a host with `gh` signed in does not read the real repo's state (#190 review).
         self.wake_subject_reader: Optional[Callable[..., Any]] = None
-        #: How an owed row's item is read on GitHub: ``(item, chat_id, thread_id)`` -> "open",
-        #: "closed", "merged" or None. None here means `gh`; tests stub it like the one above.
+        #: How an owed row's item is read on GitHub: ``(repo, "#N")`` -> "open", "closed",
+        #: "merged" or None. None here means `gh`; tests stub it like the one above.
         self.owed_item_reader: Optional[Callable[..., Optional[str]]] = None
-        #: When each owed item was last asked about on GitHub, so a beat asks a few at a time.
-        self._owed_item_checked: Dict[str, float] = {}
+        #: When each ``(repo, "#N")`` was last asked about on GitHub, and the ones it showed
+        #: merged -- final, so they are never asked about again and the sweep counts them done.
+        self._owed_item_checked: Dict[Tuple[str, str], float] = {}
+        self._owed_merged: Set[Tuple[str, str]] = set()
+        #: The round items the last sweep saw: ``(repo, "#item") -> "#pr"`` (the PR that
+        #: carries it, or the item itself), so a row written under an issue asks about its PR.
+        self._owed_round_prs: Dict[Tuple[str, str], str] = {}
         # #29: sender+chat+topic -> the parts of a split reply already here, and their timers.
         self._split_pending: Dict[Tuple[Any, ...], _PendingSplit] = {}
         self._split_tasks: Set[asyncio.Task] = set()
@@ -4486,18 +4491,19 @@ class AgentChannel:
         # Round 5.5 (#161): a turn whose CLI has gone silent past the kill limit is stopped
         # here, through the /stop path. Liveness only -- this never starts a turn.
         await self.check_stuck_turns(now=moment)
+        # Live, 24 Oct: a row whose PR merged outside any round stayed open for days, and the
+        # coordinator was handed it again and again to ask the admin to clear it. GitHub's own
+        # word on the PR closes it first -- before the sweep, so an item GitHub shows merged
+        # opens no "nobody owes the next step" row, and before anything wakes.
+        try:
+            await self.owed_settle_from_github(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("owed: the GitHub check failed this beat", exc_info=True)
         # Round 5.5 (#162): the round state's own facts open and close rows each beat.
         try:
             self.owed_sweep(now=moment)
         except Exception:                          # noqa: BLE001 - a beat must not fail on it
             logger.warning("owed: sweep failed this beat", exc_info=True)
-        # Live, 24 Oct: a row whose PR merged outside any round stayed open for days, and the
-        # coordinator was handed it again and again to ask the admin to clear it. What GitHub
-        # says about the item closes it here, before anything wakes or climbs the ladder.
-        try:
-            await self.owed_settle_from_github(now=moment)
-        except Exception:                          # noqa: BLE001 - a beat must not fail on it
-            logger.warning("owed: the GitHub check failed this beat", exc_info=True)
         # Round 5.5 (#163): and a row whose fact changed wakes its debtor, once, right after
         # the sweep -- so the beat that learns of a change is the beat that acts on it.
         try:
@@ -5674,6 +5680,7 @@ class AgentChannel:
         # PR (#230: "WAIT merge #230 at <sha>"). The facts are said under both, or a merged PR
         # keeps "Reasonix owes a merge" open for ever (round 5.5, 23 Oct).
         pr_labels: Dict[str, str] = {}
+        round_prs: Dict[Tuple[str, str], str] = {}
         for key in keys:
             try:
                 state = rounds.load(key)
@@ -5682,6 +5689,7 @@ class AgentChannel:
                 continue
             if state.status != "ok":
                 continue                           # absent or unreadable: open nothing
+            repo = str(getattr(state, "repo", "") or "").strip() or self._owed_only_repo()
             for item_key in (state.order or list(state.items)):
                 item = state.item(item_key)
                 if not item:
@@ -5690,10 +5698,16 @@ class AgentChannel:
                 pr = str(item.get("pr") or "").strip().lstrip("#")
                 if pr.isdigit() and f"#{pr}" != label:
                     pr_labels[label] = f"#{pr}"
+                carrier = f"#{pr}" if pr.isdigit() else label
+                if repo:
+                    round_prs[(repo, label)] = carrier
                 head = str(item.get("head") or "").strip().lower()
                 if head:
                     heads[label] = head
-                if str(item.get("state") or "").strip().lower() in ("merged", "closed", "done"):
+                if str(item.get("state") or "").strip().lower() in ("merged", "closed", "done") \
+                        or (repo and (repo, carrier) in getattr(self, "_owed_merged", ())):
+                    # GitHub showed the PR merged (owed_settle_from_github): the round's state
+                    # is behind, and the item opens nothing -- no "next actor" row either.
                     facts.append(Fact(kind="merge", item=label, head=head))
                     continue
                 verdicts: Dict[str, str] = {}
@@ -5796,6 +5810,7 @@ class AgentChannel:
         # next step on was never flagged (#195 review). The sweep's own next-actor rows are
         # left out of that count for the same reason: they *are* the "nobody owes it" row, and
         # counting them as live froze the gap at the day the item opened (#195 review).
+        self._owed_round_prs = round_prs
         live_now = [row for row in table.values() if not _next_actor_row(row)]
         orphaned = orphans(open_items, live_now,
                            coordinator=roles.get("coordinator", ""), roles=roles, at=moment)
@@ -5851,100 +5866,128 @@ class AgentChannel:
             logger.info("owed: %s", "; ".join(done[:8]))
         return done
 
-    def _owed_item_state(self, item: str, chat_id: int, thread_id: Optional[int]) -> Optional[str]:
-        """"open", "closed" or "merged" for an owed row's ``#N`` on GitHub; None if unknown.
+    def _owed_only_repo(self) -> str:
+        """The repo every configured project shares, or "" when there are several (or none):
+        a row that names no place is read there only when no other repo could be meant."""
+        repos = {str(settings.repo).strip() for settings in self.config.projects.values()
+                 if getattr(settings, "repo", None)}
+        return repos.pop() if len(repos) == 1 else ""
 
-        The repo is the one /cleanup reads for that discussion (its project's, else the first
-        configured); with none configured, ``gh pr view`` in the discussion's checkout names
-        it. Unknown is never a fact: a row nobody could check stays open.
+    def _owed_row_repo(self, row: Any) -> str:
+        """The repo an owed row's ``#N`` is in, or "" when that cannot be told for sure.
+
+        The row's own topic decides when its project names a repo; then the rounds that list
+        the item, when they agree; then the one repo configured. A guess is never made: a row
+        read in the wrong repo would be closed by another repo's PR, for good.
         """
+        target = self._place_target(row.topic) if row.topic else None
+        if target is not None:
+            project = self.router.project_for(target[0], target[1])
+            if project is not None and project.repo:
+                return str(project.repo).strip()
+        label = "#" + str(row.item).lstrip("#")
+        listed = {repo for repo, item in self._owed_round_prs if item == label}
+        if len(listed) == 1:
+            return listed.pop()
+        return "" if listed else self._owed_only_repo()
+
+    def _owed_item_state(self, repo: str, label: str) -> Optional[str]:
+        """"open", "closed" or "merged" for ``#N`` in *repo* on GitHub; None if unknown."""
         if self.owed_item_reader is not None:
-            return self.owed_item_reader(item, chat_id, thread_id)
-        number = int(str(item).lstrip("#"))
-        repo = self._cleanup_repo(chat_id, thread_id)
-        if repo:
-            return _ref_state(self._github_client().ref_state(repo, number))
-        from swarmly.telegram.wake import subject_state
-        found = subject_state(("pr", str(number), ""), cwd=self._workdir_for(chat_id, thread_id),
-                              timeout=20.0)
-        return None if found is None else _ref_state(found[0])
+            return self.owed_item_reader(repo, label)
+        number = int(str(label).lstrip("#"))
+        cache = self.__dict__.setdefault("_ref_state_cache", {})
+        hit = cache.get((repo, number))
+        if hit is not None and time.time() - hit[0] < _REF_STATE_CACHE_SECONDS:
+            return hit[1]
+        state = _ref_state(self._github_client().ref_state(repo, number))
+        if state is not None:
+            cache[(repo, number)] = (time.time(), state)
+        return state
 
     async def owed_settle_from_github(self, *, now: Optional[float] = None) -> List[str]:
-        """Close the rows whose item GitHub shows merged or closed (live, 24 Oct).
+        """Close the rows whose PR GitHub shows merged (live, 24 Oct).
 
         The sweep closes a row only when a round marks its item done, so a PR merged outside a
         round -- or after its round closed -- kept "Reasonix owes a merge" open for days, and
-        the stall ladder handed it to the coordinator again and again. The merge itself is the
-        fact: a merged PR answers every debt bound to it, a closed issue its progress and
-        verdict rows, exactly as :func:`swarmly.telegram.owed.closes` rules for the round's
-        own facts. Only the rows this bot would act on are checked (its own debts; every row
-        for the coordinator), each item at most every :data:`OWED_GITHUB_RECHECK_SECONDS`, a
-        few a beat. GitHub is read off the loop; the table is read and written on it, like the
-        sweep's. A closed copy written here wins the fold for every reader.
+        the stall ladder handed it to the coordinator again and again. A merge is the fact: it
+        answers every debt bound to the item, as :func:`swarmly.telegram.owed.closes` rules
+        for the round's own merge. Only a merge, and only for sure: a closed PR can be
+        reopened, and a row closed here stays closed, so "closed" and "unknown" close nothing.
+
+        A row written under an issue asks about the PR that carries it (the round knows it). A
+        bot checks the rows it would act on -- its own debts, every row when it coordinates --
+        each item at most every :data:`OWED_GITHUB_RECHECK_SECONDS`, a few a beat, read side
+        by side off the event loop. The table is read and written on the loop, like the
+        sweep's, and the closed copy written here wins the fold for every reader.
         """
-        from swarmly.telegram.owed import Fact, settle
+        from swarmly.telegram.owed import Fact, closes
         if self.config.github is None or self.held():
             return []                              # GitHub is not this bot's to read
         moment = time.time() if now is None else float(now)
         me = str(self.config.identity.alias or "").strip().lower()
         store = self.owed_store()
-        bound = [row for row in store.open_rows(now=moment)
-                 if row.kind in _OWED_ITEM_KINDS and _OWED_ITEM.fullmatch(row.item)]
-        if not bound:
-            return []
         coordinating: Optional[bool] = None
-        due: Dict[str, Tuple[int, Optional[int]]] = {}
-        for row in bound:
-            label = "#" + row.item.lstrip("#")
-            if label in due or moment - self._owed_item_checked.get(label, 0.0) \
-                    < OWED_GITHUB_RECHECK_SECONDS:
-                continue
-            if str(row.debtor).strip().lower() != me:
-                if coordinating is None:           # a lease read: only when a peer's row is due
-                    coordinating = bool(self.is_coordinator(now=moment))
-                if not coordinating:
-                    continue
-            target = self._place_target(row.topic) or self._place_target("")
-            if target is None:
-                continue
-            due[label] = target
-            if len(due) >= OWED_GITHUB_ITEMS_PER_BEAT:
-                break
-        if not due:
-            return []
 
-        def read() -> Dict[str, Optional[str]]:
-            found: Dict[str, Optional[str]] = {}
-            for label, (chat_id, thread_id) in due.items():
-                try:
-                    found[label] = self._owed_item_state(label, chat_id, thread_id)
-                except Exception:                  # noqa: BLE001 - unknown is not a fact
-                    logger.debug("owed: could not read %s on GitHub", label, exc_info=True)
-                    found[label] = None
+        def candidates() -> List[Tuple[Any, Tuple[str, str]]]:
+            """The open rows this bot acts on, each with the ``(repo, "#pr")`` that answers it."""
+            nonlocal coordinating
+            found: List[Tuple[Any, Tuple[str, str]]] = []
+            for row in store.open_rows(now=moment):
+                if row.kind not in _OWED_ITEM_KINDS or not _OWED_ITEM.fullmatch(row.item):
+                    continue
+                if str(row.debtor).strip().lower() != me:
+                    if coordinating is None:       # a lease read: only when a peer's row is here
+                        coordinating = bool(self.is_coordinator(now=moment))
+                    if not coordinating:
+                        continue
+                repo = self._owed_row_repo(row)
+                if not repo:
+                    continue
+                label = "#" + row.item.lstrip("#")
+                found.append((row, (repo, self._owed_round_prs.get((repo, label), label))))
             return found
 
-        states = await asyncio.to_thread(read)
-        for label in due:
-            self._owed_item_checked[label] = moment
-        facts = [Fact(kind="merge" if state == "merged" else "close", item=label,
-                      note=f"GitHub: {state}")
-                 for label, state in states.items() if state in ("merged", "closed")]
-        if not facts:
-            return []
-        rows = store.open_rows(now=moment)         # as it is now: a turn may have written meanwhile
+        rows = candidates()
+        due: List[Tuple[str, str]] = []
+        for _row, key in rows:
+            if key in due or key in self._owed_merged \
+                    or moment - self._owed_item_checked.get(key, 0.0) < OWED_GITHUB_RECHECK_SECONDS:
+                continue
+            due.append(key)
+            if len(due) >= OWED_GITHUB_ITEMS_PER_BEAT:
+                break
+        if due:
+            def read(key: Tuple[str, str]) -> Optional[str]:
+                try:
+                    return self._owed_item_state(*key)
+                except Exception:                  # noqa: BLE001 - unknown is not a fact
+                    logger.debug("owed: could not read %s %s on GitHub", *key, exc_info=True)
+                    return None
+
+            def read_all() -> List[Optional[str]]:
+                with ThreadPoolExecutor(max_workers=_REF_LOOKUP_WORKERS) as pool:
+                    return list(pool.map(read, due))
+
+            for key, state in zip(due, await asyncio.to_thread(read_all)):
+                self._owed_item_checked[key] = moment
+                if state == "merged":
+                    self._owed_merged.add(key)
         closed: List[Any] = []
-        for fact in facts:
-            closed.extend(settle(rows, fact, now=moment))
+        for row, key in (candidates() if due else rows):   # as it is now, after the await
+            if key not in self._owed_merged:
+                continue
+            reason = closes(row, Fact(kind="merge", item=row.item))
+            if reason is None:
+                continue
+            row.state, row.closed_by, row.updated_at = "closed", f"{reason} on GitHub", moment
+            closed.append(row)
         if not closed:
             return []
-        for row in closed:
-            row.closed_by = f"{row.closed_by} on GitHub"
         try:
             store.save_all(closed)
         except Exception:                          # noqa: BLE001 - the next beat tries again
             logger.warning("owed: could not write the rows GitHub closed", exc_info=True)
-            for fact in facts:
-                self._owed_item_checked.pop(fact.item, None)
             return []
         done = [f"closed {row.id} ({row.closed_by})" for row in closed]
         logger.info("owed: %s", "; ".join(done[:8]))
