@@ -210,6 +210,8 @@ _REF_LOOKUP_WORKERS = 6
 _REF_STATE_CACHE_SECONDS = 300.0
 #: An owed row's item, and the kinds of row a merged or closed item answers (owed.closes).
 _OWED_ITEM = re.compile(r"#?\d{1,9}")
+#: The repo a retired WAKE line's row names (wait_line.from_wake: "checked `gh ...` in o/r").
+_OWED_WAKE_REPO = re.compile(r"`\s+in\s+([\w.-]+/[\w.-]+)")
 _OWED_ITEM_KINDS = ("ci", "verdict", "fix", "merge", "progress")
 #: How often one owed item is asked about on GitHub, and how many items one beat asks about:
 #: an item still open is asked again later, and a backlog of stale rows clears over a few beats.
@@ -601,7 +603,7 @@ class AgentChannel:
         #: When each ``(repo, "#N")`` was last asked about on GitHub, and the ones it showed
         #: merged -- final, so they are never asked about again and the sweep counts them done.
         self._owed_item_checked: Dict[Tuple[str, str], float] = {}
-        self._owed_merged: Set[Tuple[str, str]] = set()
+        self._owed_merged: Optional[Set[Tuple[str, str]]] = None     # read on first use
         #: The round items the last sweep saw: ``(repo, "#item") -> "#pr"`` (the PR that
         #: carries it, or the item itself), so a row written under an issue asks about its PR.
         self._owed_round_prs: Dict[Tuple[str, str], str] = {}
@@ -5689,7 +5691,7 @@ class AgentChannel:
                 continue
             if state.status != "ok":
                 continue                           # absent or unreadable: open nothing
-            repo = str(getattr(state, "repo", "") or "").strip() or self._owed_only_repo()
+            repo = str(getattr(state, "repo", "") or "").strip().lower() or self._owed_only_repo()
             for item_key in (state.order or list(state.items)):
                 item = state.item(item_key)
                 if not item:
@@ -5700,12 +5702,16 @@ class AgentChannel:
                     pr_labels[label] = f"#{pr}"
                 carrier = f"#{pr}" if pr.isdigit() else label
                 if repo:
-                    round_prs[(repo, label)] = carrier
+                    # Two rounds that carry one issue in different PRs say nothing for sure
+                    # about it: it is asked about as itself, which closes nothing.
+                    known = round_prs.setdefault((repo, label), carrier)
+                    if known != carrier:
+                        round_prs[(repo, label)] = label
                 head = str(item.get("head") or "").strip().lower()
                 if head:
                     heads[label] = head
                 if str(item.get("state") or "").strip().lower() in ("merged", "closed", "done") \
-                        or (repo and (repo, carrier) in getattr(self, "_owed_merged", ())):
+                        or (repo and (repo, carrier) in self._owed_merged_keys()):
                     # GitHub showed the PR merged (owed_settle_from_github): the round's state
                     # is behind, and the item opens nothing -- no "next actor" row either.
                     facts.append(Fact(kind="merge", item=label, head=head))
@@ -5869,27 +5875,74 @@ class AgentChannel:
     def _owed_only_repo(self) -> str:
         """The repo every configured project shares, or "" when there are several (or none):
         a row that names no place is read there only when no other repo could be meant."""
-        repos = {str(settings.repo).strip() for settings in self.config.projects.values()
+        repos = {str(settings.repo).strip().lower() for settings in self.config.projects.values()
                  if getattr(settings, "repo", None)}
         return repos.pop() if len(repos) == 1 else ""
 
     def _owed_row_repo(self, row: Any) -> str:
         """The repo an owed row's ``#N`` is in, or "" when that cannot be told for sure.
 
-        The row's own topic decides when its project names a repo; then the rounds that list
-        the item, when they agree; then the one repo configured. A guess is never made: a row
-        read in the wrong repo would be closed by another repo's PR, for good.
+        A retired WAKE line's row names its own (``--repo``, in ``opened_by``); else the row's
+        topic decides when its project names a repo; then the rounds that list the item, when
+        they agree; then the one repo configured. A guess is never made: a row read in the
+        wrong repo would be closed by another repo's PR, for good. Lower case: GitHub's is.
         """
+        named = _OWED_WAKE_REPO.search(str(row.opened_by or "")) \
+            if str(row.key_extra or "").startswith("wake#") else None
+        if named:
+            return named.group(1).lower()
         target = self._place_target(row.topic) if row.topic else None
         if target is not None:
             project = self.router.project_for(target[0], target[1])
             if project is not None and project.repo:
-                return str(project.repo).strip()
+                return str(project.repo).strip().lower()
         label = "#" + str(row.item).lstrip("#")
         listed = {repo for repo, item in self._owed_round_prs if item == label}
         if len(listed) == 1:
             return listed.pop()
         return "" if listed else self._owed_only_repo()
+
+    def _owed_merged_path(self) -> Optional[Path]:
+        from swarmly.telegram.wake import wake_dir_for
+        state = wake_dir_for(self.config)
+        # Beside the table, never in `owed/`: the store reads every `*.json` there as a row.
+        return None if state is None else Path(state) / "owed-merged.json"
+
+    def _owed_merged_keys(self) -> Set[Tuple[str, str]]:
+        """The ``(repo, "#pr")`` GitHub has shown merged. Kept on disk: a merge is final, and a
+        bot that forgot it on a restart let the sweep open a "next actor" row for the item and
+        wake somebody before the next beat closed it again (review)."""
+        merged = getattr(self, "_owed_merged", None)
+        if merged is None:
+            merged = set()
+            path = self._owed_merged_path()
+            try:
+                data = json.loads(path.read_text(encoding="utf-8")) if path else []
+            except (OSError, ValueError):
+                data = []
+            for entry in data if isinstance(data, list) else []:
+                if isinstance(entry, list) and len(entry) == 2 \
+                        and all(isinstance(part, str) for part in entry):
+                    merged.add((entry[0], entry[1]))
+            self._owed_merged = merged
+        return merged
+
+    def _owed_note_merged(self, keys: Iterable[Tuple[str, str]]) -> None:
+        merged = self._owed_merged_keys()
+        added = [key for key in keys if key not in merged]
+        if not added:
+            return
+        merged.update(added)
+        path = self._owed_merged_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # The newest are kept: the list only grows, one entry per merged PR the table named.
+            path.write_text(json.dumps(sorted([list(key) for key in merged])[-2000:]),
+                            encoding="utf-8")
+        except OSError:
+            logger.warning("owed: could not remember the merged PRs at %s", path)
 
     def _owed_item_state(self, repo: str, label: str) -> Optional[str]:
         """"open", "closed" or "merged" for ``#N`` in *repo* on GitHub; None if unknown."""
@@ -5951,7 +6004,7 @@ class AgentChannel:
         rows = candidates()
         due: List[Tuple[str, str]] = []
         for _row, key in rows:
-            if key in due or key in self._owed_merged \
+            if key in due or key in self._owed_merged_keys() \
                     or moment - self._owed_item_checked.get(key, 0.0) < OWED_GITHUB_RECHECK_SECONDS:
                 continue
             due.append(key)
@@ -5969,13 +6022,16 @@ class AgentChannel:
                 with ThreadPoolExecutor(max_workers=_REF_LOOKUP_WORKERS) as pool:
                     return list(pool.map(read, due))
 
-            for key, state in zip(due, await asyncio.to_thread(read_all)):
+            if self.owed_item_reader is None:
+                self._github_client()              # one client, built here, not in six threads
+            states = await asyncio.to_thread(read_all)
+            for key in due:
                 self._owed_item_checked[key] = moment
-                if state == "merged":
-                    self._owed_merged.add(key)
+            self._owed_note_merged(key for key, state in zip(due, states) if state == "merged")
+        merged = self._owed_merged_keys()
         closed: List[Any] = []
         for row, key in (candidates() if due else rows):   # as it is now, after the await
-            if key not in self._owed_merged:
+            if key not in merged:
                 continue
             reason = closes(row, Fact(kind="merge", item=row.item))
             if reason is None:

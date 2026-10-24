@@ -53,6 +53,7 @@ def channel_with(rows, states, *, coordinating=True, github=True, repos=(REPO,))
     channel.owed_store = lambda: store
     channel.is_coordinator = lambda now=None: coordinating
     channel.owed_item_reader = Reader(states)
+    channel._owed_merged_path = lambda: Path(folder.name) / "owed-merged.json"
     channel._test_folder = folder
     return channel, store
 
@@ -127,6 +128,35 @@ class TestTheSweepCountsAMergedPrDone(unittest.TestCase):
         self.assertEqual(open_ids(store), [])
 
 
+    def test_a_restart_remembers_the_merge(self):
+        """Review: forgotten on a restart, the merge let the first sweep open a "next actor"
+        row for the item and wake somebody before the next beat closed it again."""
+        channel, store = channel_with([merge("#252", debtor="Claudebot")], {"#252": "merged"})
+        run(channel.owed_settle_from_github(now=NOW))
+        again, _ = channel_with([], {})
+        again.owed_store = lambda: store
+        again._owed_merged_path = channel._owed_merged_path
+        again.owed_roles = lambda: {"coordinator": "Claudebot", "developer": "Codex"}
+        items = {"252": {"pr": 252, "head": "474778a", "owner": "Codex", "ci": "green"}}
+        again.round_store = lambda: FakeRounds({"repo#167": round_state(items)})
+        again.owed_sweep(now=NOW)
+        self.assertEqual(open_ids(store), [])
+        self.assertEqual(again.owed_item_reader.asked, [])
+
+    def test_two_rounds_that_disagree_on_the_pr_name_none(self):
+        channel, store = channel_with([merge("#227", debtor="Claudebot")],
+                                      {"#227": "closed", "#230": "merged", "#240": "open"})
+        channel.owed_roles = lambda: {"coordinator": "Claudebot", "developer": "Codex"}
+        old = {"227": {"pr": 230, "head": "474778a", "owner": "Codex", "ci": "pending"}}
+        new = {"227": {"pr": 240, "head": "5b90b50", "owner": "Codex", "ci": "pending"}}
+        channel.round_store = lambda: FakeRounds({"repo#1": round_state(old),
+                                                  "repo#2": round_state(new)})
+        channel.owed_sweep(now=NOW)
+        run(channel.owed_settle_from_github(now=NOW))
+        self.assertEqual(channel.owed_item_reader.asked, [(REPO, "#227")])
+        self.assertIn(merge("#227", debtor="Claudebot").id, open_ids(store))
+
+
 class TestWhoAsksWhereAndHowOften(unittest.TestCase):
 
     def test_a_bot_that_does_not_coordinate_closes_only_its_own_debts(self):
@@ -149,6 +179,23 @@ class TestWhoAsksWhereAndHowOften(unittest.TestCase):
         channel._owed_round_prs = {("owner/other", "#252"): "#252"}
         run(channel.owed_settle_from_github(now=NOW))
         self.assertEqual(channel.owed_item_reader.asked, [("owner/other", "#252")])
+        self.assertEqual(open_ids(store), [])
+
+    def test_a_repo_spelled_in_another_case_is_the_same_repo(self):
+        channel, store = channel_with([merge("#252")], {"#252": "merged"},
+                                      repos=("Owner/Swarmly", "owner/swarmly"))
+        run(channel.owed_settle_from_github(now=NOW))
+        self.assertEqual(channel.owed_item_reader.asked, [("owner/swarmly", "#252")])
+        self.assertEqual(open_ids(store), [])
+
+    def test_a_wake_row_is_read_in_the_repo_its_check_named(self):
+        row = ow.Row(kind="progress", item="#45", debtor="Reasonix", owes="a look",
+                     key_extra="wake#abc",
+                     opened_by="a WAKE line that checked `gh pr checks 45` in Owner/Other",
+                     created_at=NOW - 86400, updated_at=NOW - 86400)
+        channel, store = channel_with([row], {"#45": "merged"})
+        run(channel.owed_settle_from_github(now=NOW))
+        self.assertEqual(channel.owed_item_reader.asked, [("owner/other", "#45")])
         self.assertEqual(open_ids(store), [])
 
     def test_an_open_item_is_asked_again_only_after_the_recheck_window(self):
