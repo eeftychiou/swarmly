@@ -1179,6 +1179,57 @@ class TestAParentClosesWithItsLastSlice(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(1 for text in comments if text), 1)   # ...the line goes once
         self.assertEqual(list(state.parent_notes), ["example-org/webapp#34"])
 
+    async def test_a_stale_note_does_not_silence_the_close_that_lands(self):
+        """#238: a note from an earlier poll must not swallow the reason for this close.
+
+        The note was a bare timestamp, so once a close had failed for any reason the comment
+        was suppressed for ever -- the parent ended up closed with nothing saying why.
+        """
+        items = {65: ("pr", "MERGED"), 68: ("issue", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN"], items)
+            state_path = Path(tmp) / "s.json"
+            # An earlier poll: only #65 had landed, and that close attempt failed.
+            NotificationState(parent_notes={
+                "example-org/webapp#34": "2026-10-10T12:00:00Z|#65"}).save(state_path)
+            ch = self.channel()
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+            state = NotificationState.load(state_path)
+        self.assertEqual(outcome.errors, [])
+        client.close_issue.assert_called_once()
+        said = client.close_issue.call_args.args[2]
+        self.assertIn("#65, #68", said)                  # this landing is announced
+        self.assertEqual(state.parent_notes, {})         # and the note is spent
+
+    async def test_a_note_from_an_older_build_is_refreshed_too(self):
+        """A bare-timestamp note (the pre-#238 shape) counts as stale, not as "already said"."""
+        items = {65: ("pr", "MERGED"), 68: ("issue", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN"], items)
+            state_path = Path(tmp) / "s.json"
+            NotificationState(parent_notes={
+                "example-org/webapp#34": "2026-10-10T12:00:00Z"}).save(state_path)
+            ch = self.channel()
+            await self.watcher(tmp, client, ch).poll_once()
+        client.close_issue.assert_called_once()
+        self.assertTrue(client.close_issue.call_args.args[2])
+
+    async def test_a_second_failure_for_the_same_landing_stays_quiet(self):
+        """The note still does its original job: one line per landing, not one per poll."""
+        items = {65: ("pr", "MERGED"), 68: ("issue", "CLOSED")}
+        with TemporaryDirectory() as tmp:
+            client = self.client(["OPEN", "OPEN"], items)
+            client.close_issue.return_value = False
+            ch = self.channel()
+            for _ in range(2):
+                await self.watcher(tmp, client, ch).poll_once()
+            state = NotificationState.load(Path(tmp) / "s.json")
+        comments = [call.args[2] for call in client.close_issue.call_args_list]
+        self.assertEqual(len(comments), 2)               # the close is still retried every poll
+        self.assertEqual(sum(1 for text in comments if text), 1)   # the line went once
+        note = state.parent_notes["example-org/webapp#34"]
+        self.assertIn("|#65, #68", note)                 # ... and it carries this landing
+
     async def test_a_close_that_lands_clears_the_note(self):
         items = {65: ("pr", "MERGED"), 68: ("issue", "CLOSED")}
         with TemporaryDirectory() as tmp:
