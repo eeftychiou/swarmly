@@ -59,8 +59,12 @@ class StateLinkTests(unittest.TestCase):
         asyncio.run(go())
         text = deepseek.describe()
         self.assertIn("lease: claudebot (term 1)", text)
-        self.assertIn("claudebot: agrees", text)
-        self.assertIn("deepseek: agrees", text)
+        self.assertIn("- claudebot agrees", text)
+        self.assertIn("- deepseek agrees", text)
+        from swarmly.telegram.wire import _addresses_alias
+        for alias in ("Claudebot", "DeepSeek"):
+            self.assertFalse(_addresses_alias(text, alias, ["Claudebot", "DeepSeek"]),
+                             "the /state reply must not @mention the bots it lists")
         self.assertEqual(claude.store.lease().holder, "claudebot")
 
     def test_a_registry_error_does_not_stop_the_beat(self):

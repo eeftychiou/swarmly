@@ -269,8 +269,10 @@ class TelegramStore(StateStore):
             logger.warning("state: the snapshot was not published: %s", exc)
             return False
         previous, self.snapshot_message = self.snapshot_message, posted.message_id
+        # Fold in the ops the *previous* snapshot covered, not this one's: the last interval
+        # stays in the log, so /state can still compare peers' recent beats (hash_at).
+        self.log.compact(self._snapshot_pos)
         self._snapshot_pos = upto
-        self.log.compact(upto)                         # the ops it covers are folded in
         if previous is not None and previous != posted.message_id:
             try:
                 await self.io.unpin(previous)

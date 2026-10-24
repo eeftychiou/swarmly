@@ -232,6 +232,29 @@ class GitHubClient:
             return "merged"
         return state if state in ("open", "closed") else None
 
+    def ref_kind_state(self, repo: str, number: int) -> Optional[Tuple[str, bool]]:
+        """(``open`` | ``closed`` | ``merged``, is a pull request) in one call; None if unknown.
+
+        The registry links a PR by its short ref (``#30``) as often as by its URL, so whether
+        it is a PR has to come from GitHub, not from how it was written."""
+        code, out, err = self._run(
+            ["api", f"repos/{repo}/issues/{int(number)}",
+             "--jq", '[.state, (.pull_request.merged_at // ""), '
+                     '(if .pull_request then "pr" else "issue" end)] | @tsv'], timeout=20.0)
+        if code != 0:
+            logger.warning("ref_kind_state(%s, %s) failed (code %d): %s", repo, number, code,
+                           err.strip())
+            return None
+        parts = out.strip().split("\t")
+        if len(parts) != 3:
+            return None
+        state, merged, kind = (part.strip().lower() for part in parts)
+        if merged:
+            state = "merged"
+        if state not in ("open", "closed", "merged"):
+            return None
+        return state, kind == "pr"
+
     def issue_view(self, repo: str, number: int) -> Optional[Issue]:
         """Get details of an issue."""
         fields = "number,title,body,author,state,labels,assignees,comments"
