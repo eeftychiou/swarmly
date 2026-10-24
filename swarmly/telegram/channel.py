@@ -35,6 +35,7 @@ import re
 import secrets
 import socket
 import subprocess
+import types
 from concurrent.futures import ThreadPoolExecutor
 import time
 import dataclasses
@@ -8305,6 +8306,26 @@ class AgentChannel:
                             author_username=f"{self.config.identity.alias} (own brief)")
         self._self_tasks.add(asyncio.create_task(self.handle_event(task)))
         self._self_tasks = {t for t in self._self_tasks if not t.done()}
+
+    async def run_transport_turn(self, text: str, chat_id: int,
+                                 thread_id: Optional[int]) -> Any:
+        """A turn the transport starts for an outside fact (a CI result, a GitHub event),
+        through the **same** path a chat message takes: the topic recap, the frozen-peer,
+        hold and usage notes, the turn lock, and the reply's WAIT, ROLE and MEMORY lines.
+
+        Live, 24 Oct 01:11: a CI wake reached the coordinator as a bare 618-character
+        message with none of the round's context, so a fresh session asked a paused bot for
+        QA the round had given to a stand-in, and the round sat for eight hours. Returns an
+        object with ``ok`` and ``text``, for the GitHub poller's retry logic.
+        """
+        task = ChannelEvent(text=text, chat_id=chat_id, thread_id=thread_id,
+                            topic_name=self.topics.name(chat_id, thread_id), self_task=True,
+                            author_username=f"{self.config.identity.alias} (own brief)")
+        errors = self.stats.errors
+        result = await self.handle_event(task)
+        failed = self.stats.errors > errors
+        return types.SimpleNamespace(ok=not failed, text=str(result or ""),
+                                     error="the turn failed" if failed else "")
 
     def _ask_for_report(self, event: ChannelEvent) -> None:
         """A topic this agent opened went quiet (its turn chose silence) before it reported
