@@ -57,17 +57,22 @@ class StoreLease:
         self.old_releases: tuple = ()
 
     # -- calls into the loop ---------------------------------------------------------------
-    def _run(self, coro: Any) -> Any:
-        """Run a store coroutine from a worker thread (or directly, in a test with no loop)."""
+    def _on_loop(self) -> bool:
         try:
-            running = asyncio.get_running_loop()
+            return asyncio.get_running_loop() is self.loop
         except RuntimeError:
-            running = None
-        if running is self.loop:
-            raise LeaseError("StoreLease is called from worker threads, not the event loop")
-        if running is None and not self.loop.is_running():
-            return self.loop.run_until_complete(coro)
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(CALL_SECONDS)
+            return False
+
+    def _run(self, make: Any) -> Any:
+        """Run a store coroutine (``make()`` builds it) from a worker thread, or directly in a
+        test with no running loop. On the loop itself a blocking call would deadlock: refused."""
+        if self.loop is None:
+            raise LeaseError("the store lease has no event loop yet")
+        if self._on_loop():
+            raise LeaseError("a blocking store call on the event loop")
+        if not self.loop.is_running():
+            return self.loop.run_until_complete(make())
+        return asyncio.run_coroutine_threadsafe(make(), self.loop).result(CALL_SECONDS)
 
     def _offset(self) -> float:
         """Server time minus this bot's clock, as the store measures it."""
@@ -75,17 +80,23 @@ class StoreLease:
 
     # -- the LeaseStore interface ----------------------------------------------------------
     def refresh(self, *, force: bool = False) -> bool:
-        if not getattr(self.store, "ready", False):
+        """True when the store can answer. Lines are folded as they arrive, so on the event
+        loop (the fence of a round write, the GitHub poll) the fold is already current and
+        no blocking call is needed; from a worker thread the store also pulls files and
+        re-reads the pin if it fell behind."""
+        if self.store is None or not getattr(self.store, "ready", False):
             return False
+        if self._on_loop():
+            return True
         try:
-            self._run(self.store.refresh())
+            self._run(self.store.refresh)
             return True
         except Exception:                              # noqa: BLE001 - no answer, no authority
             logger.warning("store lease: refresh failed", exc_info=True)
             return False
 
     def state(self, *, now: Optional[float] = None) -> LeaseState:
-        if not getattr(self.store, "ready", False):
+        if self.store is None or not getattr(self.store, "ready", False):
             return LeaseState(status="unreadable", term=0, holder="", expires_at=0.0)
         lease = self.store.lease()
         if lease.term <= 0:
@@ -94,11 +105,14 @@ class StoreLease:
         renewed = float(entry.at) if entry is not None else 0.0
         offset = self._offset()
         local_expiry = float(lease.expires_at) - offset
-        claim = StoreClaim(term=lease.term, alias=str(lease.holder or ""),
-                           expires_at=local_expiry, renews_at=renewed - offset,
-                           yielded=not lease.holder)
-        return LeaseState(status="ok", term=lease.term, holder=str(lease.holder or ""),
-                          expires_at=local_expiry if lease.holder else 0.0, claim=claim)
+        # A yield keeps the old holder's name with expiry 0, as gitbus does.
+        holder = str(lease.holder or (entry.writer if entry is not None else "") or "")
+        yielded = not lease.holder
+        claim = StoreClaim(term=lease.term, alias=holder,
+                           expires_at=0.0 if yielded else local_expiry,
+                           renews_at=renewed - offset, yielded=yielded)
+        return LeaseState(status="ok", term=lease.term, holder=holder,
+                          expires_at=0.0 if yielded else local_expiry, claim=claim)
 
     def claim(self, *, term: Optional[int] = None, now: Optional[float] = None,
               promoted: bool = False) -> StoreClaim:
@@ -111,7 +125,7 @@ class StoreLease:
         value = {"holder": self.store.alias, "term": max(wanted, 1), "ttl": self.ttl_seconds}
         if promoted:
             value["promoted"] = True
-        result = self._run(self.store.write("lease", value, confirm=True))
+        result = self._run(lambda: self.store.write("lease", value, confirm=True))
         if not result.applied:
             raise LeaseError(f"the store refused the claim for term {value['term']}: "
                              f"{result.reason}")
@@ -123,9 +137,10 @@ class StoreLease:
                     term: Optional[int] = None) -> None:
         current = self.state(now=now)
         wanted = current.term if term is None else int(term)
-        if current.holder.strip().lower() != self.store.alias or wanted != current.term:
+        if current.holder.strip().lower() != self.store.alias or wanted != current.term \
+                or not current.live(float(self.store.clock())):
             return                                     # nothing of ours to give up
-        result = self._run(self.store.write("lease", {"holder": None, "term": wanted}))
+        result = self._run(lambda: self.store.write("lease", {"holder": None, "term": wanted}))
         if not result.applied:
             raise LeaseError(f"the store refused the yield of term {wanted}: {result.reason}")
         logger.info("store lease: yielded term %d (%s)", wanted, reason or "no reason given")

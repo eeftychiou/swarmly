@@ -205,8 +205,13 @@ class StateLink:
                 lease = store.lease()
                 mine = K.norm(lease.holder or "") == store.alias
                 server = store.server_now()             # leases run on the log's clock
-                if not mine or lease.expires_at - server < LEASE_TTL_SECONDS / 2:
-                    result = await store.claim_lease(LEASE_TTL_SECONDS, confirm=False)
+                gitbus_term = int(getattr(self._cached_gitbus(), "term", 0) or 0)
+                if not mine or lease.expires_at - server < LEASE_TTL_SECONDS / 2 \
+                        or gitbus_term > lease.term:
+                    # The mirror follows gitbus's term, so a later switch to the store lease
+                    # carries on above the terms the round files already fence on.
+                    result = await store.claim_lease(LEASE_TTL_SECONDS, confirm=False,
+                                                     at_least=gitbus_term)
                     refused = not result.applied
                     done.append(f"lease {'refused' if refused else 'claimed'} "
                                 f"(term {store.lease().term})")
@@ -267,15 +272,20 @@ class StateLink:
             lines.append(f"{len(store.log.rejected)} write(s) refused since the snapshot")
         return "\n".join(lines)
 
+    def _cached_gitbus(self) -> Any:
+        """Today's lease as the transport last read it -- never a git call from here (this
+        runs on the event loop)."""
+        cached = self.channel.__dict__.get("_cached_lease_state")
+        return cached[1] if cached else None
+
     def _lease_compare(self) -> str:
         """Shadow (phase 3): does the store's lease name the same holder as today's?"""
         if self.lease_mode == "store":
             return " -- the coordinator lease (state.lease: store)"
-        try:
-            gitbus = self.channel.lease_state()
-            theirs = str(getattr(gitbus, "holder", "") or "")
-        except Exception:                              # noqa: BLE001 - a comparison only
+        gitbus = self._cached_gitbus()
+        if gitbus is None:
             return ""
+        theirs = str(getattr(gitbus, "holder", "") or "")
         mine = str(self.store.lease().holder or "") if self.store is not None else ""
         same = K.norm(theirs) == K.norm(mine)
         return f"; gitbus lease: {theirs or 'nobody'} ({'agrees' if same else 'DIFFERS'})"

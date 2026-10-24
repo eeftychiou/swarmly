@@ -260,15 +260,18 @@ class StateLog:
             if current is None or current != op.writer or op.at >= lease.expires_at:
                 return f"term {term} is not this bot's to renew"
             return None
-        if term == lease.term + 1:
+        if term > lease.term:
+            # The next term -- or a later one, so a lease that moves here from gitbus can
+            # carry on above the terms gitbus already used (round files fence on them).
             if holder is None:
                 return "a claim must name its holder"
-            if current is not None and current != op.writer and op.at < lease.expires_at                     and not value.get("promoted"):
+            live = current is not None and current != op.writer and op.at < lease.expires_at
+            if live and not value.get("promoted"):
                 # A promotion (the admin's /role, or a holder presence marks DOWN) may take a
                 # live term, as on gitbus; anything else waits for it to lapse.
                 return f"term {lease.term} is still held by {current}"
             return None
-        return f"term {term} does not follow term {lease.term}"
+        return f"term {term} is behind term {lease.term}"
 
     # -- snapshots -------------------------------------------------------------------------
     def snapshot(self, upto: Optional[int] = None) -> Dict[str, Any]:

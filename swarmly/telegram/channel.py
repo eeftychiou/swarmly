@@ -4960,8 +4960,9 @@ class AgentChannel:
     # -- durable round state (issue #86) ------------------------------------------------
 
     def store_lease_on(self) -> bool:
-        """Topic registry, phase 3: the shared state store holds the coordinator lease."""
-        return self.state_link.lease_mode == "store" and self.state_link.store is not None
+        """Topic registry, phase 3: the shared state store holds the coordinator lease (even
+        before the store has started: its lease then reads "unreadable", never gitbus)."""
+        return getattr(self.state_link, "lease_mode", "off") == "store"
 
     def lease_store(self) -> Any:
         from swarmly.telegram.lease import LeaseStore, succession_order
@@ -4989,10 +4990,10 @@ class AgentChannel:
         from swarmly.telegram.store_lease import StoreLease
         cached = self.__dict__.get("_store_lease_obj")
         store = self.state_link.store
-        if cached is None or cached.store is not store:
-            loop = self.__dict__.get("_loop") or asyncio.get_event_loop()
+        loop = self.__dict__.get("_loop")
+        if cached is None or cached.store is not store or cached.loop is not loop:
             cached = StoreLease(store, loop, alias=self.config.identity.alias,
-                                ttl_seconds=self._lease_ttl())
+                                ttl_seconds=self._lease_ttl(), clock=self._lease_clock)
             self.__dict__["_store_lease_obj"] = cached
         return cached
 
@@ -5240,7 +5241,8 @@ class AgentChannel:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _has_lease_bus(self) -> bool:
-        return bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+        return bool(self.config.bus.repo or self.config.fallback.gitbus_root) \
+            or self.store_lease_on()
 
     def _on_demoted_from_coordinator(self) -> Optional["asyncio.Task[Any]"]:
         """Yield the lease after the admin's /role named someone else.
@@ -6421,6 +6423,8 @@ class AgentChannel:
         except Exception:
             logger.warning("lease: check_lease could not read lease state", exc_info=True)
             return None
+        if state.status == "unreadable":
+            return None                                # no answer, no claim (and no noise)
 
         async def claim_at(term: int, promoted: bool = False) -> Any:
             async with self._lease_lock():

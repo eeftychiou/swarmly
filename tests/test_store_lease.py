@@ -73,6 +73,27 @@ class StoreLeaseTests(unittest.TestCase):
         self.server.t += 15                                  # past expiry by the log's clock
         self.assertFalse(behind.state().live(self.server() - 20))
 
+    def test_a_peer_sees_a_claim_as_it_arrives(self):
+        """Lines are folded on arrival: is_coordinator and succession need no refresh."""
+        claude, deepseek = self.lease_for("Claudebot"), self.lease_for("DeepSeek")
+        claude.claim(term=1)
+        self.assertEqual(deepseek.state().holder, "claudebot")   # no refresh in between
+
+    def test_a_lease_can_carry_on_above_the_gitbus_terms(self):
+        claude = self.lease_for("Claudebot")
+        claude.claim(term=41)
+        self.assertEqual(claude.state().term, 41)
+        with self.assertRaises(LeaseError):
+            claude.claim(term=40)                            # never back
+
+    def test_a_yield_keeps_the_old_holders_name(self):
+        claude = self.lease_for("Claudebot")
+        claude.claim(term=1)
+        claude.yield_lease(reason="frozen")
+        state = claude.state()
+        self.assertEqual((state.holder, state.expires_at), ("claudebot", 0.0))
+        self.assertTrue(state.claim.yielded)
+
     def test_an_unready_store_is_unreadable_and_refuses_to_claim(self):
         store = TelegramStore("Claudebot", FakeIO(self.group, "Claudebot"), clock=self.server)
         lease = StoreLease(store, self.loop, alias="Claudebot")
@@ -123,6 +144,39 @@ class ChannelUsesTheStoreLeaseTests(unittest.TestCase):
         lease = asyncio.run(go())
         self.assertEqual((lease.holder, lease.term), ("hermes", 1))
         self.assertGreater(lease.expires_at, group.clock() + 500)
+
+    def test_the_fence_answers_on_the_event_loop(self):
+        """Review: round writes and the GitHub poll call lease_fence on the loop; a blocking
+        store call there was refused, so the fence always said no."""
+        from tests.test_telegram_channel import make_channel, make_config
+        channel = make_channel(make_config(state={"backend": "telegram", "lease": "store"}))
+        group = FakeGroup(Clock())
+        store = TelegramStore("Hermes", FakeIO(group, "Hermes"), clock=group.clock)
+        store.CONFIRM_SECONDS = 0.0
+        channel.state_link.store = store
+        channel._lease_clock = group.clock
+        channel.config.identity.role = "coordinator"
+
+        async def go():
+            channel.__dict__["_loop"] = asyncio.get_running_loop()
+            await store.start()
+            self.assertFalse(channel.lease_fence())          # nothing held yet
+            await channel.check_lease()
+            return channel.lease_fence(), channel._has_lease_bus()
+        fence, bus = asyncio.run(go())
+        self.assertTrue(fence)
+        self.assertTrue(bus, "hand-over and /role yields work without a gitbus checkout")
+
+    def test_check_lease_waits_quietly_for_the_store(self):
+        from tests.test_telegram_channel import make_channel, make_config
+        channel = make_channel(make_config(state={"backend": "telegram", "lease": "store"}))
+        channel.config.identity.role = "coordinator"
+
+        async def go():
+            channel.__dict__["_loop"] = asyncio.get_running_loop()
+            with self.assertNoLogs("swarmly.telegram", level="WARNING"):
+                return await channel.check_lease()
+        self.assertIsNone(asyncio.run(go()))
 
     def test_the_default_keeps_the_gitbus_lease(self):
         from swarmly.telegram.lease import LeaseStore

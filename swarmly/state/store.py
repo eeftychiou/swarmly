@@ -213,11 +213,16 @@ class StateStore:
                                      reason=self.log.rejected.get(pos, "")))
         return final
 
-    async def claim_lease(self, ttl: float, *, confirm: bool = True) -> WriteResult:
+    async def claim_lease(self, ttl: float, *, confirm: bool = True,
+                          at_least: int = 0) -> WriteResult:
+        """Claim or renew the lease; ``at_least`` lifts the term (to stay above the terms a
+        lease moved from gitbus already used)."""
         lease = self.lease()
         mine = K.norm(lease.holder or "") == self.alias
         live = lease.held_by(self.server_now()) is not None
         term = lease.term if (mine and live) else lease.term + 1
+        if at_least > lease.term:
+            term = int(at_least)
         result = await self.write(K.LEASE, {"holder": self.alias, "term": term, "ttl": ttl},
                                   confirm=confirm)
         if not result.applied and mine and term == lease.term                 and self.lease().held_by(self.server_now()) is None:
