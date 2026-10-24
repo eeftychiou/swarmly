@@ -188,6 +188,35 @@ class TestTheStallLadder(unittest.TestCase):
         plain = [row(updated_at=1000.0, created_at=1000.0, topic="tg-1")]
         self.assertEqual(guard.stalls(plain, now=1000.0 + 999 * 60, minutes=0), [])
 
+    def test_a_debtor_that_cannot_act_does_not_hold_the_ladder(self):
+        """#246: the reminder rung is the debtor's alone, so a paused debtor stopped it dead."""
+        rows = [row(kind="verdict", debtor="Antigravity", owes="a QA verdict on #245",
+                    item="#245", updated_at=1000.0, topic="tg-1")]
+        stalled = guard.stalls(rows, now=1000.0 + 31 * 60, minutes=30,
+                               unable={"antigravity": "paused"})
+        self.assertEqual([s.step for s in stalled], [guard.STALL_COORDINATOR])
+        self.assertEqual(stalled[0].rung, 1)
+        self.assertIn("cannot act (paused)", stalled[0].text)
+
+    def test_the_skip_is_written_down_so_the_admin_rung_follows(self):
+        rows = [row(kind="verdict", debtor="Antigravity", owes="a QA verdict on #245",
+                    item="#245", updated_at=1000.0, topic="tg-1")]
+        first = guard.stalls(rows, now=1000.0 + 31 * 60, minutes=30,
+                             unable={"antigravity": "paused"})
+        guard.advance(rows, first, now=1000.0 + 31 * 60)
+        self.assertEqual(rows[0].stalls, 2)                    # both rungs are spent
+        rows[0].updated_at = 1000.0
+        after = guard.stalls(rows, now=1000.0 + 32 * 60, minutes=30,
+                             unable={"antigravity": "paused"})
+        self.assertEqual([s.step for s in after], [guard.STALL_ADMIN])
+
+    def test_a_debtor_that_can_act_keeps_its_reminder(self):
+        rows = [row(kind="verdict", debtor="Antigravity", owes="a QA verdict on #245",
+                    item="#245", updated_at=1000.0, topic="tg-1")]
+        stalled = guard.stalls(rows, now=1000.0 + 31 * 60, minutes=30,
+                               unable={"Claudebot": "paused"})
+        self.assertEqual([s.step for s in stalled], [guard.STALL_REMINDER])
+
     def test_each_rung_says_something_different(self):
         rows = self.rows()
         texts = {guard.stall_text(rows[0], step, minutes=30) for step in guard.STALL_STEPS}
@@ -303,6 +332,26 @@ class TestTheGuardTick(unittest.TestCase):
         channel.owed_guard_tick(now=1000.0 + 31 * 60)
         self.assertEqual(len(channel._test_turns), 1)
         self.assertEqual([r.stalls for r in channel._test_table[1].load()], [2])
+
+    def test_a_paused_debtors_row_reaches_the_coordinator(self):
+        """#246, the failure itself: a row owed by a paused bot must not wait on it."""
+        channel = self.channel()
+        channel._peers_frozen["Antigravity"] = {"ref": "pause", "until": None}
+        channel._test_table[1].save_all([
+            row(kind="verdict", debtor="Antigravity", owes="a QA verdict on #245",
+                item="#245", head="cefd20a", updated_at=1000.0,
+                topic=channel.topics.context(GROUP, 5122))])
+        self.assertEqual(channel.owed_guard_tick(now=1000.0 + 10 * 60), [])   # not yet
+        done = channel.owed_guard_tick(now=1000.0 + 31 * 60)
+        # This bot is not the coordinator, so the rung is held here -- but it is the
+        # coordinator's rung, not a reminder to a paused peer that nobody would deliver.
+        self.assertIn("only the coordinator climbs this rung", " ".join(done))
+        self.assertEqual([r.stalls for r in channel._test_table[1].load()], [0])
+        channel.is_coordinator = lambda **kwargs: True
+        channel.owed_guard_tick(now=1000.0 + 31 * 60)
+        self.assertEqual(len(channel._test_turns), 1)
+        self.assertIn("cannot act (paused)", channel._test_turns[0][0])
+        self.assertEqual([r.stalls for r in channel._test_table[1].load()], [2])  # both spent
 
     def test_two_bots_on_one_table_climb_one_rung_between_them(self):
         """Four bots on the beat used to mean four reminders and four rungs for one stall."""

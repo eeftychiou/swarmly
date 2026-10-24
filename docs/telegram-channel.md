@@ -1297,7 +1297,9 @@ WAIT answer on the Drive credentials
 `review` and `qa` are verdict rows on that head, `ci` is the transport's own, `merge` the
 coordinator's, `progress` an owner's, and `answer` the admin's. A head-bound kind without a
 `head <sha>` is refused, a verdict/merge/progress without `from <alias>` is refused, `ci` may
-not name a bot as its debtor, and an unknown kind is refused with the list — every refusal is
+not name a bot as its debtor, **a bot that cannot act now is refused as a debtor** (paused,
+out of quota, or DOWN — "Antigravity is paused: name a peer who can act"), and an unknown kind
+is refused with the list — every refusal is
 said back into the reply, and the line is removed either way (a WAIT the bot believes it made
 is a promise the ladder (#164) and the wakes (#163) both act on). An `answer` row is keyed by
 the question it asks (the way `owed.admin_row` keys it), so two questions to the admin in one
@@ -1406,7 +1408,14 @@ rungs, each happening once and each logged — a reminder to the debtor in code,
 coordinator turn to reassign or escalate, then the admin. **Who climbs**: only the row's own
 debtor posts the reminder, and only the coordinator the two rungs after it, in code — the table
 folds every bot's documents, so without that check four bots would each post the reminder and
-push the ladder four rungs for one stall (the rule #177 set for wakes, applied to the ladder). **A round's coordinator wakes are
+push the ladder four rungs for one stall (the rule #177 set for wakes, applied to the ladder).
+**A rung whose deliverer cannot act is skipped** (#246): the reminder is the debtor's alone, so
+a debtor that is paused, frozen, out of quota or DOWN never delivered it and the coordinator
+and admin rungs never came — on 23–24 Oct a row owed by a paused peer left the round sitting
+7.5 hours with every pulse reading `idle`. Such a row goes straight to the coordinator rung in
+one interval, and to the admin one interval after that; the rung is written down (the row's
+`stalls` counts the skipped one too), so the ladder carries on from where it climbed rather than
+re-sending the rung nobody could deliver. **A round's coordinator wakes are
 budgeted** by `limits.round_wake_budget` (default 20 a day, counted in
 `.agents/state/owed-wake-budget.json`, beside the table and never inside it, so a restart does
 not refill it): reaching it pauses those wakes, leaves the table readable in `/owed`, and tells

@@ -109,6 +109,39 @@ class TestARefusalSaysWhy(unittest.TestCase):
         self.assertIn("needs a kind", self.refused("WAIT"))
 
 
+class TestNobodyWaitsOnABotThatCannotAct(unittest.TestCase):
+    """#246: the transport accepted a WAIT on a peer whose own pulse said `paused`."""
+
+    def test_a_wait_on_a_paused_peer_is_refused_with_one_line(self):
+        with self.assertRaises(wl.WaitError) as caught:
+            wl.parse_line("WAIT qa #245 head cefd20a from Antigravity", at=1000.0,
+                          unable={"antigravity": "paused"})
+        self.assertEqual(str(caught.exception),
+                         "Antigravity is paused: name a peer who can act")
+
+    def test_the_alias_is_matched_however_it_is_written(self):
+        for said in ("Antigravity", "antigravity", "@Antigravity"):
+            with self.subTest(said=said):
+                with self.assertRaises(wl.WaitError):
+                    wl.parse_line(f"WAIT progress #246 from {said}", at=1000.0,
+                                  unable={"antigravity": "paused"})
+
+    def test_a_peer_that_can_act_is_left_alone(self):
+        row = wl.parse_line("WAIT qa #245 head cefd20a from Reasonix", at=1000.0,
+                            unable={"antigravity": "paused"})
+        self.assertEqual(row.debtor, "Reasonix")
+
+    def test_the_extraction_says_it_back_and_records_nothing(self):
+        body, rows, reasons = wl.extract_waits(
+            "Reviewed it.\n"
+            "WAIT qa #245 head cefd20a from Antigravity", topic="tg-1",
+            at=1000.0, unable={"antigravity": "paused"})
+        self.assertEqual(rows, [])
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("Antigravity is paused", reasons[0])
+        self.assertNotIn("WAIT qa", body)                     # never posted as prose
+
+
 class TestExtraction(unittest.TestCase):
 
     def test_the_line_leaves_the_reply_and_becomes_a_row(self):

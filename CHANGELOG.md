@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A row owed by a bot that cannot act no longer stalls the round (`#246`). The ladder's
+  reminder rung is the debtor's alone, so a paused, frozen or out-of-quota debtor never
+  delivered it and the coordinator and admin rungs never came — on 23–24 Oct `WAIT merge #245
+  … from Antigravity` sat for 7.5 hours while every pulse read `idle`, with Antigravity
+  admin-paused. `owed_guard.stalls` now takes the blocked peers (`blocked_peers()`: frozen,
+  out of quota, DOWN) and skips a skipped reminder straight to the coordinator rung in one
+  interval, then the admin; the rung is recorded in the row's `stalls`, so the next tick
+  carries on instead of re-sending the rung nobody could deliver, and the coordinator's rung
+  says why (`… but cannot act (paused), so its reminder was skipped`). The same map refuses a
+  `WAIT … from <peer>` naming a bot that cannot act, with one line — `Antigravity is paused:
+  name a peer who can act` — so the transport no longer opens a row nothing will deliver.
+
 - The merge attribution holds where the command shape varies (`#232`, review of `#229`). Who
   the guard speaks for is now **baked into the `gh` wrapper** `prepare()` writes
   (`SWARMLY_ALIAS=… SWARMLY_LEASE_TERM=… exec … gh "$@"`, and the `.cmd` twin), instead of
