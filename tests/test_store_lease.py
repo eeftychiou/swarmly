@@ -29,7 +29,7 @@ class StoreLeaseTests(unittest.TestCase):
         self.assertEqual(claude.state().status, "absent")
         claude.claim(term=1)
         state = claude.state()
-        self.assertEqual((state.status, state.holder, state.term), ("ok", "claudebot", 1))
+        self.assertEqual((state.status, state.holder, state.term), ("ok", "Claudebot", 1))
         self.assertTrue(state.holds("Claudebot", self.server()))
         self.server.t += 300
         claude.claim(term=1)                                 # a renewal
@@ -91,8 +91,16 @@ class StoreLeaseTests(unittest.TestCase):
         claude.claim(term=1)
         claude.yield_lease(reason="frozen")
         state = claude.state()
-        self.assertEqual((state.holder, state.expires_at), ("claudebot", 0.0))
+        self.assertEqual((state.holder, state.expires_at), ("Claudebot", 0.0))
         self.assertTrue(state.claim.yielded)
+
+    def test_the_holder_is_named_as_configured(self):
+        """Live drill, 25 Oct: the store's "claudebot" did not match presence's "Claudebot",
+        so a DOWN holder was never seen as down and nobody took over."""
+        claude, deepseek = self.lease_for("Claudebot"), self.lease_for("DeepSeek")
+        deepseek._names["claudebot"] = "Claudebot"
+        claude.claim(term=1)
+        self.assertEqual(deepseek.state().holder, "Claudebot")
 
     def test_an_unready_store_is_unreadable_and_refuses_to_claim(self):
         store = TelegramStore("Claudebot", FakeIO(self.group, "Claudebot"), clock=self.server)

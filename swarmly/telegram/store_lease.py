@@ -48,8 +48,12 @@ class StoreLease:
     """The lease interface of ``LeaseStore``, backed by the shared state store."""
 
     def __init__(self, store: Any, loop: asyncio.AbstractEventLoop, *, alias: str,
-                 ttl_seconds: float = 600.0, clock: Any = None) -> None:
+                 ttl_seconds: float = 600.0, clock: Any = None,
+                 aliases: Any = ()) -> None:
         self.store = store
+        #: The swarm's aliases as configured ("Claudebot"): the store keeps them lower-case,
+        #: and presence, the named coordinator and the notices look them up as configured.
+        self._names = {str(a).strip().lower(): str(a).strip() for a in (*aliases, alias) if a}
         self.loop = loop
         self.alias = alias
         self.ttl_seconds = float(ttl_seconds)
@@ -107,6 +111,7 @@ class StoreLease:
         local_expiry = float(lease.expires_at) - offset
         # A yield keeps the old holder's name with expiry 0, as gitbus does.
         holder = str(lease.holder or (entry.writer if entry is not None else "") or "")
+        holder = self._names.get(holder.lower(), holder)   # "claudebot" -> "Claudebot"
         yielded = not lease.holder
         claim = StoreClaim(term=lease.term, alias=holder,
                            expires_at=0.0 if yielded else local_expiry,
