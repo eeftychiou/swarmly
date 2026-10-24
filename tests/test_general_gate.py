@@ -89,6 +89,40 @@ class GeneralGateTests(unittest.TestCase):
         self.assertEqual(adapter.prompts, [])
         self.assertTrue(channel._test_sender.sent, "the command was answered")
 
+    def test_a_request_naming_another_bot_still_gets_a_topic(self):
+        """Review: the coordinator's should_respond dropped "@CodexBot ..." as another peer's,
+        and Codex left it to the coordinator -- nobody acted."""
+        channel, adapter, opened = channel_for()
+        run(channel.handle_event(admin("@CodexBot please check the CI flakes")))
+        self.assertEqual(adapter.prompts, [])
+        self.assertEqual(len(opened), 1)
+        self.assertIn("@CodexBot please check the CI flakes", opened[0][1])
+
+    def test_a_peers_request_in_general_is_still_acknowledged(self):
+        channel, adapter, _ = channel_for()
+        run(channel.handle_event(event(
+            "[A2A v1.1] REQUEST to=Hermes intent=QUERY id=r1\n\n@HermesBot status of #12?")))
+        self.assertEqual(adapter.prompts, [])
+        self.assertTrue(any("ACK" in m["text"] for m in channel._test_sender.sent),
+                        channel._test_sender.sent)
+
+    def test_an_own_brief_in_swarm_pulse_goes_to_the_work_topic(self):
+        channel, adapter, _ = channel_for()
+        channel._last_turn_place = (GROUP, 9400)
+        run(channel.run_transport_turn("[Transport notice] peer back", GROUP, PULSE))
+        self.assertEqual(len(adapter.prompts), 1)
+
+    def test_a_dropped_transport_turn_says_it_was_not_run(self):
+        channel, _, _ = channel_for()
+        result = run(channel.run_transport_turn("[Transport notice] CI red", GROUP, None))
+        self.assertFalse(result.ok)
+        self.assertIn("no work topic", result.error)
+
+    def test_a_bad_value_is_refused(self):
+        from swarmly.telegram.config import ConfigError
+        with self.assertRaises(ConfigError):
+            make_config(limits={"general_turns": "sometimes"})
+
     def test_allow_keeps_todays_behaviour(self):
         channel, adapter, opened = channel_for(general_turns="allow")
         run(channel.handle_event(admin("@HermesBot please check the CI flakes")))

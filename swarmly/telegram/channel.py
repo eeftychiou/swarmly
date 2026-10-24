@@ -7092,6 +7092,10 @@ class AgentChannel:
                                    chat_id=event.chat_id, thread_id=event.thread_id,
                                    allow_when_frozen=True)
 
+        person = await self._general_request(event)
+        if person is not None:
+            return person or None
+
         decision, reason = self.should_respond(event)
         logger.info("routing decision: respond=%s (reason: %s)", decision, reason)
         if decision and event.message_id is not None:
@@ -7126,18 +7130,18 @@ class AgentChannel:
                                    chat_id=event.chat_id, thread_id=event.thread_id,
                                    allow_when_frozen=True)
 
+        # §5, Rule 5: an addressed REQUEST from a peer is acknowledged going in.
+        if self.replies is None:
+            await self._ack_inbound_request(envelope, event)
+
         # Topic registry, phase 4: with limits.general_turns "never", no model turn runs in
         # General or Swarm pulse (an own brief is moved to a work topic, a person's work gets
-        # a topic of its own, the rest is dropped).
+        # a topic of its own, the rest is dropped). After the ACK, so no sender escalates.
         gated = await self._general_gate(event)
         if gated is not None:
             return gated or None
         topic_key = (event.chat_id, event.thread_id)      # the gate may have moved the event
         generation = (self._stop_generation, self._stop_topic_generation.get(topic_key, 0))
-
-        # §5, Rule 5: an addressed REQUEST from a peer is acknowledged going in.
-        if self.replies is None:
-            await self._ack_inbound_request(envelope, event)
 
         # The loop brake comes after commands and the ACK: a capped topic still answers
         # /ping and acknowledges a REQUEST (so no sender escalates), it only takes no turn.
@@ -8532,6 +8536,24 @@ class AgentChannel:
         return "Swarm pulse" if pulse is not None and int(event.thread_id) == int(pulse) \
             else None
 
+    async def _general_request(self, event: ChannelEvent) -> Optional[Any]:
+        """A person's message in General, with limits.general_turns "never": the coordinator
+        opens a topic for it whichever bot it names (the named bot is addressed again in the
+        topic, by the request quoted there); every other bot leaves it to the coordinator.
+        None: not such a message, the normal path goes on."""
+        if getattr(self.config.limits, "general_turns", "allow") != "never":
+            return None
+        if event.self_task or event.author_is_bot or \
+                self._transport_only_place(event) != "General":
+            return None
+        if parse_command(event.text or "") is not None or not self._may_start_turns(event):
+            return None                                    # commands and strangers as today
+        if not self.is_coordinator():
+            logger.info("general gate: a person's request in General -- the coordinator "
+                        "opens a topic for it")
+            return ""
+        return await self._topic_for_general(event)
+
     async def _general_gate(self, event: ChannelEvent) -> Optional[Any]:
         """None: the turn may run here. Otherwise this message gets no turn where it is, and
         the return value is what was sent instead ("" for nothing).
@@ -8547,7 +8569,7 @@ class AgentChannel:
             return None
         if event.self_task:
             place = self._work_place()
-            if place is not None and where == "General":
+            if place is not None:
                 logger.info("general gate: an own brief for %s goes to work topic %s instead",
                             where, place[1])
                 event.chat_id, event.thread_id = place
@@ -8555,6 +8577,7 @@ class AgentChannel:
                 return None
             logger.warning("general gate: an own brief in %s dropped -- no work topic to "
                            "take it: %r", where, (event.text or "")[:120])
+            event.__dict__["gate_dropped"] = True
             return ""
         if event.author_is_bot:
             logger.info("general gate: no turn for @%s's message in %s",
@@ -8990,6 +9013,12 @@ class AgentChannel:
         finally:
             _TRANSPORT_REPLIES.reset(token)
         reply = replies[-1] if replies else None
+        if task.__dict__.get("gate_dropped"):
+            # General is transport-only and there is no work topic: not run, and said so, so
+            # the poller can retry or surface it instead of counting it delivered.
+            return types.SimpleNamespace(ok=False, text="",
+                                         error="no work topic to run it in (General is "
+                                               "transport-only)")
         failed = reply is not None and not getattr(reply, "ok", True)
         return types.SimpleNamespace(
             ok=not failed, text=str(result or ""),
