@@ -67,6 +67,12 @@ class PushCheckTests(unittest.TestCase):
                                    "Claude", single))
         self.assertIsNone(pc.check(self.line("agents-bus"), "coordinator", "Claude", single))
 
+    def test_the_coordinator_may_create_main_on_an_empty_remote(self):
+        """#249 review: a new repository's first push has nothing to merge into."""
+        single = fake_git({("log", "-p"): "", ("rev-list",): f"{A}\n"})
+        self.assertIsNone(pc.check(self.line("main", remote=pc.ZERO), "coordinator", "Claude",
+                                   single))
+
 
 class Recording(EchoAdapter):
     def __init__(self, replies):

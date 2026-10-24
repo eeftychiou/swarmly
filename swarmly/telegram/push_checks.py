@@ -94,7 +94,9 @@ def check(lines: Sequence[str], role: str, me: str, git: Git) -> Optional[Tuple[
                 return ("coordinator_code_push", f"the coordinator does not push branches "
                         f"({branch}); a developer writes the change")
             parents = git("rev-list", "--parents", "-n", "1", local).split()
-            if len(parents) < 3:
+            # Creating main on an empty remote has nothing to merge into: that first push is
+            # how a new swarm's repository starts (#249 review).
+            if remote != ZERO and len(parents) < 3:
                 return ("coordinator_code_push", f"the coordinator pushes merges only; the tip "
                         f"of this push to {branch} is not a merge commit")
     return None

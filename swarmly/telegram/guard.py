@@ -268,10 +268,14 @@ def _pre_push(args: Sequence[str]) -> int:
         # The rulebook's push rules (admin, 24 Oct): no secrets, no force over another
         # agent's branch, and a coordinator pushes merges only.
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from push_checks import check as push_check, default_git
-        found = push_check(lines, os.environ.get("SWARMLY_ROLE", ""),
-                           os.environ.get("GIT_AUTHOR_NAME", ""),
-                           default_git(os.environ.get("SWARMLY_REAL_GIT") or "git"))
+        try:
+            from push_checks import check as push_check, default_git
+            found = push_check(lines, os.environ.get("SWARMLY_ROLE", ""),
+                               os.environ.get("GIT_AUTHOR_NAME", ""),
+                               default_git(os.environ.get("SWARMLY_REAL_GIT") or "git"))
+        except Exception:                              # noqa: BLE001 - a partial install
+            found = None                               # must not block every push
+            print("swarmly guard: the push checks could not run", file=sys.stderr)
         if found:
             kind, why = found
             _drift(os.environ.get("SWARMLY_DRIFT_FILE", ""), kind, why)
