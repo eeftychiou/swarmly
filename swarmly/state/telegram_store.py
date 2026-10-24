@@ -1,0 +1,212 @@
+"""The Telegram backend: the op log is the Swarm pulse topic, the snapshot is a pinned file.
+
+``docs/design/topic-registry.md`` §1b, "Telegram as the store":
+
+* **A write is one machine line** in Swarm pulse::
+
+      [A2A v1.1] NOTE to=* intent=STATE ref=<key>
+
+      {"k":"<key>","b":<base>,"t":<term>,"w":"<alias>","v":{...}}
+
+  Its message id is the op's position and its Telegram date the op's time, so every bot
+  folds the same log the same way. The writer is who Telegram says sent it, not who the line
+  claims. A value too big for one message goes as a JSON file with the header as caption.
+* **The snapshot is a pinned file.** The lease holder posts the state as a new JSON file,
+  pins it and unpins the previous one; ``getChat`` returns the chat's newest *sent* pin, so a
+  dashboard that is only ever edited in place never hides it. It covers only ops older than
+  ``SNAPSHOT_SETTLE_SECONDS``, so no line still on its way can land behind it.
+* **Starting or rejoining** reads the local cache, then the pin, then whatever lines arrive.
+  A line written against a version this bot has not seen (a gap) makes it read the pin again.
+
+Telegram itself is reached through a small ``TelegramIO`` the transport provides (post a
+line, post a file, pin, unpin, read the pin), so this module needs no aiogram and is tested
+with a fake group.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
+from swarmly.state.log import Op
+from swarmly.state.store import StateStore, StoreError
+from swarmly.telegram.wire import Envelope, MessageType, format_message, parse_message
+
+logger = logging.getLogger("swarmly.state.telegram")
+
+STATE_INTENT = "STATE"
+SNAPSHOT_INTENT = "SNAPSHOT"
+#: Over this, the op goes as a file (Telegram's limit is 4096; the header needs room).
+MAX_LINE_CHARS = 3500
+#: A snapshot covers only ops at least this old.
+SNAPSHOT_SETTLE_SECONDS = 15.0
+
+
+@dataclass
+class Posted:
+    message_id: int
+    date: float
+
+
+@dataclass
+class Pinned:
+    message_id: int
+    caption: str
+    read: Callable[[], Awaitable[bytes]]
+
+
+class TelegramIO:
+    """What the store needs from the transport. Every method may raise: the store fails
+    closed (``StoreError``) and the caller acts on nothing until it works again."""
+
+    async def post_line(self, text: str) -> Posted:
+        raise NotImplementedError
+
+    async def post_file(self, name: str, data: bytes, caption: str) -> Posted:
+        raise NotImplementedError
+
+    async def pin(self, message_id: int) -> None:
+        raise NotImplementedError
+
+    async def unpin(self, message_id: int) -> None:
+        raise NotImplementedError
+
+    async def pinned(self) -> Optional[Pinned]:
+        raise NotImplementedError
+
+
+def header(intent: str, ref: str) -> str:
+    return format_message(Envelope(type=MessageType.NOTE, to="*", intent=intent, ref=ref))
+
+
+class TelegramStore(StateStore):
+    CONFIRM_SECONDS = 4.0
+
+    def __init__(self, alias: str, io: TelegramIO, **kwargs: Any) -> None:
+        super().__init__(alias, **kwargs)
+        self.io = io
+        #: ops that arrived since the last refresh, as (op, None) or (wire-less file, loader)
+        self._inbox: List[Op] = []
+        self._files: List[Tuple[int, float, str, Callable[[], Awaitable[bytes]]]] = []
+        self.snapshot_message: Optional[int] = None
+        self._snapshot_pos = 0
+
+    # -- inbound: the transport calls this for every STATE / SNAPSHOT message ------------
+    def ingest(self, *, message_id: int, date: float, author: str, text: str,
+               read_file: Optional[Callable[[], Awaitable[bytes]]] = None) -> bool:
+        """Take one message from Swarm pulse; True if it was the store's. Never raises."""
+        try:
+            envelope, body = parse_message(text or "")
+        except Exception:                              # noqa: BLE001 - not ours
+            return False
+        intent = (envelope.intent or "").upper()
+        if envelope.type != MessageType.NOTE or intent not in (STATE_INTENT, SNAPSHOT_INTENT):
+            return False
+        if intent == SNAPSHOT_INTENT:
+            return True                                # read through the pin, not here
+        if read_file is not None:
+            self._files.append((int(message_id), float(date), author, read_file))
+            return True
+        try:
+            wire = json.loads(body)
+            self._inbox.append(Op.from_wire(wire, pos=message_id, at=date, writer=author))
+        except (ValueError, KeyError, TypeError):
+            logger.warning("state: unreadable STATE line %s from %s", message_id, author)
+        return True
+
+    async def _pull(self) -> List[Op]:
+        ops, self._inbox = self._inbox, []
+        files, self._files = self._files, []
+        for message_id, date, author, read in files:
+            try:
+                wire = json.loads((await read()).decode("utf-8"))
+                ops.append(Op.from_wire(wire, pos=message_id, at=date, writer=author))
+            except Exception:                          # noqa: BLE001 - one bad file
+                logger.warning("state: STATE file %s from %s unreadable", message_id, author,
+                               exc_info=True)
+        return ops
+
+    # -- outbound --------------------------------------------------------------------------
+    async def _append(self, wire: Dict[str, Any]) -> Tuple[int, float]:
+        body = json.dumps(wire, separators=(",", ":"), sort_keys=True)
+        head = header(STATE_INTENT, wire["k"])
+        try:
+            if len(head) + len(body) + 2 > MAX_LINE_CHARS:
+                posted = await self.io.post_file(f"state-{wire['k'].replace('/', '_')}.json",
+                                                 body.encode("utf-8"), head)
+            else:
+                posted = await self.io.post_line(f"{head}\n\n{body}")
+        except Exception as exc:                       # noqa: BLE001
+            raise StoreError(f"the write did not reach Telegram: {exc}") from exc
+        return int(posted.message_id), float(posted.date)
+
+    # -- the snapshot ----------------------------------------------------------------------
+    async def _load_snapshot(self) -> None:
+        try:
+            pinned = await self.io.pinned()
+        except Exception as exc:                       # noqa: BLE001
+            raise StoreError(f"the pinned snapshot could not be read: {exc}") from exc
+        if pinned is None:
+            return
+        envelope, _body = parse_message(pinned.caption or "")
+        if (envelope.intent or "").upper() != SNAPSHOT_INTENT:
+            logger.info("state: the newest pin (%s) is not a snapshot", pinned.message_id)
+            return
+        try:
+            data = json.loads((await pinned.read()).decode("utf-8"))
+        except Exception as exc:                       # noqa: BLE001
+            raise StoreError(f"the snapshot file could not be read: {exc}") from exc
+        self.log.rebase(data)
+        self.snapshot_message = pinned.message_id
+        self._snapshot_pos = self.log.base_pos
+
+    async def publish_snapshot(self, *, now: Optional[float] = None,
+                               force: bool = False) -> bool:
+        """Post and pin the state (the lease holder only). False when there is nothing new."""
+        moment = self.clock() if now is None else now
+        if not self.holds_lease(moment):
+            return False
+        settled = [o.pos for o in self.log.ops if o.at <= moment - SNAPSHOT_SETTLE_SECONDS]
+        upto = settled[-1] if settled else self.log.base_pos
+        if upto <= self._snapshot_pos and not force:
+            return False
+        data = json.dumps(self.log.snapshot(upto=upto), separators=(",", ":")).encode()
+        caption = format_message(Envelope(type=MessageType.NOTE, to="*",
+                                          intent=SNAPSHOT_INTENT, ref=f"p{upto}"),
+                                 f"term={self.lease().term} hash={self.state_hash()}")
+        try:
+            posted = await self.io.post_file(f"swarm-state-{upto}.json", data, caption)
+            await self.io.pin(posted.message_id)
+        except Exception as exc:                       # noqa: BLE001
+            logger.warning("state: the snapshot was not published: %s", exc)
+            return False
+        previous, self.snapshot_message = self.snapshot_message, posted.message_id
+        self._snapshot_pos = upto
+        if previous is not None and previous != posted.message_id:
+            try:
+                await self.io.unpin(previous)
+            except Exception:                          # noqa: BLE001 - an extra pin is harmless
+                logger.info("state: the previous snapshot %s stays pinned", previous)
+        return True
+
+    # -- recovery when the pin is lost ---------------------------------------------------
+    async def restore_from_cache(self) -> bool:
+        """The lease holder re-publishes its own state when there is no snapshot pinned.
+
+        The holder reads every line, so its state is the newest any bot has; the design's
+        fuller recovery (every bot offers its cache, the highest wins) comes with phase 3,
+        when the lease itself lives here.
+        """
+        try:
+            pinned = await self.io.pinned()
+        except Exception:                              # noqa: BLE001
+            return False
+        if pinned is not None:
+            envelope, _ = parse_message(pinned.caption or "")
+            if (envelope.intent or "").upper() == SNAPSHOT_INTENT:
+                return False
+        logger.warning("state: no snapshot is pinned; publishing this bot's state")
+        return await self.publish_snapshot(force=True)
+

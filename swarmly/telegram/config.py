@@ -193,7 +193,7 @@ def _parse_float(where: str, value: Any, default: float) -> float:
 #: against :class:`ChannelLimits`.
 KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "": ("agent", "peers", "adapter", "limits", "fallback", "bus", "projects", "github",
-         "control", "web", "public_redactions", "swarm"),
+         "control", "web", "public_redactions", "swarm", "state"),
     "agent": ("name", "alias", "bot_token", "bot_token_env", "home_channel_id",
               "admin_user_id", "maintainer_username", "allowed_users", "git_name",
               "git_email", "role"),
@@ -213,6 +213,8 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     # issue #240: the local read-only web page, off unless the operator turns it on
     "web": ("enabled", "port", "public_host", "init_max_age"),
     "swarm": ("succession",),
+    # topic registry, phase 1: the shared state store, in shadow unless the operator says
+    "state": ("backend", "mode", "heartbeat_minutes"),
 }
 
 
@@ -983,6 +985,18 @@ class ControlSettings:
 
 
 @dataclass
+class StateSettings:
+    """The shared state store (``docs/design/topic-registry.md``). Off unless turned on."""
+
+    #: ``off`` or ``telegram`` (the op log in Swarm pulse, the snapshot pinned there).
+    backend: str = "off"
+    #: ``shadow``: the store runs beside today's logic and nothing reads it (phase 1).
+    mode: str = "shadow"
+    #: How often each bot writes its heartbeat key in shadow.
+    heartbeat_minutes: float = 10.0
+
+
+@dataclass
 class WebSettings:
     """The local dashboard page (issue #240, slice 1). Off unless the operator turns it on.
 
@@ -1022,6 +1036,8 @@ class AgentConfig:
     control: Optional[ControlSettings] = None
     #: Issue #240: the local web page, when the operator wants one.
     web: Optional[WebSettings] = None
+    #: The topic registry's shared state store (off by default).
+    state: StateSettings = field(default_factory=StateSettings)
     #: Issue #22: literal -> replacement, applied to everything that leaves the host (bus
     #: payloads and GitHub-facing text). Empty by default: nothing is redacted until the
     #: operator names what is sensitive on this machine.
@@ -1375,6 +1391,24 @@ class AgentConfig:
         elif control_raw is not None:
             raise ConfigError("'control' must be a mapping")
 
+        # The topic registry's shared state store: off unless the operator turns it on.
+        state_raw = data.get("state")
+        state = StateSettings()
+        if isinstance(state_raw, dict):
+            backend = str(state_raw.get("backend") or "off").strip().lower()
+            if backend not in ("off", "telegram"):
+                raise ConfigError(f"state.backend must be off or telegram (got {backend!r})")
+            mode = str(state_raw.get("mode") or "shadow").strip().lower()
+            if mode != "shadow":
+                raise ConfigError(f"state.mode must be shadow for now (got {mode!r})")
+            minutes = _parse_float("state.heartbeat_minutes",
+                                   state_raw.get("heartbeat_minutes", 10.0), 10.0)
+            if minutes <= 0:
+                raise ConfigError("state.heartbeat_minutes must be more than 0")
+            state = StateSettings(backend=backend, mode=mode, heartbeat_minutes=minutes)
+        elif state_raw is not None:
+            raise ConfigError("'state' must be a mapping")
+
         # Issue #240: the local read-only web page. No section, no server: nothing opens a
         # port unless the operator asked for one (and only the lease holder serves it).
         web_raw = data.get("web")
@@ -1425,7 +1459,7 @@ class AgentConfig:
         swarm = dict(swarm_raw) if isinstance(swarm_raw, dict) else {}
         return cls(identity=identity, peers=peers, peer_roles=peer_roles, adapter=adapter, limits=limits,
                    fallback=fallback, bus=bus, projects=projects_dict, github=github,
-                   control=control, web=web,
+                   control=control, web=web, state=state,
                    public_redactions=public_redactions, swarm=swarm, source_path=source_path,
                    _bus_poll_minutes_explicit=bool(bus_poll_explicit),
                    unknown_keys=unknown)
