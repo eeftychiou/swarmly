@@ -242,6 +242,18 @@ def _pre_push(args: Sequence[str]) -> int:
                           text=True).returncode
 
 
+def _drift(ledger: str, kind: str, evidence: str) -> None:
+    """One violation into the transport's drift ledger (drift.py), from this process."""
+    if not ledger:
+        return
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from drift import append_inbox
+        append_inbox(ledger, kind, evidence)
+    except Exception:                                  # noqa: BLE001 - never block on it
+        pass
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "pre-push":
@@ -258,6 +270,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     git = os.environ.get("SWARMLY_REAL_GIT") or "git"
     branch = _current_branch(git, split_git(args)[0]) if tool == "git" else None
     why = refusal(os.environ.get("SWARMLY_ROLE", ""), tool, args, branch)
+    if not why and tool == "gh":
+        # The merge gate (admin, 24 Oct): review merge + QA pass + green CI on the head.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from merge_gate import check as merge_gate
+        why = merge_gate(real, args, dict(os.environ))
+        if why:
+            _drift(os.environ.get("SWARMLY_DRIFT_FILE", ""), "merge_gate_refused",
+                   f"gh {' '.join(args)}: {why}")
     if why:
         print(f"swarmly guard: refused `{tool} {' '.join(args)}`: {why}.", file=sys.stderr)
         return REFUSED
@@ -291,7 +311,7 @@ def _pass_through(name: str) -> str:
 
 
 def prepare(folder: Path, role: str, env: Dict[str, str], *, alias: str = "",
-            term: int = 0) -> Dict[str, str]:
+            term: int = 0, drift: str = "") -> Dict[str, str]:
     """Write the gh wrapper and the git hooks into ``folder`` and return ``env`` with them in
     force, or ``env`` unchanged when they cannot be written.
 
@@ -325,6 +345,8 @@ def prepare(folder: Path, role: str, env: Dict[str, str], *, alias: str = "",
     if real["gh"]:
         out["PATH"] = os.pathsep.join([str(folder), path]) if path else str(folder)
     out["SWARMLY_ROLE"] = role
+    if drift:
+        out["SWARMLY_DRIFT_FILE"] = drift
     # #228: who the guard speaks for, so a merge it runs can say so on the PR. Written even
     # when empty: an empty alias is what keeps an unguarded merge from being attributed.
     out[ALIAS_ENV] = alias

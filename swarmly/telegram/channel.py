@@ -723,6 +723,9 @@ class AgentChannel:
         self._shutting_down = False
         # The admin's /hold (admin, 23 Oct): the swarm answers but starts nothing, and no
         # timer, ladder or reminder makes work for it. Kept across restarts.
+        # Rulebook violations the transport saw this bot make (drift.py, admin 24 Oct).
+        from swarmly.telegram.drift import DriftLedger
+        self.drift = DriftLedger(_state_file(config, "drift"))
         self._hold_path = _state_file(config, "hold")
         held = load_state(self._hold_path, "hold")
         self._hold: Dict[str, Any] = held if held.get("held") else {}
@@ -1620,7 +1623,7 @@ class AgentChannel:
         if command == "effort":
             command = "reasoning"
         if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes",
-                            "owed", "usage", "memory"):
+                            "owed", "usage", "memory", "drift"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1642,6 +1645,9 @@ class AgentChannel:
             return self.usage_text(event)
         if command == "memory":
             return self._memory_command(event)
+        if command == "drift":
+            self.drift.fold_inbox()
+            return self.drift.summary(self.config.identity.alias)
         return self._command_reply(command, event)
 
     # ------------------------------------------------------------------------------
@@ -2424,8 +2430,146 @@ class AgentChannel:
                 str(entry.get("ref") or ""), "frozen")
             until = describe_until(entry.get("until"))
             parts.append(f"{alias} ({why}{', ' + until if until else ''})")
+        covers = self.stand_ins()
+        cover = ("; ".join(f"{alias}'s {role} work goes to {who}"
+                           for alias, (role, who) in sorted(covers.items())))
         return (f"\n\n[Frozen peers take no work until they resume: {'; '.join(parts)}. "
-                "Give their part to another peer; if no one else can do it, tell the admin.]")
+                + (f"Stand-ins the transport applies: {cover}. " if cover else "")
+                + "A message addressed to a frozen peer is not delivered to it. Give their part "
+                "to another peer; if no one else can do it, tell the admin.]")
+
+    #: Which role covers a frozen holder's role, in order (admin, 24 Oct): reviewer and QA
+    #: stand in for each other. A developer's or the coordinator's work is the coordinator's
+    #: to re-plan, so they have no automatic stand-in.
+    STAND_IN_FOR = {"qa-tester": ("reviewer",), "qa": ("reviewer",),
+                    "reviewer": ("reviewer", "qa-tester")}
+
+    def stand_ins(self) -> Dict[str, Tuple[str, str]]:
+        """``frozen alias -> (its role, the stand-in alias)`` for every frozen peer whose role
+        has an active stand-in. Applied in code, so a fresh turn and the owed table see it --
+        live, 24 Oct 01:11, a fresh coordinator session asked a paused QA bot for its verdict."""
+        frozen = set(self.frozen_peers())
+        roster: Dict[str, str] = {}
+        if self.config.identity.role:
+            roster[self.config.identity.alias] = str(self.config.identity.role)
+        roster.update({a: str(r) for a, r in (getattr(self.config, "peer_roles", {}) or {})
+                       .items() if r})
+        try:
+            down = set(self.presence().down_peers(self.presence_clock()))
+        except Exception:                                  # noqa: BLE001 - frozen is enough
+            down = set()
+        out: Dict[str, Tuple[str, str]] = {}
+        for alias in sorted(frozen | (down & set(roster))):
+            role = roster.get(alias, "").lower()
+            for cover in self.STAND_IN_FOR.get(role, ()):
+                who = next((a for a, r in sorted(roster.items())
+                            if r.lower() == cover and a != alias
+                            and a not in frozen and a not in down), None)
+                if who:
+                    out[alias] = (role, who)
+                    break
+        return out
+
+    def _drift_note(self) -> str:
+        """The broken rules, quoted back while this bot's drift score is over the line."""
+        try:
+            self.drift.fold_inbox()
+            if not self.drift.decide().remind:
+                return ""
+            text = self.drift.reminder()
+        except Exception:                                  # noqa: BLE001 - a note, not a turn
+            logger.debug("drift: no reminder this turn", exc_info=True)
+            return ""
+        return f"\n\n{text}" if text else ""
+
+    def record_violation(self, kind: str, evidence: str = "", chat_id: Optional[int] = None,
+                         thread_id: Optional[int] = None) -> Any:
+        """Count one rulebook violation of this bot's, and act on its drift score: a reminder
+        rides the next turns (``_drift_note``); a reset retires the topic's session so the bot
+        re-reads the rulebook from a fresh one. Never raises."""
+        topic = f"{chat_id}:{thread_id}" if chat_id is not None else ""
+        try:
+            decision = self.drift.record(kind, evidence, topic)
+        except Exception:                                  # noqa: BLE001 - bookkeeping only
+            logger.warning("drift: could not record %s", kind, exc_info=True)
+            return None
+        logger.info("drift: %s recorded (%s); score %d, hard %d", kind, evidence[:120],
+                    decision.score, decision.hard)
+        if decision.reset and chat_id is not None:
+            self._spawn_drift_reset(chat_id, thread_id, decision)
+        return decision
+
+    def _spawn_drift_reset(self, chat_id: int, thread_id: Optional[int], decision: Any) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._drift_reset(chat_id, thread_id, decision))
+        self._self_tasks.add(task)
+
+    async def _drift_reset(self, chat_id: int, thread_id: Optional[int], decision: Any) -> None:
+        """Retire this topic's session after repeated violations: the next turn starts a new
+        one, which reads the rulebook again (a fresh-session runtime gets it every turn)."""
+        context_id = self.topics.context(chat_id, thread_id)
+        try:
+            self._adapter_for(chat_id, thread_id).forget_session(context_id)
+        except Exception:                                  # noqa: BLE001 - the notice still goes
+            logger.warning("drift: could not retire the session for %s", context_id,
+                           exc_info=True)
+        self.drift.mark_reset(f"{chat_id}:{thread_id}")
+        alias = self.config.identity.alias
+        await self.send(f"♻️ {alias}: context reset after {decision.score} points of rule "
+                        "violations; it re-reads the rulebook from a fresh session next turn.",
+                        chat_id=chat_id, thread_id=thread_id, silent=True, notice=True)
+        if decision.resets_today + 1 >= 3:
+            home = self.config.identity.home_channel_id
+            if home is not None:
+                await self.send(f"⚠️ {alias} has been reset {decision.resets_today + 1} times "
+                                "in 24 hours for rule violations (/drift). Consider giving its "
+                                "role to another bot or changing its model.",
+                                chat_id=int(home), silent=True, notice=True)
+
+    def _refuse_frozen_addressees(self, body: str, event: ChannelEvent) -> str:
+        """A reply that addresses a paused, frozen or DOWN peer: the peer's handle is taken
+        out so it is not woken for work it cannot do, and the transport says so in the post
+        -- naming the stand-in, who is addressed instead when there is one. The sender is
+        charged a violation (admin, 24 Oct: "the transport bus should refuse a message to a
+        paused agent and reply in transport space")."""
+        frozen = self.frozen_peers()
+        try:
+            down = set(self.presence().down_peers(self.presence_clock()))
+        except Exception:                                  # noqa: BLE001
+            down = set()
+        unreachable = set(frozen) | down
+        if not body or not unreachable:
+            return body
+        covers = self.stand_ins()
+        notes: List[str] = []
+        for alias in sorted(unreachable):
+            handle = str(self.config.peers.get(alias, "") or "").lstrip("@")
+            if not handle or alias == self.config.identity.alias:
+                continue
+            pattern = re.compile(rf"@{re.escape(handle)}\b", re.IGNORECASE)
+            if not pattern.search(body):
+                continue
+            body = pattern.sub(alias, body)                # named, not woken
+            why = ("DOWN" if alias in down and alias not in frozen else
+                   {"quota": "out of quota", "pause": "paused by the admin"}.get(
+                       str((frozen.get(alias) or {}).get("ref") or ""), "frozen"))
+            line = f"⛔ Not delivered to {alias}: {why}."
+            cover = covers.get(alias)
+            if cover:
+                role, who = cover
+                who_handle = str(self.config.peers.get(who, "") or "").lstrip("@")
+                line += (f" Its {role} work goes to its stand-in"
+                         + (f" @{who_handle}" if who_handle else f" {who}") + ".")
+            else:
+                line += " No stand-in is free: the coordinator re-plans it."
+            notes.append(line)
+            self.record_violation("addressed_frozen_peer",
+                                  f"addressed {alias} ({why}) in a reply",
+                                  event.chat_id, event.thread_id)
+        return body + ("\n\n" + "\n".join(notes) if notes else "")
 
     # -- peer liveness: the pulse, and DOWN (issue #82) -----------------------------------
 
@@ -4966,6 +5110,13 @@ class AgentChannel:
         add(self.config.identity.alias, self.config.identity.role)
         for alias, role in (getattr(self.config, "peer_roles", {}) or {}).items():
             add(alias, role)
+        try:
+            covers = self.stand_ins()
+        except Exception:                                  # noqa: BLE001 - the roster stands
+            covers = {}
+        for key, alias in list(roles.items()):
+            if alias in covers:                            # a frozen holder's debts move
+                roles[key] = covers[alias][1]
         return roles
 
     def owed_bots(self) -> Set[str]:
@@ -6690,6 +6841,7 @@ class AgentChannel:
             text += self._waiting_note(event.text)
         text += self._frozen_peers_note()
         text += self._hold_note()
+        text += self._drift_note()
         text += self._swarm_usage_note()
         text += self._memory_note()
         if not event.self_task and asks_for_topic(event.text or ""):
@@ -7248,6 +7400,7 @@ class AgentChannel:
         adapter = self._adapter_for(event.chat_id, event.thread_id)
         self.__dict__["_turn_lease_term"] = 0            # never carry a last turn's term
         adapter.acting_coordinator = await self._acting_coordinator()
+        adapter.drift_path = str(self.drift.path or "")          # the guard reports here
         adapter.lease_term = self._turn_term()
         turn = asyncio.ensure_future(adapter.respond(incoming))
         self._current_turn = turn
@@ -7552,6 +7705,8 @@ class AgentChannel:
         if event.self_task:
             body = self._unaddress_self(body)
         body = drop_stray_silence(body)
+        if body and not is_silent_reply(body):
+            body = self._refuse_frozen_addressees(body, event)
         if not body or is_silent_reply(body):
             if body:
                 logger.info("turn for message %s chose to stay silent", event.message_id)
