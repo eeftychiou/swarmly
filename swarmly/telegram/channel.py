@@ -688,6 +688,8 @@ class AgentChannel:
         self.selftest = PeerSelfTest(self)       # startup check that the bots see each other
         from swarmly.telegram.store_probe import StoreProbe
         self.store_probe = StoreProbe(self)      # /storetest: the Telegram store's facts
+        from swarmly.telegram.state_link import StateLink
+        self.state_link = StateLink(self)        # the shared state store (shadow, phase 1)
         from swarmly.telegram.roster import Roster
         self.roster = Roster(config, clock=lambda: self._clock())   # bots admitted at runtime
         from swarmly.telegram.membership import Membership
@@ -1636,7 +1638,7 @@ class AgentChannel:
         if command == "effort":
             command = "reasoning"
         if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes",
-                            "owed", "usage", "memory", "drift", "storetest"):
+                            "owed", "usage", "memory", "drift", "storetest", "state"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1663,6 +1665,8 @@ class AgentChannel:
             return self.drift.summary(self.config.identity.alias)
         if command == "storetest":
             return self._storetest_command(event)
+        if command == "state":
+            return self.state_link.describe()
         return self._command_reply(command, event)
 
     def _storetest_command(self, event: ChannelEvent) -> str:
@@ -4462,6 +4466,9 @@ class AgentChannel:
             how = await self._publish_pulse_line(line)
             said = f"pulse {how} rev={pulse.rev or '?'} busy_since={pulse.busy_since}"
         await self.check_peer_liveness(now=moment)
+        if self.state_link.enabled:
+            # Topic registry, phase 1: the store in shadow -- its own failures stay its own.
+            logger.info("state: %s", await self.state_link.beat(now=moment))
         # Round 5.5 (#161): a turn whose CLI has gone silent past the kill limit is stopped
         # here, through the /stop path. Liveness only -- this never starts a turn.
         await self.check_stuck_turns(now=moment)
@@ -4695,7 +4702,7 @@ class AgentChannel:
     # economy, issue #43). REQUEST/RESPONSE/BLOCKED are never machine-class.
     _MACHINE_STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED", "PULSE"})
     _MACHINE_NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE",
-                                       "CONTROL", "PROBE"})
+                                       "CONTROL", "PROBE", "STATE", "SNAPSHOT"})
 
     def _machine_event_class(self, envelope: Envelope) -> Optional[str]:
         """Classify a machine-only envelope; ``None`` means it follows the normal path.
@@ -4737,6 +4744,10 @@ class AgentChannel:
             # check is repeated here: the note only ever carries the presser's Telegram id. The
             # envelope's own header is not part of the line, so the body is what is parsed.
             self.apply_control_note(parse_message(event.text)[1], sender=alias)
+        if envelope.type == MessageType.NOTE and \
+                (envelope.intent or "").upper() in ("STATE", "SNAPSHOT"):
+            # The shared state store (topic registry): a peer's write, machine traffic only.
+            self.state_link.on_machine(envelope, event)
         if envelope.type == MessageType.NOTE and (envelope.intent or "").upper() == "PROBE":
             # /storetest (topic registry, phase 0): a peer's probe line, machine traffic only.
             self.store_probe.observe(envelope, event)
@@ -9832,6 +9843,7 @@ class AgentChannel:
             self._github_task = asyncio.create_task(self._github_tick())
         if self._heartbeat_task is None and self.heartbeat_seconds() > 0:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self.state_link.start()                    # its own switch, not the heartbeat's
         replayed = self.replay_interrupted()      # what the last run accepted and never finished
         if replayed:
             logger.info("inbox: replaying %d message(s) a restart interrupted", replayed)

@@ -359,7 +359,7 @@ Rationale for "coordinator gets everything, others when named": it keeps the cos
 
 **Testing on the swarm's own bots.** There is no second swarm: a bot token can only be polled by one process, so tests run on the live bots. To keep that safe:
 
-- every phase ships **behind a flag** in `config.yaml` (`store.backend`, `registry.mode: off | shadow | on`, `routing.mode`, `drift.mode`, …), first in **shadow** (it records and compares, nothing acts on it) and only then **on**, one flag at a time;
+- every phase ships **behind a flag** in `config.yaml` (`state.backend: off | telegram` and `state.mode: shadow` for the store and the registry, `limits.general_turns: allow | never` for phase 4, and one more per later phase), first in **shadow** (it records and compares, nothing acts on it) and only then **on**, one flag at a time;
 - live tests run in a dedicated **🧪 Swarm test** topic, with scripted messages from the admin account or a transport self-test, never in the round's work topics;
 - each phase has **acceptance checks** (below) run on the live bots, and a written result in the PR before the flag is turned on;
 - every flag can be switched back to `off` without a deploy (config change and bot restart), and every phase keeps today's path working until its cleanup.
