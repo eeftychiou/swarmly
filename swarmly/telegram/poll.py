@@ -1016,7 +1016,10 @@ class MachineEventClassifier:
     """
 
     STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED"})
-    NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE"})
+    # Kept in step with AgentChannel._MACHINE_NOTE_INTENTS (review, #263): a store line or a
+    # probe line must never open a model turn, whoever classifies it.
+    NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE", "CONTROL",
+                              "PROBE", "STATE", "SNAPSHOT"})
 
     def __init__(self, channel: Any = None) -> None:
         # A channel may carry overridden sets (e.g. tests); fall back to the

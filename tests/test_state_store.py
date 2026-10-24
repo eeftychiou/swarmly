@@ -80,6 +80,11 @@ class RecordTests(unittest.TestCase):
                             "role": "reference", "added_by": "a", "added_at": "t",
                             "status": "open"})
 
+    def test_a_work_item_needs_status_and_phase(self):
+        with self.assertRaises(RecordError):
+            Link.from_dict({"id": "L1", "provider": "topic", "kind": "task", "ref": "T-1-1",
+                            "role": "work", "added_by": "a", "added_at": "t"})
+
     def test_a_missing_required_field_is_refused(self):
         with self.assertRaises(RecordError):
             Binding.from_dict({"role": "developer"})
@@ -171,6 +176,59 @@ class FoldTests(unittest.TestCase):
         self.assertEqual(partial.state_hash(), log.state_hash())
         reloaded = StateLog.load(json.loads(json.dumps(log.dump())))
         self.assertEqual(reloaded.state_hash(), log.state_hash())
+
+
+class SnapshotTests(unittest.TestCase):
+    def truth(self):
+        log = StateLog()
+        log.add_all([lease(1, "claudebot", 1, ttl=600, at=0),
+                     op(2, "topic/7", 0, "claudebot", {"n": 1}, term=1, at=10),
+                     lease(3, "deepseek", 2, ttl=600, at=700, base=1),
+                     op(4, "topic/7", 1, "deepseek", {"n": 2}, term=2, at=710)])
+        return log
+
+    def test_a_snapshot_from_an_older_term_is_refused(self):
+        """Review, #263: a deposed holder that missed its successor's claim posts a snapshot
+        later in the log; it must not roll every reader back to term 1."""
+        reader = self.truth()
+        stale = StateLog()
+        stale.add_all([lease(1, "claudebot", 1, ttl=10 ** 6, at=0),
+                       op(2, "topic/7", 0, "claudebot", {"n": 1}, term=1, at=10)])
+        snapshot = stale.snapshot()
+        snapshot["last_pos"] = 40
+        self.assertEqual(snapshot["term"], 1)
+        self.assertFalse(reader.rebase(snapshot))
+        self.assertEqual(reader.lease().holder, "deepseek")
+        self.assertEqual(reader.value("topic/7"), {"n": 2})
+
+    def test_a_snapshot_never_overwrites_a_newer_entry(self):
+        reader = self.truth()
+        partial = StateLog()
+        partial.add_all([lease(1, "claudebot", 1, ttl=600, at=0),
+                         lease(3, "deepseek", 2, ttl=600, at=700, base=1)])
+        snapshot = partial.snapshot()
+        snapshot["last_pos"] = 50                    # it never saw op 4
+        self.assertTrue(reader.rebase(snapshot))
+        self.assertEqual(reader.value("topic/7"), {"n": 2})
+
+    def test_compact_only_up_to_what_was_published(self):
+        log = self.truth()
+        before = log.state_hash()
+        log.compact(2)
+        self.assertEqual(log.base_pos, 2)
+        self.assertEqual([o.pos for o in log.ops], [3, 4])
+        self.assertEqual(log.state_hash(), before)
+        log.add(op(5, "topic/7", 2, "deepseek", {"n": 3}, term=2, at=720))
+        self.assertEqual(log.value("topic/7"), {"n": 3})
+
+
+class ClassifierTests(unittest.TestCase):
+    def test_store_and_probe_lines_are_machine_traffic_for_every_caller(self):
+        from swarmly.telegram.poll import MachineEventClassifier
+        from swarmly.telegram.wire import Envelope
+        for intent in ("STATE", "SNAPSHOT", "PROBE", "CONTROL"):
+            self.assertEqual(MachineEventClassifier().classify(
+                Envelope(type="NOTE", intent=intent, ref="x")), "note")
 
 
 class LeaseTests(unittest.TestCase):
@@ -457,7 +515,7 @@ class TelegramStoreTests(unittest.TestCase):
             self.assertEqual(c.lease().holder, "claudebot")    # the lower id won after all
             self.assertEqual(len({s.state_hash() for s in (a, b, c)}), 1)
             self.assertFalse(b.holds_lease())
-            self.assertIsNotNone(second)
+            self.assertIn(second.pos, b.log.rejected)    # b's claim lost, once it knew
         run(go())
 
     def test_a_big_value_goes_as_a_file(self):

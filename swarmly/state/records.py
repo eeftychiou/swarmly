@@ -147,6 +147,8 @@ class Link(Record):
         if self.role != "work" and (self.status or self.phase or self.assignees):
             raise RecordError(f"link {self.id}: only a work item has status, phase or "
                               "assignees")
+        if self.role == "work" and (self.status is None or self.phase is None):
+            raise RecordError(f"link {self.id}: a work item needs a status and a phase (§1a)")
 
 
 @dataclass

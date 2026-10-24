@@ -17,6 +17,11 @@
   ``SNAPSHOT_SETTLE_SECONDS``, so no line still on its way can land behind it.
 * **Starting or rejoining** reads the local cache, then the pin, then whatever lines arrive.
   A line written against a version this bot has not seen (a gap) makes it read the pin again.
+  The pin holds only settled ops, so a bot that restarts can lack the newest seconds of the
+  log until a later line (a gap) or the next snapshot fills them in; in shadow that is fine,
+  and phase 3 has to keep it in mind (review, #263).
+* **A snapshot from an older term is refused**, and a snapshot never overwrites an entry the
+  reader holds with a higher (term, position): see ``StateLog.rebase``.
 
 Telegram itself is reached through a small ``TelegramIO`` the transport provides (post a
 line, post a file, pin, unpin, read the pin), so this module needs no aiogram and is tested
@@ -93,6 +98,10 @@ class TelegramStore(StateStore):
         self.snapshot_message: Optional[int] = None
         self._snapshot_pos = 0
 
+    @property
+    def snapshot_pos(self) -> int:
+        return self._snapshot_pos
+
     # -- inbound: the transport calls this for every STATE / SNAPSHOT message ------------
     def ingest(self, *, message_id: int, date: float, author: str, text: str,
                read_file: Optional[Callable[[], Awaitable[bytes]]] = None) -> bool:
@@ -158,7 +167,11 @@ class TelegramStore(StateStore):
             data = json.loads((await pinned.read()).decode("utf-8"))
         except Exception as exc:                       # noqa: BLE001
             raise StoreError(f"the snapshot file could not be read: {exc}") from exc
-        self.log.rebase(data)
+        if not self.log.rebase(data):
+            logger.warning("state: the pinned snapshot %s is stale (term %s, position %s); "
+                           "keeping this bot's state", pinned.message_id, data.get("term"),
+                           data.get("last_pos"))
+            return
         self.snapshot_message = pinned.message_id
         self._snapshot_pos = self.log.base_pos
 
@@ -184,6 +197,7 @@ class TelegramStore(StateStore):
             return False
         previous, self.snapshot_message = self.snapshot_message, posted.message_id
         self._snapshot_pos = upto
+        self.log.compact(upto)                         # the ops it covers are folded in
         if previous is not None and previous != posted.message_id:
             try:
                 await self.io.unpin(previous)
@@ -193,7 +207,8 @@ class TelegramStore(StateStore):
 
     # -- recovery when the pin is lost ---------------------------------------------------
     async def restore_from_cache(self) -> bool:
-        """The lease holder re-publishes its own state when there is no snapshot pinned.
+        """The lease holder publishes its own state when there is no snapshot pinned (what it
+        holds is its folded log, which its local cache mirrors).
 
         The holder reads every line, so its state is the newest any bot has; the design's
         fuller recovery (every bot offers its cache, the highest wins) comes with phase 3,
@@ -209,4 +224,3 @@ class TelegramStore(StateStore):
                 return False
         logger.warning("state: no snapshot is pinned; publishing this bot's state")
         return await self.publish_snapshot(force=True)
-

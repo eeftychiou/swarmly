@@ -180,7 +180,7 @@ class StateLink:
                     done.append(f"lease {'claimed' if result.applied else 'refused'} "
                                 f"(term {store.lease().term})")
                 if await store.publish_snapshot(now=moment):
-                    done.append(f"snapshot to p{store._snapshot_pos}")
+                    done.append(f"snapshot to p{store.snapshot_pos}")
                 elif await store.restore_from_cache():
                     done.append("snapshot restored")
             if moment - self._last_beat >= self.beat_seconds:

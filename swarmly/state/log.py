@@ -264,7 +264,10 @@ class StateLog:
                                ops=[o for o in self.ops if o.pos <= upto])
             partial._refold()
             entries, last = partial.entries, max(self.base_pos, upto)
+        lease = entries.get(K.LEASE)
+        value = (lease.value or {}) if lease is not None else {}
         return {"v": SNAPSHOT_VERSION, "last_pos": last,
+                "term": int(value.get("term") or 0), "holder": value.get("holder"),
                 "entries": {k: e.to_dict() for k, e in sorted(entries.items())}}
 
     def dump(self) -> Dict[str, Any]:
@@ -294,21 +297,46 @@ class StateLog:
             log._refold()
         return log
 
-    def rebase(self, data: Dict[str, Any]) -> None:
-        """Adopt a newer snapshot, keeping the ops this reader has after it."""
+    def rebase(self, data: Dict[str, Any]) -> bool:
+        """Adopt a newer snapshot, keeping the ops this reader has after it. True if adopted.
+
+        A snapshot is refused when it is older than this reader's base, or when its lease term
+        is behind the term this reader knows (§1b: a snapshot from an older term is ignored,
+        as any stale write is). And it never replaces what this reader knows: an entry this
+        reader holds with a higher (term, position) than the snapshot's is kept, because a
+        deposed holder that missed its successor's claim can still post a snapshot *later* in
+        the log that lacks the successor's writes (review, #263).
+        """
         newer = StateLog.from_snapshot(data)
         if newer.base_pos < self.base_pos:
-            return
+            return False
+        if newer.lease().term < self.lease().term:
+            return False
+        merged = {k: copy.deepcopy(v) for k, v in newer.base.items()}
+        for key, mine in self.entries.items():
+            if mine.pos > newer.base_pos:
+                continue                               # an op after the snapshot: re-applied
+            theirs = merged.get(key)
+            if theirs is None or (mine.term, mine.pos) > (theirs.term, theirs.pos):
+                merged[key] = copy.deepcopy(mine)
         later = [o for o in self.ops if o.pos > newer.base_pos]
-        self.base, self.base_pos, self.ops = newer.base, newer.base_pos, later
+        self.base, self.base_pos, self.ops = merged, newer.base_pos, later
         self._refold()
+        return True
 
-    def compact(self) -> None:
-        """Fold the ops into the base (after the state was published as a snapshot)."""
-        self.base = {k: copy.deepcopy(v) for k, v in self.entries.items()}
-        self.base_pos = self.last_pos
-        self.ops = []
-        self.rejected = {}
+    def compact(self, upto: Optional[int] = None) -> None:
+        """Fold the ops up to ``upto`` (default: all) into the base -- after the state was
+        published as a snapshot up to there. Never past what was published: a later op may
+        still be overtaken by a line on its way."""
+        upto = self.last_pos if upto is None else min(int(upto), self.last_pos)
+        if upto <= self.base_pos:
+            return
+        folded = StateLog(base=self.base, base_pos=self.base_pos,
+                          ops=[o for o in self.ops if o.pos <= upto])
+        folded._refold()
+        self.base, self.base_pos = folded.entries, upto
+        self.ops = [o for o in self.ops if o.pos > upto]
+        self._refold()
 
     def pending(self) -> List[Tuple[int, str]]:
         """(position, reason) of rejected ops, for ``/state`` and the log."""

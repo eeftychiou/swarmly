@@ -186,8 +186,14 @@ class StateStore:
     async def _load_snapshot(self) -> None:
         return None
 
-    async def publish_snapshot(self) -> bool:
+    async def publish_snapshot(self, *, now: Optional[float] = None,
+                               force: bool = False) -> bool:
         return False
+
+    @property
+    def snapshot_pos(self) -> int:
+        """The position the last snapshot this bot published or read covers."""
+        return self.log.base_pos
 
 
 class MemoryLog:
@@ -230,8 +236,9 @@ class MemoryStore(StateStore):
             self.log.rebase(self.shared.snapshot)
             self._seen = max(self._seen, self.log.base_pos)
 
-    async def publish_snapshot(self) -> bool:
-        if not self.holds_lease():
+    async def publish_snapshot(self, *, now: Optional[float] = None,
+                               force: bool = False) -> bool:
+        if not self.holds_lease(now):
             return False
         self.shared.snapshot = self.log.snapshot()
         return True
@@ -305,8 +312,9 @@ class DirStore(StateStore):
         self.log.rebase(data)
         self._seen = max(self._seen, self.log.base_pos)
 
-    async def publish_snapshot(self) -> bool:
-        if not self.holds_lease():
+    async def publish_snapshot(self, *, now: Optional[float] = None,
+                               force: bool = False) -> bool:
+        if not self.holds_lease(now):
             return False
         path = self.root / "snapshot.json"
         tmp = path.with_suffix(f".tmp-{os.getpid()}")

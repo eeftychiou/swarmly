@@ -9804,7 +9804,7 @@ class AgentChannel:
             self._github_task = asyncio.create_task(self._github_tick())
         if self._heartbeat_task is None and self.heartbeat_seconds() > 0:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            self.state_link.start()
+        self.state_link.start()                    # its own switch, not the heartbeat's
         replayed = self.replay_interrupted()      # what the last run accepted and never finished
         if replayed:
             logger.info("inbox: replaying %d message(s) a restart interrupted", replayed)
