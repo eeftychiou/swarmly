@@ -5965,8 +5965,11 @@ class AgentChannel:
         round -- or after its round closed -- kept "Reasonix owes a merge" open for days, and
         the stall ladder handed it to the coordinator again and again. A merge is the fact: it
         answers every debt bound to the item, as :func:`swarmly.telegram.owed.closes` rules
-        for the round's own merge. Only a merge, and only for sure: a closed PR can be
-        reopened, and a row closed here stays closed, so "closed" and "unknown" close nothing.
+        for the round's own merge. A closed issue or PR answers only what
+        :func:`~swarmly.telegram.owed.closes` gives a close: progress and a verdict on work
+        that stopped (#276). A closed PR can be reopened and a row closed here stays closed, so
+        a close never touches its merge, CI or fix rows, and never an issue's rows through the
+        PR that carried it -- the issue's work may go on in another. "unknown" closes nothing.
 
         A row written under an issue asks about the PR that carries it (the round knows it). A
         bot checks the rows it would act on -- its own debts, every row when it coordinates --
@@ -6003,6 +6006,7 @@ class AgentChannel:
 
         rows = candidates()
         due: List[Tuple[str, str]] = []
+        stopped: Set[Tuple[str, str]] = set()      # read closed (not merged) on this beat
         for _row, key in rows:
             if key in due or key in self._owed_merged_keys() \
                     or moment - self._owed_item_checked.get(key, 0.0) < OWED_GITHUB_RECHECK_SECONDS:
@@ -6028,12 +6032,17 @@ class AgentChannel:
             for key in due:
                 self._owed_item_checked[key] = moment
             self._owed_note_merged(key for key, state in zip(due, states) if state == "merged")
+            stopped = {key for key, state in zip(due, states) if state == "closed"}
         merged = self._owed_merged_keys()
         closed: List[Any] = []
         for row, key in (candidates() if due else rows):   # as it is now, after the await
-            if key not in merged:
+            if key in merged:
+                fact = Fact(kind="merge", item=row.item)
+            elif key in stopped and key[1] == "#" + row.item.lstrip("#"):
+                fact = Fact(kind="close", item=row.item)
+            else:
                 continue
-            reason = closes(row, Fact(kind="merge", item=row.item))
+            reason = closes(row, fact)
             if reason is None:
                 continue
             row.state, row.closed_by, row.updated_at = "closed", f"{reason} on GitHub", moment

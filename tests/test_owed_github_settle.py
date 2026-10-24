@@ -79,8 +79,9 @@ class TestAMergedPrClosesItsRows(unittest.TestCase):
         run(channel.owed_settle_from_github(now=NOW))
         self.assertEqual(channel.owed_guard_tick(now=NOW + 7 * 86400), [])
 
-    def test_closed_or_unknown_closes_nothing(self):
-        # A closed PR can be reopened, and a row closed here stays closed: only a merge is final.
+    def test_a_close_never_closes_a_merge_and_unknown_closes_nothing(self):
+        # A closed PR can be reopened, and a row closed here stays closed: only a merge settles
+        # the merge itself.
         channel, store = channel_with([merge("#260"), merge("#261"), progress("#262")],
                                       {"#260": "closed", "#261": None, "#262": "open"})
         self.assertEqual(run(channel.owed_settle_from_github(now=NOW)), [])
@@ -100,6 +101,29 @@ class TestAMergedPrClosesItsRows(unittest.TestCase):
         run(channel.owed_settle_from_github(now=NOW + 2 * OWED_GITHUB_RECHECK_SECONDS))
         self.assertEqual(channel.owed_item_reader.asked, [(REPO, "#252")])
         self.assertEqual(open_ids(channel.owed_store()), [])
+
+
+class TestAClosedItemClosesItsProgressAndVerdict(unittest.TestCase):
+    """#276, folded in: nobody owes progress or a verdict on an issue or PR that was closed."""
+
+    def test_a_closed_issue_closes_its_progress_and_verdict_rows_only(self):
+        verdict = ow.Row(kind="verdict", item="#167", head="34a288f", debtor="Antigravity",
+                         owes="a review verdict", created_at=NOW - 86400,
+                         updated_at=NOW - 86400)
+        channel, store = channel_with([progress("#167"), verdict, merge("#167")],
+                                      {"#167": "closed"})
+        done = run(channel.owed_settle_from_github(now=NOW))
+        self.assertEqual(len(done), 2, done)
+        self.assertEqual(open_ids(store), [merge("#167").id])
+        closed = {row.id: row for row in store.load() if not row.is_open}
+        self.assertEqual(closed[progress("#167").id].closed_by, "#167 closed on GitHub")
+
+    def test_a_closed_pr_that_carried_an_issue_closes_none_of_the_issues_rows(self):
+        # The issue's work may go on in another PR.
+        channel, store = channel_with([progress("#227")], {"#230": "closed"})
+        channel._owed_round_prs = {(REPO, "#227"): "#230"}
+        self.assertEqual(run(channel.owed_settle_from_github(now=NOW)), [])
+        self.assertEqual(open_ids(store), [progress("#227").id])
 
 
 class TestTheSweepCountsAMergedPrDone(unittest.TestCase):
