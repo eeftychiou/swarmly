@@ -7586,6 +7586,7 @@ class AgentChannel:
         text += self._frozen_peers_note()
         text += self._hold_note()
         text += self._drift_note()
+        text += self.state_link.registry_note(event.chat_id, event.thread_id)
         text += self._swarm_usage_note()
         text += self._memory_note()
         if not event.self_task and asks_for_topic(event.text or ""):
@@ -8644,7 +8645,12 @@ class AgentChannel:
 
     def topic_for_text(self, text: str) -> Optional[Tuple[int, int]]:
         """The topic already about an issue or PR *text* names, if any (poll.py: a bus reply
-        is posted there rather than in General)."""
+        is posted there rather than in General). With ``state.links: registry`` the topics'
+        explicit links decide first; today's ref-learning is only the fallback."""
+        if self.state_link.links_mode == "registry":
+            found = self.state_link.topic_for_refs(issue_refs(text or ""))
+            if found is not None:
+                return found
         return self._topic_for_refs(text)
 
     def _forget_topic_refs(self, chat_id: Optional[int], thread_id: Optional[int]) -> None:

@@ -214,7 +214,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "web": ("enabled", "port", "public_host", "init_max_age"),
     "swarm": ("succession",),
     # topic registry, phase 1: the shared state store, in shadow unless the operator says
-    "state": ("backend", "mode", "heartbeat_minutes", "lease"),
+    "state": ("backend", "mode", "heartbeat_minutes", "lease", "links"),
 }
 
 
@@ -1007,6 +1007,9 @@ class StateSettings:
     #: Phase 3: ``shadow`` -- the gitbus lease decides, the store's mirrors it and /state
     #: compares them; ``store`` -- the store's lease is the coordinator lease.
     lease: str = "shadow"
+    #: Phase 5: ``legacy`` -- GitHub notices find their topic by today's ref-learning;
+    #: ``registry`` -- by the topics' explicit links first (ref-learning only as a fallback).
+    links: str = "legacy"
 
 
 @dataclass
@@ -1423,8 +1426,13 @@ class AgentConfig:
                 raise ConfigError(f"state.lease must be shadow or store (got {lease!r})")
             if lease == "store" and backend != "telegram":
                 raise ConfigError("state.lease: store needs state.backend: telegram")
+            links = str(state_raw.get("links") or "legacy").strip().lower()
+            if links not in ("legacy", "registry"):
+                raise ConfigError(f"state.links must be legacy or registry (got {links!r})")
+            if links == "registry" and backend != "telegram":
+                raise ConfigError("state.links: registry needs state.backend: telegram")
             state = StateSettings(backend=backend, mode=mode, heartbeat_minutes=minutes,
-                                  lease=lease)
+                                  lease=lease, links=links)
         elif state_raw is not None:
             raise ConfigError("'state' must be a mapping")
 

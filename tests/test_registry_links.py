@@ -212,6 +212,82 @@ class LinkFlowTests(unittest.TestCase):
         self.assertIn("DeepSeek", topic.agents)
 
 
+class RoutingAndGitHubTests(unittest.TestCase):
+    """Phase 5, part 2: notices follow the links, GitHub moves the items."""
+
+    def link_with_topics(self):
+        flow = LinkFlowTests()
+        link = flow.link()
+
+        def command(text, thread):
+            return asyncio.run(link.registry_command(SimpleNamespace(
+                text=text, author_id=1, author_is_bot=False, chat_id=-100, thread_id=thread)))
+        command("/link #12 as work", 55)
+        command("/link #12 as reference", 66)
+        command("/link https://github.com/o/r/pull/40 as work", 66)
+        command("/link https://github.com/x/other/pull/41 as work", 66)
+        command("/link #13 as work — the login fix", 88)
+        command("/link #7 as work", 77)
+        command("/phase #7 done", 77)
+        return link
+
+    def test_a_ref_finds_the_topic_whose_work_item_it_is(self):
+        link = self.link_with_topics()
+        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 55))
+        self.assertEqual(link.topic_for_refs(["#40"]), (-100, 66))
+        self.assertIsNone(link.topic_for_refs(["#7"]), "a closed item routes nothing")
+        self.assertIsNone(link.topic_for_refs(["#999"]))
+        self.assertEqual(link.topic_for_refs(["#13"]), (-100, 88), "a titled link routes")
+        self.assertIsNone(link.topic_for_refs(["#41"]), "another repo's #41 is not ours")
+
+    def test_the_coordinator_gets_the_registry_note_and_no_one_else(self):
+        link = self.link_with_topics()
+        note = link.registry_note(-100, 66)
+        self.assertIn("LINK:", note)
+        self.assertIn("L2 #40 development", note)
+        self.assertEqual(link.registry_note(-100, None), "")
+        flow = LinkFlowTests()
+        other = flow.link(holder=False)
+        self.assertEqual(other.registry_note(-100, 66), "")
+
+    def test_github_moves_the_items(self):
+        from unittest import mock
+        from swarmly.github.client import GitHubClient
+        link = self.link_with_topics()
+        states = {12: ("closed", False), 40: ("open", True), 13: ("closed", True),
+                  41: None}
+        with mock.patch.object(GitHubClient, "ref_kind_state",
+                               lambda self, repo, number: states.get(number)):
+            moved = asyncio.run(link.reconcile_github(link.store))
+        self.assertEqual(moved, 3)
+        t88 = Topic.from_dict(link.store.read("topic/88"))
+        self.assertEqual((t88.link("L1").kind, t88.link("L1").phase, t88.link("L1").status),
+                         ("pr", "development", "closed"), "a closed, unmerged PR is not done")
+        t55 = Topic.from_dict(link.store.read("topic/55"))
+        t66 = Topic.from_dict(link.store.read("topic/66"))
+        self.assertEqual((t55.link("L1").phase, t55.link("L1").status), ("done", "closed"))
+        self.assertEqual(t66.link("L2").phase, "review")
+        self.assertEqual(t55.history[-1].by, "github")
+        with mock.patch.object(GitHubClient, "ref_kind_state",
+                               lambda self, repo, number: states.get(number)):
+            self.assertEqual(asyncio.run(link.reconcile_github(link.store)), 0, "settled")
+
+    def test_the_channel_asks_the_registry_only_when_told_to(self):
+        from tests.test_telegram_channel import make_channel, make_config
+        channel = make_channel(make_config(state={"backend": "telegram", "links": "registry"}))
+        channel.state_link.topic_for_refs = lambda refs: (-100, 55) if "#12" in refs else None
+        self.assertEqual(channel.topic_for_text("CI went red on #12"), (-100, 55))
+        legacy = make_channel(make_config(state={"backend": "telegram"}))
+        legacy.state_link.topic_for_refs = lambda refs: (-100, 55)
+        self.assertIsNone(legacy.topic_for_text("CI went red on #12"))
+
+    def test_registry_links_need_the_store(self):
+        from swarmly.telegram.config import ConfigError
+        from tests.test_telegram_channel import make_config
+        with self.assertRaises(ConfigError):
+            make_config(state={"links": "registry"})
+
+
 class TopicsShowWorkItemsTests(unittest.TestCase):
     def test_describe(self):
         from swarmly.telegram.registry_shadow import RegistryShadow
