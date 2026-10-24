@@ -2153,6 +2153,8 @@ class AgentChannel:
         self.topics.forget(chat_id, thread_id)
         self._topic_memory.forget(chat_id, thread_id)
         self._forget_topic_refs(chat_id, thread_id)
+        if int(chat_id) == int(self.config.identity.home_channel_id or 0):
+            self.state_link.topic_gone(thread_id, deleted=True)
         if context:
             dropped = False
             for book, path, what in ((self._models, self._models_path, "model choices"),
@@ -7206,6 +7208,8 @@ class AgentChannel:
                                  current=event.topic_name_current)
             # Issue #63: when each topic was last active, for /cleanup's idle test.
             self.topics.touch(event.chat_id, event.thread_id)
+            if in_home_channel:
+                self.state_link.topic_seen(event.thread_id)  # open again, if it was closed
         self._note_general_message(event.chat_id, event.message_id, event.thread_id)
         self.record_topic_turn(event.chat_id, event.thread_id, event.text or "")
         self._note_progress(event)
@@ -8689,6 +8693,9 @@ class AgentChannel:
             return ("📌 /topic works inside a topic, with the items that live there: "
                     "/topic #164 #165") if speaks else ""
         self._learn_topic_refs(event.chat_id, event.thread_id, " ".join(refs), pin=True)
+        # With registry routing the topics' explicit links decide first: the lease holder
+        # records the admin's link here, and it outranks every other topic's (review, #279).
+        self.state_link.note_pin(event.chat_id, event.thread_id, refs, event.author_id)
         return (f"📌 {', '.join(refs)} live in this topic now: replies about them are "
                 "posted here.") if speaks else ""
 
@@ -10026,6 +10033,8 @@ class AgentChannel:
             self.stats.errors += 1      # not last_error: the reply still lands, no blocker
             self._gone_topics.add((destination, thread_id))
             self._forget_topic_refs(destination, thread_id)
+            if int(destination) == int(self.config.identity.home_channel_id or 0):
+                self.state_link.topic_gone(thread_id, deleted=_is_topic_deleted(gone.__cause__))
             if self._turn_slots is not None or not self.reroute_gone_topics:
                 raise
         return await self._post_in_general(payload, entities, plain, destination, thread_id,
@@ -10530,6 +10539,12 @@ def _is_topic_gone(exc: BaseException) -> bool:
     """Telegram's refusal of a post into a topic that is closed or no longer exists."""
     text = str(exc).lower()
     return any(marker in text for marker in _TOPIC_GONE)
+
+
+def _is_topic_deleted(exc: Optional[BaseException]) -> bool:
+    """A refusal that means the topic no longer exists (a closed one can be reopened)."""
+    text = str(exc or "").lower()
+    return any(marker in text for marker in _TOPIC_GONE if marker != "topic_closed")
 
 
 def _topics_path(config: AgentConfig) -> Optional[Path]:
