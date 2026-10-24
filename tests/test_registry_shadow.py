@@ -126,6 +126,70 @@ class RegistryShadowTests(unittest.TestCase):
         self.assertEqual((record["session_id"], record["rotations"], record["turns"]),
                          ("s2", 1, 0))
 
+    def test_the_first_session_is_not_a_rotation_and_its_turn_counts(self):
+        bot = channel_for("DeepSeek", self.clock)
+        seen(bot, 7, "t")
+        context = bot.topics.context(HOME, 7)
+        b = self.store("DeepSeek")
+        shadow = RegistryShadow(bot, clock=self.clock)
+
+        async def go():
+            await shadow.sync(b)                         # no session yet
+            bot.adapter.threads[context] = "T1"
+            shadow.turn_done(context, 7)
+            await shadow.sync(b)
+        asyncio.run(go())
+        record = b.read(K.topic_agent(7, "DeepSeek"))
+        self.assertEqual((record["session_id"], record.get("rotations", 0), record["turns"]),
+                         ("T1", 0, 1))
+
+    def test_a_restart_keeps_the_turn_count_and_sees_a_new_session(self):
+        bot = channel_for("DeepSeek", self.clock)
+        seen(bot, 7, "t")
+        context = bot.topics.context(HOME, 7)
+        b = self.store("DeepSeek")
+
+        async def go():
+            bot.adapter.threads[context] = "T1"
+            first = RegistryShadow(bot, clock=self.clock)
+            for _ in range(5):
+                first.turn_done(context, 7)
+            await first.sync(b)
+            again = RegistryShadow(bot, clock=self.clock)    # the transport restarted
+            again.turn_done(context, 7)
+            await again.sync(b)
+            self.assertEqual(b.read(K.topic_agent(7, "DeepSeek"))["turns"], 6)
+            bot.adapter.threads[context] = "T2"             # replaced while it was down
+            third = RegistryShadow(bot, clock=self.clock)
+            await third.sync(b)
+        asyncio.run(go())
+        record = b.read(K.topic_agent(7, "DeepSeek"))
+        self.assertEqual((record["session_id"], record["rotations"]), ("T2", 1))
+
+    def test_topics_never_active_are_not_written(self):
+        claude = channel_for("Claudebot", self.clock)
+        claude.topics.remember(HOME, 9, "named, never active")
+        a = self.store("Claudebot")
+
+        async def go():
+            await a.claim_lease(10 ** 6)
+            return await RegistryShadow(claude, clock=self.clock).sync(a)
+        self.assertNotIn("topic/9", asyncio.run(go()))
+
+    def test_a_derived_session_is_written_only_where_the_bot_worked(self):
+        claude = channel_for("Claudebot", self.clock, "claude_thread")
+        claude.adapter = SimpleNamespace(KEEPS_TOPIC_SESSION=True, alias="Claudebot",
+                                         settings=SimpleNamespace(cwd="."),
+                                         derived_session_id=lambda a, c, x: f"d-{x}")
+        seen(claude, 7, "worked here")
+        seen(claude, 8, "never here")
+        a = self.store("Claudebot")
+        shadow = RegistryShadow(claude, clock=self.clock)
+        shadow.turn_done(claude.topics.context(HOME, 7), 7)
+        written = asyncio.run(shadow.sync(a))
+        self.assertIn("topic/7/agent/claudebot", written)
+        self.assertNotIn("topic/8/agent/claudebot", written)
+
     def test_a_topic_choice_of_model_is_marked_as_the_topics(self):
         claude = channel_for("Claudebot", self.clock, "claude", "claude-opus-5-5")
         seen(claude, 7, "t")

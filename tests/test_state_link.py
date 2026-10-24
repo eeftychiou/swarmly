@@ -63,6 +63,22 @@ class StateLinkTests(unittest.TestCase):
         self.assertIn("deepseek: agrees", text)
         self.assertEqual(claude.store.lease().holder, "claudebot")
 
+    def test_a_registry_error_does_not_stop_the_beat(self):
+        clock = Clock()
+        group = FakeGroup(clock)
+        claude = link_for(group, "Claudebot", clock, coordinator=True)
+
+        async def broken(store):
+            raise ValueError("an adapter quirk")
+        claude.registry.sync = broken
+
+        async def go():
+            await claude.store.start()
+            return await claude.beat()
+        said = asyncio.run(go())
+        self.assertIn("registry failed", said)
+        self.assertIn("beat", said.replace("registry failed", ""))
+
     def test_a_failing_store_never_raises(self):
         clock = Clock()
         group = FakeGroup(clock)

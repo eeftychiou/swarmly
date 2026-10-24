@@ -41,6 +41,23 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 def session_of(adapter: Any, context_id: Optional[str]) -> Optional[str]:
     """The CLI session ``adapter`` keeps for a topic, whichever runtime it is."""
+    found = session_and_kind(adapter, context_id)
+    return found[0] if found else None
+
+
+def session_and_kind(adapter: Any, context_id: Optional[str]) -> Optional[tuple]:
+    """(session id, derived) -- derived ids (claude_thread) exist for every topic, whether the
+    bot ever ran a turn there or not."""
+    sid = _session(adapter, context_id)
+    if sid is None:
+        return None
+    return sid, bool(getattr(adapter, "KEEPS_TOPIC_SESSION", False)
+                     and hasattr(adapter, "derived_session_id")
+                     and not callable(getattr(adapter, "thread_for", None))
+                     and not callable(getattr(adapter, "conversation_for", None)))
+
+
+def _session(adapter: Any, context_id: Optional[str]) -> Optional[str]:
     if not context_id or adapter is None:
         return None
     for name in ("thread_for", "conversation_for"):
@@ -65,9 +82,8 @@ class RegistryShadow:
     def __init__(self, channel: "AgentChannel", *, clock: Any = time.time) -> None:
         self.channel = channel
         self.clock = clock
-        #: context id -> the session id seen last beat, to count rotations
-        self._sessions: Dict[str, Optional[str]] = {}
-        #: context id -> turns run since that session began (counted by the transport)
+        #: context id -> turns run since the last write that recorded them. The total lives
+        #: in the store (so a restart keeps it); this is only what is not written yet.
         self.turns: Dict[str, int] = {}
 
     # -- small readers ---------------------------------------------------------------------
@@ -94,8 +110,8 @@ class RegistryShadow:
             if chat != self._home() or thread is None:
                 continue
             seen = topics.last_seen(chat, thread)
-            if seen is not None and seen < horizon:
-                continue
+            if seen is None or seen < horizon:
+                continue                                # never active, or quiet too long
             out.append((thread, name, topics.context(chat, thread), seen))
         return out
 
@@ -120,9 +136,13 @@ class RegistryShadow:
         await store.refresh()
         changes: Dict[str, Dict[str, Any]] = {}
         self._changed(store, K.agent(self.alias, "profile"), self.profile().to_dict(), changes)
+        counted: Dict[str, tuple] = {}
         for thread, _name, context, _seen in self._topics():
-            self._changed(store, K.topic_agent(thread, self.alias),
-                          self._agent_in_topic(store, thread, context), changes)
+            key = K.topic_agent(thread, self.alias)
+            self._changed(store, key, self._agent_in_topic(store, thread, context), changes)
+            pending = self.turns.get(context or str(thread), 0)
+            if pending:
+                counted[key] = (context or str(thread), pending)
         if store.holds_lease():
             for thread, name, context, seen in self._topics():
                 self._changed(store, K.topic(thread),
@@ -133,6 +153,9 @@ class RegistryShadow:
         for result in await store.write_many(list(changes.items())):
             if result.applied:
                 written.append(result.key)
+                if result.key in counted:              # those turns are in the store now
+                    name, pending = counted[result.key]
+                    self.turns[name] = max(0, self.turns.get(name, 0) - pending)
             else:
                 logger.info("registry: %s not written: %s", result.key, result.reason)
         return written
@@ -158,22 +181,29 @@ class RegistryShadow:
 
     def _agent_in_topic(self, store: "StateStore", thread: int,
                         context: Optional[str]) -> Optional[Dict[str, Any]]:
-        session = session_of(getattr(self.channel, "adapter", None), context)
-        key = context or str(thread)
-        before = self._sessions.get(key, "unset")
+        """The agent's record for a topic, compared with what the store holds -- so a restart
+        keeps the turn count and still sees a session that changed while it was down."""
+        found = session_and_kind(getattr(self.channel, "adapter", None), context)
+        session, derived = found if found else (None, False)
+        pending = self.turns.get(context or str(thread), 0)
         current = store.read(K.topic_agent(thread, self.alias))
-        record = AgentInTopic.from_dict(current) if current else AgentInTopic()
-        if before != "unset" and before != session and session is not None:
-            record.rotations += 1
+        try:
+            record = AgentInTopic.from_dict(current) if current else AgentInTopic()
+        except RecordError:
+            record = AgentInTopic()
+        if current is None and pending == 0 and (session is None or derived):
+            # Nothing to say yet: no turn here, and (for a derived id) no session either --
+            # claude_thread has an id for every topic, used or not (review).
+            return None
+        if record.session_id is not None and session is not None \
+                and session != record.session_id:
+            record.rotations += 1                       # a new session replaced the old one
             record.started_at = now_iso(self.clock)
-            self.turns[key] = 0
-        if record.session_id is None and session is not None:
+            record.turns = 0                            # this beat's turns ran on the new one
+        elif record.session_id is None and session is not None:
             record.started_at = record.started_at or now_iso(self.clock)
-        self._sessions[key] = session
-        record.session_id = session
-        record.turns = self.turns.get(key, record.turns)
-        if record.session_id is None and record.turns == 0 and current is None:
-            return None                                 # nothing to say about this topic yet
+        record.session_id = session if session is not None else record.session_id
+        record.turns += pending
         return record.to_dict()
 
     def _topic(self, store: "StateStore", thread: int, name: Optional[str],
