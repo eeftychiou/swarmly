@@ -62,6 +62,10 @@ class PushCheckTests(unittest.TestCase):
                          "coordinator_code_push")
         merge = fake_git({**ff, ("rev-list",): f"{A} {B} {M}\n"})
         self.assertIsNone(pc.check(self.line("main"), "coordinator", "Claude", merge))
+        # A no-op push (already up to date) and the bus branch are not code pushes.
+        self.assertIsNone(pc.check(self.line("main", local=B, remote=B), "coordinator",
+                                   "Claude", single))
+        self.assertIsNone(pc.check(self.line("agents-bus"), "coordinator", "Claude", single))
 
 
 class Recording(EchoAdapter):

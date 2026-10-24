@@ -75,8 +75,8 @@ def check(lines: Sequence[str], role: str, me: str, git: Git) -> Optional[Tuple[
         if len(parts) < 4:
             continue
         _local_ref, local, remote_ref, remote = parts[:4]
-        if local == ZERO:
-            continue                                         # a delete: not ours to judge here
+        if local == ZERO or local == remote:
+            continue                                         # a delete or a no-op push
         branch = remote_ref.removeprefix("refs/heads/")
         found = secrets_in(_added_lines(git, local, remote))
         if found:
@@ -88,6 +88,8 @@ def check(lines: Sequence[str], role: str, me: str, git: Git) -> Optional[Tuple[
                 return ("foreign_force_push", f"{branch} was last written by {author}; a push "
                         "that drops their commits is not yours to make")
         if role == "coordinator":
+            if branch.startswith("agents-"):
+                continue                                     # the bus branch is state, not code
             if branch not in PROTECTED:
                 return ("coordinator_code_push", f"the coordinator does not push branches "
                         f"({branch}); a developer writes the change")
