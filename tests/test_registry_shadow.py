@@ -84,8 +84,8 @@ class RegistryShadowTests(unittest.TestCase):
         self.assertEqual(topic.title, "Stability round")
         self.assertEqual(topic.agents["Claudebot"].role, "coordinator")
         self.assertEqual(topic.agents["Claudebot"].model, "claude-opus-5-5")
-        self.assertEqual([(l.ref, l.added_by) for l in topic.links],
-                         [("https://github.com/o/r/issues/237", "legacy")])
+        self.assertEqual([(l.ref, l.added_by, l.role) for l in topic.links],
+                         [("https://github.com/o/r/issues/237", "legacy", "reference")])
         session = a.read("topic/10134/agent/deepseek")
         self.assertEqual((session["session_id"], session["turns"]), ("sess-1", 1))
         text = RegistryShadow(claude, clock=self.clock).describe(a)

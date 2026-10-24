@@ -116,30 +116,32 @@ class RegistryShadow:
 
     # -- the beat --------------------------------------------------------------------------
     async def sync(self, store: "StateStore") -> List[str]:
-        """Write what changed; returns the keys written."""
-        written: List[str] = []
-        await self._write_if_changed(store, K.agent(self.alias, "profile"),
-                                     self.profile().to_dict(), written)
+        """Write what changed, in one batch (§1b); returns the keys written."""
+        await store.refresh()
+        changes: Dict[str, Dict[str, Any]] = {}
+        self._changed(store, K.agent(self.alias, "profile"), self.profile().to_dict(), changes)
         for thread, _name, context, _seen in self._topics():
-            await self._write_if_changed(store, K.topic_agent(thread, self.alias),
-                                         self._agent_in_topic(store, thread, context),
-                                         written)
+            self._changed(store, K.topic_agent(thread, self.alias),
+                          self._agent_in_topic(store, thread, context), changes)
         if store.holds_lease():
             for thread, name, context, seen in self._topics():
-                topic = self._topic(store, thread, name, context, seen)
-                if topic is not None:
-                    await self._write_if_changed(store, K.topic(thread), topic, written)
+                self._changed(store, K.topic(thread),
+                              self._topic(store, thread, name, context, seen), changes)
+        if not changes:
+            return []
+        written = []
+        for result in await store.write_many(list(changes.items())):
+            if result.applied:
+                written.append(result.key)
+            else:
+                logger.info("registry: %s not written: %s", result.key, result.reason)
         return written
 
-    async def _write_if_changed(self, store: "StateStore", key: str,
-                                value: Optional[Dict[str, Any]], written: List[str]) -> None:
-        if value is None or store.read(key) == value:
-            return
-        result = await store.write(key, value)
-        if result.applied:
-            written.append(key)
-        else:
-            logger.info("registry: %s not written: %s", key, result.reason)
+    @staticmethod
+    def _changed(store: "StateStore", key: str, value: Optional[Dict[str, Any]],
+                 changes: Dict[str, Dict[str, Any]]) -> None:
+        if value is not None and store.read(key) != value:
+            changes[key] = value
 
     def profile(self) -> Profile:
         config = self.channel.config
@@ -213,8 +215,10 @@ class RegistryShadow:
             url = f"https://github.com/{repo}/issues/{number}"
             if url in known:
                 continue
+            # A guess from a mention is a pointer, not a work item: phase 5's explicit links
+            # carry the status, phase and assignees a work item needs.
             topic.links.append(Link(id=topic.next_link_id(), provider="github", kind="issue",
-                                    ref=url, role="work", title=f"#{number}",
+                                    ref=url, role="reference", title=f"#{number}",
                                     added_by="legacy", added_at=topic.last_activity,
                                     updated_by="legacy", updated_at=topic.last_activity))
 
