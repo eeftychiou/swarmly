@@ -101,6 +101,8 @@ github:
   tracking_label: tracking             # label that marks a tracking issue: a close with
                                        # every item merged wakes the coordinator to post the
                                        # round report (a close with items still open does not)
+  backlog_hours: 24                    # a notification older than this is marked read with no
+                                       # turn (0: answer everything, however old)
 ```
 
 ---
@@ -218,6 +220,18 @@ swarmly-telegram --config config.yaml gh-poll --once --json
   agent's own issue or pull request. Threads it only commented on or follows fire once.
 - The backstop reads the notifications of the account that owns `github.token_env`'s token,
   so that token must belong to the agent's own account (`github.login`), not the owner's.
+- **Not every notification is a reply (#87).** A notification older than
+  `github.backlog_hours` (default 24, `0` turns the rule off) is marked read without a turn:
+  a fresh start -- first enable, a rebuilt state file, a poller that was down a day -- sees
+  every unread notification at once, and answering a three-day-old publish run in the group
+  told the swarm about the past. A notification whose reason is `ci_activity`/`workflow_run`,
+  or whose subject is a `CheckSuite`/`WorkflowRun`/`CheckRun`, never opens a turn either: the
+  CI watches (#24) and the round state (#86) own those facts. Neither does one whose actor is
+  one of the swarm's own bots (any alias, any peer handle, `github.login`): one bot does not
+  open a turn to discuss what another bot just did. Both are posted instead as **one short
+  line** in the topic that owns the item, as an ephemeral notice (#64) -- "GitHub:
+  owner/repo#230 — a CI run; nothing to answer." A comment from a person is unchanged: it
+  still gets a turn. The poll outcome counts both (`backlog_skipped`, `quiet_skipped`).
 - Thread adapters (`codex_thread`, `antigravity_thread`) keep one conversation by design, so
   every project shares it; use a per-run adapter (`codex`, `claude_thread`, ...) for
   separate sessions per project.

@@ -17,6 +17,20 @@ from swarmly.telegram.channel import AgentChannel
 from swarmly.telegram.config import AgentConfig
 
 
+def _stamp(seconds_ago: float = 0.0) -> str:
+    """A notification stamp this recent.
+
+    Issue #87 gives a notification older than ``github.backlog_hours`` no turn, so a fixture
+    that wants one has to be recent: a literal date is a backlog item the day after it is
+    written.
+    """
+    import datetime
+    import time
+    moment = datetime.datetime.fromtimestamp(
+        time.time() - seconds_ago, datetime.timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class FakeAdapter:
     def __init__(self) -> None:
         self.received: list[IncomingMessage] = []
@@ -81,7 +95,7 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
                     subject_type="Issue",
                     subject_url="https://api.github.com/repos/example-org/webapp/issues/10",
                     number=10,
-                    updated_at="2026-10-10T12:00:00Z",
+                    updated_at=_stamp(0),
                 ),
                 Notification(
                     id="n2",
@@ -91,7 +105,7 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
                     subject_type="PullRequest",
                     subject_url="https://api.github.com/repos/example-org/webapp/pulls/20",
                     number=20,
-                    updated_at="2026-10-10T12:05:00Z",
+                    updated_at=_stamp(60),
                 ),
                 Notification(
                     id="n3",
@@ -101,7 +115,7 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
                     subject_type="Issue",
                     subject_url="https://api.github.com/repos/example-org/webapp/issues/30",
                     number=30,
-                    updated_at="2026-10-10T12:10:00Z",
+                    updated_at=_stamp(120),
                 ),
             ]
             mock_client.notifications.return_value = notifs
@@ -178,11 +192,11 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
                     subject_type="Issue",
                     subject_url="https://api.github.com/repos/example-org/webapp/issues/10",
                     number=10,
-                    updated_at="2026-10-10T12:00:00Z",
+                    updated_at=_stamp(0),
                 )
             ]
             state_file = Path(tmp) / "state.json"
-            pre_state = NotificationState(processed_ids={"n1": "2026-10-10T12:00:00Z"})
+            pre_state = NotificationState(processed_ids={"n1": _stamp(0)})
             pre_state.save(state_file)
 
             fake_channel = MagicMock()
@@ -208,7 +222,7 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
                     subject_type="Issue",
                     subject_url="https://api.github.com/repos/example-org/webapp/issues/42",
                     number=42,
-                    updated_at="2026-10-10T12:00:00Z",
+                    updated_at=_stamp(0),
                 )
             ]
             state_file = Path(tmp) / "state.json"
@@ -229,16 +243,17 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(reloaded.is_processed("n42"))
 
     async def test_a_notification_goes_to_the_topic_already_about_its_item(self):
-        """Round 5.5 (23 Oct): a CI failure on #230 was answered in the project's default
-        place while the PR's work ran in its round topic."""
+        """Round 5.5 (23 Oct): an answer to #230 landed in the project's default place while
+        the PR's work ran in its round topic. Issue #87 keeps the rule for what a person
+        says -- a CI event there is a notice, not a turn (see the quiet tests below)."""
         with TemporaryDirectory() as tmp:
             cfg = make_test_config(tmp, poll_minutes=5)
             mock_client = MagicMock(spec=GitHubClient)
             mock_client.notifications.return_value = [
-                Notification(id="n230", reason="ci_activity", repo="example-org/webapp",
+                Notification(id="n230", reason="mention", repo="example-org/webapp",
                              subject_title="CI failed", subject_type="Issue",
                              subject_url="https://api.github.com/repos/example-org/webapp/issues/230",
-                             number=230, updated_at="2026-10-23T17:49:00Z")]
+                             number=230, updated_at=_stamp(180))]
             mock_client.issue_view.return_value = Issue(number=230, title="CI failed", body="x",
                                                         author="bob", state="OPEN")
             fake_channel = MagicMock()
@@ -319,7 +334,7 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
                     subject_type="Issue",
                     subject_url="https://api.github.com/repos/example-org/webapp/issues/99",
                     number=99,
-                    updated_at="2026-10-10T12:00:00Z",
+                    updated_at=_stamp(0),
                 )
             ]
             mock_client.issue_view.return_value = Issue(
@@ -365,7 +380,7 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
 
 
 
-def _notif(nid="n1", updated="2026-10-10T12:00:00Z", number=10, reason="mention"):
+def _notif(nid="n1", updated=_stamp(0), number=10, reason="mention"):
     return Notification(id=nid, reason=reason, repo="example-org/webapp",
                         subject_title="t", subject_type="Issue",
                         subject_url=f"https://api.github.com/repos/example-org/webapp/issues/{number}",
@@ -440,6 +455,100 @@ class TestBackstopFixes(unittest.IsolatedAsyncioTestCase):
         state = NotificationState(processed_ids={"n1": "2026-10-10T12:30:00Z"})
         self.assertTrue(state.is_processed("n1", "2026-10-10T12:00:00Z"))
         self.assertFalse(state.is_processed("n1", "2026-10-10T13:00:00Z"))
+
+    # -- issue #87: not every notification is a reply ---------------------------------
+    async def test_a_backlog_of_old_notifications_produces_no_chat_messages(self):
+        """First enable: three-day-old runs were answered in the group, one reply each."""
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.notifications.return_value = [
+                _notif(nid="n1", updated=_stamp(3 * 86400)),
+                _notif(nid="n2", updated=_stamp(2 * 86400), number=11),
+            ]
+            ch = self.channel()
+            w = self.watcher(tmp, client, ch)
+            outcome = await w.poll_once()
+        self.assertEqual(outcome.turns_queued, 0)
+        self.assertEqual(outcome.backlog_skipped, 2)
+        self.assertEqual(ch._adapter_for.return_value.received, [])
+        ch.send.assert_not_called()                       # not even a notice: nothing happened
+        self.assertTrue(w.state.is_processed("n1"))
+        client.mark_notification_read.assert_any_call("n1")
+
+    async def test_a_recent_notification_still_gets_its_turn(self):
+        """The window (#87) must not eat what just happened."""
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.issue_view.return_value = None
+            client.notifications.return_value = [_notif(nid="n1", updated=_stamp(60))]
+            w = self.watcher(tmp, client, self.channel())
+            self.assertEqual((await w.poll_once()).turns_queued, 1)
+
+    async def test_a_ci_notification_posts_one_line_and_no_turn(self):
+        """A CI completion on a watched PR: the coordinator is woken by #24, not by a reply."""
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.issue_view.return_value = Issue(number=230, title="CI failed", body="x",
+                                                   author="bob", state="OPEN")
+            client.notifications.return_value = [
+                Notification(id="n230", reason="ci_activity", repo="example-org/webapp",
+                             subject_title="CI failed", subject_type="Issue",
+                             subject_url="https://api.github.com/repos/example-org/webapp/issues/230",
+                             number=230, updated_at=_stamp(60))]
+            ch = self.channel()
+            ch.topic_for_text.return_value = (-1001234567890, 9400)
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+        self.assertEqual(outcome.turns_queued, 0)
+        self.assertEqual(outcome.quiet_skipped, 1)
+        self.assertEqual(ch._adapter_for.return_value.received, [])
+        said = ch.send.await_args
+        self.assertEqual((said.kwargs["chat_id"], said.kwargs["thread_id"]),
+                         (-1001234567890, 9400))
+        self.assertTrue(said.kwargs["notice"])
+        self.assertIn("#230", said.args[0])
+
+    async def test_a_comment_from_one_of_the_swarm_is_not_a_turn(self):
+        """Two bots commenting on one issue must not answer each other in public."""
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.issue_view.return_value = Issue(
+                number=10, title="t", body="x", author="DeepSeek", state="OPEN",
+                comments=[IssueComment(author="Claudebot", body="merging it now", created_at="")])
+            client.notifications.return_value = [_notif(nid="n1", updated=_stamp(60),
+                                                         reason="comment")]
+            ch = self.channel()
+            # Claudebot is a configured peer, by alias and by handle: either name counts.
+            cfg = make_test_config(tmp)
+            cfg.peers["Claudebot"] = "@Claude_obot"
+            watcher = GitHubWatcher(cfg, client=client, state_path=Path(tmp) / "s.json",
+                                    channel=ch)
+            outcome = await watcher.poll_once()
+        self.assertEqual(outcome.turns_queued, 0)
+        self.assertEqual(outcome.quiet_skipped, 1)
+        self.assertIn("one of the swarm's bots", ch.send.await_args.args[0])
+
+    async def test_a_comment_from_a_person_still_gets_a_turn(self):
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.issue_view.return_value = Issue(
+                number=10, title="t", body="x", author="bob", state="OPEN",
+                comments=[IssueComment(author="alice", body="please fix the lint", created_at="")])
+            client.notifications.return_value = [_notif(nid="n1", updated=_stamp(60),
+                                                         reason="comment")]
+            ch = self.channel()
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+        self.assertEqual(outcome.turns_queued, 1)
+        self.assertEqual(outcome.quiet_skipped, 0)
+
+    def test_backlog_hours_zero_answers_everything(self):
+        """An operator who wants the whole backlog answered can say so."""
+        with TemporaryDirectory() as tmp:
+            cfg = make_test_config(tmp)
+            cfg.github.backlog_hours = 0
+            w = GitHubWatcher(cfg, client=MagicMock(spec=GitHubClient),
+                              state_path=Path(tmp) / "s.json")
+        self.assertFalse(w._in_backlog(_notif(updated=_stamp(9 * 86400))))
+        self.assertTrue(w._in_backlog(_notif(updated=_stamp(9 * 86400))) is False)
 
     async def test_dedupe_checks_every_topic_of_the_project(self):
         with TemporaryDirectory() as tmp:

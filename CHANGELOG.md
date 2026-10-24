@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- GitHub notifications no longer answer a bot's own events in chat (`#87`). The backstop used
+  to give every unread notification a model turn, so a publish run from three days earlier, or
+  a run a double merge had cancelled, was answered in the group as a reply to "@GitHub".
+  Now: a notification older than `github.backlog_hours` (default 24, `0` disables) is marked
+  read without a turn, so a fresh start does not work through the past; a notification whose
+  reason is `ci_activity`/`workflow_run`, or whose subject is a `CheckSuite`/`WorkflowRun`/
+  `CheckRun`, never opens a turn (the CI watches and the round state own those facts); and one
+  whose actor is one of the swarm's own bots — any alias, any configured handle,
+  `github.login` — does not either. Both of the last two are posted instead as one short line
+  in the topic that owns the item, as an ephemeral notice. A comment from a person still gets
+  its turn, and the poll outcome counts what it skipped (`backlog_skipped`, `quiet_skipped`).
+
 - The pinned dashboard no longer draws a ghost row for a bot it lists twice (`#246`). The
   presence table is keyed by whatever name a beat arrived under, so the coordinator's Telegram
   handle could sit beside its alias and the board showed a live bot next to a false
