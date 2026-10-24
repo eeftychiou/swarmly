@@ -686,6 +686,8 @@ class AgentChannel:
         #: Issue #81: the timer that fires this bot's own WAKE timers, with no model turn.
         from swarmly.telegram.selftest import PeerSelfTest
         self.selftest = PeerSelfTest(self)       # startup check that the bots see each other
+        from swarmly.telegram.store_probe import StoreProbe
+        self.store_probe = StoreProbe(self)      # /storetest: the Telegram store's facts
         from swarmly.telegram.roster import Roster
         self.roster = Roster(config, clock=lambda: self._clock())   # bots admitted at runtime
         from swarmly.telegram.membership import Membership
@@ -1634,7 +1636,7 @@ class AgentChannel:
         if command == "effort":
             command = "reasoning"
         if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes",
-                            "owed", "usage", "memory", "drift"):
+                            "owed", "usage", "memory", "drift", "storetest"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1659,7 +1661,20 @@ class AgentChannel:
         if command == "drift":
             self.drift.fold_inbox()
             return self.drift.summary(self.config.identity.alias)
+        if command == "storetest":
+            return self._storetest_command(event)
         return self._command_reply(command, event)
+
+    def _storetest_command(self, event: ChannelEvent) -> str:
+        """/storetest@bot [-Alias ...]: this bot leads one run of the Telegram store check
+        (topic registry, phase 0); ``-Alias`` leaves a bot out of it."""
+        if not self.config.is_admin(event.author_id):
+            return "Only the admin can start a store test."
+        skip = tuple(word[1:] for word in (event.text or "").split()[1:]
+                     if word.startswith("-") and len(word) > 1)
+        run = self.store_probe.start(origin=(event.chat_id, event.thread_id), skip=skip)
+        return (f"Store test {run} started: every bot posts probe lines in Swarm pulse, a "
+                "test file is pinned for about a minute, and the result comes here.")
 
     # ------------------------------------------------------------------------------
     # /cleanup (issue #63): the admin's tidy-up of the group
@@ -4680,7 +4695,7 @@ class AgentChannel:
     # economy, issue #43). REQUEST/RESPONSE/BLOCKED are never machine-class.
     _MACHINE_STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED", "PULSE"})
     _MACHINE_NOTE_INTENTS = frozenset({"FYI", "CLOSED", "RECEIPT", "ALERT", "TOPIC_GONE",
-                                       "CONTROL"})
+                                       "CONTROL", "PROBE"})
 
     def _machine_event_class(self, envelope: Envelope) -> Optional[str]:
         """Classify a machine-only envelope; ``None`` means it follows the normal path.
@@ -4722,6 +4737,9 @@ class AgentChannel:
             # check is repeated here: the note only ever carries the presser's Telegram id. The
             # envelope's own header is not part of the line, so the body is what is parsed.
             self.apply_control_note(parse_message(event.text)[1], sender=alias)
+        if envelope.type == MessageType.NOTE and (envelope.intent or "").upper() == "PROBE":
+            # /storetest (topic registry, phase 0): a peer's probe line, machine traffic only.
+            self.store_probe.observe(envelope, event)
         if (envelope.type == MessageType.NOTE
                 and (envelope.intent or "").upper() == "TOPIC_GONE" and envelope.ref):
             # Issue #63: one bot ran /cleanup and deleted a topic; every peer forgets it here,
