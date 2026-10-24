@@ -7099,7 +7099,7 @@ class AgentChannel:
                 self.stats.handled += 1
                 sent = await self.send(command_reply, reply_to_message_id=event.message_id,
                                        chat_id=event.chat_id, thread_id=event.thread_id,
-                                       allow_when_frozen=True)
+                                       allow_when_frozen=True, address_peers=False)
                 if self._announce_resumed:          # a /model switch lifted a quota freeze
                     self._announce_resumed = False
                     await self.send(self._resumed_notice("switched to another model"),
@@ -7159,7 +7159,7 @@ class AgentChannel:
             self.stats.handled += 1
             return await self.send(command_reply, reply_to_message_id=event.message_id,
                                    chat_id=event.chat_id, thread_id=event.thread_id,
-                                   allow_when_frozen=True)
+                                   allow_when_frozen=True, address_peers=False)
 
         # §5, Rule 5: an addressed REQUEST from a peer is acknowledged going in.
         if self.replies is None:
@@ -9563,7 +9563,7 @@ class AgentChannel:
                    *, chat_id: Optional[int] = None, thread_id: Optional[int] = None,
                    on_attempt=None, return_message_id: bool = False,
                    allow_when_frozen: bool = False, silent: bool = False,
-                   notice: bool = False):
+                   notice: bool = False, address_peers: bool = True):
         """Post to the home channel, paced, escaped, and split when it is too long.
 
         A split message goes out as consecutive parts under one hold of the send lock, so
@@ -9577,6 +9577,10 @@ class AgentChannel:
         SEEN answer, a busy/paused line, a "moved this to" note, a reminder (#64) -- so it can
         be deleted once ``limits.ephemeral_notices_minutes`` have passed. It is never set for
         a model reply, a command answer or anything a person posted.
+
+        ``address_peers=False`` sends the text as it is: no @handle is appended for a peer
+        it names. A command answer lists bots by name ("codex: agrees ..."), and appending
+        their handles would call every one of them to a turn over a status line.
         """
         destination = self.config.identity.home_channel_id if chat_id is None else chat_id
         if not callable(text):
@@ -9604,13 +9608,15 @@ class AgentChannel:
                     # One lock for the bot: the first part was rerouted in place.
                     await self._send_rest_in_general(parts[index:], index, chat_id,
                                                      return_message_id, allow_when_frozen,
-                                                     silent, notice=notice)
+                                                     silent, notice=notice,
+                                                     address_peers=address_peers)
                     break
                 try:
                     result = await self._send_locked(
                         part, reply_to_message_id if index == 0 else None, chat_id,
                         on_attempt if index == 0 else None, return_message_id,
-                        allow_when_frozen, address_peers=index == 0, thread_id=thread_id,
+                        allow_when_frozen, address_peers=address_peers and index == 0,
+                        thread_id=thread_id,
                         silent=silent, notice=notice,
                     )
                 except TopicGone:
@@ -9620,7 +9626,8 @@ class AgentChannel:
                     # to the last under General's own lock, so nothing interleaves there.
                     result = await self._send_rest_in_general(
                         parts[index:], index, chat_id, return_message_id, allow_when_frozen,
-                        silent, gone_from=thread_id, notice=notice)
+                        silent, gone_from=thread_id, notice=notice,
+                        address_peers=address_peers)
                     if index == 0:
                         first = result
                     break
@@ -9636,7 +9643,7 @@ class AgentChannel:
                                     chat_id: Optional[int], return_message_id: bool,
                                     allow_when_frozen: bool, silent: bool,
                                     gone_from: Optional[int] = None,
-                                    notice: bool = False) -> Any:
+                                    notice: bool = False, address_peers: bool = True) -> Any:
         """Post ``parts`` (from index ``start`` of a reply) in General; ``gone_from`` names
         the topic for the note on the first of them."""
         destination = self.config.identity.home_channel_id if chat_id is None else chat_id
@@ -9646,7 +9653,8 @@ class AgentChannel:
             for offset, part in enumerate(parts):
                 result = await self._send_locked(
                     part, None, chat_id, None, return_message_id, allow_when_frozen,
-                    address_peers=start + offset == 0, thread_id=None, silent=silent,
+                    address_peers=address_peers and start + offset == 0, thread_id=None,
+                    silent=silent,
                     note_for=gone_from if offset == 0 else None, notice=notice)
                 if offset == 0:
                     first = result

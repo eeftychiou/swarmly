@@ -58,7 +58,9 @@ MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
 
 #: A peer transport's built-in answer to one of those commands (or /model): machine traffic.
 _COMMAND_REPLY = re.compile(r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\]\s*)?"
-                            r"(?:PONG|STATUS|DIAG|WHERE|ROLE|MODEL)\s+\S")
+                            r"(?:(?:PONG|STATUS|DIAG|WHERE|ROLE|MODEL)\s+\S"
+                            # /state, /topics and /storetest answers (topic registry)
+                            r"|(?:State store|Store test|Topic registry)\b)")
 # The /model and /reasoning answers lead with the bot's alias ("Codex runs gpt-x here ...").
 _SETTING_REPLY = re.compile(
     r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\])?[\w .-]{0,40}?"
