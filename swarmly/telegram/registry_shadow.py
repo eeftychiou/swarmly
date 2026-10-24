@@ -60,6 +60,12 @@ def session_and_kind(adapter: Any, context_id: Optional[str]) -> Optional[tuple]
 def _session(adapter: Any, context_id: Optional[str]) -> Optional[str]:
     if not context_id or adapter is None:
         return None
+    current = getattr(adapter, "topic_session", None)
+    if callable(current) and getattr(adapter, "KEEPS_TOPIC_SESSION", False):
+        try:
+            return str(current(context_id))           # claude_thread: with its generation
+        except Exception:                              # noqa: BLE001
+            pass
     for name in ("thread_for", "conversation_for"):
         method = getattr(adapter, name, None)
         if callable(method):

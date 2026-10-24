@@ -642,6 +642,39 @@ class TestAntigravityAdapter(unittest.TestCase):
         self.assertIn("agentapi send-message --title='Telegram: @author' auto {prompt}", out)
 
 
+class TestJsonOutputTests(unittest.TestCase):
+    """--output-format json: the reply text, the token usage, the conversation id."""
+
+    def adapter(self):
+        from swarmly.telegram.adapters.antigravity import AntigravityAdapter
+        return AntigravityAdapter("Antigravity", AntigravityAdapter.default_settings())
+
+    def test_usage_and_conversation_come_from_the_json_result(self):
+        out = ('{"conversation_id":"818fc5b5","status":"SUCCESS","response":"OK\\n",'
+               '"duration_seconds":2.9,"num_turns":1,"usage":{"input_tokens":13182,'
+               '"output_tokens":5,"thinking_tokens":7,"cache_read_tokens":100,'
+               '"total_tokens":13294}}')
+        reply = self.adapter().parse_output(out, 3.0)
+        self.assertTrue(reply.ok)
+        self.assertEqual(reply.text, "OK\n")
+        self.assertEqual((reply.meta["tokens_in"], reply.meta["tokens_out"]), (13282, 12))
+        self.assertEqual(reply.meta["conversation"], "818fc5b5")
+
+    def test_a_failed_status_is_a_failed_turn(self):
+        reply = self.adapter().parse_output('{"status":"ERROR","response":"quota exceeded"}', 1)
+        self.assertFalse(reply.ok)
+        self.assertIn("quota exceeded", reply.error)
+
+    def test_a_notice_before_the_json_is_not_the_reply(self):
+        out = 'A new version of agy is available.\n{"status":"SUCCESS","response":"done"}'
+        reply = self.adapter().parse_output(out, 1.0)
+        self.assertEqual(reply.text, "done")
+
+    def test_plain_text_still_works(self):
+        reply = self.adapter().parse_output("just text", 1.0)
+        self.assertEqual((reply.ok, reply.text), (True, "just text"))
+
+
 class TestConversationFlags(unittest.TestCase):
     """Issue #9 (brainstorm 2.8): ``agy -c`` is ``--continue``, a flag with no value.
 
@@ -668,31 +701,31 @@ class TestConversationFlags(unittest.TestCase):
     def test_c_is_a_bare_flag_and_does_not_swallow_the_next_token(self):
         adapter = self.adapter("agy -c -p {prompt}")
         argv = adapter.build_argv("hello")
-        self.assertEqual(argv, ["agy", "-c", "-p", "hello"])
+        self.assertEqual(argv, ["agy", "-c", "-p", "hello", "--output-format", "json"])
         self.assertEqual(self.looked_up, [], "no conversation id may be read after -c")
 
     def test_c_as_the_last_argument_is_harmless(self):
         adapter = self.adapter("agy -p {prompt} -c")
         argv = adapter.build_argv("hello")
-        self.assertEqual(argv, ["agy", "-p", "hello", "-c"])
+        self.assertEqual(argv, ["agy", "-p", "hello", "-c", "--output-format", "json"])
 
     def test_continue_long_form_is_the_same_flag(self):
         adapter = self.adapter("agy --continue -p {prompt}")
-        self.assertEqual(adapter.build_argv("hello"), ["agy", "--continue", "-p", "hello"])
+        self.assertEqual(adapter.build_argv("hello"), ["agy", "--continue", "-p", "hello", "--output-format", "json"])
         self.assertEqual(self.looked_up, [])
 
     def test_the_long_form_still_names_a_conversation(self):
         conv = "12345678-1234-5678-1234-567812345678"
         adapter = self.adapter("agy -p {prompt} --conversation " + conv)
         argv = adapter.build_argv("hello")
-        self.assertEqual(argv, ["agy", "-p", "hello", "--conversation", conv])
+        self.assertEqual(argv, ["agy", "-p", "hello", "--conversation", conv, "--output-format", "json"])
         self.assertEqual(self.looked_up, [conv], "the model is inherited for that conversation")
 
     def test_the_equals_form_is_read_too(self):
         conv = "12345678-1234-5678-1234-567812345678"
         adapter = self.adapter("agy -p {prompt} --conversation=" + conv)
         argv = adapter.build_argv("hello")
-        self.assertEqual(argv, ["agy", "-p", "hello", f"--conversation={conv}"])
+        self.assertEqual(argv, ["agy", "-p", "hello", f"--conversation={conv}", "--output-format", "json"])
         self.assertEqual(self.looked_up, [conv])
 
     def test_a_command_that_names_a_conversation_is_not_per_topic(self):
@@ -705,7 +738,7 @@ class TestConversationFlags(unittest.TestCase):
         adapter = self.adapter("agy -p {prompt} --print-timeout 20m")
         self.assertTrue(adapter._per_topic())
         self.assertEqual(adapter.build_argv("hello"),
-                         ["agy", "-p", "hello", "--print-timeout", "20m"])
+                         ["agy", "-p", "hello", "--print-timeout", "20m", "--output-format", "json"])
 
 
 if __name__ == "__main__":
