@@ -9,15 +9,21 @@ from types import SimpleNamespace
 from swarmly.state.telegram_store import TelegramStore
 from swarmly.telegram.config import AgentConfig, ConfigError
 from swarmly.telegram.state_link import StateLink
+from swarmly.telegram.topics import TopicMap
 from tests.test_state_store import Clock, FakeGroup, FakeIO
 
 
 def link_for(group, alias, clock, coordinator=False, backend="telegram"):
     channel = SimpleNamespace(
-        config=SimpleNamespace(identity=SimpleNamespace(alias=alias, home_channel_id=-100),
+        config=SimpleNamespace(identity=SimpleNamespace(alias=alias, name=alias,
+                                                        home_channel_id=-100, role=None),
                                state=SimpleNamespace(backend=backend, mode="shadow",
-                                                     heartbeat_minutes=10)),
-        is_coordinator=lambda: coordinator, _running_revision="abc123")
+                                                     heartbeat_minutes=10),
+                               adapter=SimpleNamespace(type="codex", model=None, effort=None),
+                               projects={}),
+        is_coordinator=lambda: coordinator, _running_revision="abc123",
+        topics=TopicMap(None, home_chat_id=-100), adapter=None, _models={}, _efforts={},
+        _ref_topics={})
     link = StateLink(channel, clock=clock)
     if link.enabled:
         link.store = TelegramStore(alias, FakeIO(group, alias), clock=clock)

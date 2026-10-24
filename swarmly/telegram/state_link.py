@@ -134,6 +134,8 @@ class StateLink:
         self._last_beat = float("-inf")
         self._last_snapshot = float("-inf")
         self._starting: Optional[asyncio.Task] = None
+        from swarmly.telegram.registry_shadow import RegistryShadow
+        self.registry = RegistryShadow(channel, clock=clock)
 
     @property
     def enabled(self) -> bool:
@@ -213,6 +215,9 @@ class StateLink:
                         and await store.restore_from_cache():
                     self._last_snapshot = moment
                     done.append("snapshot restored")
+            written = await self.registry.sync(store)
+            if written:
+                done.append(f"registry: {len(written)} key(s)")
             if moment - self._last_beat >= self.beat_seconds:
                 rev = str(getattr(self.channel, "_running_revision", "") or "")
                 await store.write(K.probe(store.alias, "beat"),

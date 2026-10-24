@@ -1638,7 +1638,7 @@ class AgentChannel:
         if command == "effort":
             command = "reasoning"
         if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes",
-                            "owed", "usage", "memory", "drift", "storetest", "state"):
+                            "owed", "usage", "memory", "drift", "storetest", "state", "topics"):
             return None
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
@@ -1667,6 +1667,8 @@ class AgentChannel:
             return self._storetest_command(event)
         if command == "state":
             return self.state_link.describe()
+        if command == "topics":
+            return self.state_link.registry.describe(self.state_link.store)
         return self._command_reply(command, event)
 
     def _storetest_command(self, event: ChannelEvent) -> str:
@@ -7917,6 +7919,10 @@ class AgentChannel:
             captured = _TRANSPORT_REPLIES.get()
             if captured is not None and reply is not None:
                 captured.append(reply)
+            if reply is not None and self.state_link.enabled:
+                # Topic registry, phase 2 (shadow): count the turn for this topic's session.
+                self.state_link.registry.turn_done(
+                    self.topics.context(event.chat_id, event.thread_id), event.thread_id)
             if reply is None:
                 logger.info("turn end: message %s, no reply (%.1fs)", event.message_id,
                             time.monotonic() - started)
