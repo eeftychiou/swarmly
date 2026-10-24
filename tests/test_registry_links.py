@@ -275,10 +275,11 @@ class RoutingAndGitHubTests(unittest.TestCase):
     def test_the_channel_asks_the_registry_only_when_told_to(self):
         from tests.test_telegram_channel import make_channel, make_config
         channel = make_channel(make_config(state={"backend": "telegram", "links": "registry"}))
-        channel.state_link.topic_for_refs = lambda refs: (-100, 55) if "#12" in refs else None
+        channel.state_link.topic_for_refs = \
+            lambda refs, **_: (-100, 55) if "#12" in refs else None
         self.assertEqual(channel.topic_for_text("CI went red on #12"), (-100, 55))
         legacy = make_channel(make_config(state={"backend": "telegram"}))
-        legacy.state_link.topic_for_refs = lambda refs: (-100, 55)
+        legacy.state_link.topic_for_refs = lambda refs, **_: (-100, 55)
         self.assertIsNone(legacy.topic_for_text("CI went red on #12"))
 
     def test_registry_links_need_the_store(self):
@@ -286,6 +287,119 @@ class RoutingAndGitHubTests(unittest.TestCase):
         from tests.test_telegram_channel import make_config
         with self.assertRaises(ConfigError):
             make_config(state={"links": "registry"})
+
+
+class ReviewFixesTests(unittest.TestCase):
+    """#279 review: gone topics, the admin's /topic, and the GitHub check's cap."""
+
+    def link(self):
+        return RoutingAndGitHubTests().link_with_topics()
+
+    def run_spawned(self, link, call):
+        async def go():
+            call()
+            await asyncio.gather(*getattr(link, "_tasks", set()))
+        asyncio.run(go())
+
+    def test_a_deleted_topic_routes_nothing_and_its_record_closes(self):
+        link = self.link()
+        self.run_spawned(link, lambda: link.topic_gone(55, deleted=True))
+        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 66), "the next topic's link")
+        record = link.store.read("topic/55")
+        self.assertEqual((record["status"], bool(record["closed_at"])), ("closed", True))
+        self.assertEqual(record["history"][-1]["to"], "closed")
+
+    def test_a_closed_topic_is_skipped_here_but_its_record_stays(self):
+        link = self.link()
+        self.run_spawned(link, lambda: link.topic_gone(55, deleted=False))
+        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 66))
+        self.assertEqual(link.store.read("topic/55")["status"], "open")
+
+    def test_a_topic_a_post_found_gone_is_skipped(self):
+        link = self.link()
+        self.assertEqual(link.topic_for_refs(["#12"], skip=[55]), (-100, 66))
+
+    def test_the_channel_tells_the_registry_a_topic_is_gone(self):
+        from tests.test_telegram_channel import GROUP, make_channel, make_config
+        channel = make_channel(make_config(state={"backend": "telegram"}))
+        told = []
+        channel.state_link.topic_gone = lambda thread, deleted: told.append((thread, deleted))
+        channel.forget_topic_state(GROUP, 55)
+        self.assertEqual(told, [(55, True)])
+
+    def test_the_admins_topic_pin_outranks_an_older_work_link(self):
+        link = self.link()
+        link.clock.t += 60                              # the pin comes after the /link above
+        self.run_spawned(link, lambda: link.note_pin(-100, 44, ["#12"], 1))
+        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 44))
+        pinned = Topic.from_dict(link.store.read("topic/44")).link("L1")
+        self.assertEqual((pinned.role, pinned.added_by), ("work", "admin:1"))
+
+    def test_the_admins_pin_beats_the_coordinators_newer_link(self):
+        link = self.link()
+
+        async def coordinator_links():
+            link.note_reply(-100, 33, "LINK: #12 as work")
+            await asyncio.gather(*link._tasks)
+        link.clock.t += 60
+        asyncio.run(coordinator_links())
+        self.assertEqual(Topic.from_dict(link.store.read("topic/33")).link("L1").role, "work")
+        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 55), "the admin's link first")
+
+    def test_the_channel_records_the_pin(self):
+        from tests.test_telegram_channel import ADMIN_ID, GROUP, make_channel, make_config
+        channel = make_channel(make_config(state={"backend": "telegram"}))
+        pins = []
+        channel.state_link.note_pin = lambda *args: pins.append(args)
+        channel._handle_topic_pin(SimpleNamespace(
+            text="/topic #164", author_is_bot=False, author_id=ADMIN_ID, chat_id=GROUP,
+            thread_id=55))
+        self.assertEqual(pins, [(GROUP, 55, ["#164"], ADMIN_ID)])
+
+    def test_the_cap_goes_to_the_links_asked_about_longest_ago(self):
+        from unittest import mock
+        from swarmly.github.client import GitHubClient
+        link = self.link()
+        link.GITHUB_MAX_ITEMS = 2
+        asked = []
+
+        def state(_self, repo, number):
+            asked.append((repo, number))
+            return None
+        with mock.patch.object(GitHubClient, "ref_kind_state", state):
+            asyncio.run(link.reconcile_github(link.store))
+            first = list(asked)
+            asyncio.run(link.reconcile_github(link.store))
+        self.assertEqual(len(first), 2)
+        self.assertEqual(sorted(asked), [("o/r", 12), ("o/r", 13), ("o/r", 40),
+                                         ("x/other", 41)], "each link once, in its own repo")
+
+    def test_a_pr_found_by_its_short_ref_is_relabelled_even_when_nothing_moves(self):
+        from unittest import mock
+        from swarmly.github.client import GitHubClient
+        link = self.link()
+        asyncio.run(link.registry_command(SimpleNamespace(
+            text="/phase #13 review", author_id=1, author_is_bot=False, chat_id=-100,
+            thread_id=88)))
+        with mock.patch.object(GitHubClient, "ref_kind_state",
+                               lambda self, repo, number: ("open", True) if number == 13
+                               else None):
+            self.assertEqual(asyncio.run(link.reconcile_github(link.store)), 1)
+        self.assertEqual(Topic.from_dict(link.store.read("topic/88")).link("L1").kind, "pr")
+
+    def test_an_unreadable_topic_record_does_not_stop_the_check(self):
+        from unittest import mock
+        from swarmly.github.client import GitHubClient
+        link = self.link()
+        bad = dict(link.store.read("topic/55"), topic_id=11, status="bogus")
+        asyncio.run(link.store.write("topic/11", bad))
+        with mock.patch.object(GitHubClient, "ref_kind_state",
+                               lambda self, repo, number: ("closed", False) if number == 12
+                               else None):
+            moved = asyncio.run(link.reconcile_github(link.store))
+        self.assertEqual(moved, 1)
+        t55 = Topic.from_dict(link.store.read("topic/55"))
+        self.assertEqual(t55.link("L1").status, "closed")
 
 
 class TopicsShowWorkItemsTests(unittest.TestCase):
