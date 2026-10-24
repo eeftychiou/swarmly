@@ -2399,16 +2399,16 @@ class AgentChannel:
             ttl = parse_ttl(envelope.ttl)
             self._peers_frozen[alias] = {"ref": envelope.ref,
                                          "until": self._wall() + ttl if ttl else None}
-        elif (kind == MessageType.STATUS and intent == "RESUMED") or \
-                (kind == MessageType.HELLO and intent == "ONLINE"):
-            # A restarted peer that is still frozen says FROZEN again right after ONLINE.
+        elif kind == MessageType.STATUS and intent == "RESUMED":
+            # Only a resume clears a freeze here. A restart (HELLO ONLINE) says nothing about
+            # it: a peer still frozen says FROZEN again a second later (live, 24 Oct 14:13:
+            # Codex's restart woke the coordinator, which handed it work it bounced at once),
+            # and a peer that is no longer frozen says so in its next pulse, which
+            # _freeze_from_pulse turns into the peer-back. Clearing the entry on ONLINE would
+            # lose that peer-back (QA, #257).
             if self._peers_frozen.pop(alias, None) is None:
                 return
-            if intent == "RESUMED":
-                # Only a resume: a restarted peer that is still frozen says ONLINE and then
-                # FROZEN again a second later (live, 24 Oct 14:13: Codex's restart woke the
-                # coordinator, which handed it work it bounced at once).
-                self._peer_back(alias)
+            self._peer_back(alias)
         else:
             return
         save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
@@ -2438,7 +2438,9 @@ class AgentChannel:
     #: A peer has to stay back this long before the coordinator is told.
     PEER_BACK_SETTLE_SECONDS = 60.0
 
-    async def _peer_back_after_settle(self, alias: str, where: Tuple[int, Optional[int]]) -> None:
+    async def _peer_back_after_settle(self, alias: str, where: Tuple[int, int]) -> None:
+        # ``where`` is the work topic when the peer came back, kept on purpose: if the
+        # coordinator moved meanwhile, a known topic still beats no notice at all.
         await _maybe_await(self._sleep(self.PEER_BACK_SETTLE_SECONDS))
         if alias in self.frozen_peers():
             return                                         # it froze again: nothing changed
@@ -2457,6 +2459,14 @@ class AgentChannel:
             if isinstance(saved.get("chat_id"), int) and isinstance(saved.get("thread_id"), int):
                 where = (saved["chat_id"], saved["thread_id"])
         return where if where is not None and where[1] is not None else None
+
+    def _remember_work_place(self, chat_id: int, thread_id: Optional[int]) -> None:
+        """Keep the forum topic of this turn, across restarts; a General turn is not one."""
+        if thread_id is None or (chat_id, thread_id) == getattr(self, "_last_turn_place", None):
+            return
+        self._last_turn_place = (chat_id, thread_id)
+        save_state(_state_file(self.config, "work-place"),
+                   {"chat_id": int(chat_id), "thread_id": int(thread_id)}, "work place")
 
     def _freeze_from_pulse(self, alias: str, pulse: Any) -> None:
         """A pulse says whether its bot is frozen. Keep the peer-freeze table in step with it,
@@ -7697,12 +7707,7 @@ class AgentChannel:
         self.__dict__["_turn_lease_term"] = 0            # never carry a last turn's term
         adapter.acting_coordinator = await self._acting_coordinator()
         adapter.drift_path = str(self.drift.path or "")          # the guard reports here
-        if event.thread_id is not None and (event.chat_id, event.thread_id) != getattr(
-                self, "_last_turn_place", None):
-            self._last_turn_place = (event.chat_id, event.thread_id)  # where peer-back goes
-            save_state(_state_file(self.config, "work-place"),
-                       {"chat_id": int(event.chat_id), "thread_id": int(event.thread_id)},
-                       "work place")
+        self._remember_work_place(event.chat_id, event.thread_id)  # where peer-back goes
         adapter.lease_term = self._turn_term()
         turn = asyncio.ensure_future(adapter.respond(incoming))
         self._current_turn = turn

@@ -12,6 +12,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 from swarmly.telegram import drift as dr
@@ -400,7 +401,30 @@ class DynamicRoleTests(unittest.TestCase):
         hello = Envelope(type=MessageType.HELLO, to="*", intent="ONLINE", ref="Codex")
         channel._track_peer_freeze(hello, event("hi", username="CodexBot", is_bot=True))
         self.assertEqual(calls, [])
+        self.assertIn("Codex", channel.frozen_peers(), "a restart does not clear a freeze")
         resumed = Envelope(type=MessageType.STATUS, to="*", intent="RESUMED", ref="pause")
-        channel._peers_frozen["Codex"] = {"ref": "pause", "until": None}
         channel._track_peer_freeze(resumed, event("hi", username="CodexBot", is_bot=True))
         self.assertEqual(calls, ["Codex"])
+
+    def test_a_restarted_peer_whose_pulse_is_no_longer_frozen_comes_back(self):
+        """QA, #257: an ONLINE that cleared the freeze lost this peer-back."""
+        channel = self.channel()
+        calls = []
+        channel._peer_back = lambda alias: calls.append(alias)
+        channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        from swarmly.telegram.wire import Envelope, MessageType
+        hello = Envelope(type=MessageType.HELLO, to="*", intent="ONLINE", ref="Codex")
+        channel._track_peer_freeze(hello, event("hi", username="CodexBot", is_bot=True))
+        channel._freeze_from_pulse("Codex", SimpleNamespace(frozen=False, status={}))
+        self.assertEqual(calls, ["Codex"])
+
+    def test_the_work_topic_survives_a_restart_and_general_is_never_one(self):
+        """Review, #257: the saved work place is what a restarted coordinator uses."""
+        channel = self.channel()
+        channel.config.source_path = Path(self.tmp.name) / "config.yaml"   # state on disk
+        channel._remember_work_place(GROUP, 9400)
+        fresh = make_channel(channel.config, adapter=Recording("ok"))
+        self.assertEqual(fresh._work_place(), (GROUP, 9400))
+        channel._remember_work_place(GROUP, None)          # a General turn changes nothing
+        fresh = make_channel(channel.config, adapter=Recording("ok"))
+        self.assertEqual(fresh._work_place(), (GROUP, 9400))
