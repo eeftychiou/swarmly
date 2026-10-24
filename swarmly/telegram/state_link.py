@@ -239,6 +239,12 @@ class StateLink:
                 except Exception as exc:               # noqa: BLE001 - shadow: never fatal
                     logger.warning("state: registry sync failed: %s", exc, exc_info=True)
                     done.append("registry failed")
+                try:
+                    if await self.sync_owed(store, moment):
+                        done.append("owed")
+                except Exception as exc:               # noqa: BLE001 - shadow: never fatal
+                    logger.warning("state: owed sync failed: %s", exc, exc_info=True)
+                    done.append("owed failed")
                 rev = str(getattr(self.channel, "_running_revision", "") or "")
                 await store.write(K.probe(store.alias, "beat"),
                                   {"at": round(moment), "rev": rev[:12],
@@ -251,6 +257,59 @@ class StateLink:
             logger.warning("state: beat failed: %s", self.error)
             return "failed"
         return ", ".join(done) or "nothing to do"
+
+    # -- the owed table (phase 3, part 2: shadow) --------------------------------------------
+    #: Closed rows stay in the store this long, so a reader sees how a debt ended.
+    OWED_KEEP_CLOSED_SECONDS = 24 * 3600.0
+
+    def _own_owed_rows(self, now: float) -> list:
+        """This bot's own rows (the ones it wrote): open ones, and closed ones of the last day.
+        Each bot writes only its own rows, so its store key has one writer, as on gitbus."""
+        store = self.channel.owed_store()
+        me = K.norm(self.channel.config.identity.alias)
+        rows = [row for row in store.load() if K.norm(row.writer) == me
+                and (row.is_open or now - float(row.updated_at) <= self.OWED_KEEP_CLOSED_SECONDS)]
+        return sorted((row.to_dict() for row in rows), key=lambda row: str(row.get("kind", ""))
+                      + str(row.get("item", "")) + str(row.get("debtor", "")))
+
+    async def sync_owed(self, store: Any, now: float) -> bool:
+        """Write ``agent/<alias>/owed`` when this bot's rows changed. True if written."""
+        rows = await asyncio.to_thread(self._own_owed_rows, now)
+        key = K.agent(store.alias, "owed")
+        value = {"rows": rows}
+        if store.read(key) == value or (not rows and store.read(key) is None):
+            return False
+        result = await store.write(key, value)
+        return bool(result.applied)
+
+    def owed_from_store(self) -> list:
+        """Every bot's rows from the store, folded as the gitbus table is (owed.fold)."""
+        from swarmly.telegram.owed import Row, fold
+        store = self.store
+        if store is None:
+            return []
+        rows = []
+        for key in store.keys("agent/"):
+            if key.endswith("/owed"):
+                for data in (store.read(key) or {}).get("rows") or []:
+                    try:
+                        rows.append(Row.from_dict(data))
+                    except Exception:                  # noqa: BLE001 - one bad row
+                        logger.warning("state: an owed row in %s is unreadable", key)
+        return fold(rows)
+
+    def _owed_compare(self) -> str:
+        """Shadow: the open rows the store holds, against the ones this bot reads today."""
+        try:
+            mine = {row.id for row in self.channel.owed_store().load() if row.is_open}
+        except Exception:                              # noqa: BLE001 - a comparison only
+            return ""
+        theirs = {row.id for row in self.owed_from_store() if row.is_open}
+        if not mine and not theirs:
+            return "owed: no open rows (store and gitbus agree)"
+        missing = len(mine - theirs)
+        return (f"owed: {len(theirs)} open row(s) in the store, {len(mine)} here"
+                + (f" ({missing} not in the store yet)" if missing else " (agree)"))
 
     # -- /state ----------------------------------------------------------------------------
     def describe(self) -> str:
@@ -268,6 +327,9 @@ class StateLink:
                  f"lease: {lease.holder or 'nobody'} (term {lease.term}){self._lease_compare()}",
                  f"snapshot: message {store.snapshot_message or 'none'}"]
         lines.extend(self.agreement())
+        owed = self._owed_compare()
+        if owed:
+            lines.append(owed)
         if store.log.rejected:
             lines.append(f"{len(store.log.rejected)} write(s) refused since the snapshot")
         return "\n".join(lines)
