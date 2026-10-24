@@ -7078,7 +7078,10 @@ class AgentChannel:
                                    allow_when_frozen=True)
 
         # Topic registry, phase 5: /link, /unlink, /phase -- the store lease holder answers.
-        registry_reply = await self.state_link.registry_command(event)
+        parsed_command = parse_command(event.text or "")
+        registry_reply = (await self.state_link.registry_command(event)
+                          if parsed_command and parsed_command[0] in ("link", "unlink", "phase")
+                          else None)
         if registry_reply == "":
             return None
         if registry_reply is not None:

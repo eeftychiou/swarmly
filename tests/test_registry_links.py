@@ -53,6 +53,15 @@ class ParseRefTests(unittest.TestCase):
         ])
 
 
+class ProseIsNotALineTests(unittest.TestCase):
+    def test_prose_and_code_blocks(self):
+        self.assertEqual(parse_lines("Link: https://docs.google.com/document/d/abc"), [])
+        self.assertEqual(parse_lines("Phase: design review"), [])
+        self.assertEqual(parse_lines("LINK: #12\n- fixed the login"), [LinkLine("#12")])
+        self.assertEqual(parse_lines("Example:\n```\nLINK: #99\nPHASE: #99 qa\n```\nLINK: #5"),
+                         [LinkLine("#5")])
+
+
 class RegistryOpsTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
@@ -83,7 +92,7 @@ class RegistryOpsTests(unittest.TestCase):
         binding = topic.agents["DeepSeek"]
         self.assertEqual((binding.role, binding.runtime, binding.model, binding.effort),
                          ("developer", "reasonix", "deepseek-flash", "low"))
-        self.assertEqual([c.field for c in topic.history], ["assignees", "phase"])
+        self.assertEqual([c.field for c in topic.history], ["assignees", "role", "phase"])
         self.assertTrue(asyncio.run(self.ops.save(10134, topic)))
         again = Topic.from_dict(self.store.read("topic/10134"))
         self.assertEqual(again.link("L2").phase, "review")
@@ -106,6 +115,12 @@ class RegistryOpsTests(unittest.TestCase):
         link = topic.link("L1")
         self.assertEqual((link.role, link.added_by, link.status), ("work", "claudebot", "open"))
         self.assertEqual(len(topic.links), 1)
+
+    def test_the_coordinator_role_is_not_assigned(self):
+        topic = self.ops.topic(7)
+        self.ops.apply(topic, parse_lines("LINK: #5"), "claudebot")
+        done = self.ops.apply(topic, [AssignLine("DeepSeek", "L1", "coordinator")], "claudebot")
+        self.assertTrue(done[0].startswith("refused"))
 
     def test_unlink_keeps_the_coordinator(self):
         topic = self.ops.topic(7)
@@ -152,6 +167,31 @@ class LinkFlowTests(unittest.TestCase):
         link = self.link(holder=False)
         link.note_reply(-100, 55, "LINK: #12")
         self.assertFalse(getattr(link, "_tasks", None))
+
+    def test_a_beat_and_a_recorded_line_do_not_lose_each_others_change(self):
+        """Review: both rebuilt topic/<id> from one read; the later write dropped the link."""
+        link = self.link()
+        link.channel.topics.remember(-100, 55, "round")
+        link.channel.topics.touch(-100, 55, when=link.clock())
+
+        async def go():
+            link.note_reply(-100, 55, "LINK: #12")
+            await asyncio.gather(self._sync(link), *list(link._tasks))
+            await self._sync(link)
+        asyncio.run(go())
+        topic = Topic.from_dict(link.store.read("topic/55"))
+        self.assertIn("#12", [l.title for l in topic.links])
+
+    @staticmethod
+    async def _sync(link):
+        async with link.topic_lock:
+            await link.registry.sync(link.store)
+
+    def test_a_bare_command_reaching_a_bot_without_the_lease_is_silent(self):
+        link = self.link(holder=False)
+        reply = asyncio.run(link.registry_command(SimpleNamespace(
+            text="/link #12", author_id=1, author_is_bot=False, chat_id=-100, thread_id=55)))
+        self.assertEqual(reply, "")
 
     def test_admin_commands(self):
         link = self.link()

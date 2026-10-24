@@ -98,14 +98,20 @@ class PhaseLine:
     phase: str
 
 
-_LINK_LINE = re.compile(r"^\s*LINK:\s*(\S+)(?:\s+as\s+(\w+))?(?:\s*[—–-]+\s*(.+))?\s*$",
-                        re.I | re.M)
-_ASSIGN_LINE = re.compile(r"^\s*ASSIGN:\s*@?([\w.-]+)\s+(\S+)\s+as\s+([\w-]+)\s*$", re.I | re.M)
-_PHASE_LINE = re.compile(r"^\s*PHASE:\s*(\S+)\s+(\w+)\s*$", re.I | re.M)
+# Upper case only, one line each ([ \t], never \s, which would run into the next line): a
+# reply that says "Link: <url>" in passing, or a bullet after a LINK line, is prose.
+_LINK_LINE = re.compile(r"^[ \t]*LINK:[ \t]*(\S+)(?:[ \t]+as[ \t]+(\w+))?"
+                        r"(?:[ \t]*[—–-]+[ \t]*([^\n]+?))?[ \t]*$", re.M)
+_ASSIGN_LINE = re.compile(r"^[ \t]*ASSIGN:[ \t]*@?([\w.-]+)[ \t]+(\S+)[ \t]+as[ \t]+([\w-]+)"
+                          r"[ \t]*$", re.M)
+_PHASE_LINE = re.compile(r"^[ \t]*PHASE:[ \t]*(\S+)[ \t]+(\w+)[ \t]*$", re.M)
+_FENCE = re.compile(r"```.*?(?:```|\Z)", re.S)
 
 
 def parse_lines(text: str) -> List[object]:
-    """The LINK/ASSIGN/PHASE lines of a reply, in order. Malformed ones are skipped."""
+    """The LINK/ASSIGN/PHASE lines of a reply, in order. Malformed ones are skipped, and so
+    is anything in a fenced code block (an example the bot is explaining)."""
+    text = _FENCE.sub(lambda m: "\n" * m.group(0).count("\n"), text or "")
     found: List[Tuple[int, object]] = []
     for match in _LINK_LINE.finditer(text or ""):
         role = (match.group(2) or "work").lower()

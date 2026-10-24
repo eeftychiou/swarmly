@@ -57,8 +57,8 @@ class RegistryOps:
                                        (parsed.title and link.title == parsed.title
                                         and link.provider == parsed.provider)):
                 return link
-            if link.title and link.title == token:
-                return link
+            if parsed is None and link.title and link.title == token:
+                return link                             # a title only when it is no ref
         return None
 
     # -- changes ---------------------------------------------------------------------------
@@ -88,6 +88,8 @@ class RegistryOps:
         stamp = self._stamp()
         if existing is not None:
             if existing.role != line.role:
+                topic.history.append(Change(at=stamp, field="status", old=existing.role,
+                                            to=line.role, by=by, link=existing.id))
                 existing.role = line.role
                 if line.role == "work":
                     existing.status = existing.status or "open"
@@ -120,6 +122,8 @@ class RegistryOps:
         return link
 
     def _assign(self, topic: Topic, line: AssignLine, by: str) -> str:
+        if line.role == "coordinator":
+            raise ValueError("the coordinator role follows the lease; it is not assigned")
         link = self._work(topic, line.ref)
         agent = line.agent.lstrip("@")
         stamp = self._stamp()
@@ -162,7 +166,10 @@ class RegistryOps:
                 binding.role = role
             return f"{key} already linked"
         effort = profile.get("default_effort") or "default"
-        topic.agents[str(profile.get("alias") or alias)] = Binding(
+        name = str(profile.get("alias") or alias)
+        topic.history.append(Change(at=self._stamp(), field="role", old=None,
+                                    to=role or "linked", by=by, agent=name))
+        topic.agents[name] = Binding(
             role=role or str(profile.get("role_preference") or "developer"),
             runtime=str(profile.get("runtime") or "unknown"),
             model=str(profile.get("default_model") or "default"),
@@ -175,14 +182,18 @@ class RegistryOps:
             return f"{alias} was not linked"
         if topic.agents[key].role == "coordinator":
             raise ValueError("the coordinator follows the lease; it is not unlinked")
+        topic.history.append(Change(at=self._stamp(), field="role",
+                                    old=topic.agents[key].role, to="unlinked", by=by, agent=key))
         del topic.agents[key]
         for link in topic.links:
             link.assignees = [a for a in link.assignees if K.norm(a.agent) != K.norm(alias)]
         return f"{alias} unlinked"
 
     async def save(self, thread: int, topic: Topic) -> bool:
-        topic.validate()
-        result = await self.store.write(K.topic(thread), topic.to_dict())
+        # A full round trip validates every nested record, not just the topic's own fields:
+        # a bad link written here would make the record unreadable for everyone after.
+        data = Topic.from_dict(topic.to_dict()).to_dict()
+        result = await self.store.write(K.topic(thread), data)
         if not result.applied:
             logger.info("registry: topic/%s not written: %s", thread, result.reason)
         return bool(result.applied)
