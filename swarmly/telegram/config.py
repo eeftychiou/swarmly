@@ -581,6 +581,11 @@ MULTI_MENTIONS = ("first", "all")
 #: ``agent.allowed_users``, or a bot that is not a peer, can start a turn. A bot runs
 #: commands on its machine (adapter.permissions), so by default they cannot.
 STRANGERS = ("ignore", "answer")
+#: ``limits.general_turns`` (topic registry, phase 4): "allow" keeps today's behaviour;
+#: "never" makes General and Swarm pulse transport-only -- no model turn ever runs there,
+#: work a person types in General gets a topic of its own, and an own brief with no topic
+#: goes to the last work topic or nowhere.
+GENERAL_TURNS = ("allow", "never")
 #: Adapters whose every turn continues one shared conversation: no parallel topics.
 #: ``antigravity`` is deliberately not here (#67): the adapter keeps one conversation per
 #: topic (``_topic_conversations``), exactly as ``claude_thread`` and Reasonix do, so
@@ -762,6 +767,7 @@ class ChannelLimits:
     selftest_seconds: float = 180.0                     # startup check that bots see each other; 0 = off
     multi_mention: str = "first"                        # a person names several bots: "first" or "all" act
     strangers: str = "ignore"                           # outside the swarm: "ignore" or "answer"
+    general_turns: str = "allow"                        # model turns in General/Swarm pulse: "allow" or "never"
     #: Issue #63: ``/cleanup topics done`` deletes a topic whose linked issue or PR is closed
     #: or merged only once it has been idle this many hours. 0 offers it as soon as the item
     #: is done.
@@ -781,6 +787,10 @@ class ChannelLimits:
         if self.strangers not in STRANGERS:
             raise ConfigError(
                 f"limits.strangers must be one of {list(STRANGERS)} (got {self.strangers!r}).")
+        if self.general_turns not in GENERAL_TURNS:
+            raise ConfigError(
+                f"limits.general_turns must be one of {list(GENERAL_TURNS)} "
+                f"(got {self.general_turns!r}).")
         if self.multi_mention not in MULTI_MENTIONS:
             raise ConfigError(
                 f"limits.multi_mention must be one of {list(MULTI_MENTIONS)} "
