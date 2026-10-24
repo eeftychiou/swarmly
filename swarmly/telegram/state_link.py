@@ -129,6 +129,10 @@ class StateLink:
         self.backend = str(getattr(settings, "backend", "off") or "off").lower()
         self.mode = str(getattr(settings, "mode", "shadow") or "shadow").lower()
         self.beat_seconds = 60.0 * float(getattr(settings, "heartbeat_minutes", 10) or 10)
+        #: Phase 3: "shadow" mirrors today's lease into the store and compares; "store" makes
+        #: the store's lease the coordinator lease (check_lease claims it; nothing mirrors).
+        self.lease_mode = str(getattr(settings, "lease", "shadow") or "shadow").lower() \
+            if self.backend == "telegram" else "off"
         self.store: Optional[TelegramStore] = None
         self.error = ""
         self._last_beat = float("-inf")
@@ -194,16 +198,21 @@ class StateLink:
         done = []
         try:
             await store.refresh()
-            if self.channel.is_coordinator():
+            holder_beat, refused = False, False
+            if self.lease_mode == "shadow" and self.channel.is_coordinator():
+                # Shadow: today's lease decides; the store's mirrors it.
+                holder_beat = True
                 lease = store.lease()
                 mine = K.norm(lease.holder or "") == store.alias
                 server = store.server_now()             # leases run on the log's clock
-                refused = False
                 if not mine or lease.expires_at - server < LEASE_TTL_SECONDS / 2:
                     result = await store.claim_lease(LEASE_TTL_SECONDS, confirm=False)
                     refused = not result.applied
                     done.append(f"lease {'refused' if refused else 'claimed'} "
                                 f"(term {store.lease().term})")
+            elif self.lease_mode == "store" and store.holds_lease():
+                holder_beat = True                      # check_lease renews the lease itself
+            if holder_beat:
                 fresh = sum(1 for o in store.log.ops if o.pos > store.snapshot_pos)
                 due = (moment - self._last_snapshot >= SNAPSHOT_EVERY_SECONDS
                        or fresh >= SNAPSHOT_AFTER_OPS)
@@ -251,12 +260,25 @@ class StateLink:
                  + (f" -- last error: {self.error}" if self.error else ""),
                  f"position {store.log.last_pos}, {len(store.keys())} key(s), "
                  f"hash {store.state_hash()}",
-                 f"lease: {lease.holder or 'nobody'} (term {lease.term})",
+                 f"lease: {lease.holder or 'nobody'} (term {lease.term}){self._lease_compare()}",
                  f"snapshot: message {store.snapshot_message or 'none'}"]
         lines.extend(self.agreement())
         if store.log.rejected:
             lines.append(f"{len(store.log.rejected)} write(s) refused since the snapshot")
         return "\n".join(lines)
+
+    def _lease_compare(self) -> str:
+        """Shadow (phase 3): does the store's lease name the same holder as today's?"""
+        if self.lease_mode == "store":
+            return " -- the coordinator lease (state.lease: store)"
+        try:
+            gitbus = self.channel.lease_state()
+            theirs = str(getattr(gitbus, "holder", "") or "")
+        except Exception:                              # noqa: BLE001 - a comparison only
+            return ""
+        mine = str(self.store.lease().holder or "") if self.store is not None else ""
+        same = K.norm(theirs) == K.norm(mine)
+        return f"; gitbus lease: {theirs or 'nobody'} ({'agrees' if same else 'DIFFERS'})"
 
     def agreement(self) -> list:
         """For each bot's last beat: does this bot's state at that position hash the same?"""

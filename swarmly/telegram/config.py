@@ -214,7 +214,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "web": ("enabled", "port", "public_host", "init_max_age"),
     "swarm": ("succession",),
     # topic registry, phase 1: the shared state store, in shadow unless the operator says
-    "state": ("backend", "mode", "heartbeat_minutes"),
+    "state": ("backend", "mode", "heartbeat_minutes", "lease"),
 }
 
 
@@ -1004,6 +1004,9 @@ class StateSettings:
     mode: str = "shadow"
     #: How often each bot writes its heartbeat key in shadow.
     heartbeat_minutes: float = 10.0
+    #: Phase 3: ``shadow`` -- the gitbus lease decides, the store's mirrors it and /state
+    #: compares them; ``store`` -- the store's lease is the coordinator lease.
+    lease: str = "shadow"
 
 
 @dataclass
@@ -1415,7 +1418,13 @@ class AgentConfig:
                                    state_raw.get("heartbeat_minutes", 10.0), 10.0)
             if minutes <= 0:
                 raise ConfigError("state.heartbeat_minutes must be more than 0")
-            state = StateSettings(backend=backend, mode=mode, heartbeat_minutes=minutes)
+            lease = str(state_raw.get("lease") or "shadow").strip().lower()
+            if lease not in ("shadow", "store"):
+                raise ConfigError(f"state.lease must be shadow or store (got {lease!r})")
+            if lease == "store" and backend != "telegram":
+                raise ConfigError("state.lease: store needs state.backend: telegram")
+            state = StateSettings(backend=backend, mode=mode, heartbeat_minutes=minutes,
+                                  lease=lease)
         elif state_raw is not None:
             raise ConfigError("'state' must be a mapping")
 
