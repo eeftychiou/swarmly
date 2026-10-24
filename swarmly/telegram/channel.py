@@ -3479,6 +3479,76 @@ class AgentChannel:
             roles[mine] = my_role
         return roles
 
+    # -- the local web page (issue #240, slice 1) ---------------------------------------
+    def web_settings(self) -> Any:
+        """``web`` from the config, or ``None``: no section means no page, and no port opened."""
+        return getattr(self.config, "web", None)
+
+    def web_state(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """The page's JSON: the same records the pinned card is built from, nothing more.
+
+        Read per request, so the page is as fresh as the transport's own state and costs no
+        turn. Every field is picked by name in ``webui``, so a snapshot or usage row carrying
+        a chat id, a token or a path cannot reach the wire. A table that cannot be read
+        leaves its section empty and says so in the log -- the page is a view, not the
+        authority ``/owed`` is, and a page that raises is worse than one that is thin.
+        """
+        from swarmly.telegram import webui
+        moment = self.presence_clock() if now is None else float(now)
+        try:
+            lease = self.lease_state(now=moment)
+        except Exception:                          # noqa: BLE001 - a page without a lease
+            logger.warning("web dashboard: the lease is not readable", exc_info=True)
+            lease = None
+        try:
+            owed = list(self.owed_store().open_rows(now=moment))
+        except Exception:                          # noqa: BLE001 - a page without debts
+            logger.warning("web dashboard: the owed table is not readable", exc_info=True)
+            owed = []
+        return webui.watch_state(
+            now=moment, snapshots=self.control_snapshots(moment),
+            usage=self.control_usage(), roles=self.control_roles(),
+            coordinator=str(self.current_coordinator(now=moment) or ""), lease=lease,
+            round_state=self.control_round(), owed=owed)
+
+    def _sync_web_dashboard(self, *, now: Optional[float] = None) -> str:
+        """Serve the page while this bot holds the lease; stop when it does not (#240).
+
+        The page belongs to the lease holder, for the same reason the pin does: one transport
+        answers for the swarm. Started on the first beat that finds this bot coordinating,
+        stopped on the first that finds it has been replaced -- so a failover moves the page
+        with the lease instead of leaving a stale one answering on an old host.
+        """
+        from swarmly.telegram import webui
+        moment = self.presence_clock() if now is None else float(now)
+        web = self.web_settings()
+        server = getattr(self, "_web_server", None)
+        if web is None or not getattr(web, "enabled", False):
+            if server is not None:
+                server.stop()
+                self._web_server = None
+                return "stopped: web dashboard is off"
+            return "off"
+        if not self.is_coordinator(now=moment):
+            if server is not None:
+                server.stop()
+                self._web_server = None
+                return "stopped: not the lease holder"
+            return "idle: not the lease holder"
+        if server is not None and server.running:
+            return "serving " + server.url
+        server = webui.DashboardServer(self.web_state,
+                                       port=int(getattr(web, "port", 8787) or 0))
+        try:
+            url = server.start()
+        except OSError as exc:
+            logger.warning("web dashboard: cannot serve on port %s: %s",
+                           getattr(web, "port", 8787), exc)
+            return f"failed: {exc}"
+        self._web_server = server
+        logger.info("web dashboard: serving %s (read-only, loopback)", url)
+        return "serving " + url
+
     def control_usage(self) -> Dict[str, Dict[str, Any]]:
         """What each bot spent today: this bot from its ledger, peers from their own pulses.
 
@@ -4311,6 +4381,12 @@ class AgentChannel:
         # refreshing one message would fight over it (#117).
         if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
             await self.refresh_control_center(now=moment)
+        # Issue #240: the local web page follows the lease, like the pin -- served by the bot
+        # that coordinates, stopped when another one does.
+        try:
+            self._sync_web_dashboard(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("web dashboard: could not be synced this beat", exc_info=True)
         return said
 
     async def _register_command_menu(self) -> str:
@@ -9677,6 +9753,10 @@ class AgentChannel:
     async def stop(self) -> None:
         self._shutting_down = True                # cancelled turns stay in the inbox
         self._topic_memory.save()
+        server = getattr(self, "_web_server", None)   # issue #240: no port left listening
+        if server is not None:
+            server.stop()
+            self._web_server = None
         if self.bot is not None and getattr(self, "_started_wall", None) is not None \
                 and not self.restart_requested:
             try:                                  # peers mark this agent offline

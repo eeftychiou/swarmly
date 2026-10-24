@@ -239,7 +239,7 @@ class TestOneRowPerBot(unittest.TestCase):
             "",
             "🔵 Claude · coordinator · working 3m · opus/high · 9 turns · 19.0M tok · $22.33",
             "⏸ Codex · reviewer · paused 61m · deepseek/high · ? turns · ? tok · ?",
-            "🟢 DeepSeek · developer · idle 12m · deepseek/high · 4 turns · 900+? tok · $0.42",
+            "🟢 DeepSeek · developer · idle 12m · deepseek/high · 4 turns · 900/? tok · $0.42",
             "🔴 Hermes · ? · DOWN 5s · deepseek/high · ? turns · ? tok · ?",
             "⚠️ Reasonix · reviewer · stuck 12m · deepseek/high · ? turns · ? tok · ?",
             "",
@@ -309,6 +309,26 @@ class TestTheMessageFits(unittest.TestCase):
         text = ct.dashboard(now=NOW, snapshots=rows, coordinator="Bot0", limit=400)
         self.assertLessEqual(len(text), 400)
         self.assertIn("DOWN Hermes", text)
+
+    def test_the_hidden_count_includes_what_the_note_itself_displaced(self):
+        """The note makes room for itself by dropping lines, and those are hidden too."""
+        rows = [snap(f"Bot{index}", BUSY, queue=3) for index in range(30)]
+        state = round_state(**{str(200 + index): {
+            "issue": 200 + index, "pr": 200 + index, "owner": "Bot3", "head": "abcdef1",
+            "ci": "7/7"} for index in range(5)})
+        text = ct.dashboard(now=NOW, snapshots=rows, round_state=state, coordinator="Bot0",
+                            limit=900)
+        drawn = len([line for line in text.splitlines() if line.strip()]) - 1
+        # Every line the card could hold: 1 header + 30 rows + 1 lease + title + 5 items.
+        self.assertIn(f"{1 + 30 + 1 + 6 - drawn} more line(s) hidden", text)
+
+    def test_a_limit_too_small_for_the_card_still_shows_its_first_lines(self):
+        """There is no whole-line cut left that keeps an alert: keep what fits, never the note alone."""
+        rows = [snap(f"Bot{index}", at=NOW - 900, every=60.0) for index in range(5)]
+        text = ct.dashboard(now=NOW, snapshots=rows, limit=64)
+        self.assertLessEqual(len(text), 64)
+        self.assertIn("SWARM", text)                       # the head survives the clipping
+        self.assertIn("more line(s) hidden", text)
 
 
 class TestControls(unittest.TestCase):

@@ -406,7 +406,7 @@ class TestWhatEachBotSpent(unittest.TestCase):
                                                   "cost_known": 3}}}))
         text = channel.control_text()
         self.assertIn(" Codex · ", text)
-        self.assertIn("900+?", text)                   # its input tokens, and the side that
+        self.assertIn("900/?", text)                   # its input tokens, and the side that
         self.assertNotIn("1.0k", text)                 # was never reported: not a zero
 
     def test_the_snapshot_carries_the_usage_and_a_peer_keeps_the_newest(self):

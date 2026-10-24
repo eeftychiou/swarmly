@@ -105,3 +105,24 @@ class TestUnknownKeys(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWebDashboardConfig(unittest.TestCase):
+    """Issue #240: the local page is off unless the operator asks for it, and its port is checked."""
+
+    def test_no_web_section_means_no_page_and_no_port(self):
+        self.assertIsNone(make_config().web)
+
+    def test_the_section_parses_enabled_and_port(self):
+        web = make_config(web={"enabled": True, "port": 9123}).web
+        self.assertTrue(web.enabled)
+        self.assertEqual(web.port, 9123)
+        # An absent key keeps the documented default: a port is still named, but nothing serves.
+        self.assertEqual(make_config(web={"enabled": "false"}).web.port, 8787)
+
+    def test_a_port_outside_the_range_is_refused_by_name(self):
+        with self.assertRaises(ConfigError) as caught:
+            make_config(web={"enabled": True, "port": 70000})
+        self.assertIn("web.port", str(caught.exception))
+        with self.assertRaises(ConfigError):
+            make_config(web={"enabled": "maybe"})

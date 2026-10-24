@@ -193,7 +193,7 @@ def _parse_float(where: str, value: Any, default: float) -> float:
 #: against :class:`ChannelLimits`.
 KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "": ("agent", "peers", "adapter", "limits", "fallback", "bus", "projects", "github",
-         "control", "public_redactions", "swarm"),
+         "control", "web", "public_redactions", "swarm"),
     "agent": ("name", "alias", "bot_token", "bot_token_env", "home_channel_id",
               "admin_user_id", "maintainer_username", "allowed_users", "git_name",
               "git_email", "role"),
@@ -210,6 +210,8 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
                "backlog_hours"),
     # issue #117: where the pinned dashboard lives -- it rides the heartbeat, so no interval
     "control": ("chat_id", "topic_id"),
+    # issue #240: the local read-only web page, off unless the operator turns it on
+    "web": ("enabled", "port"),
     "swarm": ("succession",),
 }
 
@@ -981,6 +983,19 @@ class ControlSettings:
 
 
 @dataclass
+class WebSettings:
+    """The local dashboard page (issue #240, slice 1). Off unless the operator turns it on.
+
+    The page is served by the transport that holds the lease, on the loopback only: slice 1
+    is local by design, and exposing it is slice 2's decision (the admin's, over HTTPS).
+    """
+
+    enabled: bool = False
+    #: The port on ``127.0.0.1``. ``0`` asks the OS for a free one, which tests use.
+    port: int = 8787
+
+
+@dataclass
 class AgentConfig:
     """The whole per-agent configuration."""
 
@@ -995,6 +1010,8 @@ class AgentConfig:
     github: Optional[GitHubSettings] = None
     #: Issue #117: the pinned dashboard's home, when the operator wants one.
     control: Optional[ControlSettings] = None
+    #: Issue #240: the local web page, when the operator wants one.
+    web: Optional[WebSettings] = None
     #: Issue #22: literal -> replacement, applied to everything that leaves the host (bus
     #: payloads and GitHub-facing text). Empty by default: nothing is redacted until the
     #: operator names what is sensitive on this machine.
@@ -1348,6 +1365,20 @@ class AgentConfig:
         elif control_raw is not None:
             raise ConfigError("'control' must be a mapping")
 
+        # Issue #240: the local read-only web page. No section, no server: nothing opens a
+        # port unless the operator asked for one (and only the lease holder serves it).
+        web_raw = data.get("web")
+        web: Optional[WebSettings] = None
+        if isinstance(web_raw, dict):
+            web = WebSettings(
+                enabled=_parse_bool("web.enabled", web_raw.get("enabled", False)),
+                port=_parse_int("web.port", web_raw.get("port", 8787), 8787),
+            )
+            if web.port < 0 or web.port > 65535:
+                raise ConfigError(f"web.port must be 0-65535 (got {web.port})")
+        elif web_raw is not None:
+            raise ConfigError("'web' must be a mapping")
+
         # Issue #22: what must not leave this host. The literal is the sensitive value
         # (a handle, a path); the replacement is what the bus and GitHub text carry instead.
         redactions_raw = data.get("public_redactions") or {}
@@ -1371,7 +1402,7 @@ class AgentConfig:
         swarm = dict(swarm_raw) if isinstance(swarm_raw, dict) else {}
         return cls(identity=identity, peers=peers, peer_roles=peer_roles, adapter=adapter, limits=limits,
                    fallback=fallback, bus=bus, projects=projects_dict, github=github,
-                   control=control,
+                   control=control, web=web,
                    public_redactions=public_redactions, swarm=swarm, source_path=source_path,
                    _bus_poll_minutes_explicit=bool(bus_poll_explicit),
                    unknown_keys=unknown)

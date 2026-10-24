@@ -1200,6 +1200,43 @@ the `/stop all` form, because the dashboard speaks for the whole bot rather than
   (`CONTROL bot.model target=self value=claude-opus-4 by=…`): a record that says a model
   changed and not which one is not a record.
 
+**The live page — a local web dashboard (#240, slice 1).** The pinned card is one message;
+a page has room for the detail it drops. Turn it on in `config.yaml` and the transport that
+holds the lease serves it on the loopback:
+
+```yaml
+web:
+  enabled: true
+  port: 8787          # optional, default 8787; 0 asks the OS for a free one
+```
+
+`http://127.0.0.1:8787/` is one page; `/state.json` is the state it polls. Both are rendered
+in code, per request, from records the transport already holds — the status snapshots (#124),
+the `/usage` ledger (#125), the round state (#86), the lease (#83) the roster's roles and the
+owed table (#162) — so a refresh costs no model turn and no Telegram edit. One card per bot:
+alias, role, a coloured badge (working / idle / paused / frozen / stuck / down), the topic and
+running time of a turn in flight, the age of the last pulse, runtime (model/effort) and rev,
+today's turns, tokens in/out and cost. A strip on top carries the coordinator, the lease term
+and time left, and the round in flight with its checklist progress; the open debts are listed
+under the cards. A bot that stopped beating is `down` whatever it last said of itself, and a
+number the runtime never reported is `null` in the JSON and `?` on the page — never a zero.
+
+Three rules bound it. **Read-only:** `GET`/`HEAD` on those two paths and nothing else — a write
+is a `405`, an unknown path a `404`, and the admin's buttons stay in Telegram. **Loopback
+only:** it binds `127.0.0.1`, so nothing off the host reaches it; slice 2 — the same page as a
+Telegram Mini App, over HTTPS with `initData` checked — is the admin's decision, not a
+config flag. **No identifiers, no external references:** every field is picked by name, so a
+record carrying a chat id, a token or a path shows none of them, and the page loads nothing
+from anywhere (no CDN, no font host), so it works on a LAN with no route out. It follows the
+system's light or dark preference and is built phone-width first, ready to be the Mini App's
+page unchanged.
+
+The page follows the lease like the pin: the first heartbeat that finds this bot coordinating
+starts the server, and the first that finds another bot coordinating stops it — so a failover
+moves the page with the role instead of leaving a stale one answering on an old host. The
+server is one daemon thread; `stop()` closes the port, so a restart never leaves two answers
+on one port. Slice 2 needs a public HTTPS address for the host, and that is the admin's call.
+
 A swarm-wide control — pause everything — holds the bot that owns the message and broadcasts
 `target=*`, so every peer applies it: one press stops the swarm, and each bot keeps its own
 `CONTROL` record of the press that stopped it.

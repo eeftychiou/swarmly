@@ -284,14 +284,18 @@ def _partial(known: Any, turns: Any) -> bool:
 
 
 def _token_cell(usage: Optional[Mapping[str, Any]]) -> str:
-    """A bot's tokens today: ``19.0M``, ``900+?`` when one direction is unreported, or ``?"""
+    """A bot's tokens today: ``19.0M``, or ``900/?`` when one direction was not reported.
+
+    The one-direction form is always ``<in>/<out>``, never ``<out>+<in>``: a cell stays the
+    same shape whichever side is missing, so it is read the same way twice (review, #254).
+    """
     if not usage or (usage.get("tokens_in") is None and usage.get("tokens_out") is None):
         return "?"
     tokens_in, tokens_out = usage.get("tokens_in"), usage.get("tokens_out")
     if tokens_in is None or tokens_out is None:
         # One direction was reported: showing it is the point, and the ``?`` beside it keeps
         # the cell from reading as a whole total (#125).
-        return f"{_count(tokens_in)}+{_count(tokens_out)}"
+        return f"{_count(tokens_in)}/{_count(tokens_out)}"
     text = _count(_num(tokens_in) + _num(tokens_out))
     known = min(_num(usage.get("tokens_in_known")), _num(usage.get("tokens_out_known")))
     if _partial(known, usage.get("turns")):
@@ -574,11 +578,17 @@ def _join(kept: Mapping[str, Sequence[str]], order: Iterable[str]) -> str:
 
 
 def _render(kept: Dict[str, List[str]], dropped: int, limit: int) -> str:
-    """The sections in reading order, plus how many lines did not fit (#117, #241)."""
+    """The sections in reading order, plus how many lines did not fit (#117, #241).
+
+    ``dropped`` is what ``_fit`` could not place. Making room for the note itself hides
+    further lines, and those are counted too: a "3 more hidden" that is really six is the
+    kind of number this module exists not to print (review, #254).
+    """
     if not dropped:
         return _join(kept, _SHOW)
-    note = f"... {dropped} more line(s) hidden; detail is one button away"
+    hidden = dropped
     while True:
+        note = f"... {hidden} more line(s) hidden; detail is one button away"
         text = _join(kept, _SHOW)
         if text and len(text) + 1 + len(note) <= limit:
             return text + "\n" + note
@@ -588,11 +598,19 @@ def _render(kept: Dict[str, List[str]], dropped: int, limit: int) -> str:
             rows = kept.get(name) or []
             if rows:
                 rows.pop()
+                hidden += 1
                 if not rows:
                     del kept[name]
                 break
         else:
-            return note[:limit]
+            # Only the header and the alerts are left and this limit cannot hold them. There
+            # is no whole line left to drop that is not an alert, so the text keeps as many
+            # whole lines as fit rather than returning the note alone: a clipped card still
+            # says something, and a limit this small is a misconfiguration, not a reader's
+            # day (review, #254).
+            room = max(0, limit - 1 - len(note))
+            whole = text[:room].rsplit("\n", 1)[0] if room else ""
+            return (whole + "\n" + note) if whole else note[:limit]
 
 
 def dashboard(*, now: Optional[float] = None, snapshots: Sequence[Snapshot] = (),
