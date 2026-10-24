@@ -133,6 +133,10 @@ class StateLink:
         #: the store's lease the coordinator lease (check_lease claims it; nothing mirrors).
         self.lease_mode = str(getattr(settings, "lease", "shadow") or "shadow").lower() \
             if self.backend == "telegram" else "off"
+        #: Phase 5: "registry" lets GitHub notices follow the topics' explicit links.
+        self.links_mode = str(getattr(settings, "links", "legacy") or "legacy").lower() \
+            if self.backend == "telegram" else "legacy"
+        self._last_github = float("-inf")
         self.store: Optional[TelegramStore] = None
         self.error = ""
         self._last_beat = float("-inf")
@@ -244,6 +248,16 @@ class StateLink:
                 except Exception as exc:               # noqa: BLE001 - shadow: never fatal
                     logger.warning("state: registry sync failed: %s", exc, exc_info=True)
                     done.append("registry failed")
+                if store.holds_lease() and \
+                        moment - self._last_github >= self.GITHUB_EVERY_SECONDS:
+                    self._last_github = moment
+                    try:
+                        moved = await self.reconcile_github(store)
+                        if moved:
+                            done.append(f"github: {moved} item(s) moved")
+                    except Exception as exc:           # noqa: BLE001 - shadow: never fatal
+                        logger.warning("state: github reconcile failed: %s", exc,
+                                       exc_info=True)
                 try:
                     if await self.sync_owed(store, moment):
                         done.append("owed")
@@ -300,6 +314,123 @@ class StateLink:
         self._tasks = getattr(self, "_tasks", set())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    #: How often the lease holder asks GitHub where its linked items stand.
+    GITHUB_EVERY_SECONDS = 900.0
+
+    def _topic_records(self) -> list:
+        """(topic id, record) for every topic in the store."""
+        out = []
+        store = self.store
+        if store is None:
+            return out
+        for key in store.keys("topic/"):
+            place = K.topic_of(key)
+            if place is not None and place[1] is None:
+                out.append((place[0], store.read(key) or {}))
+        return out
+
+    def topic_for_refs(self, refs: list) -> Optional[tuple]:
+        """The open topic whose explicit links name one of ``refs`` (``#12``): a work item
+        first, then a tracking link, then a reference; legacy guesses do not count."""
+        if self.store is None or not refs:
+            return None
+        rank = {"work": 0, "tracking": 1, "reference": 2}
+        best = None
+        for topic_id, data in self._topic_records():
+            if data.get("status") == "closed":
+                continue
+            for link in data.get("links") or []:
+                if link.get("added_by") == "legacy" or link.get("provider") != "github":
+                    continue
+                if link.get("title") in refs and link.get("status") != "closed":
+                    score = (rank.get(link.get("role"), 3), -int(topic_id))
+                    if best is None or score < best[0]:
+                        best = (score, topic_id)
+        if best is None:
+            return None
+        return int(self.channel.config.identity.home_channel_id or 0), int(best[1])
+
+    def registry_note(self, chat_id: int, thread_id: Optional[int]) -> str:
+        """The coordinator's per-turn hint (the store lease holder, in a topic): how to record
+        this topic's work, and what is recorded already. Empty for everyone else."""
+        store = self.store
+        if store is None or not store.ready or thread_id is None or not store.holds_lease():
+            return ""
+        if int(chat_id) != int(self.channel.config.identity.home_channel_id or 0):
+            return ""
+        data = store.read(K.topic(thread_id)) or {}
+        items = [self.registry._link_text(link) for link in data.get("links") or []
+                 if link.get("added_by") != "legacy"]
+        known = ("Recorded here: " + "; ".join(items[:8]) + ".") if items else \
+            "Nothing is recorded for this topic yet."
+        return ("\n\n[Topic registry, from the transport: record this topic's work with lines "
+                "of their own -- `LINK: <#N|url> [as work|tracking|reference] [— title]`, "
+                "`ASSIGN: @<bot> <#N|L1> as <role>`, `PHASE: <#N|L1> <research|design|"
+                "development|review|qa|done|blocked>`. " + known + "]")
+
+    async def reconcile_github(self, store: Any) -> int:
+        """Move linked GitHub work items by where GitHub says they stand (the lease holder):
+        merged or a closed issue -> done and closed; a closed, unmerged PR -> closed; an open
+        PR still before review -> review. Returns how many items moved."""
+        import re
+        from swarmly.github.client import GitHubClient
+        from swarmly.state.records import Change, Topic, now_iso
+        github = getattr(self.channel.config, "github", None)
+        client = GitHubClient(token_env=getattr(github, "token_env", None) or "GH_TOKEN")
+        moved = 0
+        for topic_id, data in self._topic_records():
+            links = [link for link in data.get("links") or []
+                     if link.get("provider") == "github" and link.get("role") == "work"
+                     and link.get("status") == "open"]
+            if not links:
+                continue
+            states = {}
+            for link in links:
+                found = re.match(r"https://github\.com/([^/]+/[^/]+)/(?:issues|pull)/(\d+)",
+                                 str(link.get("ref") or ""))
+                if found:
+                    states[link["id"]] = await asyncio.to_thread(
+                        client.ref_state, found.group(1), int(found.group(2)))
+            async with self.topic_lock:
+                await store.refresh()
+                current = store.read(K.topic(topic_id))
+                if not current:
+                    continue
+                topic = Topic.from_dict(current)
+                stamp = now_iso(self.clock)
+                changed = 0
+                for link in topic.links:
+                    state = states.get(link.id)
+                    if state is None or link.status != "open":
+                        continue
+                    phase, status = link.phase, link.status
+                    if state == "merged" or (state == "closed" and link.kind == "issue"):
+                        phase, status = "done", "closed"
+                    elif state == "closed":
+                        status = "closed"
+                    elif state == "open" and link.kind == "pr" and \
+                            link.phase in ("research", "design", "development"):
+                        phase = "review"
+                    if (phase, status) == (link.phase, link.status):
+                        continue
+                    if phase != link.phase:
+                        topic.history.append(Change(at=stamp, field="phase", old=link.phase,
+                                                    to=phase, by="github", link=link.id))
+                    if status != link.status:
+                        topic.history.append(Change(at=stamp, field="status", old=link.status,
+                                                    to=status, by="github", link=link.id))
+                    if phase != link.phase:
+                        link.phase_at = stamp
+                    link.phase, link.status = phase, status
+                    link.updated_by, link.updated_at = "github", stamp
+                    changed += 1
+                if changed:
+                    result = await store.write(K.topic(topic_id),
+                                               Topic.from_dict(topic.to_dict()).to_dict())
+                    if result.applied:
+                        moved += changed
+        return moved
 
     REGISTRY_COMMANDS = ("link", "unlink", "phase")
 
