@@ -173,6 +173,26 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- The dashboard page as a **Telegram Mini App** (`#240`, slice 2): set `web.public_host` to the
+  name a tunnel gives the host and the pinned card grows an **Open dashboard** button
+  (`web_app`), whose URL is `https://<public_host>/` — `web.port` is the loopback port the
+  tunnel forwards to, never part of the public URL, and the button is drawn only when the
+  section is enabled (both from the review of #258). The page reads Telegram's signed
+  `initData` from the URL hash and sends it back on every poll, and the server checks it the way
+  Telegram specifies — `HMAC-SHA256` over the sorted fields under a secret derived from the bot
+  token — refusing anything older than `web.init_max_age` (default 300 s), anything dated in the
+  future, anything signed by another token, and any `user.id` that is not `admin_user_id`
+  (`403`); a window must be more than 0 seconds, and a request from the loopback still needs
+  none, so the operator keeps the plain local page. The page is served without it and loads no Telegram script, so it stays
+  self-contained. A request whose `Host` is neither the loopback nor the configured name is a
+  `404`, which closes the DNS-rebinding hole opened by binding a port the LAN can name (review,
+  #256). Also from that review: a bind failure is logged once and retried after `60 s` instead
+  of warning on every heartbeat, `stop()` joins the serve thread with a short bound (it can run
+  on the event loop), `running` means the serve thread is alive rather than that a socket was
+  once made, and `web_state`'s docstring states that the HTTP thread may only call read-only
+  accessors. Exposure itself stays the admin's: a tunnel forwards to `127.0.0.1`, and
+  `docs/telegram-channel.md` names one way to do it.
+
 - A **local web dashboard** (`#240`, slice 1): with `web.enabled: true` in `config.yaml`, the
   transport that holds the lease serves one read-only page on `127.0.0.1` (port 8787 by
   default) and the JSON it polls, `/state.json`. Both are rendered per request from records

@@ -3367,7 +3367,7 @@ class AgentChannel:
         chat_id = settings.chat_id or self.config.identity.home_channel_id
         centre = ControlCenter(bot, chat_id=chat_id, thread_id=settings.topic_id,
                                render=self.control_text,
-                               markup=lambda: control_mod.keyboard(self.control_actions()),
+                               markup=self.control_markup,
                                me_username=self.config.identity.name)
         self._control_center = centre
         return centre
@@ -3461,6 +3461,19 @@ class AgentChannel:
                                      roles=self.control_roles(),
                                      limit=self.config.limits.max_message_chars)
 
+    def control_markup(self) -> List[List[Dict[str, Any]]]:
+        """The pinned card's keyboard: the dashboard button first when a Mini App is set.
+
+        A ``web_app`` button is the only kind that opens a Mini App, and it must carry a URL,
+        so it exists only when ``web.public_host`` does (#240 slice 2). The controls below it
+        are unchanged.
+        """
+        rows: List[List[Dict[str, Any]]] = []
+        url = self.mini_app_url()
+        if url:
+            rows.append([{"text": "Open dashboard", "web_app": {"url": url}}])
+        return rows + control_mod.keyboard(self.control_actions())
+
     def control_roles(self) -> Dict[str, str]:
         """Each bot's role, from the swarm's own roster (#241's row, #154's names).
 
@@ -3479,7 +3492,30 @@ class AgentChannel:
             roles[mine] = my_role
         return roles
 
-    # -- the local web page (issue #240, slice 1) ---------------------------------------
+    # -- the local web page (issue #240) ------------------------------------------------
+    #: How long a port that could not be bound is left alone before it is tried again.
+    WEB_RETRY_SECONDS = 60.0
+
+    def mini_app_url(self) -> str:
+        """The address a Mini App opens, or ``""`` when there is nowhere to open (#240).
+
+        The name in ``web.public_host`` is the *public* one, so the port is the public port:
+        ``https://<public_host>/``. ``web.port`` is where the tunnel forwards *to*, on the
+        loopback, and putting it in the URL opens a dead address -- a tunnel publishes on 443
+        (review, #258). An operator whose public port is not 443 puts it in ``public_host``
+        itself, which is why the config takes a host *and optional port*.
+
+        Empty means no ``web_app`` button: a button that opens nothing is worse than no
+        button, and a disabled section is exactly that case.
+        """
+        web = self.web_settings()
+        if web is None or not getattr(web, "enabled", False):
+            return ""
+        host = str(getattr(web, "public_host", "") or "").strip()
+        if not host:
+            return ""
+        return f"https://{host}/"
+
     def web_settings(self) -> Any:
         """``web`` from the config, or ``None``: no section means no page, and no port opened."""
         return getattr(self.config, "web", None)
@@ -3537,16 +3573,30 @@ class AgentChannel:
             return "idle: not the lease holder"
         if server is not None and server.running:
             return "serving " + server.url
-        server = webui.DashboardServer(self.web_state,
-                                       port=int(getattr(web, "port", 8787) or 0))
+        # A port that cannot be bound is not worth a warning per heartbeat (review, #256):
+        # one line, then a quiet retry interval -- the port may be a peer's for a moment
+        # during a failover, and the operator needs the fact once, not sixty times an hour.
+        now_wall = time.time()
+        failed_at = float(getattr(self, "_web_failed_at", 0.0) or 0.0)
+        if failed_at and now_wall - failed_at < self.WEB_RETRY_SECONDS:
+            return "failed: waiting to retry the port"
+        server = webui.DashboardServer(
+            self.web_state, port=int(getattr(web, "port", 8787) or 0),
+            public_host=str(getattr(web, "public_host", "") or ""),
+            bot_token=str(getattr(self.config.identity, "bot_token", "") or ""),
+            admin_id=getattr(self.config.identity, "admin_user_id", 0),
+            init_max_age=float(getattr(web, "init_max_age", 300.0) or 0.0))
         try:
             url = server.start()
         except OSError as exc:
-            logger.warning("web dashboard: cannot serve on port %s: %s",
-                           getattr(web, "port", 8787), exc)
+            self._web_failed_at = now_wall
+            logger.warning("web dashboard: cannot serve on port %s (%s); retrying in %ds",
+                           getattr(web, "port", 8787), exc, self.WEB_RETRY_SECONDS)
             return f"failed: {exc}"
+        self._web_failed_at = 0.0
         self._web_server = server
-        logger.info("web dashboard: serving %s (read-only, loopback)", url)
+        logger.info("web dashboard: serving %s (read-only, %s)", url,
+                    f"Mini App for {server.public_host}" if server.requires_init else "loopback")
         return "serving " + url
 
     def control_usage(self) -> Dict[str, Dict[str, Any]]:
@@ -4384,7 +4434,9 @@ class AgentChannel:
         # Issue #240: the local web page follows the lease, like the pin -- served by the bot
         # that coordinates, stopped when another one does.
         try:
-            self._sync_web_dashboard(now=moment)
+            # Off the loop: a sync that loses the lease stops the server, and stopping it
+            # waits on the serve thread (#256 review).
+            await asyncio.to_thread(self._sync_web_dashboard, now=moment)
         except Exception:                          # noqa: BLE001 - a beat must not fail on it
             logger.warning("web dashboard: could not be synced this beat", exc_info=True)
         return said
