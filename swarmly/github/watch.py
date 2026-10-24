@@ -557,6 +557,9 @@ class GitHubWatcher:
         """Run one GitHub-driven turn in the project's topic and post its answer."""
         if self.channel is None:                 # the CLI path: no topic to post into
             return await self._standalone_reply(project, incoming, thread_id, router)
+        if callable(getattr(type(self.channel), "run_transport_turn", None)):
+            # The full turn path (#237): recap, notes, lock, and the reply's WAIT/ROLE lines.
+            return await self.channel.run_transport_turn(incoming.text, chat_id, thread_id)
         adapter = (
             self.channel._adapter_for(chat_id, thread_id)
             if hasattr(self.channel, "_adapter_for")
