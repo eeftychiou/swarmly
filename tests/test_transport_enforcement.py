@@ -312,3 +312,50 @@ class GuardEnvTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DynamicRoleTests(unittest.TestCase):
+    """Admin, 24 Oct: roles are assigned by availability at runtime, not fixed to bots, and
+    no agent state belongs in a static rule."""
+
+    def channel(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        config = make_config(peers={"Codex": "CodexBot", "Antigravity": "AntigravityBot",
+                                    "Reasonix": "ReasonixBot"})
+        channel = make_channel(config, adapter=Recording("ok"))
+        channel.bot = object()
+        channel.config.identity.role = "coordinator"
+        channel.config.peer_roles.update({"Antigravity": "qa-tester", "Reasonix": "reviewer",
+                                          "Codex": "developer"})
+        channel.drift = dr.DriftLedger(Path(self.tmp.name) / "drift.json", clock=Clock())
+        return channel
+
+    def test_the_live_note_says_who_can_act_and_is_marked_as_changing(self):
+        channel = self.channel()
+        channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        note = channel._frozen_peers_note()
+        self.assertIn("Swarm right now", note)
+        self.assertIn("never copy it into an issue", note)
+        self.assertIn("Codex (developer): frozen", note)
+        self.assertIn("Reasonix (reviewer): available", note)
+
+    def test_any_available_bot_stands_in_when_no_role_fits(self):
+        channel = self.channel()
+        channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        role, who = channel.stand_ins()["Codex"]
+        self.assertEqual(role, "developer")
+        self.assertIn(who, ("Antigravity", "Reasonix"))         # nobody else develops
+        self.assertNotEqual(who, "Hermes")                      # never the coordinator
+
+    def test_a_peer_that_comes_back_gives_the_coordinator_a_turn(self):
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: True
+        briefs = []
+        channel._run_own_task = lambda text, chat, thread, name: briefs.append((text, thread))
+        channel._last_turn_place = (GROUP, 9400)
+        channel._peers_frozen["Antigravity"] = {"ref": "pause", "until": None}
+        channel._peer_back("Antigravity")
+        self.assertEqual(len(briefs), 1)
+        self.assertIn("Antigravity (qa-tester) can act again", briefs[0][0])
+        self.assertEqual(briefs[0][1], 9400)

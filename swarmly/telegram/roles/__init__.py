@@ -40,12 +40,15 @@ class Role:
     source: str                        # "builtin" or the file it was read from
 
     def prompt(self, peer_roles: Optional[Dict[str, str]] = None) -> str:
-        """The role as prompt text: who this agent is, how it works, who does what."""
+        """The role as prompt text: who this agent is and how it works.
+
+        No "who does what" here (admin, 24 Oct): roles are assignments the swarm makes at
+        runtime by availability, not identities fixed to bots, and this text is baked into a
+        session once. Who can act right now is the transport's per-turn note, never a rule.
+        ``peer_roles`` is accepted for callers that still pass it."""
+        del peer_roles
         lines = [f"YOUR ROLE IN THE SWARM: {self.name} — {self.description}", "",
                  self.instructions.strip()]
-        team = team_line(peer_roles)
-        if team:
-            lines += ["", team]
         return "\n".join(lines)
 
 
