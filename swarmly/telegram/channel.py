@@ -2586,7 +2586,8 @@ class AgentChannel:
             handle = str(self.config.peers.get(alias, "") or "").lstrip("@")
             if not handle or alias == self.config.identity.alias:
                 continue
-            pattern = re.compile(rf"@{re.escape(handle)}\b", re.IGNORECASE)
+            pattern = re.compile(rf"@(?:{re.escape(handle)}|{re.escape(alias)})\b",
+                                 re.IGNORECASE)
             if not pattern.search(body):
                 continue
             body = pattern.sub(alias, body)                # named, not woken

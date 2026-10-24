@@ -305,11 +305,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not why and tool == "gh":
         # The merge gate (admin, 24 Oct): review merge + QA pass + green CI on the head.
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from merge_gate import check as merge_gate
-        why = merge_gate(real, args, dict(os.environ))
-        if why:
-            _drift(os.environ.get("SWARMLY_DRIFT_FILE", ""), "merge_gate_refused",
-                   f"gh {' '.join(args)}: {why}")
+        try:
+            import merge_gate
+        except Exception:                              # noqa: BLE001 - a partial install
+            merge_gate = None                          # must not break every gh call
+            print("swarmly guard: the merge gate could not load", file=sys.stderr)
+        if merge_gate is not None:
+            why = merge_gate.check(real, args, dict(os.environ))
+            ledger = os.environ.get("SWARMLY_DRIFT_FILE", "")
+            if why:
+                _drift(ledger, "merge_gate_refused", f"gh {' '.join(args)}: {why}")
+            elif merge_gate.bypassed(args, os.environ):
+                _drift(ledger, "merge_gate_bypassed", f"gh {' '.join(args)}")
     if why:
         print(f"swarmly guard: refused `{tool} {' '.join(args)}`: {why}.", file=sys.stderr)
         return REFUSED

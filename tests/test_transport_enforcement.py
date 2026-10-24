@@ -71,7 +71,8 @@ class MergeGateTests(unittest.TestCase):
     def view(self, *comments, ci="SUCCESS", status="COMPLETED"):
         return {"headRefOid": HEAD,
                 "statusCheckRollup": [{"name": "lint", "status": status, "conclusion": ci}],
-                "comments": [{"body": body} for body in comments]}
+                "comments": [{"body": body} for body in comments],
+                "commits": [{"authors": [{"name": "Codex"}]}]}
 
     def test_met_when_merge_and_qa_pass_name_the_head_and_ci_is_green(self):
         body = "Reviewed at 0636b79.\n**Verdict: merge.**\nQA: PASS — 368 passed.\n— Reasonix"
@@ -84,15 +85,38 @@ class MergeGateTests(unittest.TestCase):
         self.assertIn("a QA pass", missing)
 
     def test_the_latest_verdict_on_the_head_wins(self):
-        missing = mg.evaluate(self.view("0636b79 Verdict: merge. QA: pass.",
-                                        "0636b79 re-check: Verdict: fix-first, Windows quoting."))
+        missing = mg.evaluate(self.view("0636b79 Verdict: merge. QA: pass.\n— Reasonix",
+                                        "0636b79 re-check: Verdict: fix-first, Windows quoting."
+                                        "\n— Reasonix"))
         self.assertEqual(missing, ["a reviewer's merge verdict (the latest says fix-first)"])
 
     def test_pending_or_red_ci_blocks(self):
-        body = "0636b79 Verdict: merge. QA: pass."
+        body = "0636b79 Verdict: merge. QA: pass.\n— Reasonix"
         self.assertEqual(mg.evaluate(self.view(body, ci="", status="IN_PROGRESS")),
-                         ["CI is pending"])
-        self.assertEqual(mg.evaluate(self.view(body, ci="FAILURE")), ["CI is red"])
+                         ["green CI (it is pending)"])
+        self.assertEqual(mg.evaluate(self.view(body, ci="FAILURE")), ["green CI (it is red)"])
+
+    def test_an_unsigned_or_own_verdict_does_not_count(self):
+        """#247 review: any comment's words opened the gate, the PR's developer's included."""
+        unsigned = mg.evaluate(self.view("0636b79 Verdict: merge. QA: pass."))
+        self.assertIn("a reviewer's merge verdict", unsigned)
+        self.assertIn("unsigned", unsigned[-1])
+        own = mg.evaluate(self.view("0636b79 Verdict: merge. QA: pass.\n— Codex"))
+        self.assertIn("a QA pass", own)
+        self.assertIn("own authors", own[-1])
+        bullets = mg.evaluate(self.view("0636b79\n- Verdict: merge\n- QA: pass"))
+        self.assertIn("unsigned", bullets[-1])               # a bullet is not a signature
+
+    def test_a_merge_without_a_number_is_looked_up_or_refused(self):
+        """#247 review: `gh pr merge`, `--squash` alone or a branch skipped the gate."""
+        self.assertEqual(mg.pr_target(["pr", "merge", "--squash"]),
+                         {"number": None, "repo_args": []})
+        self.assertEqual(mg.pr_target(["pr", "merge", "feat/x"])["number"], "feat/x")
+        why = mg.check("/nonexistent/gh", ["pr", "merge", "--squash"], {})
+        self.assertIn("gh pr merge <number>", why)
+        self.assertIsNone(mg.check("/nonexistent/gh", ["pr", "merge", "245"], {}))
+        self.assertTrue(mg.bypassed(["pr", "merge", "1"], {"SWARMLY_MERGE_GATE": "off"}))
+        self.assertFalse(mg.bypassed(["pr", "list"], {"SWARMLY_MERGE_GATE": "off"}))
 
     def test_the_gate_reads_only_pr_merge_with_a_number(self):
         self.assertEqual(mg.pr_target(["pr", "merge", "245", "--merge"]),
@@ -233,10 +257,27 @@ class TheNightOf24OctTests(unittest.TestCase):
         """The stand-in note asks for `QA: pass`; a merge verdict alone is not a QA pass."""
         view = MergeGateTests.view
         bare = f"Re-review at {HEAD[:7]}: 100 passed.\n**Verdict: merge at {HEAD[:7]}.**"
-        self.assertEqual(mg.evaluate(view(None, bare)), ["a QA pass"])
-        self.assertEqual(mg.evaluate(view(None, bare + f"\nQA: pass at {HEAD[:7]}")), [])
+        self.assertEqual(mg.evaluate(view(None, bare + "\n— Reasonix")), ["a QA pass"])
+        self.assertEqual(mg.evaluate(view(None, bare + f"\nQA: pass at {HEAD[:7]}\n— Reasonix")),
+                         [])
         channel, _ = self.channel()
         self.assertIn("`QA: pass` or `QA: fail`", channel._frozen_peers_note())
+
+    def test_an_alias_written_as_a_mention_is_refused_too(self):
+        """#247 review: peers write `@Antigravity` in prose; that is an address as well."""
+        channel, _ = self.channel("@Antigravity please QA #245 at 0636b79.")
+        run(channel.handle_event(event("@HermesBot CI on #245 is green", thread_id=9400,
+                                       message_id=41)))
+        posted = channel._test_sender.sent[-1]["text"]
+        self.assertIn("⛔ Not delivered to Antigravity", posted)
+
+    def test_the_drift_inbox_is_moved_aside_before_it_is_read(self):
+        ledger = dr.DriftLedger(Path(self.tmp.name if hasattr(self, "tmp") else
+                                     tempfile.mkdtemp()) / "d.json", clock=Clock())
+        dr.append_inbox(str(ledger.path), "merge_gate_refused", "gh pr merge 1")
+        self.assertEqual([v.kind for v in ledger.fold_inbox()], ["merge_gate_refused"])
+        self.assertFalse(ledger.inbox.exists())
+        self.assertFalse(list(ledger.path.parent.glob("*.draining-*")))
 
     def test_the_gate_skips_option_values_when_it_looks_for_the_pr(self):
         self.assertEqual(mg.pr_target(["pr", "merge", "--match-head-commit", "1234567", "245"])

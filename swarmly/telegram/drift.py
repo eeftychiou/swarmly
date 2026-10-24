@@ -29,6 +29,8 @@ RULES: Dict[str, Tuple[int, str]] = {
                                  "coordinator."),
     "merge_gate_refused": (3, "Merge only when a reviewer's merge verdict, a QA pass and green "
                               "CI are all on the PR's current head."),
+    "merge_gate_bypassed": (2, "Do not switch the merge gate off: merge when the gate is met, "
+                               "or ask the admin."),
     "unknown": (1, "Follow the rulebook."),
 }
 
@@ -109,9 +111,13 @@ class DriftLedger:
         inbox = self.inbox
         if inbox is None or not inbox.exists():
             return []
+        # Move the inbox aside first, so a row the guard appends meanwhile lands in a new
+        # inbox and is read next time, not deleted unread.
+        draining = inbox.with_suffix(f".draining-{os.getpid()}")
         try:
-            lines = inbox.read_text(encoding="utf-8").splitlines()
-            inbox.unlink()
+            os.replace(inbox, draining)
+            lines = draining.read_text(encoding="utf-8").splitlines()
+            draining.unlink()
         except OSError:
             return []
         found = []

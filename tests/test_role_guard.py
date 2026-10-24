@@ -176,6 +176,57 @@ class TestTheMergeThroughTheGuardedPath(unittest.TestCase):
 
 
 @unittest.skipIf(os.name == "nt", "the POSIX wrapper is tested here")
+class TestTheMergeGateThroughTheGuard(unittest.TestCase):
+    """#247 review: the guard really runs the gate before a merge, gate on."""
+
+    HEAD = "0636b79aa1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+    def merge(self, *args, comments=()):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            view = Path(tmp) / "view.json"
+            view.write_text(json.dumps({
+                "headRefOid": self.HEAD, "comments": [{"body": c} for c in comments],
+                "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+                "commits": [{"authors": [{"name": "Codex"}]}]}))
+            fake = bin_dir / "gh"
+            fake.write_text(
+                "#!/bin/sh\n"
+                'case "$*" in *statusCheckRollup*) cat "$GATE_VIEW"; exit 0 ;; esac\n'
+                'case "$1 $2" in "pr merge") echo merged ;; "pr view") echo 1a2b3c4 ;; esac\n'
+                "exit 0\n")
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            env = prepare(Path(tmp) / "guard", "coordinator",
+                          {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+                          alias="Claudebot", term=4)
+            env = {**env, "GATE_VIEW": str(view)}
+            return subprocess.run(["gh", "pr", "merge", *args], env=env,
+                                  capture_output=True, text=True)
+
+    def test_no_verdict_is_refused(self):
+        done = self.merge("8")
+        self.assertEqual(done.returncode, REFUSED, done.stdout)
+        self.assertIn("a reviewer's merge verdict", done.stderr)
+
+    def test_a_merge_without_a_number_is_still_gated(self):
+        done = self.merge("--squash")
+        self.assertEqual(done.returncode, REFUSED, done.stdout)
+        self.assertNotIn("merged", done.stdout)
+
+    def test_the_developers_own_verdict_is_refused(self):
+        done = self.merge("8", comments=["0636b79 Verdict: merge. QA: pass.\n— Codex"])
+        self.assertEqual(done.returncode, REFUSED)
+        self.assertIn("own authors", done.stderr)
+
+    def test_a_signed_reviewer_verdict_merges(self):
+        done = self.merge("8", comments=["0636b79 Verdict: merge. QA: pass.\n— Reasonix"])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("merged", done.stdout)
+
+
+@unittest.skipIf(os.name == "nt", "the POSIX wrapper is tested here")
 class TestWrapper(unittest.TestCase):
 
     def test_the_gh_wrapper_refuses_and_passes_through(self):
