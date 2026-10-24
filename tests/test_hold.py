@@ -200,6 +200,21 @@ class TestTheHoldOnThePulse(unittest.TestCase):
         self.assertIn("Codex:up+held", line)
         self.assertNotIn("Hermes:up+held", line)            # this bot is not held
 
+    def test_status_names_this_bots_own_hold(self):
+        """#234 review nit: /status reads for the operator, so it says this bot is held too.
+
+        #245 review (Reasonix): a free-text reason is quoted, and an empty one is `_`, so the
+        token never swallows the rest of the line.
+        """
+        channel = self.channel()
+        self.assertNotIn(" held=", channel._command_reply("status"))
+        channel._handle_hold(self.admin("/hold drill"))
+        self.assertIn(' held="drill"', channel._command_reply("status"))
+        channel._handle_hold(self.admin("/hold until the drill is done"))
+        self.assertIn(' held="until the drill is done"', channel._command_reply("status"))
+        channel._handle_hold(self.admin("/hold"))
+        self.assertIn(" held=_", channel._command_reply("status"))
+
     def test_a_beat_with_no_hold_leaves_the_hold_alone(self):
         """A peer on an older build carries neither field: that is silence, not a release."""
         channel = self.channel()
