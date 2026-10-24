@@ -173,6 +173,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A **local web dashboard** (`#240`, slice 1): with `web.enabled: true` in `config.yaml`, the
+  transport that holds the lease serves one read-only page on `127.0.0.1` (port 8787 by
+  default) and the JSON it polls, `/state.json`. Both are rendered per request from records
+  the transport already holds — the status snapshots, the `/usage` ledger, the round state,
+  the lease, the roster's roles and the owed table — so a refresh costs no model turn and no
+  Telegram edit. One card per bot (alias, role, a coloured badge for working/idle/paused/
+  frozen/stuck/down, the topic and running time of a turn in flight, pulse age, model/effort
+  and rev, today's turns, tokens in/out and cost), a strip with the coordinator, lease term,
+  time left and the round's checklist progress, and the open debts underneath. A record that
+  stopped being renewed is `down` whatever it last said; a number nobody reported is `null`
+  in the JSON and `?` on the page, never a zero. The server answers `GET`/`HEAD` on two paths
+  only (a write is a `405`, an unknown path a `404`), binds the loopback, carries no
+  identifier beyond an alias, and loads nothing from anywhere — no CDN — while following the
+  system's light or dark preference at phone width. It follows the lease like the pin: started
+  by the first heartbeat that finds this bot coordinating, stopped by the first that finds
+  another bot coordinating, and the port is closed on `stop()`. Slice 2 (the same page as a
+  Telegram Mini App over HTTPS) is the admin's decision, not a flag.
+
 - The transport says **who merged** (round 5.5 `#228`): right after a merge the role guard ran
   (`gh` wrapper, `swarmly/telegram/guard.py`), it posts one comment on the pull request —
   `Merged by DeepSeek (lease term 4) at 1a2b3c4` — with the alias and the lease term taken from
