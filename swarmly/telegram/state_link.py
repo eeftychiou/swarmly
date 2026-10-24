@@ -248,16 +248,15 @@ class StateLink:
                 except Exception as exc:               # noqa: BLE001 - shadow: never fatal
                     logger.warning("state: registry sync failed: %s", exc, exc_info=True)
                     done.append("registry failed")
-                if store.holds_lease() and \
+                running = getattr(self, "_github_task", None)
+                if store.holds_lease() and (running is None or running.done()) and \
                         moment - self._last_github >= self.GITHUB_EVERY_SECONDS:
+                    # In the background: GitHub calls must never hold up the heartbeat (the
+                    # silent-turn check runs right after this beat).
                     self._last_github = moment
-                    try:
-                        moved = await self.reconcile_github(store)
-                        if moved:
-                            done.append(f"github: {moved} item(s) moved")
-                    except Exception as exc:           # noqa: BLE001 - shadow: never fatal
-                        logger.warning("state: github reconcile failed: %s", exc,
-                                       exc_info=True)
+                    self._github_task = asyncio.get_running_loop().create_task(
+                        self._reconcile_logged(store))
+                    done.append("github check started")
                 try:
                     if await self.sync_owed(store, moment):
                         done.append("owed")
@@ -330,11 +329,16 @@ class StateLink:
                 out.append((place[0], store.read(key) or {}))
         return out
 
-    def topic_for_refs(self, refs: list) -> Optional[tuple]:
-        """The open topic whose explicit links name one of ``refs`` (``#12``): a work item
-        first, then a tracking link, then a reference; legacy guesses do not count."""
+    def topic_for_refs(self, refs: list, repo: Optional[str] = None) -> Optional[tuple]:
+        """The open topic whose explicit links name one of ``refs`` (``#12``) in ``repo``
+        (default: this swarm's project repo): a work item first, then a tracking link, then a
+        reference; legacy guesses do not count. Matched on the link's URL, not its title (a
+        titled link keeps routing, and #40 in another repo is not this repo's #40)."""
+        import re
         if self.store is None or not refs:
             return None
+        repo = (repo or self.registry._repo() or "").lower()
+        wanted = {str(ref).lstrip("#") for ref in refs}
         rank = {"work": 0, "tracking": 1, "reference": 2}
         best = None
         for topic_id, data in self._topic_records():
@@ -343,7 +347,11 @@ class StateLink:
             for link in data.get("links") or []:
                 if link.get("added_by") == "legacy" or link.get("provider") != "github":
                     continue
-                if link.get("title") in refs and link.get("status") != "closed":
+                found = re.match(r"https://github\.com/([^/]+/[^/]+)/(?:issues|pull)/(\d+)",
+                                 str(link.get("ref") or ""))
+                if not found or found.group(1).lower() != repo:
+                    continue
+                if found.group(2) in wanted and link.get("status") != "closed":
                     score = (rank.get(link.get("role"), 3), -int(topic_id))
                     if best is None or score < best[0]:
                         best = (score, topic_id)
@@ -369,6 +377,17 @@ class StateLink:
                 "`ASSIGN: @<bot> <#N|L1> as <role>`, `PHASE: <#N|L1> <research|design|"
                 "development|review|qa|done|blocked>`. " + known + "]")
 
+    #: At most this many GitHub calls per check.
+    GITHUB_MAX_ITEMS = 30
+
+    async def _reconcile_logged(self, store: Any) -> None:
+        try:
+            moved = await self.reconcile_github(store)
+            if moved:
+                logger.info("state: github moved %d work item(s)", moved)
+        except Exception:                              # noqa: BLE001 - shadow: never fatal
+            logger.warning("state: github reconcile failed", exc_info=True)
+
     async def reconcile_github(self, store: Any) -> int:
         """Move linked GitHub work items by where GitHub says they stand (the lease holder):
         merged or a closed issue -> done and closed; a closed, unmerged PR -> closed; an open
@@ -379,7 +398,10 @@ class StateLink:
         github = getattr(self.channel.config, "github", None)
         client = GitHubClient(token_env=getattr(github, "token_env", None) or "GH_TOKEN")
         moved = 0
+        calls = 0
         for topic_id, data in self._topic_records():
+            if data.get("status") == "closed":
+                continue
             links = [link for link in data.get("links") or []
                      if link.get("provider") == "github" and link.get("role") == "work"
                      and link.get("status") == "open"]
@@ -389,9 +411,10 @@ class StateLink:
             for link in links:
                 found = re.match(r"https://github\.com/([^/]+/[^/]+)/(?:issues|pull)/(\d+)",
                                  str(link.get("ref") or ""))
-                if found:
+                if found and calls < self.GITHUB_MAX_ITEMS:
+                    calls += 1
                     states[link["id"]] = await asyncio.to_thread(
-                        client.ref_state, found.group(1), int(found.group(2)))
+                        client.ref_kind_state, found.group(1), int(found.group(2)))
             async with self.topic_lock:
                 await store.refresh()
                 current = store.read(K.topic(topic_id))
@@ -401,15 +424,18 @@ class StateLink:
                 stamp = now_iso(self.clock)
                 changed = 0
                 for link in topic.links:
-                    state = states.get(link.id)
-                    if state is None or link.status != "open":
+                    answer = states.get(link.id)
+                    if answer is None or link.status != "open":
                         continue
+                    state, is_pr = answer
+                    if is_pr and link.kind != "pr":
+                        link.kind = "pr"                # linked by its short ref: it is a PR
                     phase, status = link.phase, link.status
-                    if state == "merged" or (state == "closed" and link.kind == "issue"):
+                    if state == "merged" or (state == "closed" and not is_pr):
                         phase, status = "done", "closed"
                     elif state == "closed":
-                        status = "closed"
-                    elif state == "open" and link.kind == "pr" and \
+                        status = "closed"               # a PR closed without a merge
+                    elif state == "open" and is_pr and \
                             link.phase in ("research", "design", "development"):
                         phase = "review"
                     if (phase, status) == (link.phase, link.status):
@@ -601,9 +627,11 @@ class StateLink:
             except (TypeError, ValueError):
                 mine = None
             theirs = value.get("hash")
+            # "- name verb ...", never "name: ...": an alias opening a line followed by a colon
+            # reads as an address, and the transport would @mention every bot (live, 24 Oct).
             if mine is None:
-                verdicts.append(f"{who}: beat before this bot's snapshot, not comparable")
+                verdicts.append(f"- {who} last beat before this bot's snapshot (not comparable)")
             else:
-                verdicts.append(f"{who}: {'agrees' if mine == theirs else 'DIFFERS'} at "
+                verdicts.append(f"- {who} {'agrees' if mine == theirs else 'DIFFERS'} at "
                                 f"p{value.get('pos')} ({theirs})")
         return verdicts
