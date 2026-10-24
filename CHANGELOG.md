@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- The pinned dashboard no longer draws a ghost row for a bot it lists twice (`#246`). The
+  presence table is keyed by whatever name a beat arrived under, so the coordinator's Telegram
+  handle could sit beside its alias and the board showed a live bot next to a false
+  `DOWN, stale 2.0d` for the same bot. `control_snapshots()` folds the names a bot is known by
+  into its configured alias (and its own `agent.name` into its own alias) and keeps the newest
+  record per bot, so each bot is one row; this bot's own live row always wins, so a stale
+  record under its handle cannot replace it.
+
 - A row owed by a bot that cannot act no longer stalls the round (`#246`). The ladder's
   reminder rung is the debtor's alone, so a paused, frozen or out-of-quota debtor never
   delivered it and the coordinator and admin rungs never came — on 23–24 Oct `WAIT merge #245

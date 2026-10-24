@@ -3072,24 +3072,64 @@ class AgentChannel:
         self._control_center = centre
         return centre
 
+    def canonical_peer(self, alias: Any) -> str:
+        """A bot's configured name, whichever of its names a record arrived under (#246).
+
+        The presence table is keyed by whatever name a beat came in with -- an alias, a
+        Telegram username, a banner -- and a record keyed by the handle is the *same bot* as the
+        one keyed by the alias. Without folding the two, the pinned dashboard draws the bot
+        twice: its live row and a ghost row for the handle, reading ``DOWN, stale 2.0d``.
+        """
+        asked = str(alias or "").strip()
+        if not asked:
+            return asked
+        mine = str(getattr(self.config.identity, "alias", "") or "").strip()
+        own = str(getattr(self.config.identity, "name", "") or "").lstrip("@").strip()
+        if mine and asked.lower() in (mine.lower(), own.lower()):
+            return mine                          # this bot's own names are one bot
+        try:
+            known = self.config.peer_alias_for(asked)
+        except Exception:                          # noqa: BLE001 - an unknown name is its own
+            known = None
+        return str(known or asked)
+
     def control_snapshots(self, now: Optional[float] = None) -> List[Any]:
-        """Every bot's snapshot: this one's, and each peer's as it last published it (#124)."""
+        """Every bot's snapshot: this one's, and each peer's as it last published it (#124).
+
+        One row per bot, not one per name it is known by (#246): a peer seen under its Telegram
+        handle as well as its alias folds into the alias, keeping the newest snapshot, so the
+        board cannot show a live bot beside its own ghost. This bot's own row always wins: a
+        stale record under its handle must not replace the state it is in right now.
+        """
         moment = self.presence_clock() if now is None else float(now)
-        rows: List[Any] = [self.status_snapshot(moment)]
+        mine = str(self.config.identity.alias or "").strip()
+        rows: Dict[str, Any] = {}
+
+        def keep(row: Any) -> None:
+            name = self.canonical_peer(getattr(row, "alias", "")) or mine
+            key = name.strip().lower()
+            seen = rows.get(key)
+            if seen is not None and float(getattr(seen, "at", 0.0) or 0.0) > float(
+                    getattr(row, "at", 0.0) or 0.0):
+                return                            # the newer record is already in
+            rows[key] = row if name == getattr(row, "alias", "") else dataclasses.replace(
+                row, alias=name)
+
+        keep(self.status_snapshot(moment))
         table = self.presence()
         for alias, peer in sorted(table.peers.items()):
-            if alias.strip().lower() == self.config.identity.alias.strip().lower():
-                continue
+            if self.canonical_peer(alias).strip().lower() == mine.strip().lower():
+                continue                          # this bot, under any of its names
             if peer.snapshot:
                 try:
-                    rows.append(snapshot_mod.Snapshot.from_dict(peer.snapshot))
+                    keep(snapshot_mod.Snapshot.from_dict(peer.snapshot))
                     continue
                 except Exception:              # noqa: BLE001 - an unreadable peer record
                     logger.warning("control centre: unreadable snapshot from %s", alias)
-            rows.append(snapshot_mod.Snapshot(
+            keep(snapshot_mod.Snapshot(
                 alias=alias, state=table.status(alias, moment), at=peer.last_seen,
                 every=self.heartbeat_seconds(), term=peer.term, rev=peer.rev))
-        return rows
+        return list(rows.values())
 
     def control_round(self) -> Optional[Any]:
         """The round the bus knows, for the dashboard's board. None when there is none.
