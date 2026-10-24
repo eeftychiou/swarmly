@@ -4479,6 +4479,8 @@ class AgentChannel:
             self.owed_sweep(now=moment)
         except Exception:                          # noqa: BLE001 - a beat must not fail on it
             logger.warning("owed: sweep failed this beat", exc_info=True)
+        # And GitHub's own word for items no round tracks, in the background.
+        self._spawn_owed_github_check(moment)
         # Round 5.5 (#163): and a row whose fact changed wakes its debtor, once, right after
         # the sweep -- so the beat that learns of a change is the beat that acts on it.
         try:
@@ -5620,6 +5622,67 @@ class AgentChannel:
                 bots.add(str(alias or "").strip())
         bots.discard("")
         return bots
+
+    #: How often the rows' items are checked on GitHub, and how many items per check.
+    OWED_GITHUB_EVERY_SECONDS = 900.0
+    OWED_GITHUB_MAX_ITEMS = 20
+
+    def _spawn_owed_github_check(self, moment: float) -> None:
+        """Start the GitHub check of open rows, at most every 15 minutes, never twice at once.
+
+        The sweep closes a row from the round state, so a PR no round tracks -- merged outside
+        a round, or by someone who is not the coordinator -- left its merge, CI and progress
+        rows open for ever, and the stall ladder kept waking the coordinator about debts long
+        settled (live, 24 Oct: about sixty rows for merged PRs, owed by a paused bot)."""
+        last = float(self.__dict__.get("_owed_github_at", float("-inf")))
+        running = self.__dict__.get("_owed_github_task")
+        if moment - last < self.OWED_GITHUB_EVERY_SECONDS or \
+                (running is not None and not running.done()):
+            return
+        self.__dict__["_owed_github_at"] = moment
+        try:
+            self.__dict__["_owed_github_task"] = asyncio.get_running_loop().create_task(
+                self.owed_github_settle())
+        except RuntimeError:
+            pass                                   # no loop (a test calling the tick directly)
+
+    async def owed_github_settle(self) -> int:
+        """Close open rows whose item GitHub says is merged or closed. Returns rows closed."""
+        from swarmly.github.client import GitHubClient
+        from swarmly.telegram.owed import Fact, settle
+        try:
+            store = await asyncio.to_thread(self.owed_store)
+            rows = await asyncio.to_thread(store.load)
+        except Exception:                          # noqa: BLE001 - best effort
+            logger.warning("owed: rows not read for the GitHub check", exc_info=True)
+            return 0
+        repo = next((p.repo for p in (self.config.projects or {}).values()
+                     if getattr(p, "repo", None)), None)
+        if not repo:
+            return 0
+        items: List[str] = []
+        for row in rows:
+            number = str(row.item or "").lstrip("#")
+            if row.is_open and number.isdigit() and number not in items:
+                items.append(number)
+        github = getattr(self.config, "github", None)
+        client = GitHubClient(token_env=getattr(github, "token_env", None) or "GH_TOKEN")
+        closed = []
+        for number in items[:self.OWED_GITHUB_MAX_ITEMS]:
+            state = await asyncio.to_thread(client.ref_state, repo, int(number))
+            if state == "merged":
+                closed += settle(rows, Fact(kind="merge", item=f"#{number}"))
+            if state in ("merged", "closed"):
+                closed += settle(rows, Fact(kind="close", item=f"#{number}"))
+        alias = self.config.identity.alias.strip().lower()
+        mine = [row for row in closed if str(row.writer or "").strip().lower() == alias]
+        if mine:
+            try:
+                await asyncio.to_thread(store.save_all, mine)
+                logger.info("owed: GitHub says %d row(s) are settled; closed them", len(mine))
+            except Exception:                      # noqa: BLE001 - next check tries again
+                logger.warning("owed: settled rows not saved", exc_info=True)
+        return len(mine)
 
     def owed_sweep(self, *, now: Optional[float] = None) -> List[str]:
         """Open and close the rows the round state answers -- every source but a hand-off.
