@@ -406,5 +406,58 @@ class TestWhatEachBotSpent(unittest.TestCase):
         usage = (table.peers["Codex"].snapshot or {}).get("usage") or {}
         self.assertEqual(usage["today"]["tokens_in"], 5000)
 
+class TestOneRowPerBotWhicheverNameItArrivesUnder(unittest.TestCase):
+    """#246: the board drew a live bot beside a ghost row for its Telegram handle."""
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": GROUP, "topic_id": 307},
+                                          limits={"heartbeat_minutes": 2}))
+        channel.bot = FakeBot()
+        channel.control_round = lambda: None
+        channel.presence_clock = lambda: 1_800_000_000.0
+        return channel
+
+    def test_a_handle_and_an_alias_are_one_row(self):
+        from swarmly.telegram.presence import Pulse
+        channel = self.channel()
+        table = channel.presence()
+        table.note(Pulse(alias="Codex", at=1_800_000_000.0, rev="abc1234",
+                         status={"at": 1_800_000_000.0, "alias": "Codex", "state": "idle"}))
+        # ... and the same bot recorded under its Telegram handle, two days stale.
+        table.note(Pulse(alias="CodexBot", at=1_800_000_000.0 - 2 * 86400,
+                         status={"at": 1_800_000_000.0 - 2 * 86400, "alias": "CodexBot",
+                                 "state": "idle"}))
+        rows = channel.control_snapshots()
+        names = [str(row.alias).lower() for row in rows]
+        self.assertEqual(names.count("codex"), 1, names)
+        self.assertNotIn("codexbot", names, "the handle must fold into the alias")
+        text = channel.control_text()
+        self.assertEqual(len([line for line in text.splitlines() if line.startswith("Codex")]),
+                         1, text)
+        self.assertNotIn("stale 2.0d", text)
+
+    def test_a_peers_own_ghost_is_not_drawn_and_the_newest_record_wins(self):
+        from swarmly.telegram.presence import Pulse
+        channel = self.channel()
+        table = channel.presence()
+        table.note(Pulse(alias="CodexBot", at=1_800_000_000.0,
+                         status={"at": 1_800_000_000.0, "alias": "CodexBot", "state": "busy"}))
+        rows = [row for row in channel.control_snapshots()
+                if str(row.alias).lower() == "codex"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].alias, "Codex")        # drawn under its configured name
+        self.assertEqual(rows[0].state, "busy")         # the newest record, not the oldest
+
+    def test_a_bot_never_appears_twice_even_under_its_own_handle(self):
+        from swarmly.telegram.presence import Pulse
+        channel = self.channel()
+        channel.presence().note(Pulse(alias="HermesBot",  # this bot's own Telegram handle
+                                      at=1_800_000_000.0 - 2 * 86400,
+                                      status={"at": 1_800_000_000.0 - 2 * 86400,
+                                              "alias": "HermesBot", "state": "down"}))
+        rows = channel.control_snapshots()
+        self.assertEqual([str(row.alias) for row in rows], ["Hermes"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

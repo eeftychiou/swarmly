@@ -1135,6 +1135,14 @@ rows that actually reported one), so the dashboard shows every bot's tokens and 
 asking any of them for a turn. A peer that has not said anything is `unknown` there — never a
 zero it did not report.
 
+**One row per bot, whichever name it arrived under** (#246). The presence table is keyed by
+whatever name a beat came in with, so a bot can sit there twice — once under its alias and once
+under its Telegram handle — and the board then drew a live bot beside a ghost row for its own
+handle reading `DOWN, stale 2.0d`. The board folds those names into the name the bot is
+configured under (alias, or the agent's own name for itself) and keeps the newest record for
+that bot, so its own live state is what is drawn; a stale record under its handle can never
+replace the row this bot is writing right now.
+
 Telegram allows 4,096 characters in one message, so the layout drops whole lines in that
 order when it runs out of room — the round board first, the alerts last — and says how many
 it hid. The pin is the state, and a failover retires it rather than adopting it: a new
