@@ -275,11 +275,10 @@ class RoutingAndGitHubTests(unittest.TestCase):
     def test_the_channel_asks_the_registry_only_when_told_to(self):
         from tests.test_telegram_channel import make_channel, make_config
         channel = make_channel(make_config(state={"backend": "telegram", "links": "registry"}))
-        channel.state_link.topic_for_refs = \
-            lambda refs, **_: (-100, 55) if "#12" in refs else None
+        channel.state_link.topic_for_refs = lambda refs: (-100, 55) if "#12" in refs else None
         self.assertEqual(channel.topic_for_text("CI went red on #12"), (-100, 55))
         legacy = make_channel(make_config(state={"backend": "telegram"}))
-        legacy.state_link.topic_for_refs = lambda refs, **_: (-100, 55)
+        legacy.state_link.topic_for_refs = lambda refs: (-100, 55)
         self.assertIsNone(legacy.topic_for_text("CI went red on #12"))
 
     def test_registry_links_need_the_store(self):
@@ -315,9 +314,30 @@ class ReviewFixesTests(unittest.TestCase):
         self.assertEqual(link.topic_for_refs(["#12"]), (-100, 66))
         self.assertEqual(link.store.read("topic/55")["status"], "open")
 
-    def test_a_topic_a_post_found_gone_is_skipped(self):
+    def test_a_closed_topic_is_routed_again_once_a_message_is_seen_there(self):
         link = self.link()
-        self.assertEqual(link.topic_for_refs(["#12"], skip=[55]), (-100, 66))
+        link.topic_gone(55, deleted=False)
+        link.topic_seen(55)
+        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 55))
+
+    def test_a_closed_topics_items_are_still_checked_on_github(self):
+        from unittest import mock
+        from swarmly.github.client import GitHubClient
+        link = self.link()
+        link.topic_gone(55, deleted=False)
+        with mock.patch.object(GitHubClient, "ref_kind_state",
+                               lambda self, repo, number: ("closed", False) if number == 12
+                               else None):
+            self.assertEqual(asyncio.run(link.reconcile_github(link.store)), 1)
+        self.assertEqual(Topic.from_dict(link.store.read("topic/55")).link("L1").status,
+                         "closed")
+
+    def test_only_a_refusal_that_says_deleted_means_deleted(self):
+        from swarmly.telegram.channel import _is_topic_deleted
+        self.assertFalse(_is_topic_deleted(Exception("Bad Request: TOPIC_CLOSED")))
+        self.assertTrue(_is_topic_deleted(Exception("Bad Request: message thread not found")))
+        self.assertTrue(_is_topic_deleted(Exception("Bad Request: TOPIC_DELETED")))
+        self.assertFalse(_is_topic_deleted(None))
 
     def test_the_channel_tells_the_registry_a_topic_is_gone(self):
         from tests.test_telegram_channel import GROUP, make_channel, make_config
@@ -335,7 +355,7 @@ class ReviewFixesTests(unittest.TestCase):
         pinned = Topic.from_dict(link.store.read("topic/44")).link("L1")
         self.assertEqual((pinned.role, pinned.added_by), ("work", "admin:1"))
 
-    def test_the_admins_pin_beats_the_coordinators_newer_link(self):
+    def test_the_newest_work_link_wins_and_a_pin_re_adds_an_existing_one(self):
         link = self.link()
 
         async def coordinator_links():
@@ -343,8 +363,18 @@ class ReviewFixesTests(unittest.TestCase):
             await asyncio.gather(*link._tasks)
         link.clock.t += 60
         asyncio.run(coordinator_links())
-        self.assertEqual(Topic.from_dict(link.store.read("topic/33")).link("L1").role, "work")
-        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 55), "the admin's link first")
+        self.assertEqual(Topic.from_dict(link.store.read("topic/33")).link("L1").added_by,
+                         "claudebot")
+        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 33), "work moved to topic 33")
+        link.clock.t += 60
+        self.run_spawned(link, lambda: link.note_pin(-100, 55, ["#12"], 1))
+        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 55), "the admin moved it back")
+        link.clock.t += 60
+        self.run_spawned(link, lambda: link.note_pin(-100, 33, ["#12"], 1))
+        pinned = Topic.from_dict(link.store.read("topic/33")).link("L1")
+        self.assertEqual((pinned.added_by, len(Topic.from_dict(
+            link.store.read("topic/33")).links)), ("admin:1", 1), "re-added, not duplicated")
+        self.assertEqual(link.topic_for_refs(["#12"]), (-100, 33))
 
     def test_the_channel_records_the_pin(self):
         from tests.test_telegram_channel import ADMIN_ID, GROUP, make_channel, make_config
@@ -374,6 +404,27 @@ class ReviewFixesTests(unittest.TestCase):
         self.assertEqual(sorted(asked), [("o/r", 12), ("o/r", 13), ("o/r", 40),
                                          ("x/other", 41)], "each link once, in its own repo")
 
+    def test_an_item_linked_in_two_topics_is_asked_about_once_for_both(self):
+        from unittest import mock
+        from swarmly.github.client import GitHubClient
+        link = self.link()
+        asyncio.run(link.registry_command(SimpleNamespace(
+            text="/link #12 as work", author_id=1, author_is_bot=False, chat_id=-100,
+            thread_id=99)))
+        link.GITHUB_MAX_ITEMS = 1
+        asked = []
+
+        def state(_self, repo, number):
+            asked.append(number)
+            return ("closed", False) if number == 12 else None
+        with mock.patch.object(GitHubClient, "ref_kind_state", state):
+            asyncio.run(link.reconcile_github(link.store))
+        self.assertEqual(asked, [12])
+        for topic in ("topic/55", "topic/99"):
+            work = [item for item in Topic.from_dict(link.store.read(topic)).links
+                    if item.ref.endswith("/12")]
+            self.assertEqual(work[0].status, "closed", topic)
+
     def test_a_pr_found_by_its_short_ref_is_relabelled_even_when_nothing_moves(self):
         from unittest import mock
         from swarmly.github.client import GitHubClient
@@ -384,7 +435,7 @@ class ReviewFixesTests(unittest.TestCase):
         with mock.patch.object(GitHubClient, "ref_kind_state",
                                lambda self, repo, number: ("open", True) if number == 13
                                else None):
-            self.assertEqual(asyncio.run(link.reconcile_github(link.store)), 1)
+            self.assertEqual(asyncio.run(link.reconcile_github(link.store)), 0, "nothing moved")
         self.assertEqual(Topic.from_dict(link.store.read("topic/88")).link("L1").kind, "pr")
 
     def test_an_unreadable_topic_record_does_not_stop_the_check(self):

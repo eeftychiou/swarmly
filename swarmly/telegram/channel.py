@@ -7207,6 +7207,8 @@ class AgentChannel:
                                  current=event.topic_name_current)
             # Issue #63: when each topic was last active, for /cleanup's idle test.
             self.topics.touch(event.chat_id, event.thread_id)
+            if in_home_channel:
+                self.state_link.topic_seen(event.thread_id)  # open again, if it was closed
         self._note_general_message(event.chat_id, event.message_id, event.thread_id)
         self.record_topic_turn(event.chat_id, event.thread_id, event.text or "")
         self._note_progress(event)
@@ -8650,8 +8652,7 @@ class AgentChannel:
         is posted there rather than in General). With ``state.links: registry`` the topics'
         explicit links decide first; today's ref-learning is only the fallback."""
         if self.state_link.links_mode == "registry":
-            found = self.state_link.topic_for_refs(
-                issue_refs(text or ""), skip=[thread for _chat, thread in self._gone_topics])
+            found = self.state_link.topic_for_refs(issue_refs(text or ""))
             if found is not None:
                 return found
         return self._topic_for_refs(text)

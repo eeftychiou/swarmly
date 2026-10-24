@@ -20,7 +20,7 @@ import asyncio
 import io
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from swarmly.state import keys as K
 from swarmly.state.telegram_store import Pinned, Posted, TelegramIO, TelegramStore
@@ -140,9 +140,12 @@ class StateLink:
         #: When each work link (by its URL) was last asked about: the check's cap goes to the
         #: links asked about longest ago, so no link waits behind 30 that never close (review).
         self._github_checked: Dict[str, float] = {}
-        #: Topics deleted or forgotten here: no notice is routed to them, whatever their record
-        #: says, until the lease holder's write marks the record closed for everyone (review).
+        #: Topics deleted here: no notice is routed to them, whatever their record says, until
+        #: the lease holder's write marks the record closed for everyone (review).
         self._gone: Set[int] = set()
+        #: Topics Telegram refused a post to as closed: no notice is routed to them until a
+        #: message is seen there again (a closed topic can be reopened).
+        self._closed: Set[int] = set()
         self.store: Optional[TelegramStore] = None
         self.error = ""
         self._last_beat = float("-inf")
@@ -335,21 +338,19 @@ class StateLink:
                 out.append((place[0], store.read(key) or {}))
         return out
 
-    def topic_for_refs(self, refs: list, repo: Optional[str] = None,
-                       skip: Iterable[int] = ()) -> Optional[tuple]:
+    def topic_for_refs(self, refs: list, repo: Optional[str] = None) -> Optional[tuple]:
         """The open topic whose explicit links name one of ``refs`` (``#12``) in ``repo``
         (default: this swarm's project repo); legacy guesses do not count. A work item first,
-        then a tracking link, then a reference; within each, the admin's own link (``/topic
-        #N``, ``/link``) before the coordinator's, then the link added most recently, then the
-        newer topic. Matched on the
-        link's URL, not its title (a titled link keeps routing, and #40 in another repo is not
-        this repo's #40). A topic in ``skip``, or deleted here, is never the answer."""
+        then a tracking link, then a reference; within each, the link added most recently
+        (the admin's ``/topic #N`` re-adds it), then the newer topic. Matched on the link's URL,
+        not its title (a titled link keeps routing, and #40 in another repo is not this repo's
+        #40). A topic deleted here, or found closed, is never the answer."""
         import re
         if self.store is None or not refs:
             return None
         repo = (repo or self.registry._repo() or "").lower()
         wanted = {str(ref).lstrip("#") for ref in refs}
-        gone = {int(topic) for topic in skip} | self._gone
+        gone = self._gone | self._closed
         rank = {"work": 0, "tracking": 1, "reference": 2}
         best = None
         for topic_id, data in self._topic_records():
@@ -363,8 +364,7 @@ class StateLink:
                 if not found or found.group(1).lower() != repo:
                     continue
                 if found.group(2) in wanted and link.get("status") != "closed":
-                    admin = str(link.get("added_by") or "").startswith("admin")
-                    score = (rank.get(link.get("role"), 3), 0 if admin else 1)
+                    score = rank.get(link.get("role"), 3)
                     recent = (str(link.get("added_at") or ""), int(topic_id))
                     if best is None or score < best[0] or \
                             (score == best[0] and recent > best[1]):
@@ -374,14 +374,19 @@ class StateLink:
         return int(self.channel.config.identity.home_channel_id or 0), int(best[2])
 
     def topic_gone(self, thread_id: int, *, deleted: bool) -> None:
-        """A topic was deleted, closed or forgotten here: this bot routes nothing to it from
-        now on. A deleted one (``deleted``) also has its record closed by the lease holder, so
-        no bot's notice follows its links there; a closed topic can be reopened, so its record
-        stays (registry routing then falls back to ref-learning, which forgot it too)."""
+        """A topic was deleted or closed: this bot routes nothing to it. A deleted one
+        (``deleted``) is gone for good, and the lease holder closes its record, so no bot's
+        notice follows its links there. A closed one can be reopened: it is skipped until a
+        message is seen there again (:meth:`topic_seen`), and its record and its items' GitHub
+        check stay as they are."""
         thread_id = int(thread_id)
+        if not deleted:
+            self._closed.add(thread_id)
+            return
         self._gone.add(thread_id)
+        self._closed.discard(thread_id)
         store = self.store
-        if not deleted or store is None or not store.ready or not store.holds_lease():
+        if store is None or not store.ready or not store.holds_lease():
             return
         if (store.read(K.topic(thread_id)) or {}).get("status") != "open":
             return
@@ -406,6 +411,10 @@ class StateLink:
                 logger.warning("registry: a gone topic's record was not closed",
                                exc_info=True)
         self._spawn(record())
+
+    def topic_seen(self, thread_id: int) -> None:
+        """A message was seen in a topic: it is open again, if a post had found it closed."""
+        self._closed.discard(int(thread_id))
 
     def note_pin(self, chat_id: int, thread_id: Optional[int], refs: list,
                  author_id: Optional[int]) -> None:
@@ -448,6 +457,7 @@ class StateLink:
             task = asyncio.get_running_loop().create_task(work)
         except RuntimeError:                           # no loop: a test calling it directly
             work.close()
+            logger.debug("registry: no event loop, so a topic record change was not made")
             return
         self._tasks = getattr(self, "_tasks", set())
         self._tasks.add(task)
@@ -496,7 +506,8 @@ class StateLink:
         github = getattr(self.channel.config, "github", None)
         client = GitHubClient(token_env=getattr(github, "token_env", None) or "GH_TOKEN")
         moved = 0
-        wanted = []                                     # (last asked, ref, topic, link id, repo, n)
+        # One call per item, whichever topics link it: (repo, number) and its (topic, link)s.
+        wanted: Dict[str, Tuple[str, int, List[Tuple[int, Any]]]] = {}
         for topic_id, data in self._topic_records():
             if data.get("status") == "closed" or int(topic_id) in self._gone:
                 continue
@@ -508,15 +519,17 @@ class StateLink:
                 found = re.match(r"https://github\.com/([^/]+/[^/]+)/(?:issues|pull)/(\d+)",
                                  ref)
                 if found:
-                    wanted.append((self._github_checked.get(ref, float("-inf")), ref,
-                                   int(topic_id), link.get("id"), found.group(1),
-                                   int(found.group(2))))
-        wanted.sort(key=lambda entry: (entry[0], entry[2], str(entry[3])))
+                    wanted.setdefault(ref, (found.group(1), int(found.group(2)), []))[2].append(
+                        (int(topic_id), link.get("id")))
+        order = sorted(wanted, key=lambda ref: (self._github_checked.get(ref, float("-inf")),
+                                                ref))
         by_topic: Dict[int, Dict[Any, Any]] = {}
-        for _asked, ref, topic_id, link_id, repo, number in wanted[:self.GITHUB_MAX_ITEMS]:
+        for ref in order[:self.GITHUB_MAX_ITEMS]:
+            repo, number, places = wanted[ref]
             self._github_checked[ref] = self.clock()
-            by_topic.setdefault(topic_id, {})[link_id] = await asyncio.to_thread(
-                client.ref_kind_state, repo, number)
+            answer = await asyncio.to_thread(client.ref_kind_state, repo, number)
+            for topic_id, link_id in places:
+                by_topic.setdefault(topic_id, {})[link_id] = answer
         for topic_id, states in sorted(by_topic.items()):
             async with self.topic_lock:
                 await store.refresh()
@@ -529,7 +542,7 @@ class StateLink:
                     logger.warning("state: github check skipped topic %s: %s", topic_id, exc)
                     continue
                 stamp = now_iso(self.clock)
-                changed = 0
+                changed = relabels = 0
                 for link in topic.links:
                     answer = states.get(link.id)
                     if answer is None or link.status != "open":
@@ -549,7 +562,7 @@ class StateLink:
                     if (phase, status) == (link.phase, link.status):
                         if relabelled:
                             link.updated_by, link.updated_at = "github", stamp
-                            changed += 1
+                            relabels += 1
                         continue
                     if phase != link.phase:
                         topic.history.append(Change(at=stamp, field="phase", old=link.phase,
@@ -562,7 +575,7 @@ class StateLink:
                     link.phase, link.status = phase, status
                     link.updated_by, link.updated_at = "github", stamp
                     changed += 1
-                if changed:
+                if changed or relabels:
                     result = await store.write(K.topic(topic_id),
                                                Topic.from_dict(topic.to_dict()).to_dict())
                     if result.applied:
