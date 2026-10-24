@@ -141,3 +141,9 @@ class TestWebDashboardConfig(unittest.TestCase):
             with self.assertRaises(ConfigError) as caught:
                 make_config(web={"enabled": True, "public_host": wrong})
             self.assertIn("web.public_host", str(caught.exception))
+
+    def test_a_window_of_zero_is_refused_because_that_is_no_window(self):
+        for wrong in (0, -5):
+            with self.assertRaises(ConfigError) as caught:
+                make_config(web={"enabled": True, "init_max_age": wrong})
+            self.assertIn("web.init_max_age", str(caught.exception))

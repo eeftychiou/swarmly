@@ -999,8 +999,9 @@ class WebSettings:
     #: ``/state.json``, and the pinned card grows a button that opens the page. Empty keeps the
     #: local page exactly as slice 1 shipped it.
     public_host: str = ""
-    #: How old a Mini App ``initData`` may be and still be accepted, in seconds. Telegram signs
-    #: it when the app opens; a replayed one is refused after this window.
+    #: How old a Mini App ``initData`` may be and still be accepted, in seconds (must be
+    #: positive). Telegram signs it when the app opens; a replayed one is refused after this
+    #: window, which is why there is no "0 means forever".
     init_max_age: float = 300.0
 
 
@@ -1391,6 +1392,11 @@ class AgentConfig:
                 init_max_age=_parse_float("web.init_max_age",
                                           web_raw.get("init_max_age", 300.0), 300.0),
             )
+            if web.init_max_age <= 0:
+                # A zero window would silently accept a replayed payload forever; a window is
+                # the point of asking for one (review, #258).
+                raise ConfigError("web.init_max_age must be more than 0 seconds "
+                                  f"(got {web.init_max_age:g})")
             if web.port < 0 or web.port > 65535:
                 raise ConfigError(f"web.port must be 0-65535 (got {web.port})")
         elif web_raw is not None:

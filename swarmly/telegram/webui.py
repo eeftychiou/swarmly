@@ -57,8 +57,10 @@ logger = logging.getLogger(__name__)
 
 #: The ``Host`` values that are always allowed. A request naming anything else is refused
 #: unless the operator configured that name -- see :func:`allowed_hosts` and the DNS-rebinding
-#: note in :class:`DashboardServer`.
-LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+#: note in :class:`DashboardServer`. Only the IPv4 loopback is listed because that is the only
+#: address the server binds; an IPv6 entry here could never match a bracketed ``Host`` and
+#: would be a rule that only looks like one (review, #258).
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
 
 #: The header a Mini App's page sends its ``initData`` in, and how long a known-good one lasts.
 INIT_HEADER = "X-Telegram-Init-Data"
@@ -547,7 +549,6 @@ class DashboardServer:
         self.init_max_age = float(init_max_age)
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
-        self._last_refusal: Optional[tuple] = None
 
     # -- reading it ------------------------------------------------------------------
     @property
@@ -561,6 +562,19 @@ class DashboardServer:
     def requires_init(self) -> bool:
         """A page reachable under a public name is the admin's alone: it asks for ``initData``."""
         return bool(self.public_host)
+
+    def needs_init(self, host: str) -> bool:
+        """Whether a request from *host* must carry ``initData``.
+
+        A loopback request never does: the operator on the host itself is not a stranger, and
+        turning the Mini App on must not take away the plain local page (review, #258). The
+        ``Host`` check still applies to it, so this is not a hole in the rebinding rule.
+        """
+        if not self.requires_init:
+            return False
+        name = str(host or "").strip().lower()
+        name = name.rsplit(":", 1)[0] if name.count(":") == 1 else name
+        return name not in LOOPBACK_HOSTS
 
     @property
     def hosts(self) -> List[str]:
@@ -660,7 +674,7 @@ class DashboardServer:
 
             def _init_ok(self, query: str) -> bool:
                 """Whether this request carries a valid Mini App ``initData`` for the admin."""
-                if not server.requires_init:
+                if not server.needs_init(self.headers.get("Host", "")):
                     return True
                 raw = str(self.headers.get(INIT_HEADER, "") or "")
                 if not raw:

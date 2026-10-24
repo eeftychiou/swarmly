@@ -336,7 +336,13 @@ TOKEN = "123456:TEST-TOKEN"
 
 def init_data(*, token: str = TOKEN, admin: int = ADMIN_ID, auth_date: float = NOW,
               hash_override: str = "", **extra: Any) -> str:
-    """A Telegram Mini App ``initData`` string, signed the way Telegram signs one."""
+    """A Telegram Mini App ``initData`` string, signed the way Telegram signs one.
+
+    Written from Telegram's Web App docs, not from ``webui.verify_init_data``: ``key`` is
+    ``HMAC-SHA256("WebAppData", bot_token)`` and the hash is ``HMAC-SHA256(key, sorted
+    ``k=v`` lines joined by newlines)``. The signer here and the checker there agreeing is
+    therefore two readings of the spec, not one function checking itself (review, #258).
+    """
     fields = {"auth_date": str(int(auth_date)), "user": json.dumps({"id": admin}),
               "query_id": "AAH-test"}
     fields.update({key: str(value) for key, value in extra.items()})
@@ -384,6 +390,9 @@ class TestWhoMayRead(unittest.TestCase):
         try:
             url = server.start() + webui.STATE_PATH.lstrip("/")
             host = "swarm.example.ts.net"
+            # The operator on the host itself keeps the plain local page (review, #258).
+            self.assertEqual(self.get(url)[0], 200)
+            self.assertEqual(self.get(url, host="localhost")[0], 200)
             self.assertEqual(self.get(url, host=host)[0], 403)         # no payload
             fresh = init_data(auth_date=time.time())
             self.assertEqual(self.get(url, host=host,
@@ -451,12 +460,27 @@ class TestThePinnedCardsButton(unittest.TestCase):
             for button in row:
                 self.assertNotIn("web_app", button)
 
+    def test_a_disabled_section_draws_no_button_even_with_a_public_host(self):
+        """A button that opens nothing is worse than no button (review, #258)."""
+        from tests.test_telegram_channel import make_channel, make_config
+        channel = make_channel(make_config(web={"enabled": False, "port": 8787,
+                                                "public_host": "swarm.example.ts.net"}))
+        self.assertEqual(channel.mini_app_url(), "")
+        self.assertFalse(any("web_app" in button
+                             for row in channel.control_markup() for button in row))
+
+    def test_a_non_443_public_port_goes_in_the_host(self):
+        channel = self.channel(public_host="swarm.example.ts.net:9443")
+        self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net:9443/")
+
     def test_a_public_host_puts_the_button_first(self):
         channel = self.channel(public_host="swarm.example.ts.net")
-        self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net:8787/")
+        # The public name is served on 443 by the tunnel: web.port is the loopback *bind* port
+        # and must not appear, or the button opens a dead address (review, #258).
+        self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net/")
         first = channel.control_markup()[0][0]
         self.assertEqual(first["text"], "Open dashboard")
-        self.assertEqual(first["web_app"], {"url": "https://swarm.example.ts.net:8787/"})
+        self.assertEqual(first["web_app"], {"url": "https://swarm.example.ts.net/"})
         # The controls are still there, below it.
         self.assertTrue(any("callback_data" in button
                             for row in channel.control_markup() for button in row))

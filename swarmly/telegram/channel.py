@@ -3497,19 +3497,24 @@ class AgentChannel:
     WEB_RETRY_SECONDS = 60.0
 
     def mini_app_url(self) -> str:
-        """The address a Mini App opens, or ``""`` when none is configured (#240 slice 2).
+        """The address a Mini App opens, or ``""`` when there is nowhere to open (#240).
 
-        Built from ``web.public_host`` and ``web.port`` -- the tunnel's name and the port this
-        transport serves on. Empty means no ``web_app`` button: a button that opens nothing is
-        worse than no button.
+        The name in ``web.public_host`` is the *public* one, so the port is the public port:
+        ``https://<public_host>/``. ``web.port`` is where the tunnel forwards *to*, on the
+        loopback, and putting it in the URL opens a dead address -- a tunnel publishes on 443
+        (review, #258). An operator whose public port is not 443 puts it in ``public_host``
+        itself, which is why the config takes a host *and optional port*.
+
+        Empty means no ``web_app`` button: a button that opens nothing is worse than no
+        button, and a disabled section is exactly that case.
         """
         web = self.web_settings()
-        host = str(getattr(web, "public_host", "") or "").strip() if web is not None else ""
+        if web is None or not getattr(web, "enabled", False):
+            return ""
+        host = str(getattr(web, "public_host", "") or "").strip()
         if not host:
             return ""
-        port = int(getattr(web, "port", 8787) or 0)
-        shown = "" if port in (0, 443) else f":{port}"
-        return f"https://{host}{shown}/"
+        return f"https://{host}/"
 
     def web_settings(self) -> Any:
         """``web`` from the config, or ``None``: no section means no page, and no port opened."""

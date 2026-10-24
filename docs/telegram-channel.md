@@ -1251,8 +1251,8 @@ web:
 
 Three things change when `public_host` is set, and only then.
 
-- **The `Host` check.** The server answers for `127.0.0.1`, `localhost`, `[::1]` and the
-  configured name, and answers `404` to anything else. Binding the loopback is not enough on
+- **The `Host` check.** The server answers for `127.0.0.1`, `localhost` and the configured name,
+  and answers `404` to anything else. Binding the loopback is not enough on
   its own: a page served from a name that resolves to `127.0.0.1` is *same-origin* with this
   one, so its script could read `/state.json` — that is DNS rebinding, and the `Host` header is
   the only thing that tells the two apart (review, #256).
@@ -1261,12 +1261,17 @@ Three things change when `public_host` is set, and only then.
   Telegram says to: `HMAC-SHA256` of the sorted `key=value` pairs under a secret that is
   itself `HMAC-SHA256` of the bot token keyed by `WebAppData`. A payload older than
   `init_max_age`, one dated in the future, one signed by another bot, or one whose `user.id` is
-  not this bot's `admin_user_id` is a `403`. The page itself is served without it — it holds no
-  state — and it loads no Telegram script: the payload is read from the URL hash, so the page
+  not this bot's `admin_user_id` is a `403`. A request from the loopback never needs one: the
+  operator sitting at the host keeps the plain local page, and the `Host` check still applies to
+  it. The page itself is served without it — it holds no state — and it loads no Telegram
+  script: the payload is read from the URL hash, so the page
   stays self-contained and works on a LAN.
 - **The button.** A `web_app` button is the only kind that opens a Mini App, so it appears only
-  when `public_host` is set, first row, above the controls; its URL is
-  `https://<public_host>:<port>/` (port omitted for 443).
+  when `public_host` is set *and* the section is enabled, first row, above the controls; its URL
+  is `https://<public_host>/`. `web.port` is the loopback port the tunnel forwards *to*, never
+  part of the public URL — a tunnel publishes on 443. An operator whose public port is not 443
+  puts it in `public_host` itself (`swarm.example.ts.net:9443`), which is why that key takes a
+  host and optional port.
 
 Exposing the port is the admin's job, not the transport's: the tunnel terminates TLS and
 forwards to `127.0.0.1:8787`, so the bind stays local and nothing on the LAN can reach it

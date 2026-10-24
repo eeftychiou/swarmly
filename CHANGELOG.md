@@ -175,12 +175,15 @@ All notable changes to this project are documented here. The format follows
 
 - The dashboard page as a **Telegram Mini App** (`#240`, slice 2): set `web.public_host` to the
   name a tunnel gives the host and the pinned card grows an **Open dashboard** button
-  (`web_app`), whose URL is `https://<public_host>:<port>/`. The page reads Telegram's signed
+  (`web_app`), whose URL is `https://<public_host>/` — `web.port` is the loopback port the
+  tunnel forwards to, never part of the public URL, and the button is drawn only when the
+  section is enabled (both from the review of #258). The page reads Telegram's signed
   `initData` from the URL hash and sends it back on every poll, and the server checks it the way
   Telegram specifies — `HMAC-SHA256` over the sorted fields under a secret derived from the bot
   token — refusing anything older than `web.init_max_age` (default 300 s), anything dated in the
   future, anything signed by another token, and any `user.id` that is not `admin_user_id`
-  (`403`). The page is served without it and loads no Telegram script, so it stays
+  (`403`); a window must be more than 0 seconds, and a request from the loopback still needs
+  none, so the operator keeps the plain local page. The page is served without it and loads no Telegram script, so it stays
   self-contained. A request whose `Host` is neither the loopback nor the configured name is a
   `404`, which closes the DNS-rebinding hole opened by binding a port the LAN can name (review,
   #256). Also from that review: a bind failure is logged once and retried after `60 s` instead
