@@ -36,6 +36,10 @@ class _Repos(unittest.TestCase):
         self.base = Path(tmp.name)
         self.remote = self.base / "remote.git"
         git(self.base, "init", "-q", "--bare", "-b", "main", str(self.remote))
+        # git 2.47+ runs auto maintenance detached after a commit or a push; one still running
+        # creates objects/maintenance.lock while the temp folder is removed, and the cleanup
+        # fails with "Directory not empty: 'objects'" (CI, py3.10, 24 Oct).
+        git(self.base, "--git-dir", str(self.remote), "config", "maintenance.auto", "false")
         self.clone = self.clone_as("one")
         (self.clone / "README").write_text("x\n", encoding="utf-8")
         git(self.clone, "add", "README")
@@ -47,6 +51,7 @@ class _Repos(unittest.TestCase):
         git(self.base, "clone", "-q", str(self.remote), str(path))
         git(path, "config", "user.email", f"{name}@example.com")
         git(path, "config", "user.name", name)
+        git(path, "config", "maintenance.auto", "false")
         git(path, "checkout", "-q", "-B", "main")
         return path
 
