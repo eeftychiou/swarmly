@@ -12,10 +12,11 @@ Verified surface (Antigravity CLI operator guide, checked 2026-09-16):
 * interactive sessions use ``agy -i`` under a PTY. ``--conversation <id>`` resumes a
   conversation by id; ``-c`` is the short alias for ``--continue`` -- a flag with **no
   value** that continues the most recent conversation (``agy --help``, checked 2026-10-17).
-* token usage: because Antigravity CLI operates in plain-text print mode and its SQLite
-  conversation metadata (``gen_metadata``) carries no token usage counters, Antigravity's
-  token usage is not reported by the CLI and stays unknown in the turn ledger and pulse
-  (issue #166).
+* token usage: ``--output-format json`` (print mode, checked 2026-10-25) returns
+  ``{"conversation_id", "status", "response", "usage": {"input_tokens", "output_tokens",
+  "thinking_tokens", "cache_read_tokens", "total_tokens"}}``. The adapter asks for it, so
+  the turn ledger, the pulse and ``/usage`` carry Antigravity's tokens (they were unknown
+  before, issue #166), and a new topic's conversation id comes from the reply itself.
 
 Default command::
 
@@ -756,6 +757,9 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
                 before = await asyncio.to_thread(_cli_conversations)
                 reply = await SubprocessAdapter.respond(self, message)
                 new = (await asyncio.to_thread(_cli_conversations)) - before
+            reported = (reply.meta or {}).get("conversation") if reply is not None else None
+            if reply is not None and reply.ok and reported:
+                new = {str(reported)}                  # the reply says which one it was
             if reply is not None and reply.ok and len(new) == 1:
                 found = next(iter(new))
                 logger.info("%s: discussion %s continues in conversation %s", self.alias,
@@ -818,6 +822,10 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
     # -- execution hooks ---------------------------------------------------------------
     def build_argv(self, prompt: str) -> List[str]:
         argv = super().build_argv(prompt)
+        if ("-p" in argv or "--print" in argv or "--prompt" in argv) \
+                and "--output-format" not in argv:
+            # The JSON result carries the token usage and the conversation id.
+            argv.extend(["--output-format", "json"])
         # Check if conversation is specified in template or dynamically. Only
         # ``--conversation <id>`` names an id; ``-c``/``--continue`` is a bare flag.
         active = None
@@ -844,6 +852,38 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
                 argv.extend(["--model", conv_model])
 
         return _unquote_model(argv)
+
+    def parse_output(self, out: str, duration: float) -> AdapterReply:
+        """The JSON result of ``--output-format json``; plain text when it is not JSON (a
+        custom command, an older agy)."""
+        text = (out or "").strip()
+        try:
+            data = json.loads(text) if text.startswith("{") else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict) or "response" not in data:
+            return super().parse_output(out, duration)
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        meta: Dict[str, Any] = {}
+
+        def count(*keys: str) -> Optional[int]:
+            values = [usage.get(k) for k in keys if isinstance(usage.get(k), int)]
+            return sum(values) if values else None
+        tokens_in = count("input_tokens", "cache_read_tokens")
+        tokens_out = count("output_tokens", "thinking_tokens")
+        if tokens_in is not None:
+            meta["tokens_in"] = tokens_in
+        if tokens_out is not None:
+            meta["tokens_out"] = tokens_out
+        if data.get("conversation_id"):
+            meta["conversation"] = str(data["conversation_id"])
+        status = str(data.get("status") or "SUCCESS").upper()
+        response = self.trim(str(data.get("response") or ""))
+        if status != "SUCCESS":
+            reason = str(data.get("error") or response or status)
+            return AdapterReply(text="", ok=False, error=f"Antigravity: {reason}",
+                                duration_seconds=duration, meta=meta)
+        return AdapterReply(text=response, duration_seconds=duration, meta=meta)
 
     async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
         if not self.settings.enabled:

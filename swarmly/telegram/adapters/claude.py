@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextvars
+import dataclasses
 import json
 import os
 import shlex
@@ -295,6 +296,11 @@ class ClaudeThreadAdapter(ClaudeAdapter):
         # inline once.
         self._rules_held: Dict[str, str] = {}
         self._state_path: Optional[Path] = None
+        #: context id -> how often its session was replaced (a drift reset, a deleted topic).
+        #: The generation is part of the derived id, so a replaced session is really new:
+        #: re-creating the old id is refused as "in use" and would resume it.
+        self._generations: Dict[str, int] = {}
+        self._generations_path: Optional[Path] = None
 
     def use_state_file(self, path: Optional[Path]) -> None:
         """Keep, per session, the hash of the channel rules it holds in ``path`` (JSON), so a
@@ -303,6 +309,14 @@ class ClaudeThreadAdapter(ClaudeAdapter):
         held = load_state(path, f"{self.alias}: Claude sessions")
         self._rules_held.update({str(k): str(v) for k, v in held.items() if v})
         self._known.update(self._rules_held)    # these exist: resume them, never re-create
+        if path is not None:
+            self._generations_path = Path(path).with_name(
+                Path(path).name.replace("claude-sessions", "claude-generations"))
+            if self._generations_path == Path(path):
+                self._generations_path = Path(path).with_suffix(".generations.json")
+            saved = load_state(self._generations_path, f"{self.alias}: Claude generations")
+            self._generations.update({str(k): int(v) for k, v in saved.items()
+                                      if isinstance(v, int) and not isinstance(v, bool)})
 
     @property
     def _create_next(self) -> bool:
@@ -310,18 +324,31 @@ class ClaudeThreadAdapter(ClaudeAdapter):
 
     @staticmethod
     def derived_session_id(alias: str, cwd: Optional[str],
-                           context_id: Optional[str] = None) -> str:
-        """A stable session id per agent, working directory and discussion."""
+                           context_id: Optional[str] = None, generation: int = 0) -> str:
+        """A stable session id per agent, working directory, discussion and generation."""
         seed = f"a2a:{alias.strip().lower()}:{os.path.abspath(cwd or os.getcwd())}"
         if context_id:
             seed += f":{context_id}"
+        if generation:
+            seed += f":g{int(generation)}"
         return str(uuid.uuid5(_SESSION_NAMESPACE, seed))
 
-    def session_for(self, message: IncomingMessage) -> str:
-        context_id = getattr(message, "context_id", None)
+    def topic_session(self, context_id: Optional[str]) -> str:
+        """The session a discussion resumes now (its current generation)."""
         if not context_id:
             return self.session_id
-        return self.derived_session_id(self.alias, self.settings.cwd, context_id)
+        return self.derived_session_id(self.alias, self.settings.cwd, context_id,
+                                       self._generations.get(context_id, 0))
+
+    def session_for(self, message: IncomingMessage) -> str:
+        return self.topic_session(getattr(message, "context_id", None))
+
+    def topic_mode(self, context_id: Optional[str]) -> str:
+        """A topic whose session does not exist yet starts fresh: the transport gives the
+        first turn the task and the progress (a new topic, a replaced session)."""
+        if context_id and self.topic_session(context_id) not in self._known:
+            return "fresh"
+        return "session"
 
     def forget_session(self, context_id: Optional[str]) -> bool:
         """A deleted topic's Claude session is dropped (issue #63).
@@ -332,12 +359,17 @@ class ClaudeThreadAdapter(ClaudeAdapter):
         """
         if not context_id:
             return False
-        session = self.derived_session_id(self.alias, self.settings.cwd, context_id)
+        session = self.topic_session(context_id)
         if session not in self._known and session not in self._rules_held:
             return False
         self._known.discard(session)
         self._rules_held.pop(session, None)
         save_state(self._state_path, self._rules_held, f"{self.alias}: Claude sessions")
+        # The next turn gets a new id: re-creating this one would be refused as in use, and
+        # the old session resumed (a drift reset that reset nothing).
+        self._generations[context_id] = self._generations.get(context_id, 0) + 1
+        save_state(self._generations_path, dict(self._generations),
+                   f"{self.alias}: Claude generations")
         return True
 
     def _can_create(self, session_id: Optional[str] = None) -> bool:
@@ -376,8 +408,12 @@ class ClaudeThreadAdapter(ClaudeAdapter):
             create_first = (not configured and session not in self._known
                             and self._can_create(session))
             self._create.set(create_first)
+            first = message
+            if create_first and message.fresh_text:
+                # A new session needs the task and the progress, not only the last messages.
+                first = dataclasses.replace(message, text=message.fresh_text)
             try:
-                reply = await super().respond(message)
+                reply = await super().respond(first)
             finally:
                 self._create.set(False)
             if (create_first and reply is not None and not reply.ok
@@ -393,7 +429,9 @@ class ClaudeThreadAdapter(ClaudeAdapter):
                                " (set adapter.conversation to an existing session id)"))
                 self._create.set(True)
                 try:
-                    reply = await super().respond(message)
+                    reply = await super().respond(
+                        dataclasses.replace(message, text=message.fresh_text)
+                        if message.fresh_text else message)
                 finally:
                     self._create.set(False)
             if reply is not None and reply.ok:

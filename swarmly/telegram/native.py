@@ -77,7 +77,7 @@ BINARY = {
 RESUME_FLAGS: Dict[str, Tuple[str, ...]] = {
     "claude": ("--resume", "{session}"),
     "codex": ("resume", "{session}"),
-    "antigravity": ("--resume", "{session}"),
+    "antigravity": ("--conversation", "{session}"),   # agy has no --resume (agy --help)
     "reasonix": ("--resume", "{session}"),
 }
 
@@ -152,7 +152,7 @@ ALLOWLISTS: Dict[str, Allowlist] = {
     ),
     "antigravity": Allowlist(
         one_shot=(("--version",), ("-v",), ("--help",), ("models",)),
-        read=("/status", "/model", "/help"),
+        read=("/status", "/model", "/context", "/help"),
         changes=("/clear",),
         model=("/init", "/review"),
     ),
