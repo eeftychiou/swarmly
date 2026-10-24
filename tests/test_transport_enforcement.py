@@ -12,6 +12,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 from swarmly.telegram import drift as dr
@@ -348,14 +349,82 @@ class DynamicRoleTests(unittest.TestCase):
         self.assertIn(who, ("Antigravity", "Reasonix"))         # nobody else develops
         self.assertNotEqual(who, "Hermes")                      # never the coordinator
 
+    def back(self, channel, alias):
+        """Run _peer_back and its settle task inside one loop."""
+        async def go():
+            channel._peer_back(alias)
+            for task in list(channel._self_tasks):
+                await task
+        run(go())
+
     def test_a_peer_that_comes_back_gives_the_coordinator_a_turn(self):
         channel = self.channel()
         channel.is_coordinator = lambda now=None: True
         briefs = []
         channel._run_own_task = lambda text, chat, thread, name: briefs.append((text, thread))
         channel._last_turn_place = (GROUP, 9400)
-        channel._peers_frozen["Antigravity"] = {"ref": "pause", "until": None}
-        channel._peer_back("Antigravity")
+        self.back(channel, "Antigravity")
         self.assertEqual(len(briefs), 1)
         self.assertIn("Antigravity (qa-tester) can act again", briefs[0][0])
         self.assertEqual(briefs[0][1], 9400)
+
+    def test_a_peer_that_froze_again_within_the_settle_window_wakes_nobody(self):
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: True
+        briefs = []
+        channel._run_own_task = lambda *args: briefs.append(args)
+        channel._last_turn_place = (GROUP, 9400)
+
+        def refreeze(_seconds):
+            channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        channel._sleep = refreeze
+        self.back(channel, "Codex")
+        self.assertEqual(briefs, [])
+
+    def test_no_work_topic_means_no_turn_in_general(self):
+        """Live, 24 Oct 14:14: right after a restart the coordinator had no place, and the
+        hand-out went to General."""
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: True
+        briefs = []
+        channel._run_own_task = lambda *args: briefs.append(args)
+        self.back(channel, "Antigravity")
+        self.assertEqual(briefs, [])
+
+    def test_an_online_hello_is_not_a_return(self):
+        """A restarted frozen peer says ONLINE, then FROZEN a second later."""
+        channel = self.channel()
+        calls = []
+        channel._peer_back = lambda alias: calls.append(alias)
+        channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        from swarmly.telegram.wire import Envelope, MessageType
+        hello = Envelope(type=MessageType.HELLO, to="*", intent="ONLINE", ref="Codex")
+        channel._track_peer_freeze(hello, event("hi", username="CodexBot", is_bot=True))
+        self.assertEqual(calls, [])
+        self.assertIn("Codex", channel.frozen_peers(), "a restart does not clear a freeze")
+        resumed = Envelope(type=MessageType.STATUS, to="*", intent="RESUMED", ref="pause")
+        channel._track_peer_freeze(resumed, event("hi", username="CodexBot", is_bot=True))
+        self.assertEqual(calls, ["Codex"])
+
+    def test_a_restarted_peer_whose_pulse_is_no_longer_frozen_comes_back(self):
+        """QA, #257: an ONLINE that cleared the freeze lost this peer-back."""
+        channel = self.channel()
+        calls = []
+        channel._peer_back = lambda alias: calls.append(alias)
+        channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        from swarmly.telegram.wire import Envelope, MessageType
+        hello = Envelope(type=MessageType.HELLO, to="*", intent="ONLINE", ref="Codex")
+        channel._track_peer_freeze(hello, event("hi", username="CodexBot", is_bot=True))
+        channel._freeze_from_pulse("Codex", SimpleNamespace(frozen=False, status={}))
+        self.assertEqual(calls, ["Codex"])
+
+    def test_the_work_topic_survives_a_restart_and_general_is_never_one(self):
+        """Review, #257: the saved work place is what a restarted coordinator uses."""
+        channel = self.channel()
+        channel.config.source_path = Path(self.tmp.name) / "config.yaml"   # state on disk
+        channel._remember_work_place(GROUP, 9400)
+        fresh = make_channel(channel.config, adapter=Recording("ok"))
+        self.assertEqual(fresh._work_place(), (GROUP, 9400))
+        channel._remember_work_place(GROUP, None)          # a General turn changes nothing
+        fresh = make_channel(channel.config, adapter=Recording("ok"))
+        self.assertEqual(fresh._work_place(), (GROUP, 9400))
