@@ -86,7 +86,9 @@ class TestPrompt(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             adapter = build_adapter(config(tmp, role="developer"))
         self.assertIn("YOUR ROLE IN THE SWARM: developer", adapter.role_text)
-        self.assertIn("Antigravity: qa-tester", adapter.role_text)
+        # Admin, 24 Oct: roles are runtime assignments, so no static "who does what" here.
+        self.assertNotIn("TEAM ROLES", adapter.role_text)
+        self.assertNotIn("Antigravity: qa-tester", adapter.role_text)
         framed = format_channel_prompt("Human", "build it", role=adapter.role_text)
         self.assertLess(framed.index("YOUR ROLE"), framed.index("build it"))
         self.assertIn("YOUR ROLE", channel_rules(role=adapter.role_text))

@@ -2404,9 +2404,30 @@ class AgentChannel:
             # A restarted peer that is still frozen says FROZEN again right after ONLINE.
             if self._peers_frozen.pop(alias, None) is None:
                 return
+            self._peer_back(alias)
         else:
             return
         save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
+
+    def _peer_back(self, alias: str) -> None:
+        """A peer that could not act can again: the coordinator gets one turn to give it work
+        (admin, 24 Oct: the swarm re-balances itself; nobody has to notice a resume). The
+        stand-in ends by itself, since stand-ins are computed from the live state."""
+        try:
+            if not self.is_coordinator():
+                return
+        except Exception:                                  # noqa: BLE001
+            return
+        where = getattr(self, "_last_turn_place", None)
+        home = self.config.identity.home_channel_id
+        if where is None and home is None:
+            return
+        chat_id, thread_id = where if where is not None else (int(home), None)
+        role = str((getattr(self.config, "peer_roles", {}) or {}).get(alias) or "")
+        self._run_own_task(
+            f"[Transport notice] {alias}" + (f" ({role})" if role else "") + " can act again: "
+            "any stand-in for its work has ended. Give it open work that fits, or say why not.",
+            chat_id, thread_id, self.topics.name(chat_id, thread_id))
 
     def _freeze_from_pulse(self, alias: str, pulse: Any) -> None:
         """A pulse says whether its bot is frozen. Keep the peer-freeze table in step with it,
@@ -2420,6 +2441,7 @@ class AgentChannel:
             self._peers_frozen[alias] = {"ref": ref, "until": None}
         elif not frozen and known:
             self._peers_frozen.pop(alias, None)
+            self._peer_back(alias)
         else:
             return
         save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
@@ -2464,7 +2486,47 @@ class AgentChannel:
         return out
 
     def _frozen_peers_note(self) -> str:
-        """A line for every turn naming the frozen peers, so work is not handed to them."""
+        """Every turn's live view of the swarm: who can act now, in what role, and who cannot
+        (admin, 24 Oct: roles are assigned by availability at runtime, and no agent state
+        belongs in a static rule). Then the frozen peers and their stand-ins, if any."""
+        return self._swarm_now_line() + self._frozen_detail()
+
+    def _swarm_now_line(self) -> str:
+        roster: Dict[str, str] = {}
+        if self.config.identity.alias:
+            roster[self.config.identity.alias] = str(self.config.identity.role or "")
+        for alias in (self.config.peers or {}):
+            roster.setdefault(alias, "")
+        roster.update({a: str(r) for a, r in (getattr(self.config, "peer_roles", {}) or {})
+                       .items() if r})
+        if len(roster) < 2:
+            return ""
+        frozen = set(self.frozen_peers())
+        try:
+            coordinating = bool(self.is_coordinator())
+        except Exception:                                  # noqa: BLE001
+            coordinating = False
+        try:
+            down = set(self.presence().down_peers(self.presence_clock()))
+        except Exception:                                  # noqa: BLE001 - frozen is enough
+            down = set()
+        try:
+            lead = self.current_coordinator() or ""
+        except Exception:                                  # noqa: BLE001
+            lead = ""
+        if not coordinating and not frozen and not down:
+            return ""          # a peer needs the view when someone cannot act; the lead always
+        parts = []
+        for alias in sorted(roster):
+            role = "coordinator" if lead and alias.lower() == lead.lower() else roster[alias]
+            state = ("frozen" if alias in frozen else "DOWN" if alias in down else "available")
+            parts.append(f"{alias}" + (f" ({role})" if role else "") + f": {state}")
+        return ("\n\n[Swarm right now — live from the transport, it changes every turn; never "
+                "copy it into an issue, checklist or instruction: " + "; ".join(parts) + ". "
+                "Any available bot can take any piece of work except reviewing or QA-ing its "
+                "own pull request.]")
+
+    def _frozen_detail(self) -> str:
         peers = self.frozen_peers()
         if not peers:
             return ""
@@ -2506,15 +2568,23 @@ class AgentChannel:
         except Exception:                                  # noqa: BLE001 - frozen is enough
             down = set()
         out: Dict[str, Tuple[str, str]] = {}
+        try:
+            lead = (self.current_coordinator() or "").lower()
+        except Exception:                                  # noqa: BLE001
+            lead = ""
         for alias in sorted(frozen | (down & set(roster))):
             role = roster.get(alias, "").lower()
-            for cover in self.STAND_IN_FOR.get(role, ()):
-                who = next((a for a, r in sorted(roster.items())
-                            if r.lower() == cover and a != alias
-                            and a not in frozen and a not in down), None)
-                if who:
-                    out[alias] = (role, who)
-                    break
+            if not role or role == "coordinator":
+                continue                                   # the lease moves the coordinator
+            able = [a for a, r in sorted(roster.items()) if a != alias and a not in frozen
+                    and a not in down and a.lower() != lead and r.lower() != "coordinator"]
+            # Who fits first: the same role, then the role that covers it, then any available
+            # bot (admin, 24 Oct: any bot can take any piece of work).
+            order = [role, *self.STAND_IN_FOR.get(role, ())]
+            ranked = sorted(able, key=lambda a: (order.index(roster[a].lower())
+                                                 if roster[a].lower() in order else len(order)))
+            if ranked:
+                out[alias] = (role, ranked[0])
         return out
 
     def _drift_note(self) -> str:
@@ -7598,6 +7668,7 @@ class AgentChannel:
         self.__dict__["_turn_lease_term"] = 0            # never carry a last turn's term
         adapter.acting_coordinator = await self._acting_coordinator()
         adapter.drift_path = str(self.drift.path or "")          # the guard reports here
+        self._last_turn_place = (event.chat_id, event.thread_id)  # where a peer-back turn goes
         adapter.lease_term = self._turn_term()
         turn = asyncio.ensure_future(adapter.respond(incoming))
         self._current_turn = turn

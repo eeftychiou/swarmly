@@ -175,7 +175,7 @@ class TestFrozenPeers(unittest.TestCase):
         self.assertIn("frozen_peers=Codex(quota)", channel._test_sender.last)
         self._peer(channel, "[A2A v1.1] STATUS to=* intent=RESUMED ref=quota", 2)
         self.assertEqual(channel.frozen_peers(), {})
-        self.assertEqual(channel._frozen_peers_note(), "")
+        self.assertNotIn("Frozen peers", channel._frozen_peers_note())
 
     def test_a_peer_freeze_past_its_end_is_forgotten(self):
         channel = make_channel()
