@@ -134,7 +134,9 @@ class TelegramStore(StateStore):
             self._files.append((int(message_id), float(date), author, read_file))
             return True
         try:
-            self._inbox.extend(self._ops(json.loads(body), message_id, date, author))
+            # Folded at once, not at the next refresh: lease readers (is_coordinator, the
+            # fence, succession) must see a peer's claim when it arrives (review, phase 3).
+            self.log.add_all(self._ops(json.loads(body), message_id, date, author))
         except (ValueError, KeyError, TypeError):
             logger.warning("state: unreadable STATE line %s from %s", message_id, author)
         return True

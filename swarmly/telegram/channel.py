@@ -4959,8 +4959,15 @@ class AgentChannel:
 
     # -- durable round state (issue #86) ------------------------------------------------
 
+    def store_lease_on(self) -> bool:
+        """Topic registry, phase 3: the shared state store holds the coordinator lease (even
+        before the store has started: its lease then reads "unreadable", never gitbus)."""
+        return getattr(self.state_link, "lease_mode", "off") == "store"
+
     def lease_store(self) -> Any:
         from swarmly.telegram.lease import LeaseStore, succession_order
+        if self.store_lease_on():
+            return self._store_lease()
         root = self._gitbus_root()
         role = str(self.config.identity.role or "").strip().lower()
         succession = getattr(self.config, "swarm", {}).get("succession") or ()
@@ -4972,6 +4979,23 @@ class AgentChannel:
         transport = self.bus_transport(root) if has_bus else None
         return LeaseStore(self.config.identity.alias, transport=transport,
                           root=root, clock=self._lease_clock, ttl_seconds=ttl, rank=rank)
+
+    def _lease_ttl(self) -> float:
+        limits = getattr(self.config, "limits", None)
+        takeover = getattr(limits, "takeover_minutes", 10.0) if limits else 10.0
+        return max(float(takeover) * 60.0, 60.0)
+
+    def _store_lease(self) -> Any:
+        """The lease on the shared state store, with the interface check_lease talks to."""
+        from swarmly.telegram.store_lease import StoreLease
+        cached = self.__dict__.get("_store_lease_obj")
+        store = self.state_link.store
+        loop = self.__dict__.get("_loop")
+        if cached is None or cached.store is not store or cached.loop is not loop:
+            cached = StoreLease(store, loop, alias=self.config.identity.alias,
+                                ttl_seconds=self._lease_ttl(), clock=self._lease_clock)
+            self.__dict__["_store_lease_obj"] = cached
+        return cached
 
     def lease_fence(self, *, now: Optional[float] = None) -> bool:
         """May this bot still act? Freshly read from the bus, once per side effect.
@@ -5217,7 +5241,8 @@ class AgentChannel:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _has_lease_bus(self) -> bool:
-        return bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+        return bool(self.config.bus.repo or self.config.fallback.gitbus_root) \
+            or self.store_lease_on()
 
     def _on_demoted_from_coordinator(self) -> Optional["asyncio.Task[Any]"]:
         """Yield the lease after the admin's /role named someone else.
@@ -6382,7 +6407,8 @@ class AgentChannel:
 
     async def check_lease(self, *, now: Optional[float] = None) -> Optional[Any]:
         """Renew the lease if this bot is the holder, or claim N+1 if expired and next in succession."""
-        if not (self.config.bus.repo or self.config.fallback.gitbus_root):
+        if not (self.config.bus.repo or self.config.fallback.gitbus_root) \
+                and not self.store_lease_on():
             return None
         if self._frozen or self._pause_pending:
             return None
@@ -6397,6 +6423,8 @@ class AgentChannel:
         except Exception:
             logger.warning("lease: check_lease could not read lease state", exc_info=True)
             return None
+        if state.status == "unreadable":
+            return None                                # no answer, no claim (and no noise)
 
         async def claim_at(term: int, promoted: bool = False) -> Any:
             async with self._lease_lock():
@@ -9948,7 +9976,9 @@ class AgentChannel:
         if self._bus_task is None and self.config.fallback.gitbus_poll_minutes > 0 \
                 and self.config.bus.enabled:
             self._bus_task = asyncio.create_task(self._bus_tick())
-        if self._lease_task is None and (self.config.bus.repo or self.config.fallback.gitbus_root):
+        self.__dict__["_loop"] = asyncio.get_running_loop()   # for the store lease's threads
+        if self._lease_task is None and (self.config.bus.repo or self.config.fallback.gitbus_root
+                                         or self.state_link.lease_mode == "store"):
             self._lease_task = asyncio.create_task(self._lease_tick())
         if self._github_task is None and self.config.github and self.config.github.poll_minutes > 0:
             self._github_task = asyncio.create_task(self._github_tick())
