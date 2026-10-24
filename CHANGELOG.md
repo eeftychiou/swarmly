@@ -129,6 +129,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- The pinned dashboard is **one clear row per bot** (`#241`). The card opened with alerts and
+  then a dense line per bot; it now opens with a header line (the round, the swarm's spend
+  today — turns, tokens, cost — and the time of the last refresh), then one row per bot in a
+  fixed order and layout: a status icon (🔵 working, 🟢 idle, ⏸ paused, 🧊 frozen, ⚠️ stuck,
+  🔴 DOWN), the alias, the role the swarm gave that bot (`agent.role`/`peers[*].role`),
+  "working 3m" or "idle 12m", model/effort, today's turns, tokens and cost. Under the rows:
+  the lease (holder, term, how long it holds), then the alerts — only when there are any —
+  then the round's open items. Unknown stays unknown and is now a `?` in the row rather than
+  the word `unknown`; a total short of the turns it covers still says `(known/turns)`. The
+  buttons are unchanged, and the 4,096-character limit drops the round board first, then the
+  lease, then bot rows — an alert is still the last thing to go.
+
 - A **parent issue closes with its last slice** (round 5.5 `#227`): the poller reads the same
   refs a tracking issue's body lists — the checklist, or "split into #a, #b" — and once every
   one of them is merged (a pull request) or closed (an issue) it closes the parent itself, with

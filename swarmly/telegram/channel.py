@@ -3388,7 +3388,26 @@ class AgentChannel:
         return control_mod.dashboard(now=moment, snapshots=self.control_snapshots(moment),
                                      round_state=self.control_round(), usage=usage,
                                      coordinator=str(self.current_coordinator() or ""),
+                                     roles=self.control_roles(),
                                      limit=self.config.limits.max_message_chars)
+
+    def control_roles(self) -> Dict[str, str]:
+        """Each bot's role, from the swarm's own roster (#241's row, #154's names).
+
+        ``agent.role`` for this bot and ``peers[*].role`` for the rest -- the same roster
+        ``/role`` prints. A bot nobody was given a role keeps no entry, so its row says ``?``
+        rather than guessing one from the board.
+        """
+        roles: Dict[str, str] = {}
+        for alias, role in (getattr(self.config, "peer_roles", None) or {}).items():
+            name, said = str(alias or "").strip(), str(role or "").strip()
+            if name and said:
+                roles[name] = said
+        mine = str(getattr(self.config.identity, "alias", "") or "").strip()
+        my_role = str(getattr(self.config.identity, "role", "") or "").strip()
+        if mine and my_role:
+            roles[mine] = my_role
+        return roles
 
     def control_usage(self) -> Dict[str, Dict[str, Any]]:
         """What each bot spent today: this bot from its ledger, peers from their own pulses.

@@ -49,6 +49,14 @@ def usage(**fields: Any) -> Dict[str, Any]:
     return base
 
 
+def _row(text: str, alias: str) -> str:
+    """The one card row for *alias*: a row is recognised by its alias cell, not by its start."""
+    for line in text.splitlines():
+        if f" {alias} · " in line:
+            return line
+    raise AssertionError(f"no row for {alias} in:\n{text}")
+
+
 def round_state(**items: Dict[str, Any]) -> RoundState:
     state = RoundState(round="5", status="ok", term=4)
     state.items = dict(items)
@@ -99,26 +107,34 @@ class TestAlerts(unittest.TestCase):
 
 
 class TestHeaderAndBoard(unittest.TestCase):
-    def test_the_header_carries_the_round_the_items_and_the_lease(self):
+    def test_the_header_carries_the_round_the_items_and_todays_spend(self):
         state = round_state(**{
             "124": {"issue": 124, "state": "merged"},
             "125": {"issue": 125, "state": "open"},
         })
-        lease = snap("Claude", term=4, lease_ends=NOW + 600)
-        text = ct.header(now=NOW, round_state=state, coordinator="Claude",
-                         lease=lease, usage=usage())
+        text = ct.header(now=NOW, round_state=state, usage=ct._sum_usage({"Claude": usage()}))
         self.assertIn("round=5", text)
         self.assertIn("items=1/2", text)
-        self.assertIn("coord=Claude", text)
-        self.assertIn("term=4", text)
-        self.assertIn("lease=10m", text)
-        self.assertIn("today=1.2k/340 $0.42", text)
+        self.assertIn("today 4 turns", text)
+        self.assertIn("1.5k tok", text)                    # both directions, one total
+        self.assertIn("$0.42", text)
+        # The time of the last refresh, so a stale pin is recognised without a second look.
+        self.assertIn("refreshed 22:13Z", text)
+        self.assertNotIn("coord=", text)                   # the lease has its own line now
 
     def test_an_unreadable_round_is_not_reported_as_empty(self):
         state = RoundState(round="5", status="unreadable", reason="fetch failed")
         text = ct.header(now=NOW, round_state=state)
         self.assertIn("state=unreadable", text)
         self.assertNotIn("items=0/0", text)
+
+    def test_the_lease_line_names_the_holder_its_term_and_how_long_it_holds(self):
+        line = ct.lease_line(now=NOW, coordinator="Claude",
+                             lease=snap("Claude", term=4, lease_ends=NOW + 600))
+        self.assertIn("lease: Claude", line)
+        self.assertIn("term=4", line)
+        self.assertIn("10m left", line)
+        self.assertEqual(ct.lease_line(now=NOW), "lease: ?")   # nobody named is not a guess
 
     def test_the_board_shows_each_item_and_whether_it_can_merge(self):
         state = round_state(**{
@@ -172,13 +188,107 @@ class TestNoLeaks(unittest.TestCase):
                             usage={"Hermes": usage(tokens_in=None, tokens_out=None,
                                                    tokens_in_known=1, tokens_out_known=0,
                                                    cost_usd=None, cost_known=0)})
-        self.assertIn("today=unknown/unknown unknown", text)
-        self.assertNotIn("today=0", text)
+        row = _row(text, "Hermes")
+        self.assertIn("4 turns", row)
+        self.assertIn("? tok", row)
+        self.assertNotIn("0 tok", row)                    # never a zero it did not report
+        self.assertNotIn("$0.00", row)
+        self.assertIn("? tok", text.splitlines()[0])      # the swarm total, the same way
 
     def test_a_partial_total_says_how_partial_it_is(self):
         text = ct.dashboard(now=NOW, snapshots=[snap("Hermes")],
                             usage={"Hermes": usage(tokens_in_known=2)})
-        self.assertIn("1.2k (2/4)", text)
+        self.assertIn("1.5k (2/4) tok", _row(text, "Hermes"))
+
+
+class TestOneRowPerBot(unittest.TestCase):
+    """#241: one row per bot in a fixed order -- icon, alias, role, doing, model, turns, spend.
+
+    The whole card is pinned as text: "keep the data, change the presentation" is only a
+    guarantee if the presentation itself is a fixture that has to be changed on purpose.
+    """
+
+    def card(self, state: Any = None) -> str:
+        rows = [
+            snap("Claude", BUSY, since=NOW - 180, model="opus", effort="high",
+                 term=4, lease_ends=NOW + 600),
+            snap("Codex", PAUSED, since=NOW - 3660),
+            snap("DeepSeek", IDLE, since=NOW - 720),
+            snap("Hermes", DOWN),
+            snap("Reasonix", STUCK, since=NOW - 700, turn_elapsed=700, turn_timeout=600),
+        ]
+        spend = {"Claude": usage(turns=9, tokens_in=15_000_000, tokens_out=4_000_000,
+                                 tokens_in_known=9, tokens_out_known=9,
+                                 cost_usd=22.33, cost_known=9),
+                 "DeepSeek": usage(turns=4, tokens_in=900, tokens_out=None,
+                                   tokens_in_known=4, tokens_out_known=0,
+                                   cost_usd=0.42, cost_known=4)}
+        roles = {"Claude": "coordinator", "Codex": "reviewer", "DeepSeek": "developer",
+                 "Reasonix": "reviewer"}
+        state = state if state is not None else round_state(**{"241": {
+            "issue": 241, "pr": 254, "owner": "DeepSeek", "head": "abcdef1", "ci": "7/7",
+            "review": {"verdict": "merge", "sha": "abcdef1"},
+            "qa": {"verdict": "pass", "sha": "abcdef1"}}})
+        return ct.dashboard(now=NOW, snapshots=rows, round_state=state, usage=spend,
+                            coordinator="Claude", roles=roles)
+
+    def test_the_whole_card_for_a_five_bot_swarm(self):
+        self.assertEqual(self.card(), "\n".join([
+            "SWARM · round=5 · items=0/1 · today 13 turns · 19.0M (9/13) tok"
+            " · $22.75 · refreshed 22:13Z",
+            "",
+            "🔵 Claude · coordinator · working 3m · opus/high · 9 turns · 19.0M tok · $22.33",
+            "⏸ Codex · reviewer · paused 61m · deepseek/high · ? turns · ? tok · ?",
+            "🟢 DeepSeek · developer · idle 12m · deepseek/high · 4 turns · 900+? tok · $0.42",
+            "🔴 Hermes · ? · DOWN 5s · deepseek/high · ? turns · ? tok · ?",
+            "⚠️ Reasonix · reviewer · stuck 12m · deepseek/high · ? turns · ? tok · ?",
+            "",
+            "lease: Claude · term=4 · 10m left",
+            "",
+            "! DOWN Hermes: reported down by a peer",
+            "! STUCK Reasonix: 12m over 10m",
+            "! PAUSED Codex: 61m",
+            "",
+            "round board (1 items):",
+            "#241 DeepSeek PR#254 abcdef1 ci=7/7 review=merge qa=pass ready",
+        ]))
+
+    def test_every_state_has_its_own_icon_and_its_own_word(self):
+        for state, icon, said in ((BUSY, "🔵", "working 5m"), (IDLE, "🟢", "idle 5m"),
+                                  (PAUSED, "⏸", "paused 5m"), (FROZEN, "🧊", "frozen 5m"),
+                                  (STUCK, "⚠️", "stuck 5m")):
+            row = ct.bot_row(snap("Bot", state, since=NOW - 300), now=NOW)
+            self.assertTrue(row.startswith(f"{icon} Bot · "), row)
+            self.assertIn(said, row)
+        # A snapshot that stopped being renewed is DOWN, whatever it last said of itself.
+        row = ct.bot_row(snap("Bot", IDLE, at=NOW - 600), now=NOW)
+        self.assertTrue(row.startswith("🔴 Bot · "), row)
+        self.assertIn("DOWN 10m", row)
+
+    def test_a_frozen_bot_reads_as_frozen_under_its_row(self):
+        row = ct.bot_row(snap("Bot", FROZEN, since=NOW - 5400), now=NOW)
+        self.assertIn("🧊 Bot · ", row)
+        self.assertIn("frozen 1.5h", row)
+
+    def test_the_row_order_never_moves(self):
+        row = ct.bot_row(snap("Claude", BUSY, since=NOW - 180, model="opus", effort="high"),
+                         now=NOW, usage=usage(turns=9, tokens_in=15_000_000,
+                                              tokens_out=4_000_000, tokens_in_known=9,
+                                              tokens_out_known=9, cost_usd=22.33,
+                                              cost_known=9),
+                         role="coordinator")
+        self.assertEqual(row, "🔵 Claude · coordinator · working 3m · opus/high"
+                              " · 9 turns · 19.0M tok · $22.33")
+
+    def test_five_bots_and_ten_open_items_still_fit_one_message(self):
+        state = round_state(**{str(241 + index): {
+            "issue": 241 + index, "pr": 254 + index, "owner": "DeepSeek", "head": "abcdef1",
+            "ci": "5/7", "review": {"verdict": "merge", "sha": "abcdef1"}} for index in range(10)})
+        text = self.card(state)
+        self.assertLessEqual(len(text), ct.MAX_CHARS)
+        self.assertNotIn("hidden", text)                  # nothing had to be dropped
+        self.assertEqual(len([line for line in text.splitlines()
+                          if line.startswith(tuple(ct._ICONS.values()))]), 5)
 
 
 class TestTheMessageFits(unittest.TestCase):
