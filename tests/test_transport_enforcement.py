@@ -180,7 +180,7 @@ class ChannelEnforcementTests(unittest.TestCase):
         self.assertEqual(adapter.forgotten, [channel.topics.context(GROUP, 9400)])
         sent = " ".join(s["text"] for s in channel._test_sender.sent)
         self.assertIn("context reset after", sent)
-        self.assertEqual(channel.drift.decide().score, 0)
+        self.assertLess(channel.drift.decide().score, dr.REMIND_AT)   # counting starts again
 
     def test_drift_command_reports_the_score(self):
         channel, _ = self.channel()

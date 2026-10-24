@@ -2511,6 +2511,8 @@ class AgentChannel:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        # Marked now, not when the task runs: two violations in one reply must reset once.
+        self.drift.mark_reset(f"{chat_id}:{thread_id}")
         task = loop.create_task(self._drift_reset(chat_id, thread_id, decision))
         self._self_tasks.add(task)
 
@@ -2523,7 +2525,6 @@ class AgentChannel:
         except Exception:                                  # noqa: BLE001 - the notice still goes
             logger.warning("drift: could not retire the session for %s", context_id,
                            exc_info=True)
-        self.drift.mark_reset(f"{chat_id}:{thread_id}")
         alias = self.config.identity.alias
         await self.send(f"♻️ {alias}: context reset after {decision.score} points of rule "
                         "violations; it re-reads the rulebook from a fresh session next turn.",
