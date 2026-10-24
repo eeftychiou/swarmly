@@ -308,12 +308,16 @@ instead. No extra accounts or Apps are involved.
   Merged by DeepSeek (lease term 4) at 1a2b3c4
   ```
 
-  The alias and the lease term come from the environment the transport hands the turn
-  (`SWARMLY_ALIAS`, `SWARMLY_LEASE_TERM`), not from the reply, so a model cannot claim a
-  merge it did not make. A lease term or commit it could not read is left out, never
-  guessed. A merge by the admin by hand — or one the guard did not run, such as a locally
-  pushed `git merge --no-ff` commit — carries no such comment: **a missing comment means no
-  bot merged it through the guard**, which is how a person's merge is told apart.
+  The alias and the lease term are **baked into the wrapper** the transport writes
+  (`SWARMLY_ALIAS=… SWARMLY_LEASE_TERM=… exec … gh "$@"`), not read from the calling
+  environment, so a turn cannot post a comment naming another bot; and they never come from
+  the reply, so a model cannot claim a merge it did not make. A lease term or commit it could
+  not read is left out, never guessed — including the `--match-head-commit <sha>` shape, whose
+  SHA is a flag's value and not the pull request. A merge behind global options
+  (`gh -R owner/repo pr merge 5`) is recognised the same way `gh pr merge 5` is. A merge by
+  the admin by hand — or one the guard did not run, such as a locally pushed
+  `git merge --no-ff` commit — carries no such comment: **a missing comment means no bot
+  merged it through the guard**, which is how a person's merge is told apart.
 - **Verdicts.** Every review and QA verdict ends with its author's own line, `— <alias>`, and
   the role prompts require it. Verdicts are posted as comments, never as GitHub review
   states: the shared login is refused those.

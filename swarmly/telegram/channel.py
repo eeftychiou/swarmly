@@ -1350,6 +1350,13 @@ class AgentChannel:
             except Exception:                          # noqa: BLE001 - /status must answer
                 result += " coordinator=none(unverifiable)"
             result += f" {self.presence_line()}"
+            # #234 review: `/status` shows this bot's own hold too, not only the peers' -- a
+            # held bot's line must say so even when no peer has been heard from yet.
+            # #245 review (Reasonix): the reason is free text, so it is quoted -- otherwise
+            # `held=until the drill is done` reads as if the rest of the line were the reason.
+            if self._hold:
+                why = str(self._hold.get("reason") or "").strip().replace('"', "'")
+                result += f' held="{why}"' if why else " held=_"
             if self.config.identity.role:
                 result += f" role={self._role_name()}"
             if self.replies is not None:
@@ -7150,8 +7157,9 @@ class AgentChannel:
         either one, with or without a mention, and the mention only picks who answers (else the
         coordinator), so five bots don't say it five times. Held, a bot still answers, but the
         hand-off reminders, the stall ladder and the owed wakes stay quiet, and every turn is
-        told to start nothing. The hold is this bot's own state, carried by no machine line: a
-        bot that was down when /hold was sent, or joins later, is not held (#218 review)."""
+        told to start nothing. The hold rides this bot's own pulse (#234, was "#218 review"): the
+        beat carries `held {at, reason}` or the release's time, so a bot that was down when
+        /hold was sent -- or that joins later -- adopts the newer admin action from a peer."""
         parsed = parse_command(event.text or "")
         if not parsed or parsed[0] not in ("hold", "release"):
             return None

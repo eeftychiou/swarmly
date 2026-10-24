@@ -11,8 +11,10 @@ others see:
   The other hooks pass through to the repository's own.
 
 It is a guard against drift, not a security boundary: an agent can still call a program by
-its full path or unset the variables. This file imports only the standard library, so the
-wrappers run it directly (``python -I -S guard.py``) and stay fast.
+its full path or unset the variables. What the *wrapper* says about who it speaks for is the
+exception -- that is baked into it, not read from the calling environment (#232). This file
+imports only the standard library, so the wrappers run it directly (``python -I -S
+guard.py``) and stay fast.
 
     python guard.py gh <args...>
     python guard.py pre-push <remote> <url>   (refs on stdin, as git gives them)
@@ -40,8 +42,13 @@ ALIAS_ENV = "SWARMLY_ALIAS"
 TERM_ENV = "SWARMLY_LEASE_TERM"
 
 #: ``gh`` options that take a separate value, so the PR after ``gh pr merge`` is not confused
-#: with a flag's argument.
-_GH_VALUE_OPTIONS = ("-b", "--body", "-t", "--subject", "-R", "--repo", "-A", "--author-email")
+#: with a flag's argument. ``--match-head-commit`` was missing and its SHA read as the PR
+#: number, so the attribution comment went to a pull request nobody merged (#232).
+_GH_VALUE_OPTIONS = ("-b", "--body", "-t", "--subject", "-R", "--repo", "-A", "--author-email",
+                     "--match-head-commit")
+
+#: ``gh`` options that come **before** the subcommand and take a separate value.
+_GH_GLOBAL_VALUE_OPTIONS = ("-R", "--repo", "--hostname", "--config-dir", "-c")
 
 #: How long one ``gh`` call the guard makes on its own behalf may take.
 _GH_TIMEOUT = 20
@@ -67,6 +74,19 @@ def split_git(args: Sequence[str]) -> "tuple[List[str], List[str]]":
     return args[:i], args[i:]
 
 
+def split_gh(args: Sequence[str]) -> "tuple[List[str], List[str]]":
+    """``gh`` arguments as (global options, subcommand and its arguments).
+
+    ``gh -R owner/repo pr merge 5`` is the same merge as ``gh pr merge 5``. Reading the
+    subcommand off the first two words missed it, so a merge that named its repository first
+    was neither refused for a role that may not merge nor followed by its comment (#232).
+    """
+    i, args = 0, list(args)
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in _GH_GLOBAL_VALUE_OPTIONS else 1
+    return args[:i], args[i:]
+
+
 def _push_targets_protected(args: Sequence[str], current_branch: Optional[str]) -> bool:
     """Whether ``git push <args>`` would update main/master."""
     words = _words(args)
@@ -89,6 +109,8 @@ def refusal(role: str, tool: str, args: Sequence[str],
         return None
     if tool == "git":
         args = split_git(args)[1]
+    elif tool == "gh":
+        args = split_gh(args)[1]             # `gh -R owner/repo pr merge 5` is a merge (#232)
     words = [w.lower() for w in _words(args)]
     if tool == "gh" and words[:2] == ["pr", "merge"]:
         return (f"the {role} does not merge pull requests; say it is ready and the "
@@ -141,21 +163,31 @@ def attribution(alias: str, term: int, sha: str) -> str:
     return f"Merged by {who}{lease}{at}"
 
 
-def merge_sha(real: str, pr: str, run: "Runner") -> str:
-    """The commit the merge landed at: its merge commit, else the head it merged."""
-    code, out = run([real, "pr", "view", pr, "--json", "mergeCommit,headRefOid",
+def merge_sha(real: str, pr: str, run: "Runner",
+              global_options: Sequence[str] = ()) -> str:
+    """The commit the merge landed at: its merge commit, else the head it merged.
+
+    *global_options* is what came before the subcommand (``-R owner/repo``): dropping it made
+    the lookup run against the cwd repository, so a merge of another repository's PR would
+    read this one's commit (#245 review).
+    """
+    code, out = run([real, *global_options, "pr", "view", pr, "--json", "mergeCommit,headRefOid",
                      "--jq", ".mergeCommit.oid // .headRefOid"])
     return out.strip() if code == 0 else ""
 
 
 def comment_merge(real: str, args: Sequence[str], env: Mapping[str, str],
-                  run: "Runner") -> Optional[str]:
+                  run: "Runner", *, global_options: Sequence[str] = ()) -> Optional[str]:
     """Post the attribution comment after a merge this guard ran, or None when there is
     nobody to attribute it to (an unguarded run) or no PR to comment on.
 
     The transport does this, not the model: a merge by the admin by hand leaves no comment,
     so a missing comment means no bot merged through the guard. A failure here is logged and
     swallowed -- the merge already happened, and it stays merged.
+
+    *args* is the merge's own arguments (after any global options); *global_options* is the
+    prefix they came behind, and it is repeated on both `gh` calls the attribution makes, so
+    `gh -R other/repo pr merge 5` comments on **that** repository's PR 5 (#245 review).
     """
     alias = str(env.get(ALIAS_ENV) or "").strip()
     pr = _merge_pr(args)
@@ -169,8 +201,8 @@ def comment_merge(real: str, args: Sequence[str], env: Mapping[str, str],
         term = int(str(env.get(TERM_ENV) or "0").strip() or 0)
     except ValueError:
         term = 0
-    body = attribution(alias, term, merge_sha(real, pr, run))
-    code, out = run([real, "pr", "comment", pr, "--body", body])
+    body = attribution(alias, term, merge_sha(real, pr, run, global_options))
+    code, out = run([real, *global_options, "pr", "comment", pr, "--body", body])
     if code != 0:
         print(f"swarmly guard: merged, but the attribution comment on #{pr} failed: "
               f"{out.strip()[:200]}", file=sys.stderr)
@@ -282,11 +314,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"swarmly guard: refused `{tool} {' '.join(args)}`: {why}.", file=sys.stderr)
         return REFUSED
     code = subprocess.call([real, *args])
-    if code == 0 and tool == "gh" and [w.lower() for w in _words(args)][:2] == ["pr", "merge"]:
+    # `gh -R owner/repo pr merge 5` merges just as `gh pr merge 5` does, so the comment goes
+    # by the subcommand found after the global options -- and repeats that prefix on its own
+    # calls, or the SHA and the comment would name this checkout's repository instead (#232).
+    prefix, tail = split_gh(args) if tool == "gh" else ([], args)
+    if code == 0 and tool == "gh" and [w.lower() for w in _words(tail)][:2] == ["pr", "merge"]:
         # A merge this guard ran leaves one comment saying who merged it, at which term and
         # commit (#228). After the merge, and never in place of its exit code.
         try:
-            comment_merge(real, args, os.environ, _gh_run)
+            comment_merge(real, tail, os.environ, _gh_run, global_options=prefix)
         except Exception:                          # noqa: BLE001 - the merge stands
             print("swarmly guard: the attribution comment failed", file=sys.stderr)
     return code
@@ -310,6 +346,43 @@ def _pass_through(name: str) -> str:
             "exit 0\n")
 
 
+def _sh_quote(value: str) -> str:
+    """*value* as one POSIX shell word, for the wrapper that bakes the alias in (#232)."""
+    text = str(value or "")
+    if text and all(ch.isalnum() or ch in "-_@.:/," for ch in text):
+        return text
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def _gh_wrapper(run: str, alias: str, term: int) -> str:
+    """The POSIX ``gh`` wrapper, with **who it speaks for baked in** (#232).
+
+    The alias and the term ride the environment otherwise, and the environment is the
+    caller's: ``SWARMLY_ALIAS=someone-else gh pr merge 5`` used to post a comment naming
+    another bot. Baked into the wrapper they cannot be changed from outside it, so the
+    comment always names the bot whose turn ran the merge.
+    """
+    return (f"#!/bin/sh\nexec env {ALIAS_ENV}={_sh_quote(alias)} {TERM_ENV}={int(term or 0)} "
+            f"{run} gh \"$@\"\n")
+
+
+def _cmd_quote(value: str) -> str:
+    """*value* as the right-hand side of a **quoted** ``set`` assignment (#245 review).
+
+    The quotes belong around ``NAME=value`` -- ``set "VAR=x"`` is the form cmd strips, while
+    ``set VAR="x"`` stores the quotes and the comment would read ``Merged by "DeepSeek"``.
+    ``%`` is doubled because a batch file expands it before ``set`` ever runs.
+    """
+    return str(value or "").replace("%", "%%")
+
+
+def _gh_wrapper_cmd(run: str, alias: str, term: int) -> str:
+    """The ``.cmd`` twin of :func:`_gh_wrapper`, for a Windows turn (#232)."""
+    return (f'@set "{ALIAS_ENV}={_cmd_quote(alias)}"\r\n'
+            f'@set "{TERM_ENV}={int(term or 0)}"\r\n'
+            f"@{run} gh %*\r\n")
+
+
 def prepare(folder: Path, role: str, env: Dict[str, str], *, alias: str = "",
             term: int = 0, drift: str = "") -> Dict[str, str]:
     """Write the gh wrapper and the git hooks into ``folder`` and return ``env`` with them in
@@ -327,9 +400,10 @@ def prepare(folder: Path, role: str, env: Dict[str, str], *, alias: str = "",
         hooks.mkdir(parents=True, exist_ok=True)
         if real["gh"]:
             sh = folder / "gh"
-            sh.write_text(f'#!/bin/sh\nexec {run} gh "$@"\n', encoding="utf-8")
+            sh.write_text(_gh_wrapper(run, alias, term), encoding="utf-8")
             sh.chmod(0o755)
-            (folder / "gh.cmd").write_text(f"@{run} gh %*\r\n", encoding="utf-8")
+            (folder / "gh.cmd").write_text(_gh_wrapper_cmd(run, alias, term),
+                                           encoding="utf-8")
         for stale in ("git", "git.cmd"):           # earlier builds wrapped git on PATH
             (folder / stale).unlink(missing_ok=True)
         pre_push = hooks / "pre-push"
@@ -349,6 +423,8 @@ def prepare(folder: Path, role: str, env: Dict[str, str], *, alias: str = "",
         out["SWARMLY_DRIFT_FILE"] = drift
     # #228: who the guard speaks for, so a merge it runs can say so on the PR. Written even
     # when empty: an empty alias is what keeps an unguarded merge from being attributed.
+    # #232: and written into the wrapper too (`_gh_wrapper`), because this half is only the
+    # caller's environment and a caller can overwrite it.
     out[ALIAS_ENV] = alias
     out[TERM_ENV] = str(int(term or 0))
     for tool, found in real.items():
