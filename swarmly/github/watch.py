@@ -679,14 +679,22 @@ class GitHubWatcher:
                          ", ".join(f"#{item} {why}" for item, why in blockers))
             return False
         landed = ", ".join(f"#{item}" for item, _why in states)
-        said = self.state.parent_notes.get(key)
-        comment = "" if said else (f"Every listed slice has landed ({landed}), so this parent "
-                                  f"closes itself. — the transport")
+        # The note says "this landing was already announced", and it carries **which** landing
+        # (#238): a note from an earlier poll whose slices have moved on must not silence the
+        # close that finally works. Before this it was a bare timestamp, so the reason for a
+        # close was suppressed for ever after one failed attempt, and a parent could end up
+        # closed with nobody able to account for why.
+        said = self.state.parent_notes.get(key) or ""
+        announced = said.split("|", 1)[1] if "|" in said else ""
+        comment = "" if announced == landed and announced else (
+            f"Every listed slice has landed ({landed}), so this parent closes itself. "
+            f"— the transport")
         if not self.client.close_issue(repo, number, comment):
-            # The line went out once, on the first attempt: a close that keeps failing is
-            # retried without re-posting the same comment on every poll (#227 review).
+            # The line goes out once per landing, not on every poll: a close that keeps
+            # failing for the same reason is retried without re-posting its comment (#227
+            # review). A landing that changed earns its own line (#238).
             if comment:
-                self.state.parent_notes[key] = _utc()
+                self.state.parent_notes[key] = f"{_utc()}|{landed}"
             outcome.errors.append(f"{repo}#{number}: could not close a finished parent issue")
             return False
         issue.state = "CLOSED"

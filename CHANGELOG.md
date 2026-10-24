@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A parent issue still closes with its reason after an earlier close attempt failed (`#238`).
+  `parent_notes` suppressed the "every listed slice has landed" comment once a close had
+  failed, so the retry closed the parent silently — and the note outlived the landing it was
+  written for. The note now carries the landing it announced (`<utc>|#65, #68`); a later poll
+  whose slices have moved on posts its own line, a note from an older build (a bare timestamp)
+  counts as stale, and one line per landing is still all that is said.
+
 - GitHub notifications no longer answer a bot's own events in chat (`#87`). The backstop used
   to give every unread notification a model turn, so a publish run from three days earlier, or
   a run a double merge had cancelled, was answered in the group as a reply to "@GitHub".
