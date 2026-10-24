@@ -49,6 +49,10 @@ class PR:
     reviewers: List[str] = field(default_factory=list)
     head_ref: str = ""
     mergeable: str = "UNKNOWN"
+    #: The conversation, oldest first (#87): who *acted* on a pull request is its last
+    #: commenter, not its author -- the author opened it once, and every later notification
+    #: about it is somebody else speaking.
+    comments: List["IssueComment"] = field(default_factory=list)
 
 
 @dataclass
@@ -278,7 +282,8 @@ class GitHubClient:
 
     def pr_view(self, repo: str, number: int) -> Optional[PR]:
         """Get details of a pull request."""
-        fields = "number,title,body,author,state,labels,reviewRequests,headRefName,mergeable"
+        fields = ("number,title,body,author,state,labels,reviewRequests,headRefName,"
+                  "mergeable,comments")
         code, out, err = self._run(["pr", "view", str(number), "--repo", repo, "--json", fields])
         if code != 0:
             logger.warning("pr_view(%s, %s) failed (code %d): %s", repo, number, code, err.strip())
@@ -302,6 +307,16 @@ class GitHubClient:
                         reviewers.append(str(r_login))
                 elif isinstance(r, str):
                     reviewers.append(r)
+            comments: List[IssueComment] = []
+            for c in (data.get("comments") or []):
+                if not isinstance(c, dict):
+                    continue
+                c_auth = c.get("author")
+                c_login = c_auth.get("login", "") if isinstance(c_auth, dict) else str(
+                    c_auth or "")
+                comments.append(IssueComment(
+                    author=c_login, body=str(c.get("body") or ""),
+                    created_at=str(c.get("createdAt") or c.get("created_at") or "")))
             return PR(
                 number=int(data.get("number") or number),
                 title=str(data.get("title") or ""),
@@ -312,6 +327,7 @@ class GitHubClient:
                 reviewers=reviewers,
                 head_ref=str(data.get("headRefName") or data.get("head_ref") or ""),
                 mergeable=str(data.get("mergeable") or "UNKNOWN"),
+                comments=comments,
             )
         except Exception as exc:
             logger.warning("failed to parse pr_view json: %s", exc)

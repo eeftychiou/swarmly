@@ -174,6 +174,19 @@ def _parse_int(where: str, value: Any, default: int, *, positive: bool = False) 
     return number
 
 
+def _parse_float(where: str, value: Any, default: float) -> float:
+    """A float config value, ``default`` when unset. A YAML ``true`` is not a number, and
+    ``0`` stays ``0`` -- the settings that use this read 0 as "off"."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ConfigError(f"{where} must be a number (got {value!r})")
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        raise ConfigError(f"{where} must be a number (got {value!r})") from None
+
+
 #: Review P1-7: the keys each section of the transport config is read for. Anything else
 #: is reported by :func:`unknown_keys` (and ``swarmly-telegram check``) instead of being
 #: ignored without a word. ``peers`` maps free-form aliases and ``limits`` is checked
@@ -193,7 +206,8 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
             "mirror_handoffs"),
     "fallback": ("gitbus_root", "gitbus_ref", "gitbus_poll_minutes"),
     "projects": ("repo", "cwd", "topics", "worktrees", "reply_chars"),
-    "github": ("login", "token_env", "poll_minutes", "mark_read", "tracking_label"),
+    "github": ("login", "token_env", "poll_minutes", "mark_read", "tracking_label",
+               "backlog_hours"),
     # issue #117: where the pinned dashboard lives -- it rides the heartbeat, so no interval
     "control": ("chat_id", "topic_id"),
     "swarm": ("succession",),
@@ -948,6 +962,12 @@ class GitHubSettings:
     #: coordinator when a run finishes (admin, 23 Oct): what is watched never depends on a
     #: model having named the PR. Only the lease holder polls.
     watch_repo_ci: bool = True
+    #: Issue #87: how old a notification may be and still get a turn. A fresh start -- first
+    #: enable, a rebuilt state file, a poller that was down for a day -- otherwise works
+    #: through the backlog answering each item as a chat reply ("@GitHub: a publish run from
+    #: three days ago"). Anything older is marked read without a turn. 0 disables the rule:
+    #: every notification is answered however old it is.
+    backlog_hours: float = 24.0
 
 
 @dataclass
@@ -1302,6 +1322,8 @@ class AgentConfig:
             gmark = _parse_bool("github.mark_read", github_raw.get("mark_read", True))
             glabel = str(github_raw.get("tracking_label", "tracking") or "").strip()
             grepo_ci = _parse_bool("github.watch_repo_ci", github_raw.get("watch_repo_ci", True))
+            gbacklog = _parse_float("github.backlog_hours",
+                                    github_raw.get("backlog_hours"), 24.0)
             github = GitHubSettings(
                 login=glogin,
                 token_env=gtoken_env,
@@ -1309,6 +1331,7 @@ class AgentConfig:
                 mark_read=gmark,
                 tracking_label=glabel,
                 watch_repo_ci=grepo_ci,
+                backlog_hours=gbacklog,
             )
         elif github_raw is not None:
             raise ConfigError("'github' must be a mapping")

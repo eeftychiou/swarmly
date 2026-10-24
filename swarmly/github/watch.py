@@ -40,6 +40,13 @@ logger = logging.getLogger("swarmly.github.watch")
 REFIRE_REASONS = frozenset({"mention", "team_mention", "review_requested", "assign",
                             "author"})
 
+#: Issue #87: the notification reasons and subject types that are a **bot's own machinery**
+#: talking -- a CI run, a workflow. They feed the CI watches (#24) and the round state (#86),
+#: and never become a chat reply addressed to "@GitHub": the swarm asking itself, in public,
+#: what its own runner just did.
+CI_REASONS = frozenset({"ci_activity", "workflow_run"})
+CI_SUBJECTS = frozenset({"CheckSuite", "WorkflowRun", "CheckRun"})
+
 #: A turn that failed leaves its notification unread, so the next poll picks it up again --
 #: without turning one broken turn into a hot loop. Between attempts the thread waits
 #: ``poll_minutes * 2**(attempt - 1)`` (one poll interval, then two, then four), and after
@@ -339,6 +346,10 @@ class GitHubPollOutcome:
     ci_watched: int = 0
     ci_wakes: int = 0
     ci_skipped: int = 0
+    #: Issue #87: notifications answered without a turn -- older than ``github.backlog_hours``
+    #: (``backlog_skipped``), or a bot's own CI/workflow activity (``quiet_skipped``).
+    backlog_skipped: int = 0
+    quiet_skipped: int = 0
 
 
 #: How long a PR is watched for its checks before the watch is dropped. A PR whose checks
@@ -909,6 +920,17 @@ class GitHubWatcher:
                     continue
 
                 num = notif.number
+                # Issue #87: a backlog is not news. A fresh start (first enable, a rebuilt
+                # state file, a poller that was down) sees every unread notification at once,
+                # and answering a three-day-old run in the group told the swarm about the past.
+                if self._in_backlog(notif):
+                    self.state.mark_processed(notif.id, notif.updated_at)
+                    if self.config.github.mark_read:
+                        self.client.mark_notification_read(notif.id)
+                    outcome.backlog_skipped += 1
+                    logger.info("notification %s is older than github.backlog_hours: marked "
+                                "read without a turn", notif.id)
+                    continue
                 # Check whether any of the project's topics recently handled this issue/PR
                 if self.channel is not None and num is not None and hasattr(self.channel, "has_recent_ref"):
                     seen_in = topics or [(chat_id, thread_id)]
@@ -929,8 +951,14 @@ class GitHubWatcher:
                 if notif.subject_type == "PullRequest" and num is not None:
                     pr = self.client.pr_view(repo, num)
                     if pr:
-                        user = pr.author or "a contributor"
-                        snippet = pr.title or snippet
+                        # #87 review: the *actor* is whoever spoke last, not the PR's author.
+                        # Taking the author quieted a person's comment on a swarm-opened PR --
+                        # the author was the bot, so the reply it owed was never written.
+                        last = pr.comments[-1] if pr.comments else None
+                        actor = (last.author if last and last.author else "") or pr.author
+                        user = actor or "a contributor"
+                        said = last.body[:200] if last and last.body else ""
+                        snippet = said or pr.title or snippet
                 elif num is not None:
                     issue = self.client.issue_view(repo, num)
                     if issue:
@@ -940,6 +968,21 @@ class GitHubWatcher:
                         else:
                             user = issue.author or "a contributor"
                             snippet = issue.body[:200] if issue.body else issue.title
+
+                # Issue #87: a bot's own machinery -- a CI run, a workflow -- and a bot's own
+                # activity never open a turn. One short line in the item's topic says what it
+                # was, if the topic is there to say it in; the facts themselves land on the CI
+                # watches and the round state, which read the repo, not the notification.
+                quiet = self._quiet_reason(notif, user)
+                if quiet:
+                    self.state.mark_processed(notif.id, notif.updated_at)
+                    if self.config.github.mark_read:
+                        self.client.mark_notification_read(notif.id)
+                    outcome.quiet_skipped += 1
+                    said = f"GitHub: {repo}#{num} — {quiet}; nothing to answer."
+                    await self._quiet_notice(chat_id, thread_id, num, said)
+                    logger.info("notification %s: %s; posted one line, no turn", notif.id, quiet)
+                    continue
 
                 # Frame turn message
                 if notif.reason == "review_requested":
@@ -1013,6 +1056,83 @@ class GitHubWatcher:
     # ----------------------------------------------------------------------------------
     # Turns, and the CI wake that uses them (issue #24)
     # ----------------------------------------------------------------------------------
+    # -- what is not news (#87) ---------------------------------------------------------
+    def _stamp(self, text: str) -> Optional[float]:
+        """An ISO-8601 notification stamp as an epoch, or ``None`` when it will not parse."""
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            return None
+
+    def _in_backlog(self, notif: Notification, *, now: Optional[float] = None) -> bool:
+        """Whether this notification is older than ``github.backlog_hours`` (#87).
+
+        A poller that starts fresh -- first enable, a rebuilt state file, a day offline -- sees
+        every unread notification at once, and each one used to become a chat reply about
+        something that happened days ago. Past the window it is marked read without a turn:
+        the item's own state is on GitHub, and the CI watches (#24) read current facts rather
+        than notifications. ``0`` turns the rule off. An unparseable stamp is not made young:
+        it is left to the old path rather than dropped on a guess.
+        """
+        hours = float(getattr(self.config.github, "backlog_hours", 0) or 0)
+        if hours <= 0:
+            return False
+        then = self._stamp(notif.updated_at)
+        if then is None:
+            return False
+        moment = time.time() if now is None else float(now)
+        return moment - then > hours * 3600.0
+
+    def _swarm_names(self) -> set:
+        """Every name this swarm's own bots answer to, lower case, ``@`` stripped (#87)."""
+        names = {str(self.config.identity.alias or "").strip().lstrip("@").lower(),
+                 str(self.config.identity.name or "").strip().lstrip("@").lower()}
+        if self.config.github is not None:
+            names.add(str(self.config.github.login or "").strip().lstrip("@").lower())
+        for alias, target in (getattr(self.config, "peers", {}) or {}).items():
+            names.add(str(alias or "").strip().lstrip("@").lower())
+            names.add(str(target or "").strip().lstrip("@").lower())
+        return {name for name in names if name}
+
+    def _quiet_reason(self, notif: Notification, actor: str) -> str:
+        """Why this notification must not become a turn, or ``""`` when it may (#87).
+
+        Two answers: it is CI or a workflow (the CI watches own those facts, and the run has no
+        author to answer), or its actor is one of the swarm's own bots (one bot does not open a
+        turn to discuss what another bot just did).
+        """
+        if str(notif.reason or "").strip().lower() in CI_REASONS:
+            return "a CI run"
+        if str(notif.subject_type or "").strip() in CI_SUBJECTS:
+            return "a CI run"
+        who = str(actor or "").strip().lstrip("@").lower()
+        if who and who in self._swarm_names():
+            return f"{actor} is one of the swarm's bots"
+        return ""
+
+    async def _quiet_notice(self, chat_id: int, thread_id: Optional[int],
+                            number: Optional[int], text: str) -> None:
+        """One short line in the topic that owns the item, never a turn (#64, #87)."""
+        if self.channel is None:
+            return                           # the CLI path has nowhere to say it
+        chat, thread = chat_id, thread_id
+        finder = getattr(self.channel, "topic_for_text", None)
+        if callable(finder) and number is not None:
+            try:
+                found = finder(f"#{number}")
+                if isinstance(found, tuple) and len(found) == 2:
+                    chat, thread = int(found[0]), found[1]
+            except Exception:                       # noqa: BLE001 - keep the default topic
+                logger.debug("github: no topic lookup for #%s", number, exc_info=True)
+        try:
+            await self.channel.send(text, chat_id=chat, thread_id=thread, notice=True)
+        except Exception:                           # noqa: BLE001 - a notice never fails a poll
+            logger.warning("github: could not post the status notice", exc_info=True)
+
     def _refused_topic(self, chat_id: int, thread_id: Optional[int]) -> Optional[str]:
         """Why a turn in this topic has no safe context id, or ``None`` when it has one.
 

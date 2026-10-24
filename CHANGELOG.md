@@ -8,6 +8,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- GitHub notifications no longer answer a bot's own events in chat (`#87`). The backstop used
+  to give every unread notification a model turn, so a publish run from three days earlier, or
+  a run a double merge had cancelled, was answered in the group as a reply to "@GitHub".
+  Now: a notification older than `github.backlog_hours` (default 24, `0` disables) is marked
+  read without a turn, so a fresh start does not work through the past; a notification whose
+  reason is `ci_activity`/`workflow_run`, or whose subject is a `CheckSuite`/`WorkflowRun`/
+  `CheckRun`, never opens a turn (the CI watches and the round state own those facts); and one
+  whose actor is one of the swarm's own bots — any alias, any configured handle,
+  `github.login` — does not either. Both of the last two are posted instead as one short line
+  in the topic that owns the item, as an ephemeral notice. A comment from a person still gets
+  its turn, and the poll outcome counts what it skipped (`backlog_skipped`, `quiet_skipped`).
+  The actor is the pull request's **last commenter** (`PR.comments`, new), not its author: a
+  person's comment on a swarm-opened PR was quieted, because the author was the bot itself.
+
+- A `/model`-time `prepare()` no longer erases the lease term baked into the `gh` wrapper
+  (`#245` review). Rewriting it at term 0 took the term away from a merge already in flight, and
+  its attribution comment lost the term it had earned; `prepare()` now keeps the term already
+  in the wrapper unless the caller brings a higher one.
+
 - The pinned dashboard no longer draws a ghost row for a bot it lists twice (`#246`). The
   presence table is keyed by whatever name a beat arrived under, so the coordinator's Telegram
   handle could sit beside its alias and the board showed a live bot next to a false

@@ -554,11 +554,16 @@ class TestRefusedTopicTurns(SecretSandbox):
         from swarmly.github.client import GitHubClient, Notification
         from swarmly.github.watch import GitHubWatcher
         client = mock.MagicMock(spec=GitHubClient)
+        # A recent stamp: #87 gives a notification older than ``github.backlog_hours`` no turn.
+        import datetime
+        import time
+        recent = datetime.datetime.fromtimestamp(
+            time.time() - 60, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         client.notifications.return_value = [Notification(
             id="n1", reason="mention", repo="example-org/webapp", subject_title="t",
             subject_type="Issue",
             subject_url="https://api.github.com/repos/example-org/webapp/issues/1",
-            number=1, updated_at="2026-10-10T12:00:00Z")]
+            number=1, updated_at=recent)]
         client.issue_view.return_value = None
         watcher = GitHubWatcher(self._config(tmp, chat), client=client,
                                 state_path=Path(tmp) / "s.json")
