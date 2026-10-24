@@ -11,6 +11,7 @@ from swarmly.telegram.store_probe import StoreProbe
 from swarmly.telegram.wire import parse_message
 
 CHAT = -100123
+ORIGINAL_START = StoreProbe.start
 PULSE = 3418
 
 
@@ -24,6 +25,7 @@ class FakeGroup:
         self.files = {}                    # message id -> bytes
         self.blind = set()                 # (reader, sender) pairs that are not delivered
         self.send_fails = set()            # aliases whose sends raise
+        self.fail_once = set()             # aliases whose next send raises, once
 
     def mint(self):
         self.next_id += 1
@@ -86,6 +88,9 @@ class FakeChannel:
     async def send(self, text, chat_id=None, thread_id=None, return_message_id=False, **_):
         if self.alias in self.group.send_fails and thread_id == PULSE:
             raise RuntimeError("Flood control exceeded. Retry in 7 seconds")
+        if self.alias in self.group.fail_once and thread_id == PULSE                 and "step=line" in text:
+            self.group.fail_once.discard(self.alias)
+            raise RuntimeError("Flood control exceeded. Retry in 7 seconds")
         await asyncio.sleep(0)
         if thread_id != PULSE:
             self.reports.append(text)
@@ -136,7 +141,7 @@ class StoreProbeTests(unittest.TestCase):
         _run, state = run_test(group, claude)
         report = claude.store_probe.verdict(state)
         self.assertFalse(report["ok"])
-        self.assertIn("Reasonix saw 0/3 of DeepSeek's lines", report["summary"])
+        self.assertIn("Reasonix saw 0/4 of DeepSeek's lines", report["summary"])
 
     def test_a_newer_pin_hides_the_file(self):
         """getChat returns only the newest pin: a dashboard re-sent after the file wins."""
@@ -161,7 +166,7 @@ class StoreProbeTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["missing"], ["DeepSeek"])
 
-    def test_a_bot_left_out_is_not_expected(self):
+    def test_a_bot_left_out_is_not_expected(self):  # noqa: D102
         group, (claude, deepseek, reasonix) = swarm("Claudebot", "DeepSeek", "Reasonix")
         group.channels.remove(reasonix)    # it does not take part
         claude.store_probe.skipped = set()
@@ -174,16 +179,83 @@ class StoreProbeTests(unittest.TestCase):
             _run, state = run_test(group, claude)
         report = claude.store_probe.verdict(state)
         self.assertTrue(report["ok"], report["summary"])
-        self.assertIn("left out: Reasonix", report["summary"])
+        self.assertIn("left out: reasonix", report["summary"])
 
     def test_send_errors_are_reported(self):
         group, (claude, deepseek) = swarm("Claudebot", "DeepSeek")
-        group.send_fails.add("DeepSeek")
+        group.fail_once.add("DeepSeek")    # one burst line hits a flood wait, the rest go
         _run, state = run_test(group, claude)
         report = claude.store_probe.verdict(state)
         self.assertFalse(report["ok"])
-        self.assertTrue(any("Flood control" in p or "DeepSeek" in p
-                            for p in report["problems"] + report["missing"]))
+        self.assertEqual(report["missing"], [])
+        self.assertTrue(any("DeepSeek: send error" in p and "Flood control" in p
+                            for p in report["problems"]), report["problems"])
+
+    def test_a_bot_left_out_takes_no_part(self):
+        group, (claude, deepseek, reasonix) = swarm("Claudebot", "DeepSeek", "Reasonix")
+        sent = []
+        original = FakeChannel.send
+
+        async def counting(self, text, **kwargs):
+            if self.alias == "Reasonix":
+                sent.append(text)
+            return await original(self, text, **kwargs)
+
+        with mock.patch.object(FakeChannel, "send", counting),                 mock.patch.object(StoreProbe, "start",
+                                  lambda self, origin=None, skip=(): ORIGINAL_START(
+                                      self, origin, skip=("reasonix",))):
+            _run, state = run_test(group, claude)
+        self.assertEqual(sent, [], "a bot left out (any case) posts nothing")
+        self.assertTrue(claude.store_probe.verdict(state)["ok"])
+
+    def test_a_line_with_two_ids_and_ids_out_of_send_order_fail(self):
+        group, (claude, deepseek) = swarm("Claudebot", "DeepSeek")
+        _run, state = run_test(group, claude)
+        state.results["DeepSeek"]["saw"]["Claudebot"]["1"] += 1
+        report = claude.store_probe.verdict(state)
+        self.assertTrue(any("line 1 has different ids" in p for p in report["problems"]))
+        group, (claude, deepseek) = swarm("Claudebot", "DeepSeek")
+        _run, state = run_test(group, claude)
+        saw = state.results["DeepSeek"]["saw"]["Claudebot"]
+        saw["1"], saw["2"] = saw["2"], saw["1"]
+        for reader in state.results.values():
+            reader["saw"]["Claudebot"] = dict(saw)
+        report = claude.store_probe.verdict(state)
+        self.assertTrue(any("do not rise in send order" in p for p in report["problems"]))
+
+    def test_a_corrupt_download_fails(self):
+        group, (claude, deepseek) = swarm("Claudebot", "DeepSeek")
+        original = FakeBot.download
+
+        async def corrupt(self, file_id, destination):
+            await original(self, file_id, destination)
+            destination.write(b"garbage")
+            return destination
+
+        with mock.patch.object(FakeBot, "download", corrupt):
+            _run, state = run_test(group, claude)
+        report = claude.store_probe.verdict(state)
+        self.assertTrue(any("download sha" in p for p in report["problems"]), report)
+
+    def test_late_arrivals_are_reported_but_allowed(self):
+        group, (claude, deepseek) = swarm("Claudebot", "DeepSeek")
+        _run, state = run_test(group, claude)
+        arrival = state.results["DeepSeek"]["arrival"]
+        state.results["DeepSeek"]["arrival"] = list(reversed(arrival))
+        report = claude.store_probe.verdict(state)
+        self.assertTrue(report["ok"], report["summary"])
+        self.assertIn("arrived behind a later id", report["summary"])
+
+    def test_a_lead_that_fails_still_reports(self):
+        group, (claude, deepseek) = swarm("Claudebot", "DeepSeek")
+
+        async def broken(self, *args, **kwargs):
+            raise RuntimeError("not enough rights to pin")
+
+        with mock.patch.object(FakeBot, "pin_chat_message", broken):
+            run_test(group, claude)
+        self.assertTrue(claude.reports and "FAIL: the lead could not finish" in claude.reports[0],
+                        claude.reports)
 
     def test_lines_without_a_known_run_are_ignored(self):
         group, (claude,) = swarm("Claudebot")

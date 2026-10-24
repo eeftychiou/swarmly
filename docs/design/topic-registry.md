@@ -371,7 +371,7 @@ Codex is out of quota until 18 Nov and Antigravity is rate-limited, so the live 
 A `swarmly selftest store` command, run by each bot on start and on demand:
 
 - every bot, Reasonix on CT100 included, sees the others' machine lines in Swarm pulse (bot-to-bot mode);
-- message ids in the group rise strictly across bots, and posts from two bots in the same second keep one order for all;
+- a line has the same message id for every bot, and one bot's lines get rising ids in the order it sent them; lines may *arrive* in a different order at different bots (the fold sorts by id), and how often that happens is measured;
 - a bot can post a JSON file, pin it, unpin the previous one, and every other bot reads it back through `getChat` while the dashboard is also pinned;
 - post rate stays under the limit with a burst of 10 changes batched into one line.
 

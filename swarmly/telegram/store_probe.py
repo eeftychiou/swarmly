@@ -8,12 +8,17 @@ live bots, every one of them:
 
 1. **Visibility.** Every bot receives every other bot's machine lines in Swarm pulse.
 2. **One order.** A line has the same message id for every reader, and one bot's lines get
-   rising ids in the order it sent them.
-3. **The pin.** A bot can post a JSON file, pin it, and every other bot reads that file back
-   through ``getChat`` -- while the dashboard is pinned too -- and downloads it intact.
-4. **Rate.** A small burst goes out without a flood wait.
+   rising ids in the order it sent them. Lines may *arrive* in a different order at different
+   bots -- the store's fold sorts by id, so that is allowed -- and how often it happens is
+   measured and reported, because every such arrival costs the fold a re-fold.
+3. **The pin.** A bot can post a JSON file, pin it, post and pin a second one, unpin the first,
+   and every other bot reads the second back through ``getChat`` -- while the dashboard is
+   pinned too -- and downloads it intact.
+4. **Rate.** A burst of single lines and one batched line (ten changes, the shape the store
+   writes when several change at once) go out without a flood wait.
 
-``/storetest@bot`` makes that bot the lead of one run. It posts ``step=start`` in Swarm pulse;
+``/storetest@bot [-Alias ...]`` makes that bot the lead of one run; ``-Alias`` leaves a bot
+out (it does not take part at all). It posts ``step=start`` in Swarm pulse;
 every bot (the lead too) sends three numbered lines; the lead posts and pins a JSON file and
 says which message it is; every bot reads the pin back and posts its findings; the lead unpins
 the file, writes ``storetest-<run>.json`` next to the other state files and posts a summary.
@@ -27,6 +32,7 @@ import hashlib
 import io
 import json
 import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -39,8 +45,12 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger("swarmly.telegram.store_probe")
 
 INTENT = "PROBE"
-#: Lines each bot sends in its burst.
+#: Single lines each bot sends in its burst, then one batched line.
 BURST = 3
+#: Changes in the batched line.
+BATCH = 10
+#: Lines every bot must see from every other bot.
+LINES = BURST + 1
 #: The lead waits this long after ``start`` before it posts the file: long enough for every
 #: bot's burst to go out through its paced sender.
 PIN_AFTER_SECONDS = 20.0
@@ -89,12 +99,13 @@ class Run:
 
     run: str
     lead: str
-    started: float
+    #: Bots left out of this run (casefolded).
+    skip: frozenset = frozenset()
     #: Where the lead reports the verdict: the chat and topic the command came from.
     origin: Optional[Tuple[int, Optional[int]]] = None
     #: (sender alias, line number) -> message id, as received (or as sent, for our own lines).
     lines: Dict[Tuple[str, int], int] = field(default_factory=dict)
-    #: The order lines arrived here, as message ids.
+    #: The order other bots' lines arrived here, as message ids.
     arrival: List[int] = field(default_factory=list)
     send_seconds: float = 0.0
     send_errors: List[str] = field(default_factory=list)
@@ -113,9 +124,6 @@ class StoreProbe:
         self.channel = channel
         self.clock = clock
         self.runs: Dict[str, Run] = {}
-        #: Bots the admin left out of the test (``/storetest@bot -Reasonix``): a bot running
-        #: the same harness and model as another adds nothing, and an old release never answers.
-        self.skipped: set = set()
         self._tasks: set = set()
 
     # -- small helpers -------------------------------------------------------------------
@@ -123,9 +131,13 @@ class StoreProbe:
     def alias(self) -> str:
         return str(self.channel.config.identity.alias)
 
-    def peers(self) -> List[str]:
+    def peers(self, state: Optional[Run] = None) -> List[str]:
+        """The other bots expected in a run: everyone the self-test knows, minus the ones the
+        admin left out (``-Reasonix``: a bot running the same harness and model as another
+        adds nothing, and an old release never answers)."""
+        skip = state.skip if state is not None else frozenset()
         return [p for p in self.channel.selftest.peers()
-                if p.strip().lower() != self.alias.strip().lower()]
+                if p.casefold() != self.alias.casefold() and p.casefold() not in skip]
 
     def _spawn(self, coro: Any) -> None:
         task = asyncio.get_running_loop().create_task(coro)
@@ -148,16 +160,18 @@ class StoreProbe:
     def start(self, origin: Optional[Tuple[int, Optional[int]]] = None,
               skip: Tuple[str, ...] = ()) -> str:
         """Begin a run with this bot as the lead; returns the run id at once."""
-        self.skipped = {name.strip() for name in skip if name.strip()}
-        run = f"{int(self.clock())}-{self.alias.lower()}"
-        self.runs[run] = Run(run=run, lead=self.alias, started=self.clock(), origin=origin)
+        left_out = frozenset(name.strip().casefold() for name in skip if name.strip())
+        run = f"{int(self.clock())}-{self.alias.lower()}-{secrets.token_hex(2)}"
+        self.runs[run] = Run(run=run, lead=self.alias, skip=left_out, origin=origin)
         self._spawn(self._lead(run))
         return run
 
     async def _lead(self, run: str) -> None:
         state = self.runs[run]
         try:
-            await self._post(run, f"step=start lead={self.alias}")
+            skip = ",".join(sorted(state.skip))
+            await self._post(run, f"step=start lead={self.alias}"
+                             + (f" skip={skip}" if skip else ""))
             burst = asyncio.get_running_loop().create_task(self._burst(state))
             await asyncio.sleep(PIN_AFTER_SECONDS)
             await self._pin_snapshot(state)
@@ -173,37 +187,54 @@ class StoreProbe:
             self._write(run, report)
             await self._post(run, "step=done\n" + json.dumps(
                 {"ok": report["ok"], "summary": report["summary"]}, separators=(",", ":")))
-            logger.info("store test %s: %s", run, report["summary"])
-            if state.origin is not None:
+        except Exception as exc:                       # noqa: BLE001 - a test must not crash
+            logger.warning("store test %s failed", run, exc_info=True)
+            await self._unpin(state)
+            report = {"run": run, "ok": False, "results": state.results,
+                      "summary": f"FAIL: the lead could not finish: "
+                                 f"{type(exc).__name__}: {exc}"[:300]}
+            self._write(run, report)
+        logger.info("store test %s: %s", run, report["summary"])
+        if state.origin is not None:
+            try:
                 await self.channel.send(f"Store test {run}: {report['summary']}",
                                         chat_id=state.origin[0], thread_id=state.origin[1],
                                         allow_when_frozen=True)
-        except Exception:                              # noqa: BLE001 - a test must not crash
-            logger.warning("store test %s failed", run, exc_info=True)
-            await self._unpin(state)
+            except Exception:                          # noqa: BLE001 - the file has it
+                logger.warning("store test %s: the summary was not posted", run,
+                               exc_info=True)
 
     async def _all_results(self, state: Run) -> None:
-        while not all(p in state.results for p in self.peers() if p not in self.skipped):
+        while not all(p in state.results for p in self.peers(state)):
             state.results_event.clear()
             await state.results_event.wait()
 
-    async def _pin_snapshot(self, state: Run) -> None:
+    async def _post_file(self, state: Run, n: int) -> Tuple[int, str]:
         bot = self.channel.bot
         chat, topic = await self._place()
         filler = "x" * max(0, SNAPSHOT_BYTES - 200)
-        data = json.dumps({"run": state.run, "lead": self.alias, "at": self.clock(),
+        data = json.dumps({"run": state.run, "lead": self.alias, "n": n, "at": self.clock(),
                            "filler": filler}).encode("utf-8")
-        sha = hashlib.sha256(data).hexdigest()
+        sha = hashlib.sha256(data).hexdigest()[:16]
         from aiogram.types import BufferedInputFile
         caption = format_message(Envelope(type=MessageType.NOTE, to="*", intent=INTENT,
-                                          ref=state.run), f"step=snapshot sha={sha[:16]}")
+                                          ref=state.run), f"step=snapshot n={n} sha={sha}")
         sent = await bot.send_document(chat_id=chat, message_thread_id=topic,
-                                       document=BufferedInputFile(data, f"probe-{state.run}.json"),
+                                       document=BufferedInputFile(data,
+                                                                  f"probe-{state.run}-{n}.json"),
                                        caption=caption, disable_notification=True)
-        state.pin_id, state.pin_sha = sent.message_id, sha[:16]
         await bot.pin_chat_message(chat_id=chat, message_id=sent.message_id,
                                    disable_notification=True)
-        await self._post(state.run, f"step=pin mid={sent.message_id} sha={sha[:16]}")
+        return sent.message_id, sha
+
+    async def _pin_snapshot(self, state: Run) -> None:
+        """Pin a file, pin a second one, unpin the first: the store's snapshot turnover."""
+        first, _sha = await self._post_file(state, 1)
+        state.pin_id = first                           # unpinned even if the rest fails
+        second, sha = await self._post_file(state, 2)
+        await self._unpin(state)
+        state.pin_id, state.pin_sha = second, sha
+        await self._post(state.run, f"step=pin mid={second} sha={sha}")
         state.pin_event.set()
 
     async def _unpin(self, state: Run) -> None:
@@ -229,6 +260,18 @@ class StoreProbe:
                 state.send_errors.append(f"line {n}: no message id")
             else:
                 state.lines[(self.alias, n)] = mid
+        # The batched line: the shape the store writes when several values change at once.
+        changes = [{"k": f"probe/{self.alias.lower()}/c{i}", "b": 0, "t": 0,
+                    "w": self.alias.lower(), "v": {"i": i, "at": round(self.clock(), 3)}}
+                   for i in range(BATCH)]
+        try:
+            mid = await self._post(state.run, f"step=line n={LINES} batch={BATCH}\n"
+                                   + json.dumps(changes, separators=(",", ":")))
+        except Exception as exc:                       # noqa: BLE001 - recorded, reported
+            state.send_errors.append(f"batch: {type(exc).__name__}: {exc}"[:200])
+            mid = None
+        if mid is not None:
+            state.lines[(self.alias, LINES)] = mid
         state.send_seconds = round(self.clock() - began, 2)
 
     async def _join(self, state: Run) -> None:
@@ -281,7 +324,7 @@ class StoreProbe:
         saw: Dict[str, Dict[str, int]] = {}
         for (sender, n), mid in state.lines.items():
             saw.setdefault(sender, {})[str(n)] = mid
-        return {"alias": self.alias, "saw": saw, "arrival": state.arrival[-30:],
+        return {"alias": self.alias, "saw": saw, "arrival": state.arrival,
                 "send_seconds": state.send_seconds, "send_errors": state.send_errors[:5],
                 **pin}
 
@@ -304,14 +347,15 @@ class StoreProbe:
         state = self.runs.get(run)
         if step == "start":
             if state is None:
+                skip = frozenset(s.strip().casefold() for s in fields.get("skip", "").split(",")
+                                 if s.strip())
                 state = self.runs[run] = Run(run=run, lead=fields.get("lead", sender),
-                                             started=self.clock())
-                self._spawn(self._join(state))
+                                             skip=skip)
+                if self.alias.casefold() not in skip:  # left out: take no part at all
+                    self._spawn(self._join(state))
             return
-        if state is None:
+        if state is None or self.alias.casefold() in state.skip:
             return
-        if event.message_id is not None:
-            state.arrival.append(int(event.message_id))
         if step == "line":
             try:
                 n = int(fields.get("n", ""))
@@ -319,6 +363,7 @@ class StoreProbe:
                 return
             if event.message_id is not None:
                 state.lines[(sender, n)] = int(event.message_id)
+                state.arrival.append(int(event.message_id))
         elif step == "pin":
             try:
                 state.pin_id = int(fields.get("mid", ""))
@@ -334,8 +379,8 @@ class StoreProbe:
 
     # -- the verdict (the lead) ----------------------------------------------------------
     def verdict(self, state: Run) -> Dict[str, Any]:
-        everyone = [self.alias, *[p for p in self.peers() if p not in self.skipped]]
-        # A skipped bot that answered anyway is not checked: it was left out on purpose.
+        everyone = [self.alias, *self.peers(state)]
+        # Only the bots in the run are checked, as readers and as senders.
         reported = [a for a in everyone if a in state.results]
         missing = [a for a in everyone if a not in state.results]
         problems: List[str] = []
@@ -346,22 +391,32 @@ class StoreProbe:
                 if sender == reader:
                     continue
                 got = len(saw.get(sender) or {})
-                if got < BURST:
-                    problems.append(f"{reader} saw {got}/{BURST} of {sender}'s lines")
+                if got < LINES:
+                    problems.append(f"{reader} saw {got}/{LINES} of {sender}'s lines")
         # 2. one order: the same line has the same id everywhere; a sender's ids rise.
         ids: Dict[Tuple[str, str], set] = {}
         for reader in reported:
             for sender, numbered in (state.results[reader].get("saw") or {}).items():
+                if sender not in reported:
+                    continue
                 for n, mid in (numbered or {}).items():
                     ids.setdefault((sender, n), set()).add(mid)
         for (sender, n), seen in sorted(ids.items()):
             if len(seen) > 1:
                 problems.append(f"{sender} line {n} has different ids: {sorted(seen)}")
         for sender in reported:
-            ordered = [min(ids[(sender, str(n))]) for n in range(1, BURST + 1)
+            ordered = [min(ids[(sender, str(n))]) for n in range(1, LINES + 1)
                        if (sender, str(n)) in ids]
             if ordered != sorted(ordered) or len(set(ordered)) != len(ordered):
                 problems.append(f"{sender}'s ids do not rise in send order: {ordered}")
+        # Arrival order: allowed to differ (the fold sorts by id), measured.
+        late = {}
+        for reader in reported:
+            arrival = [m for m in state.results[reader].get("arrival") or []
+                       if isinstance(m, int)]
+            behind = sum(1 for i, m in enumerate(arrival) if m < max(arrival[:i], default=m))
+            if behind:
+                late[reader] = behind
         # 3. the pin and the file.
         for reader in reported:
             result = state.results[reader]
@@ -378,12 +433,15 @@ class StoreProbe:
         ok = not problems and not missing
         summary = (f"{'PASS' if ok else 'FAIL'}: {len(reported)}/{len(everyone)} bots reported"
                    + (f" (no result from {', '.join(missing)})" if missing else "")
-                   + (f"; left out: {', '.join(sorted(self.skipped))}" if self.skipped else "")
-                   + f"; slowest burst of {BURST} lines {slowest:.1f}s"
+                   + (f"; left out: {', '.join(sorted(state.skip))}" if state.skip else "")
+                   + f"; slowest burst of {LINES} lines {slowest:.1f}s"
+                   + ("; arrived behind a later id (allowed, the fold re-sorts): "
+                      + ", ".join(f"{r} {n}" for r, n in sorted(late.items()))
+                      if late else "; every bot saw ids in rising order")
                    + (f"; {len(problems)} problem(s): " + "; ".join(problems[:6])
                       if problems else ""))
         return {"run": state.run, "ok": ok, "summary": summary, "problems": problems,
-                "missing": missing, "results": state.results}
+                "missing": missing, "late_arrivals": late, "results": state.results}
 
     def _write(self, run: str, report: Dict[str, Any]) -> None:
         try:
