@@ -58,9 +58,14 @@ MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
 
 #: A peer transport's built-in answer to one of those commands (or /model): machine traffic.
 _COMMAND_REPLY = re.compile(r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\]\s*)?"
-                            r"(?:(?:PONG|STATUS|DIAG|WHERE|ROLE|MODEL)\s+\S"
-                            # /state, /topics and /storetest answers (topic registry)
-                            r"|(?:State store|Store test|Topic registry)\b)")
+                            r"(?:(?:PONG|STATUS|DIAG|WHERE|ROLE|MODEL|SWARM)\s+\S"
+                            # The /state, /storetest and /topics answers, by their exact shapes:
+                            # a peer's "State store is wedged, Hermes ..." is still a hand-off.
+                            r"|State store(?: \([^()\n]{1,40}\))?: "
+                            r"(?:ready|not ready|off \(state\.backend|not started\.)"
+                            r"|Store test \d+-[\w.-]{1,40}-[0-9a-f]{4}(?: started)?:"
+                            r"|Topic registry(?: \(shadow\):\n|: the state store is not running"
+                            r"|: empty so far))")
 # The /model and /reasoning answers lead with the bot's alias ("Codex runs gpt-x here ...").
 _SETTING_REPLY = re.compile(
     r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\])?[\w .-]{0,40}?"
