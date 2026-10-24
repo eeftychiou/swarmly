@@ -758,7 +758,8 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
                 reply = await SubprocessAdapter.respond(self, message)
                 new = (await asyncio.to_thread(_cli_conversations)) - before
             reported = (reply.meta or {}).get("conversation") if reply is not None else None
-            if reply is not None and reply.ok and reported:
+            if reply is not None and reply.ok and reported and \
+                    str(reported) in (new or await asyncio.to_thread(_cli_conversations)):
                 new = {str(reported)}                  # the reply says which one it was
             if reply is not None and reply.ok and len(new) == 1:
                 found = next(iter(new))
@@ -857,10 +858,17 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
         """The JSON result of ``--output-format json``; plain text when it is not JSON (a
         custom command, an older agy)."""
         text = (out or "").strip()
-        try:
-            data = json.loads(text) if text.startswith("{") else None
-        except ValueError:
-            data = None
+        data = None
+        # The result is the last JSON object on stdout: a notice printed before it (an update
+        # banner, a warning) must not turn the whole blob into the reply.
+        for start in [i for i, ch in enumerate(text) if ch == "{"][::-1][:20]:
+            try:
+                found, end = json.JSONDecoder().raw_decode(text[start:])
+            except ValueError:
+                continue
+            if isinstance(found, dict) and "response" in found and not text[start + end:].strip():
+                data = found
+                break
         if not isinstance(data, dict) or "response" not in data:
             return super().parse_output(out, duration)
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}

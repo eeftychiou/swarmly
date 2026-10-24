@@ -665,6 +665,11 @@ class TestJsonOutputTests(unittest.TestCase):
         self.assertFalse(reply.ok)
         self.assertIn("quota exceeded", reply.error)
 
+    def test_a_notice_before_the_json_is_not_the_reply(self):
+        out = 'A new version of agy is available.\n{"status":"SUCCESS","response":"done"}'
+        reply = self.adapter().parse_output(out, 1.0)
+        self.assertEqual(reply.text, "done")
+
     def test_plain_text_still_works(self):
         reply = self.adapter().parse_output("just text", 1.0)
         self.assertEqual((reply.ok, reply.text), (True, "just text"))

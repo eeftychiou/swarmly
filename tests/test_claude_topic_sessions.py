@@ -30,15 +30,15 @@ class ClaudeTopicSessionTests(unittest.TestCase):
     def test_a_topic_keeps_one_session_and_starts_it_fresh(self):
         claude, runner = self.adapter(2)
         message = topic_message()
-        self.assertEqual(claude.topic_mode(message.context_id), "fresh")
+        self.assertEqual(claude.topic_mode(message.context_id), "session")
         first = dataclasses.replace(message, fresh_text="TASK and PROGRESS\n\nhello")
         asyncio.run(claude.respond(first))
-        self.assertEqual(claude.topic_mode(message.context_id), "session")
-        asyncio.run(claude.respond(message))
+        asyncio.run(claude.respond(dataclasses.replace(message, fresh_text="IGNORED")))
         (flag1, id1), (flag2, id2) = (session_flag(a) for a in runner.calls)
         self.assertEqual((flag1, flag2), ("--session-id", "--resume"))
         self.assertEqual(id1, id2, "the same session for every turn in the topic")
         self.assertIn("TASK and PROGRESS", runner.calls[0][-1], "a new session gets the task")
+        self.assertNotIn("IGNORED", runner.calls[1][-1], "a resumed one gets the message")
 
     def test_a_replaced_session_is_really_new_and_survives_a_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -53,12 +53,14 @@ class ClaudeTopicSessionTests(unittest.TestCase):
             self.assertEqual(session_flag(runner.calls[1]), ("--session-id", new))
             again, _ = self.adapter(0, tmp)                              # the transport restarts
             self.assertEqual(again.topic_session(message.context_id), new)
-            self.assertEqual(again.topic_mode(message.context_id), "session")
+            self.assertIn(new, again._known, "a session it used is resumed after a restart")
 
     def test_the_registry_records_the_current_session(self):
         from swarmly.telegram.registry_shadow import session_of
         claude, _ = self.adapter(0)
-        claude.forget_session("tg-7")                   # nothing known: no change
+        before = claude.topic_session("tg-7")
+        claude.forget_session("tg-7")       # even an unrecorded session is replaced (review)
+        self.assertNotEqual(claude.topic_session("tg-7"), before)
         self.assertEqual(session_of(claude, "tg-7"), claude.topic_session("tg-7"))
 
 

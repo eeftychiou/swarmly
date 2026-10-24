@@ -343,13 +343,6 @@ class ClaudeThreadAdapter(ClaudeAdapter):
     def session_for(self, message: IncomingMessage) -> str:
         return self.topic_session(getattr(message, "context_id", None))
 
-    def topic_mode(self, context_id: Optional[str]) -> str:
-        """A topic whose session does not exist yet starts fresh: the transport gives the
-        first turn the task and the progress (a new topic, a replaced session)."""
-        if context_id and self.topic_session(context_id) not in self._known:
-            return "fresh"
-        return "session"
-
     def forget_session(self, context_id: Optional[str]) -> bool:
         """A deleted topic's Claude session is dropped (issue #63).
 
@@ -360,17 +353,18 @@ class ClaudeThreadAdapter(ClaudeAdapter):
         if not context_id:
             return False
         session = self.topic_session(context_id)
-        if session not in self._known and session not in self._rules_held:
-            return False
+        known = session in self._known or session in self._rules_held
         self._known.discard(session)
         self._rules_held.pop(session, None)
         save_state(self._state_path, self._rules_held, f"{self.alias}: Claude sessions")
         # The next turn gets a new id: re-creating this one would be refused as in use, and
         # the old session resumed (a drift reset that reset nothing).
+        # Always, known or not: a session on disk that this process never recorded would
+        # otherwise be resumed by the next turn's "in use" retry.
         self._generations[context_id] = self._generations.get(context_id, 0) + 1
         save_state(self._generations_path, dict(self._generations),
                    f"{self.alias}: Claude generations")
-        return True
+        return known
 
     def _can_create(self, session_id: Optional[str] = None) -> bool:
         try:

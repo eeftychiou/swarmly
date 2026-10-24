@@ -344,14 +344,14 @@ class TestAdapterCommands(unittest.TestCase):
         settings = AntigravityAdapter.default_settings(cwd="/repo")
         self.assertEqual(settings.command, "agy -p {prompt} --print-timeout 20m --dangerously-skip-permissions")
         adapter = AntigravityAdapter("Antigravity", settings)
-        self.assertEqual(adapter.build_argv("hello"), ["agy", "-p", "hello", "--print-timeout", "20m", "--dangerously-skip-permissions"])
+        self.assertEqual(adapter.build_argv("hello"), ["agy", "-p", "hello", "--print-timeout", "20m", "--dangerously-skip-permissions", "--output-format", "json"])
 
     def test_antigravity_with_conversation_appends_flag(self):
         settings = AntigravityAdapter.default_settings(cwd="/repo", conversation="12345678-1234-5678-1234-567812345678")
         adapter = AntigravityAdapter("Antigravity", settings)
         self.assertEqual(
             adapter.build_argv("hello"),
-            ["agy", "-p", "hello", "--print-timeout", "20m", "--dangerously-skip-permissions", "--conversation", "12345678-1234-5678-1234-567812345678"]
+            ["agy", "-p", "hello", "--print-timeout", "20m", "--dangerously-skip-permissions", "--output-format", "json", "--conversation", "12345678-1234-5678-1234-567812345678"]
         )
 
     def test_antigravity_admin_switch_command(self):
