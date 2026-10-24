@@ -1121,18 +1121,25 @@ control:
 ```
 
 The message is built in code from the records the transport already holds — the status
-snapshots (#124), the turn ledger (#125) and the round state (#86) — and it reads in four
-parts. **Alerts first**: a bot DOWN or stuck over its timeout, one frozen or out of quota, a
-hand-off nobody answered, the round's blockers. Then **a line per bot**: state and since when,
-the topic as its `tg-…` token, queue and armed WAKEs, model and effort, rev, uptime and
-restarts, today's tokens and cost, quota and its reset. Then the **round board**: each item's
-owner, PR, head, CI, the review and QA verdicts — a verdict counts only on the head it names —
-and whether it can merge. A number no runtime reported stays **unknown**, never zero.
+snapshots (#124), the turn ledger (#125), the round state (#86) and the swarm's own roster of
+roles — and it reads in five parts (#241). A **header line**: the round, the swarm's spend
+today (turns, tokens, cost, and `?` wherever a runtime was silent) and the time of the last
+refresh. Then **one row per bot**, in a fixed order and layout: a status icon (🔵 working,
+🟢 idle, ⏸ paused, 🧊 frozen, ⚠️ stuck, 🔴 DOWN), the alias, the role the swarm gave that bot,
+"working 3m" or "idle 12m", model/effort, today's turns, tokens and cost. Then the **lease**:
+who coordinates, its term and how long it has left. Then the **alerts**, only when there are
+any: a bot DOWN or stuck over its timeout, one frozen or out of quota, a hand-off nobody
+answered, the round's blockers. Then the **round board**: each item's owner, PR, head, CI, the
+review and QA verdicts — a verdict counts only on the head it names — and whether it can
+merge. A value no runtime reported is **`?`**, never a zero, and a total short of the turns it
+covers says how short (`(known/turns)`). The detail the rows leave out — the topic as its
+`tg-…` token, the queue and armed WAKEs, rev, uptime and restarts, the quota and its reset —
+is still in the snapshot, and `/status` prints it.
 
 Each bot's spend rides its own heartbeat: the pulse carries today's totals from that bot's
 ledger (`turns`, tokens in and out, cost, quota and its reset time, each with the count of
 rows that actually reported one), so the dashboard shows every bot's tokens and cost without
-asking any of them for a turn. A peer that has not said anything is `unknown` there — never a
+asking any of them for a turn. A peer that has not said anything is `?` there — never a
 zero it did not report.
 
 **One row per bot, whichever name it arrived under** (#246). The presence table is keyed by
@@ -1141,11 +1148,14 @@ under its Telegram handle — and the board then drew a live bot beside a ghost 
 handle reading `DOWN, stale 2.0d`. The board folds those names into the name the bot is
 configured under (alias, or the agent's own name for itself) and keeps the newest record for
 that bot, so its own live state is what is drawn; a stale record under its handle can never
-replace the row this bot is writing right now.
+replace the row this bot is writing right now. A record that stopped being renewed is a
+`🔴 DOWN` row whatever it last said of itself: a dead bot publishes nothing, so the age of
+its record is what says it.
 
 Telegram allows 4,096 characters in one message, so the layout drops whole lines in that
-order when it runs out of room — the round board first, the alerts last — and says how many
-it hid. The pin is the state, and a failover retires it rather than adopting it: a new
+order when it runs out of room — the round board first, then the lease, then bot rows, the
+alerts last — and says how many it hid. The pin is the state, and a failover retires it
+rather than adopting it: a new
 coordinator (a failover, #83) reads the chat's pinned message and recognises the previous
 dashboard by its `SWARM` marker, but **Telegram lets a bot edit only its own messages**, so it
 cannot take that message over. It unpins the predecessor's message (retiring its keyboard with

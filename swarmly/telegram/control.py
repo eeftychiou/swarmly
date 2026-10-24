@@ -8,10 +8,13 @@ no adapter and no network, and never costs a model turn.
 
 Three rules decide the shape.
 
-**Alerts first, and the alerts are what survives.** The message is read at a glance, in a
-chat, when something has gone wrong: a bot that stopped beating, a turn over its limit, a
-hand-off nobody answered, a quota that ran out. Those lines come first, and when the
-message runs out of room it is the *detail* that is dropped, never an alert.
+**One row per bot, and the alerts still survive.** The card opens with a header line -- the
+round, the swarm's spend today and when that line was refreshed -- then one row per bot in a
+fixed order: a status icon, the alias, its role, what it is doing and for how long, model and
+effort, today's turns, tokens and cost (#241). "Who is doing what" is the question a card in a
+chat answers first. Under the rows come the lease, then the alerts, then the round's open
+items. When the message runs out of room it is the *detail* that is dropped -- the round board
+first, then the lease -- never an alert.
 
 **A dashboard is a status, not a leak.** Every field here is picked by name, so a record
 carrying a chat id, a thread id, a token or a path shows nothing extra: a topic appears as
@@ -47,9 +50,21 @@ COMPACT_BOTS = 12
 #: marker alone (#117): change it and every pin on every host is orphaned.
 MARKER = "SWARM"
 
-#: Section order in the rendered message: an alert outranks a bot line, which outranks the
-#: round board. `_fill` walks this order and stops when the next section would not fit.
-_ORDER = ("alerts", "bots", "board")
+#: What survives a full message, best first. `_fit` walks this order and stops taking lines
+#: when the next one would not fit: the header and the alerts come before detail, and the
+#: round board is the first thing to go (#241).
+_FILL = ("head", "alerts", "bots", "lease", "board")
+
+#: Where those sections are drawn: one row per bot first, then the lease, then the alerts,
+#: then the round's open items (#241).
+_SHOW = ("head", "bots", "lease", "alerts", "board")
+
+#: One icon per state, so a row is recognised before it is read (#241).
+_ICONS = {BUSY: "🔵", IDLE: "🟢", PAUSED: "⏸", FROZEN: "🧊", STUCK: "⚠️", DOWN: "🔴"}
+
+#: What the row says the bot is doing, in the same order as :data:`_ICONS`.
+_WORDS = {BUSY: "working", IDLE: "idle", PAUSED: "paused", FROZEN: "frozen",
+          STUCK: "stuck", DOWN: "DOWN"}
 
 
 # ------------------------------------------------------------------------------------
@@ -243,7 +258,7 @@ def _dur(seconds: Any) -> str:
 def _count(value: Optional[float]) -> str:
     """A token count for a dashboard: short, and never a made-up zero."""
     if value is None:
-        return "unknown"
+        return "?"
     value = _num(value)
     if value >= 1_000_000:
         return f"{value / 1_000_000:.1f}M"
@@ -252,42 +267,36 @@ def _count(value: Optional[float]) -> str:
     return f"{value:.0f}"
 
 
-def _tokens(value: Optional[float], known: Any, turns: Any) -> str:
-    """A token total that says how much of it was reported (#125's rule, short form)."""
-    turns, known = int(_num(turns)), int(_num(known))
+def _cost(value: Any, known: Any = None, turns: Any = None) -> str:
+    """Today's cost for a card: ``$22.33``, or ``?`` when the runtime never said."""
     if value is None:
-        return "unknown"
-    if turns and known < turns:
-        return f"{_count(value)} ({known}/{turns})"
-    return _count(value)
-
-
-def _money(value: Any, known: Any, turns: Any) -> str:
-    turns, known = int(_num(turns)), int(_num(known))
-    if value is None:
-        return "unknown"
+        return "?"
     text = f"${_num(value):.2f}"
-    if turns and known < turns:
-        text += f" ({known}/{turns})"
+    if _partial(known, turns):
+        text += f" ({int(_num(known))}/{int(_num(turns))})"
     return text
 
 
-def usage_line(alias: str, usage: Optional[Mapping[str, Any]]) -> str:
-    """``today=1.2k/340 $0.42`` for one bot, or ``unknown`` where the runtime was silent."""
-    if not usage:
-        return f"{alias}: usage unknown (no turns recorded)"
-    turns = usage.get("turns")
-    text = (f"today={_tokens(usage.get('tokens_in'), usage.get('tokens_in_known'), turns)}"
-            f"/{_tokens(usage.get('tokens_out'), usage.get('tokens_out_known'), turns)}"
-            f" {_money(usage.get('cost_usd'), usage.get('cost_known'), turns)}")
-    if usage.get("quota_left") is not None:
-        text += f" quota={_count(usage.get('quota_left'))}"
-        if usage.get("quota_resets_at"):
-            text += " resets=" + time.strftime("%H:%MZ", time.gmtime(
-                _num(usage.get("quota_resets_at"))))
-    else:
-        text += " quota=unknown"
-    return f"{alias}: {text}"
+def _partial(known: Any, turns: Any) -> bool:
+    """Whether a total is short of the turns it covers: it then says how short (#125)."""
+    turns, known = int(_num(turns)), int(_num(known))
+    return bool(turns and known < turns)
+
+
+def _token_cell(usage: Optional[Mapping[str, Any]]) -> str:
+    """A bot's tokens today: ``19.0M``, ``900+?`` when one direction is unreported, or ``?"""
+    if not usage or (usage.get("tokens_in") is None and usage.get("tokens_out") is None):
+        return "?"
+    tokens_in, tokens_out = usage.get("tokens_in"), usage.get("tokens_out")
+    if tokens_in is None or tokens_out is None:
+        # One direction was reported: showing it is the point, and the ``?`` beside it keeps
+        # the cell from reading as a whole total (#125).
+        return f"{_count(tokens_in)}+{_count(tokens_out)}"
+    text = _count(_num(tokens_in) + _num(tokens_out))
+    known = min(_num(usage.get("tokens_in_known")), _num(usage.get("tokens_out_known")))
+    if _partial(known, usage.get("turns")):
+        text += f" ({int(known)}/{int(_num(usage.get('turns')))})"
+    return text
 
 
 # ------------------------------------------------------------------------------------
@@ -347,9 +356,8 @@ def alerts(*, now: Optional[float] = None, snapshots: Sequence[Snapshot] = (),
 
 
 def header(*, now: Optional[float] = None, round_state: Any = None,
-           coordinator: str = "", usage: Optional[Mapping[str, Any]] = None,
-           lease: Optional[Snapshot] = None) -> str:
-    """``SWARM round=5 items=6/9 coord=Claude term=4 lease=12m today=1.2M/340 $0.42``."""
+           usage: Optional[Mapping[str, Any]] = None) -> str:
+    """``SWARM · round=5 · items=6/9 · today 12 turns · 19.0M tok · $22.33 · refreshed 12:04Z``"""
     moment = time.time() if now is None else float(now)
     parts = [MARKER]
     round_name = str(getattr(round_state, "round", "") or "")
@@ -364,21 +372,33 @@ def header(*, now: Optional[float] = None, round_state: Any = None,
         done = sum(1 for _, item in items
                    if str(item.get("state") or "").lower() in ("merged", "closed", "done"))
         parts.append(f"items={done}/{len(items)}")
-    if coordinator:
-        parts.append(f"coord={coordinator}")
-    term = int(_num(getattr(round_state, "term", 0))) or int(_num(getattr(lease, "term", 0)))
-    if term:
-        parts.append(f"term={term}")
+    parts.append(_spend(usage))
+    parts.append("refreshed " + time.strftime("%H:%MZ", time.gmtime(moment)))
+    return " · ".join(parts)
+
+
+def _spend(usage: Optional[Mapping[str, Any]]) -> str:
+    """The swarm's today, in one phrase: turns, tokens and cost, each ``?`` when unreported."""
+    usage = usage or {}
+    turns = usage.get("turns")
+    turns_text = "?" if turns is None else str(int(_num(turns)))
+    return (f"today {turns_text} turns · {_token_cell(usage)} tok"
+            f" · {_cost(usage.get('cost_usd'), usage.get('cost_known'), turns)}")
+
+
+def lease_line(*, now: Optional[float] = None, coordinator: str = "",
+               lease: Optional[Snapshot] = None) -> str:
+    """``lease: Claude · term=4 · 10m left`` -- who coordinates, and how long that holds."""
+    moment = time.time() if now is None else float(now)
+    holder = str(coordinator or getattr(lease, "alias", "") or "").strip()
+    if not holder:
+        return "lease: ?"
+    term = int(_num(getattr(lease, "term", 0)))
+    parts = [f"lease: {holder}", f"term={term or '?'}"]
     ends = _num(getattr(lease, "lease_ends", 0.0))
     if ends > moment:
-        parts.append(f"lease={_dur(ends - moment)}")
-    if usage:
-        turns = usage.get("turns")
-        parts.append("today="
-                     f"{_tokens(usage.get('tokens_in'), usage.get('tokens_in_known'), turns)}"
-                     f"/{_tokens(usage.get('tokens_out'), usage.get('tokens_out_known'), turns)}"
-                     f" {_money(usage.get('cost_usd'), usage.get('cost_known'), turns)}")
-    return " ".join(parts)
+        parts.append(f"{_dur(ends - moment)} left")
+    return " · ".join(parts)
 
 
 def _items(round_state: Any) -> List[Tuple[str, Dict[str, Any]]]:
@@ -456,11 +476,56 @@ def board(round_state: Any) -> List[str]:
     return lines
 
 
+def bot_row(row: Snapshot, *, now: float, usage: Optional[Mapping[str, Any]] = None,
+            role: str = "") -> str:
+    """One fixed row: icon, alias, role, what it is doing, model/effort, turns, tokens, cost.
+
+    The order never varies, so a reader learns where to look once (#241). A number the
+    runtime did not report is ``?``, in the row as everywhere else: a made-up ``0`` would read
+    as a bot that spent nothing, which is a different fact from one that said nothing.
+    """
+    moment = float(now)
+    # A bot that stopped beating is DOWN however it last described itself (#124): its own
+    # record cannot say it died, so the age of the record says it instead.
+    state = DOWN if (row.state == DOWN or row.is_stale(moment)) else row.state
+    since = _num(getattr(row, "since", 0.0))
+    if state == DOWN:
+        took = _dur(row.age(moment)) if row.at else "?"
+        activity = f"{_WORDS[state]} {took}"
+    elif since and since <= moment:
+        activity = f"{_words(state)} {_dur(moment - since)}"
+    else:
+        activity = f"{_words(state)} ?"
+    model = str(getattr(row, "model", "") or "").strip() or "?"
+    effort = str(getattr(row, "effort", "") or "").strip()
+    usage = usage or {}
+    turns = usage.get("turns")
+    return " · ".join([
+        f"{_icon(state)} {row.alias}",
+        str(role or "").strip() or "?",
+        activity,
+        f"{model}/{effort}" if effort else model,
+        "? turns" if turns is None else f"{int(_num(turns))} turns",
+        f"{_token_cell(usage)} tok",
+        _cost(usage.get("cost_usd"), usage.get("cost_known"), turns),
+    ])
+
+
+def _icon(state: str) -> str:
+    return _ICONS.get(state, "?")
+
+
+def _words(state: str) -> str:
+    return _WORDS.get(state, "?")
+
+
 def bot_lines(*, now: Optional[float] = None, snapshots: Sequence[Snapshot] = (),
-              usage: Optional[Mapping[str, Mapping[str, Any]]] = None) -> List[str]:
-    """One line per bot: the snapshot the heartbeat took, plus today's tokens and cost."""
+              usage: Optional[Mapping[str, Mapping[str, Any]]] = None,
+              roles: Optional[Mapping[str, str]] = None) -> List[str]:
+    """One row per bot, the newest record for each, in alias order: a fixed card (#241)."""
     moment = time.time() if now is None else float(now)
     usage = usage or {}
+    roles = roles or {}
     newest: Dict[str, Snapshot] = {}
     for row in snapshots:
         key = str(row.alias).strip().lower()
@@ -469,16 +534,9 @@ def bot_lines(*, now: Optional[float] = None, snapshots: Sequence[Snapshot] = ()
     lines: List[str] = []
     for key in sorted(newest):
         row = newest[key]
-        line = row.line(moment)
-        if row.model:
-            line += f" {row.model}"
-        if row.effort:
-            line += f"/{row.effort}"
-        if row.rev:
-            line += f" rev={row.rev}"
-        if row.state == IDLE and not row.queue:
-            line += " ready"
-        lines.append(line + " " + usage_line(row.alias, usage.get(row.alias)))
+        mine = usage.get(row.alias) or {}
+        role = roles.get(row.alias) or roles.get(key) or ""
+        lines.append(bot_row(row, now=moment, usage=mine, role=role))
     return lines
 
 
@@ -487,59 +545,81 @@ def bot_lines(*, now: Optional[float] = None, snapshots: Sequence[Snapshot] = ()
 # ------------------------------------------------------------------------------------
 
 
-def _fill(sections: Mapping[str, Sequence[str]], order: Iterable[str],
-          limit: int) -> Tuple[List[str], int]:
-    """Take whole lines in priority order until the message is full. Returns (lines, dropped)."""
-    out: List[str] = []
+def _fit(sections: Mapping[str, Sequence[str]], order: Iterable[str],
+         limit: int) -> Tuple[Dict[str, List[str]], int]:
+    """Take whole lines in priority order until the message is full. Returns (kept, dropped)."""
+    kept: Dict[str, List[str]] = {}
     used = 0
     dropped = 0
     for name in order:
         lines = list(sections.get(name) or ())
         if not lines:
             continue
-        if out:
-            used += 1                            # the blank line between sections
+        room: List[str] = []
         for index, line in enumerate(lines):
-            cost = len(line) + (1 if (out or index) else 0)
+            # A newline inside a section, and a blank line before a section that follows one.
+            cost = len(line) + (1 if room else (2 if kept else 0))
             if used + cost > limit:
                 dropped += len(lines) - index
                 break
-            out.append(line)
+            room.append(line)
             used += cost
-    return out, dropped
+        if room:
+            kept[name] = room
+    return kept, dropped
+
+
+def _join(kept: Mapping[str, Sequence[str]], order: Iterable[str]) -> str:
+    return "\n\n".join("\n".join(kept[name]) for name in order if kept.get(name))
+
+
+def _render(kept: Dict[str, List[str]], dropped: int, limit: int) -> str:
+    """The sections in reading order, plus how many lines did not fit (#117, #241)."""
+    if not dropped:
+        return _join(kept, _SHOW)
+    note = f"... {dropped} more line(s) hidden; detail is one button away"
+    while True:
+        text = _join(kept, _SHOW)
+        if text and len(text) + 1 + len(note) <= limit:
+            return text + "\n" + note
+        # Make room for the note by dropping the least important line still drawn: the round
+        # board first, then the lease, then a bot row -- an alert is the last thing to go.
+        for name in ("board", "lease", "bots"):
+            rows = kept.get(name) or []
+            if rows:
+                rows.pop()
+                if not rows:
+                    del kept[name]
+                break
+        else:
+            return note[:limit]
 
 
 def dashboard(*, now: Optional[float] = None, snapshots: Sequence[Snapshot] = (),
               round_state: Any = None, usage: Optional[Mapping[str, Mapping[str, Any]]] = None,
               coordinator: str = "", lease: Optional[Snapshot] = None,
+              roles: Optional[Mapping[str, str]] = None,
               limit: int = MAX_CHARS) -> str:
-    """The pinned message: alerts, then a line per bot, then the round board.
+    """The pinned card: a header, one row per bot, the lease, alerts, then round items.
 
-    Anything that does not fit is dropped whole, alert lines last to go: a bot that is down
-    is worth more than a round-board row, and the compact view is one button away.
+    Anything that does not fit is dropped whole, the round board first and the alerts last:
+    a bot that is down is worth more than a round-board row, and the compact view is one
+    button away.
     """
     moment = time.time() if now is None else float(now)
-    head = header(now=moment, round_state=round_state, coordinator=coordinator,
-                  usage=_sum_usage(usage), lease=lease or _coordinator_snapshot(
-                      snapshots, coordinator))
-    alert_lines = alerts(now=moment, snapshots=snapshots, round_state=round_state,
-                         usage=usage)
-    bots = bot_lines(now=moment, snapshots=snapshots, usage=usage)
+    held = lease or _coordinator_snapshot(snapshots, coordinator)
     board_lines = board(round_state)
     sections = {
-        "alerts": alert_lines,
-        "bots": bots,
+        "head": [header(now=moment, round_state=round_state, usage=_sum_usage(usage))],
+        "alerts": alerts(now=moment, snapshots=snapshots, round_state=round_state,
+                         usage=usage),
+        "bots": bot_lines(now=moment, snapshots=snapshots, usage=usage, roles=roles),
+        "lease": [lease_line(now=moment, coordinator=coordinator, lease=held)],
         "board": [f"round board ({len(board_lines)} items):"] + board_lines
         if board_lines else [],
     }
-    text, dropped = _fill({"head": [head], **sections},
-                          ("head", "alerts", "bots", "board"), max(64, int(limit)))
-    if dropped:
-        note = f"... {dropped} more line(s) hidden; detail is one button away"
-        while text and len("\n".join(text + [note])) > limit:
-            text.pop()
-        text.append(note)
-    return "\n".join(text)
+    kept, dropped = _fit(sections, _FILL, max(64, int(limit)))
+    return _render(kept, dropped, max(64, int(limit)))
 
 
 def _coordinator_snapshot(snapshots: Sequence[Snapshot],

@@ -15,6 +15,7 @@ from unittest import mock
 
 from swarmly.telegram import control_center as cc
 from swarmly.telegram import control as ct
+from swarmly.telegram.snapshot import Snapshot
 from tests.test_telegram_channel import GROUP, make_channel, make_config, run
 
 CHAT = GROUP
@@ -371,8 +372,26 @@ class TestWhatEachBotSpent(unittest.TestCase):
         # A peer that has said nothing is absent from the map, so it renders unknown -- not a
         # zero it never reported.
         self.assertNotIn("Codex", channel.control_usage())
-        self.assertEqual(ct.usage_line("Codex", None),
-                         "Codex: usage unknown (no turns recorded)")
+        # Its card row says so too: ``?`` in every cell it never reported (#241).
+        quiet = ct.bot_row(Snapshot(alias="Codex", state="idle", since=1_800_000_000.0,
+                                    at=1_800_000_010.0, every=60.0),
+                           now=1_800_000_010.0)
+        self.assertIn("? turns", quiet)
+        self.assertIn("? tok", quiet)
+        self.assertNotIn("0 turns", quiet)
+
+    def test_each_row_carries_the_role_the_swarm_gave_that_bot(self):
+        """#241: the role is the roster's (``peers[*].role``), never guessed from the board."""
+        channel = self.channel()
+        self.assertEqual(channel.control_roles(), {})
+        channel.config.identity.role = "coordinator"
+        channel.config.peer_roles.update({"Codex": "reviewer", "Antigravity": "qa-tester"})
+        self.assertEqual(channel.control_roles(),
+                         {"Hermes": "coordinator", "Codex": "reviewer",
+                          "Antigravity": "qa-tester"})
+        row = [line for line in channel.control_text().splitlines()
+               if " Hermes · " in line][0]
+        self.assertIn("Hermes · coordinator", row)
 
     def test_a_peers_spend_arrives_on_its_pulse(self):
         from swarmly.telegram.presence import Pulse
@@ -386,9 +405,9 @@ class TestWhatEachBotSpent(unittest.TestCase):
                                                   "tokens_out_known": 0, "cost_usd": 0.10,
                                                   "cost_known": 3}}}))
         text = channel.control_text()
-        self.assertIn("Codex:", text)
-        self.assertIn("900", text)                     # its input tokens
-        self.assertIn("unknown", text)                 # output was never reported: not a zero
+        self.assertIn(" Codex · ", text)
+        self.assertIn("900+?", text)                   # its input tokens, and the side that
+        self.assertNotIn("1.0k", text)                 # was never reported: not a zero
 
     def test_the_snapshot_carries_the_usage_and_a_peer_keeps_the_newest(self):
         from swarmly.telegram.presence import Pulse
@@ -432,7 +451,7 @@ class TestOneRowPerBotWhicheverNameItArrivesUnder(unittest.TestCase):
         self.assertEqual(names.count("codex"), 1, names)
         self.assertNotIn("codexbot", names, "the handle must fold into the alias")
         text = channel.control_text()
-        self.assertEqual(len([line for line in text.splitlines() if line.startswith("Codex")]),
+        self.assertEqual(len([line for line in text.splitlines() if " Codex · " in line]),
                          1, text)
         self.assertNotIn("stale 2.0d", text)
 
