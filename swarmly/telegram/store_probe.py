@@ -199,7 +199,7 @@ class StoreProbe:
             try:
                 await self.channel.send(f"Store test {run}: {report['summary']}",
                                         chat_id=state.origin[0], thread_id=state.origin[1],
-                                        allow_when_frozen=True)
+                                        allow_when_frozen=True, address_peers=False)
             except Exception:                          # noqa: BLE001 - the file has it
                 logger.warning("store test %s: the summary was not posted", run,
                                exc_info=True)

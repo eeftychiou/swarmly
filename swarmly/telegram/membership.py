@@ -856,8 +856,9 @@ class Membership:
             # backlog with "bus: unknown, coordinator: none" while the coordinator was up).
             joining = self.dynamic and not self.joined()
             if self.is_coordinator() or target or (not self.state.coordinator and not joining):
+                # It lists every bot by name: an answer, never a call to each of them.
                 await self.ch.send(await self.status_text(),
-                                   reply_to_message_id=event.message_id)
+                                   reply_to_message_id=event.message_id, address_peers=False)
             return True
         handles = [a.lstrip("@") for a in args if a.startswith("@")]
         roles = [a for a in args if not a.startswith("@")]
