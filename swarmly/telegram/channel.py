@@ -2404,7 +2404,11 @@ class AgentChannel:
             # A restarted peer that is still frozen says FROZEN again right after ONLINE.
             if self._peers_frozen.pop(alias, None) is None:
                 return
-            self._peer_back(alias)
+            if intent == "RESUMED":
+                # Only a resume: a restarted peer that is still frozen says ONLINE and then
+                # FROZEN again a second later (live, 24 Oct 14:13: Codex's restart woke the
+                # coordinator, which handed it work it bounced at once).
+                self._peer_back(alias)
         else:
             return
         save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
@@ -2418,16 +2422,41 @@ class AgentChannel:
                 return
         except Exception:                                  # noqa: BLE001
             return
-        where = getattr(self, "_last_turn_place", None)
-        home = self.config.identity.home_channel_id
-        if where is None and home is None:
+        where = self._work_place()
+        if where is None:
+            # No topic the coordinator works in: say nothing rather than start a turn in
+            # General (live, 24 Oct 14:14: a restart left no place, and the work went there).
+            logger.info("peer back: %s can act again; no work topic to say it in", alias)
             return
-        chat_id, thread_id = where if where is not None else (int(home), None)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._peer_back_after_settle(alias, where))
+        self._self_tasks.add(task)
+
+    #: A peer has to stay back this long before the coordinator is told.
+    PEER_BACK_SETTLE_SECONDS = 60.0
+
+    async def _peer_back_after_settle(self, alias: str, where: Tuple[int, Optional[int]]) -> None:
+        await _maybe_await(self._sleep(self.PEER_BACK_SETTLE_SECONDS))
+        if alias in self.frozen_peers():
+            return                                         # it froze again: nothing changed
+        chat_id, thread_id = where
         role = str((getattr(self.config, "peer_roles", {}) or {}).get(alias) or "")
         self._run_own_task(
             f"[Transport notice] {alias}" + (f" ({role})" if role else "") + " can act again: "
             "any stand-in for its work has ended. Give it open work that fits, or say why not.",
             chat_id, thread_id, self.topics.name(chat_id, thread_id))
+
+    def _work_place(self) -> Optional[Tuple[int, int]]:
+        """The forum topic this bot last took a turn in, kept across restarts; never General."""
+        where = getattr(self, "_last_turn_place", None)
+        if where is None:
+            saved = load_state(_state_file(self.config, "work-place"), "work place")
+            if isinstance(saved.get("chat_id"), int) and isinstance(saved.get("thread_id"), int):
+                where = (saved["chat_id"], saved["thread_id"])
+        return where if where is not None and where[1] is not None else None
 
     def _freeze_from_pulse(self, alias: str, pulse: Any) -> None:
         """A pulse says whether its bot is frozen. Keep the peer-freeze table in step with it,
@@ -7668,7 +7697,12 @@ class AgentChannel:
         self.__dict__["_turn_lease_term"] = 0            # never carry a last turn's term
         adapter.acting_coordinator = await self._acting_coordinator()
         adapter.drift_path = str(self.drift.path or "")          # the guard reports here
-        self._last_turn_place = (event.chat_id, event.thread_id)  # where a peer-back turn goes
+        if event.thread_id is not None and (event.chat_id, event.thread_id) != getattr(
+                self, "_last_turn_place", None):
+            self._last_turn_place = (event.chat_id, event.thread_id)  # where peer-back goes
+            save_state(_state_file(self.config, "work-place"),
+                       {"chat_id": int(event.chat_id), "thread_id": int(event.thread_id)},
+                       "work place")
         adapter.lease_term = self._turn_term()
         turn = asyncio.ensure_future(adapter.respond(incoming))
         self._current_turn = turn
