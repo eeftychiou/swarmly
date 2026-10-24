@@ -1666,10 +1666,13 @@ class AgentChannel:
         return self._command_reply(command, event)
 
     def _storetest_command(self, event: ChannelEvent) -> str:
-        """/storetest@bot: this bot leads one run of the Telegram store check (phase 0)."""
+        """/storetest@bot [-Alias ...]: this bot leads one run of the Telegram store check
+        (topic registry, phase 0); ``-Alias`` leaves a bot out of it."""
         if not self.config.is_admin(event.author_id):
             return "Only the admin can start a store test."
-        run = self.store_probe.start(origin=(event.chat_id, event.thread_id))
+        skip = tuple(word[1:] for word in (event.text or "").split()[1:]
+                     if word.startswith("-") and len(word) > 1)
+        run = self.store_probe.start(origin=(event.chat_id, event.thread_id), skip=skip)
         return (f"Store test {run} started: every bot posts probe lines in Swarm pulse, a "
                 "test file is pinned for about a minute, and the result comes here.")
 

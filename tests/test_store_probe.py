@@ -161,6 +161,21 @@ class StoreProbeTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["missing"], ["DeepSeek"])
 
+    def test_a_bot_left_out_is_not_expected(self):
+        group, (claude, deepseek, reasonix) = swarm("Claudebot", "DeepSeek", "Reasonix")
+        group.channels.remove(reasonix)    # it does not take part
+        claude.store_probe.skipped = set()
+        original = StoreProbe.start
+
+        def start(self, origin=None, skip=()):
+            return original(self, origin, skip=("Reasonix",))
+
+        with mock.patch.object(StoreProbe, "start", start):
+            _run, state = run_test(group, claude)
+        report = claude.store_probe.verdict(state)
+        self.assertTrue(report["ok"], report["summary"])
+        self.assertIn("left out: Reasonix", report["summary"])
+
     def test_send_errors_are_reported(self):
         group, (claude, deepseek) = swarm("Claudebot", "DeepSeek")
         group.send_fails.add("DeepSeek")

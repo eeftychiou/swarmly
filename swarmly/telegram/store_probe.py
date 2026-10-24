@@ -113,6 +113,9 @@ class StoreProbe:
         self.channel = channel
         self.clock = clock
         self.runs: Dict[str, Run] = {}
+        #: Bots the admin left out of the test (``/storetest@bot -Reasonix``): a bot running
+        #: the same harness and model as another adds nothing, and an old release never answers.
+        self.skipped: set = set()
         self._tasks: set = set()
 
     # -- small helpers -------------------------------------------------------------------
@@ -142,8 +145,10 @@ class StoreProbe:
         return _message_id(sent)
 
     # -- starting a run (the lead) -------------------------------------------------------
-    def start(self, origin: Optional[Tuple[int, Optional[int]]] = None) -> str:
+    def start(self, origin: Optional[Tuple[int, Optional[int]]] = None,
+              skip: Tuple[str, ...] = ()) -> str:
         """Begin a run with this bot as the lead; returns the run id at once."""
+        self.skipped = {name.strip() for name in skip if name.strip()}
         run = f"{int(self.clock())}-{self.alias.lower()}"
         self.runs[run] = Run(run=run, lead=self.alias, started=self.clock(), origin=origin)
         self._spawn(self._lead(run))
@@ -178,7 +183,7 @@ class StoreProbe:
             await self._unpin(state)
 
     async def _all_results(self, state: Run) -> None:
-        while not all(p in state.results for p in self.peers()):
+        while not all(p in state.results for p in self.peers() if p not in self.skipped):
             state.results_event.clear()
             await state.results_event.wait()
 
@@ -329,7 +334,8 @@ class StoreProbe:
 
     # -- the verdict (the lead) ----------------------------------------------------------
     def verdict(self, state: Run) -> Dict[str, Any]:
-        everyone = [self.alias, *self.peers()]
+        everyone = [self.alias, *[p for p in self.peers() if p not in self.skipped]]
+        # A skipped bot that answered anyway is not checked: it was left out on purpose.
         reported = [a for a in everyone if a in state.results]
         missing = [a for a in everyone if a not in state.results]
         problems: List[str] = []
@@ -372,6 +378,7 @@ class StoreProbe:
         ok = not problems and not missing
         summary = (f"{'PASS' if ok else 'FAIL'}: {len(reported)}/{len(everyone)} bots reported"
                    + (f" (no result from {', '.join(missing)})" if missing else "")
+                   + (f"; left out: {', '.join(sorted(self.skipped))}" if self.skipped else "")
                    + f"; slowest burst of {BURST} lines {slowest:.1f}s"
                    + (f"; {len(problems)} problem(s): " + "; ".join(problems[:6])
                       if problems else ""))
