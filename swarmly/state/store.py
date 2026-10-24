@@ -142,6 +142,42 @@ class StateStore:
         return WriteResult(applied, key, pos=pos, version=self.version(key),
                            reason=self.log.rejected.get(pos, ""))
 
+    async def write_many(self, items: List[Tuple[str, Optional[Dict[str, Any]]]]
+                         ) -> List[WriteResult]:
+        """Several writes made together, each a compare-and-set against the version this bot
+        sees now; the backend sends them in as few messages as it can (§1b: batched)."""
+        await self.refresh()
+        lease = self.lease()
+        holder = lease.held_by(self.clock())
+        term = lease.term if K.norm(holder or "") == self.alias else 0
+        results: List[Optional[WriteResult]] = []
+        wires: List[Dict[str, Any]] = []
+        for key, value in items:
+            if not K.valid(key) or key == K.LEASE:
+                results.append(WriteResult(False, key, reason="not a batch key"))
+            elif not K.may_write(key, self.alias, holder):
+                results.append(WriteResult(False, key, reason=f"{self.alias} may not write {key}"))
+            else:
+                results.append(None)
+                wires.append({"k": key, "b": self.version(key), "t": term, "w": self.alias,
+                              "v": value})
+        placed = await self._append_many(wires) if wires else []
+        for wire, (pos, at) in zip(wires, placed):
+            self.log.add(Op.from_wire(wire, pos=pos, at=at, writer=self.alias))
+        await self.refresh()
+        self._write_cache()
+        sent = iter(zip(wires, placed))
+        final: List[WriteResult] = []
+        for result in results:
+            if result is not None:
+                final.append(result)
+                continue
+            wire, (pos, _at) = next(sent)
+            final.append(WriteResult(pos not in self.log.rejected, wire["k"], pos=pos,
+                                     version=self.version(wire["k"]),
+                                     reason=self.log.rejected.get(pos, "")))
+        return final
+
     async def claim_lease(self, ttl: float, *, confirm: bool = True) -> WriteResult:
         lease = self.lease()
         mine = K.norm(lease.holder or "") == self.alias
@@ -179,6 +215,10 @@ class StateStore:
     # -- backend hooks ---------------------------------------------------------------------
     async def _append(self, wire: Dict[str, Any]) -> Tuple[int, float]:
         raise NotImplementedError
+
+    async def _append_many(self, wires: List[Dict[str, Any]]) -> List[Tuple[int, float]]:
+        """One message per op unless the backend can do better."""
+        return [await self._append(wire) for wire in wires]
 
     async def _pull(self) -> List[Op]:
         return []

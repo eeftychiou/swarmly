@@ -8,8 +8,10 @@
 
       {"k":"<key>","b":<base>,"t":<term>,"w":"<alias>","v":{...}}
 
-  Its message id is the op's position and its Telegram date the op's time, so every bot
-  folds the same log the same way. The writer is who Telegram says sent it, not who the line
+  Several writes made together go in one line as a JSON list (``ref=batch``), as the design
+  asks, so a beat that changes ten keys is one message. An op's position is
+  ``message id * SLOTS + its index in the message`` and its time the message's Telegram date,
+  so every bot folds the same log the same way. The writer is who Telegram says sent it, not who the line
   claims. A value too big for one message goes as a JSON file with the header as caption.
 * **The snapshot is a pinned file.** The lease holder posts the state as a new JSON file,
   pins it and unpins the previous one; ``getChat`` returns the chat's newest *sent* pin, so a
@@ -45,6 +47,9 @@ STATE_INTENT = "STATE"
 SNAPSHOT_INTENT = "SNAPSHOT"
 #: Over this, the op goes as a file (Telegram's limit is 4096; the header needs room).
 MAX_LINE_CHARS = 3500
+#: One message may carry up to this many ops (a batch); an op's position is
+#: ``message_id * SLOTS + its index in the message``, so the order stays total.
+SLOTS = 64
 #: A snapshot covers only ops at least this old.
 SNAPSHOT_SETTLE_SECONDS = 15.0
 
@@ -119,19 +124,26 @@ class TelegramStore(StateStore):
             self._files.append((int(message_id), float(date), author, read_file))
             return True
         try:
-            wire = json.loads(body)
-            self._inbox.append(Op.from_wire(wire, pos=message_id, at=date, writer=author))
+            self._inbox.extend(self._ops(json.loads(body), message_id, date, author))
         except (ValueError, KeyError, TypeError):
             logger.warning("state: unreadable STATE line %s from %s", message_id, author)
         return True
+
+    @staticmethod
+    def _ops(payload: Any, message_id: int, date: float, author: str) -> List[Op]:
+        """The ops of one message: an object, or a list of them (a batch)."""
+        wires = payload if isinstance(payload, list) else [payload]
+        return [Op.from_wire(wire, pos=int(message_id) * SLOTS + index, at=date,
+                             writer=author)
+                for index, wire in enumerate(wires[:SLOTS])]
 
     async def _pull(self) -> List[Op]:
         ops, self._inbox = self._inbox, []
         files, self._files = self._files, []
         for message_id, date, author, read in files:
             try:
-                wire = json.loads((await read()).decode("utf-8"))
-                ops.append(Op.from_wire(wire, pos=message_id, at=date, writer=author))
+                ops.extend(self._ops(json.loads((await read()).decode("utf-8")), message_id,
+                                     date, author))
             except Exception:                          # noqa: BLE001 - one bad file
                 logger.warning("state: STATE file %s from %s unreadable", message_id, author,
                                exc_info=True)
@@ -139,17 +151,43 @@ class TelegramStore(StateStore):
 
     # -- outbound --------------------------------------------------------------------------
     async def _append(self, wire: Dict[str, Any]) -> Tuple[int, float]:
-        body = json.dumps(wire, separators=(",", ":"), sort_keys=True)
-        head = header(STATE_INTENT, wire["k"])
-        try:
-            if len(head) + len(body) + 2 > MAX_LINE_CHARS:
-                posted = await self.io.post_file(f"state-{wire['k'].replace('/', '_')}.json",
-                                                 body.encode("utf-8"), head)
-            else:
-                posted = await self.io.post_line(f"{head}\n\n{body}")
-        except Exception as exc:                       # noqa: BLE001
-            raise StoreError(f"the write did not reach Telegram: {exc}") from exc
-        return int(posted.message_id), float(posted.date)
+        return (await self._append_many([wire]))[0]
+
+    async def _append_many(self, wires: List[Dict[str, Any]]) -> List[Tuple[int, float]]:
+        """As few messages as fit: lines of up to SLOTS ops under MAX_LINE_CHARS; a single
+        op too big for a line goes as a file."""
+        out: List[Tuple[int, float]] = []
+        chunk: List[Dict[str, Any]] = []
+
+        async def flush() -> None:
+            if not chunk:
+                return
+            payload: Any = chunk[0] if len(chunk) == 1 else list(chunk)
+            ref = chunk[0]["k"] if len(chunk) == 1 else "batch"
+            body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            head = header(STATE_INTENT, ref)
+            try:
+                if len(head) + len(body) + 2 > MAX_LINE_CHARS:
+                    name = f"state-{ref.replace('/', '_')}.json"
+                    posted = await self.io.post_file(name, body.encode("utf-8"), head)
+                else:
+                    posted = await self.io.post_line(f"{head}\n\n{body}")
+            except Exception as exc:                   # noqa: BLE001
+                raise StoreError(f"the write did not reach Telegram: {exc}") from exc
+            out.extend((int(posted.message_id) * SLOTS + i, float(posted.date))
+                       for i in range(len(chunk)))
+            chunk.clear()
+
+        size = 0
+        for wire in wires:
+            length = len(json.dumps(wire, separators=(",", ":"))) + 1
+            if chunk and (len(chunk) >= SLOTS or size + length > MAX_LINE_CHARS - 200):
+                await flush()
+                size = 0
+            chunk.append(wire)
+            size += length
+        await flush()
+        return out
 
     # -- the snapshot ----------------------------------------------------------------------
     async def _load_snapshot(self) -> None:

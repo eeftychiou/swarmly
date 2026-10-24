@@ -602,6 +602,32 @@ class TelegramStoreTests(unittest.TestCase):
             self.assertEqual(late.read("topic/7"), {"n": 1})
         run(go())
 
+    def test_writes_made_together_go_in_one_message(self):
+        async def go():
+            a, b = self.store("Claudebot"), self.store("DeepSeek")
+            await a.start()
+            await b.start()
+            await a.claim_lease(10 ** 6)
+            await b.refresh()
+            first = next(self.group.ids)
+            items = [(K.agent("Claudebot", f"x{i}"), {"i": i}) for i in range(10)]
+            items.append(("agent/deepseek/profile", {"forged": True}))
+            results = await a.write_many(items)
+            used = next(self.group.ids) - first - 1
+            self.assertEqual(used, 1, "ten writes, one message")
+            self.assertTrue(all(r.applied for r in results[:10]))
+            self.assertFalse(results[10].applied)
+            await b.refresh()
+            self.assertEqual(b.read("agent/claudebot/x9"), {"i": 9})
+            self.assertEqual(a.state_hash(), b.state_hash())
+            big = [(K.agent("Claudebot", f"y{i}"), {"pad": "z" * 900}) for i in range(8)]
+            first = next(self.group.ids)
+            self.assertTrue(all(r.applied for r in await a.write_many(big)))
+            self.assertGreater(next(self.group.ids) - first - 1, 1, "split under the limit")
+            await b.refresh()
+            self.assertEqual(a.state_hash(), b.state_hash())
+        run(go())
+
     def test_other_traffic_is_not_the_stores(self):
         a = self.store("Claudebot")
         self.assertFalse(a.ingest(message_id=1, date=1, author="deepseek",
