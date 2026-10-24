@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from swarmly.telegram.owed import ADMIN, CI, OwedError, Row
 
@@ -106,8 +106,16 @@ def _question_key(owes: str) -> str:
 
 
 def parse_line(line: str, *, topic: str = "", place: str = "",
-               at: Optional[float] = None) -> Row:
-    """One ``WAIT`` line as a row. Raises :class:`WaitError` with the reason it cannot be one."""
+               at: Optional[float] = None,
+               unable: Optional[Mapping[str, str]] = None) -> Row:
+    """One ``WAIT`` line as a row. Raises :class:`WaitError` with the reason it cannot be one.
+
+    *unable* maps a bot's alias (lower case) to why it cannot act -- paused, frozen, out of
+    quota, down. A row owed by such a bot is a row nothing will deliver, so the line is refused
+    with one line and the peer is named as the reason (#246): the transport accepted
+    ``WAIT … from Antigravity`` while Antigravity's own pulse said ``paused``, and the round
+    then waited on a bot that was never going to answer.
+    """
     moment = time.time() if at is None else float(at)
     words = _words(line)
     if not words or words[0].upper() != WAIT_MARKER:
@@ -130,6 +138,9 @@ def parse_line(line: str, *, topic: str = "", place: str = "",
     if KINDS[kind] == "ci" and debtor:
         raise WaitError("WAIT ci is owed by the transport, not a bot: drop "
                         f"'from {debtor}'")
+    cannot = str((unable or {}).get(str(debtor or "").strip().lower(), "") or "").strip()
+    if debtor and cannot:
+        raise WaitError(f"{debtor} is {cannot}: name a peer who can act")
     owes = _owes(kind, words, head, item)
     row_kind = KINDS[kind]
     if row_kind == "handoff":
@@ -186,7 +197,8 @@ def from_wake(spec: Any, *, alias: str, topic: str = "", at: Optional[float] = N
 
 
 def extract_waits(text: str, *, topic: str = "", place: str = "",
-                  at: Optional[float] = None) -> Tuple[str, List[Row], List[str]]:
+                  at: Optional[float] = None,
+                  unable: Optional[Mapping[str, str]] = None) -> Tuple[str, List[Row], List[str]]:
     """``(text, rows, reasons)``: every ``WAIT`` line turned into a row and removed.
 
     A line is stripped in every case -- a refused one is said back into the reply instead of
@@ -206,7 +218,7 @@ def extract_waits(text: str, *, topic: str = "", place: str = "",
             kept.append(line)           # "WAITING for the bus" is prose, not a line
             continue
         try:
-            rows.append(parse_line(line, topic=topic, place=place, at=at))
+            rows.append(parse_line(line, topic=topic, place=place, at=at, unable=unable))
         except WaitError as exc:
             reasons.append(str(exc))
     return "\n".join(kept).strip(), rows, reasons

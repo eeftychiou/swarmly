@@ -155,6 +155,9 @@ class Stall:
     step: str                  # reminder | coordinator | admin
     debtor: str
     text: str
+    #: The rung's index in :data:`STALL_STEPS`. Usually one past the row's own count, and
+    #: higher when a rung was skipped because its deliverer cannot act (#246).
+    rung: int = 0
 
 
 def _wait_words(minutes: float) -> str:
@@ -163,9 +166,27 @@ def _wait_words(minutes: float) -> str:
     return f"{value:g} minute" if value == 1 else f"{value:g} minutes"
 
 
-def stall_text(row: Row, step: str, *, minutes: float) -> str:
-    """What each rung says. A ladder that repeats itself is a ladder nobody reads."""
+def stall_text(row: Row, step: str, *, minutes: float, unable: str = "",
+               skipped: bool = False) -> str:
+    """What each rung says. A ladder that repeats itself is a ladder nobody reads.
+
+    *unable* is why the debtor cannot take its own reminder (paused, frozen, down), when that
+    is why this rung is the coordinator's: the fact belongs in the sentence, or the
+    coordinator reads a reminder that was never delivered and wonders where it went (#246).
+    *skipped* says whether **this tick** is the one that skipped the reminder. A row already at
+    the coordinator rung whose debtor was paused afterwards was not skipped -- it was
+    delivered, and the debtor then stopped acting -- and saying otherwise is a false report
+    (#248 review).
+    """
     waited = f"nothing has moved for {_wait_words(minutes)}"
+    if unable and step != STALL_REMINDER:
+        if skipped:
+            return (f"{row.debtor} owes {row.owes} on {row.subject} and {waited}, but cannot "
+                    f"act ({unable}), so its reminder was skipped. Coordinator: reassign it "
+                    f"or escalate it; the table says nobody else can.")
+        return (f"{row.debtor} owes {row.owes} on {row.subject} and {waited}, and cannot act "
+                f"({unable}) any more. Coordinator: reassign it or escalate it; the table "
+                f"says nobody else can.")
     if step == STALL_REMINDER:
         return (f"{row.debtor} owes {row.owes} on {row.subject} and {waited}. This is the "
                 f"reminder: act on it, or say in one line why not.")
@@ -208,15 +229,8 @@ def overdue(row: Row, *, now: float, limit: float) -> Optional[float]:
     return None
 
 
-def away_text(row: Row, why: str, *, minutes: float) -> str:
-    """The rung for a debt whose debtor cannot act: straight to the coordinator (#246)."""
-    return (f"{row.debtor} owes {row.owes} on {row.subject}, but {row.debtor} is {why} and "
-            f"cannot act (nothing has moved for {_wait_words(minutes)}). Coordinator: give it "
-            f"to a peer who can, or tell the admin.")
-
-
 def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float,
-           away: Optional[Mapping[str, str]] = None) -> List[Stall]:
+           unable: Optional[Mapping[str, str]] = None) -> List[Stall]:
     """The rungs due now: a row that is overdue, one rung at a time.
 
     Overdue is :func:`overdue`: the row's own ``deadline`` first, then ``updated_at`` plus
@@ -231,15 +245,18 @@ def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float,
     one reminder it promised itself -- and it is written down in ``docs/telegram-channel.md``
     rather than papered over (#213 review).
 
-    **A debtor that cannot act skips its own rung** (#246). The reminder is the debtor's to
-    deliver, so a paused, frozen or DOWN debtor never sent it and the ladder never climbed:
-    #245 waited seven hours on a paused Antigravity with every bot idle. *away* maps the
-    lower-cased aliases that cannot act to why; such a row goes to the coordinator rung at
-    once, without waiting out *minutes* (when the ladder is on at all).
+    **A rung whose deliverer cannot act is skipped (#246).** ``unable`` maps a bot's alias
+    (lower case) to why it cannot act -- paused, frozen, out of quota, down -- and the ladder
+    exists to route round a bot that is not there. The reminder rung is the debtor's alone, so
+    a paused debtor never delivered it and the coordinator and admin rungs never came: the
+    round sat for 7.5 hours with every pulse saying ``idle``. Skipping lifts the row straight
+    to the rung whose deliverer can act, and :attr:`Stall.rung` records how far it climbed so
+    the next tick carries on from there rather than re-sending the skipped rung.
     """
     moment = time.time() if now is None else float(now)
     limit = max(0.0, float(minutes or 0)) * 60.0
-    gone = {str(alias).strip().lower(): str(why) for alias, why in (away or {}).items()}
+    stuck = {str(alias).strip().lower(): str(why).strip()
+             for alias, why in (unable or {}).items() if str(alias or "").strip()}
     out: List[Stall] = []
     for row in sorted(rows, key=lambda item: item.id):
         if not row.is_open:
@@ -247,19 +264,24 @@ def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float,
         rung = int(row.stalls or 0)
         if rung >= len(STALL_STEPS):
             continue                      # the ladder is done: nothing left to climb
-        why = gone.get(str(row.debtor or "").strip().lower(), "") if rung == 0 else ""
         waited = overdue(row, now=moment, limit=limit)
-        if waited is None and why and limit > 0:
-            waited = max(0.0, moment - float(row.updated_at or row.created_at or 0.0))
         if waited is None:
             continue
-        if why:
-            out.append(Stall(row=row.id, step=STALL_COORDINATOR, debtor=row.debtor,
-                             text=away_text(row, why, minutes=waited / 60.0)))
+        cannot = stuck.get(str(row.debtor or "").strip().lower(), "")
+        step_at = rung
+        skipped = bool(cannot and STALL_STEPS[step_at] == STALL_REMINDER)
+        if skipped:
+            # The reminder is the debtor's own rung and nobody else may deliver it, so a
+            # debtor that cannot act takes the row straight to the coordinator (#246). The
+            # rungs above are the coordinator's and the admin's, and neither is skipped here.
+            step_at += 1
+        if step_at >= len(STALL_STEPS):
             continue
-        step = STALL_STEPS[rung]
+        step = STALL_STEPS[step_at]
         out.append(Stall(row=row.id, step=step, debtor=row.debtor,
-                         text=stall_text(row, step, minutes=waited / 60.0)))
+                         text=stall_text(row, step, minutes=waited / 60.0, unable=cannot,
+                                         skipped=skipped),
+                         rung=step_at))
     return out
 
 
@@ -273,9 +295,7 @@ def advance(rows: Sequence[Row], decided: Sequence[Stall], *,
         row = by_id.get(stall.row)
         if row is None:
             continue
-        # A skipped rung counts as climbed: the next one is the rung after the one delivered.
-        delivered = STALL_STEPS.index(stall.step) + 1 if stall.step in STALL_STEPS else 0
-        row.stalls = max(int(row.stalls or 0) + 1, delivered)
+        row.stalls = max(int(row.stalls or 0) + 1, int(stall.rung or 0) + 1)
         row.updated_at = moment
         touched.append(row)
     return touched

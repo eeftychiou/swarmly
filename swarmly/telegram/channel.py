@@ -2430,6 +2430,39 @@ class AgentChannel:
         return {alias: dict(entry) for alias, entry in self._peers_frozen.items()
                 if entry.get("until") is None or float(entry["until"]) > now}
 
+    def blocked_peers(self) -> Dict[str, str]:
+        """Peers that cannot act now, and why: paused, out of quota, or DOWN (#246).
+
+        One answer for the two places that need it. The stall ladder reads it so a rung whose
+        deliverer is a paused or absent bot is skipped instead of waited on, and the ``WAIT``
+        parser reads it so a row is never opened with a debtor who will never answer. Keys are
+        lower-case aliases, because a line may write ``from Antigravity`` or ``from antigravity``.
+        """
+        out: Dict[str, str] = {}
+        try:
+            frozen = self.frozen_peers()
+        except Exception:                          # noqa: BLE001 - unknown is not blocked
+            frozen = {}
+        for alias, entry in frozen.items():
+            out[str(alias).strip().lower()] = {
+                "quota": "out of quota", "pause": "paused",
+            }.get(str(entry.get("ref") or ""), "frozen")
+        me = str(self.config.identity.alias or "").strip().lower()
+        try:
+            table, now = self.presence(), self.presence_clock()
+        except Exception:                          # noqa: BLE001 - no presence: no down peers
+            return out
+        for alias in self.config.peers:
+            key = str(alias).strip().lower()
+            if not key or key == me or key in out:
+                continue
+            try:
+                if table.is_down(alias, now):
+                    out[key] = "down"
+            except Exception:                      # noqa: BLE001 - one peer, one answer
+                continue
+        return out
+
     def _frozen_peers_note(self) -> str:
         """A line for every turn naming the frozen peers, so work is not handed to them."""
         peers = self.frozen_peers()
@@ -5043,27 +5076,23 @@ class AgentChannel:
         from swarmly.telegram.wait_line import ack, extract_waits
         body, rows, reasons = extract_waits(
             text or "", topic=self._topic_token(event.chat_id, event.thread_id),
-            place=self._place_key(event.chat_id, event.thread_id))
+            place=self._place_key(event.chat_id, event.thread_id),
+            unable=self.blocked_peers())
         if not rows and not reasons:
             return text
-        # A WAIT on a peer that cannot act is a debt nobody pays (24 Oct: `WAIT merge #245 ...
-        # from Antigravity` on a paused bot sat seven hours). It is refused like a message to
-        # that peer, and bounced back to this bot as a turn.
-        from swarmly.telegram.owed import ADMIN, CI
-        kept = []
-        for row in rows:
-            debtor = str(getattr(row, "debtor", "") or "").strip()
-            why = "" if debtor in (CI, ADMIN) else self.away_reason(debtor)
-            if not why:
-                kept.append(row)
+        # A WAIT on a peer that cannot act is refused by the parser (#248). The refusal is
+        # also bounced back to this bot as a turn, like a message to that peer, so it re-plans
+        # instead of reading its own reply (24 Oct: `WAIT merge #245 ... from Antigravity` on
+        # a paused bot sat seven hours).
+        for reason in reasons:
+            found = re.match(r"^(\S+) is (.+): name a peer who can act$", reason)
+            if not found:
                 continue
-            reasons = [*reasons, f"{debtor} is {why} and takes no work until it is back"]
-            self.record_violation("addressed_frozen_peer",
-                                  f"WAIT {row.kind} {row.subject} from {debtor} ({why})",
+            debtor, why = found.group(1).lstrip("@"), found.group(2)
+            self.record_violation("addressed_frozen_peer", f"WAIT from {debtor} ({why})",
                                   event.chat_id, event.thread_id)
             role, who = self._stand_in_for(debtor)
             self._tell_sender_undelivered(debtor, why, (role, who) if who else None, event)
-        rows = kept
         notes: List[str] = []
         if rows:
             try:
@@ -5830,12 +5859,7 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - a tick must survive
             logger.warning("owed guard: the table could not be read", exc_info=True)
             return []
-        away: Dict[str, str] = {}
-        for row in rows:
-            why = self.away_reason(row.debtor)
-            if why:
-                away[str(row.debtor).lower()] = why
-        decided = stalls(rows, now=moment, minutes=minutes, away=away)
+        decided = stalls(rows, now=moment, minutes=minutes, unable=self.blocked_peers())
         if not decided:
             return []
         # Who may deliver a rung. The table folds every writer's documents, so a bot that

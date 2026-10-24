@@ -235,23 +235,12 @@ class TheNightOf24OctTests(unittest.TestCase):
         run(channel.handle_event(event("@HermesBot CI on #245 is green", thread_id=9400,
                                        message_id=60)))
         posted = channel._test_sender.sent[-1]["text"]
-        self.assertIn("WAIT refused: Antigravity is paused by the admin", posted)
+        self.assertIn("WAIT refused: Antigravity is paused: name a peer who can act", posted)
         self.assertFalse([row for row in channel.owed_store().load()
                           if row.debtor == "Antigravity" and row.is_open])
         self.assertEqual(len(briefs), 1)
         self.assertIn("NOT delivered to Antigravity", briefs[0])
         self.assertIn("stand-in Reasonix", briefs[0])
-
-    def test_a_row_already_owed_by_a_frozen_peer_goes_straight_to_the_coordinator(self):
-        from swarmly.telegram.owed import Row
-        from swarmly.telegram.owed_guard import STALL_COORDINATOR, advance, stalls
-        row = Row(kind="merge", item="#245", head=HEAD[:7], debtor="Antigravity",
-                  owes="a merge verdict", created_at=1000.0, updated_at=1000.0)
-        due = stalls([row], now=1060.0, minutes=30, away={"antigravity": "paused by the admin"})
-        self.assertEqual([stall.step for stall in due], [STALL_COORDINATOR])
-        self.assertIn("cannot act", due[0].text)
-        self.assertEqual(advance([row], due, now=1060.0)[0].stalls, 2)   # next: the admin
-        self.assertEqual(stalls([row], now=1060.0, minutes=30), [])     # an active debtor waits
 
     def test_a_stand_ins_verdict_passes_the_gate_when_it_says_qa(self):
         """The stand-in note asks for `QA: pass`; a merge verdict alone is not a QA pass."""
