@@ -195,17 +195,22 @@ class StateLink:
             if self.channel.is_coordinator():
                 lease = store.lease()
                 mine = K.norm(lease.holder or "") == store.alias
-                if not mine or lease.expires_at - moment < LEASE_TTL_SECONDS / 2:
+                server = store.server_now()             # leases run on the log's clock
+                refused = False
+                if not mine or lease.expires_at - server < LEASE_TTL_SECONDS / 2:
                     result = await store.claim_lease(LEASE_TTL_SECONDS, confirm=False)
-                    done.append(f"lease {'claimed' if result.applied else 'refused'} "
+                    refused = not result.applied
+                    done.append(f"lease {'refused' if refused else 'claimed'} "
                                 f"(term {store.lease().term})")
                 fresh = sum(1 for o in store.log.ops if o.pos > store.snapshot_pos)
                 due = (moment - self._last_snapshot >= SNAPSHOT_EVERY_SECONDS
                        or fresh >= SNAPSHOT_AFTER_OPS)
-                if due and await store.publish_snapshot(now=moment):
+                # A beat whose lease write was refused publishes nothing (review, #263).
+                if due and not refused and await store.publish_snapshot():
                     self._last_snapshot = moment
                     done.append(f"snapshot to p{store.snapshot_pos}")
-                elif store.snapshot_message is None and await store.restore_from_cache():
+                elif not refused and store.snapshot_message is None \
+                        and await store.restore_from_cache():
                     self._last_snapshot = moment
                     done.append("snapshot restored")
             if moment - self._last_beat >= self.beat_seconds:

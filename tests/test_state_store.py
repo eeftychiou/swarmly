@@ -29,6 +29,16 @@ class Clock:
         return self.t
 
 
+class OffsetClock:
+    """A bot's own clock: the server's, off by ``offset`` seconds."""
+
+    def __init__(self, server, offset=0.0):
+        self.server, self.offset = server, offset
+
+    def __call__(self):
+        return self.server() + self.offset
+
+
 def op(pos, key, base, writer, value, term=0, at=None):
     return Op(pos=pos, key=key, base=base, term=term, writer=writer, value=value,
               at=float(pos if at is None else at))
@@ -220,6 +230,79 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(log.state_hash(), before)
         log.add(op(5, "topic/7", 2, "deepseek", {"n": 3}, term=2, at=720))
         self.assertEqual(log.value("topic/7"), {"n": 3})
+
+
+class TwoClockTests(unittest.TestCase):
+    """Review, #263: lease decisions run on the log's clock (Telegram's dates), never on a
+    bot's own -- every test before used one shared clock, which is why this stayed green."""
+
+    def setUp(self):
+        self.server = Clock()
+        self.group = FakeGroup(self.server)
+
+    def store(self, alias, offset=0.0):
+        local = OffsetClock(self.server, offset)
+        store = TelegramStore(alias, FakeIO(self.group, alias), clock=local)
+        store.CONFIRM_SECONDS = 0.0
+        self.group.stores[alias] = store
+        return store, local
+
+    def test_a_clock_far_behind_still_climbs_to_the_next_term(self):
+        """A holder whose clock stepped back past its TTL renewed the same term forever."""
+        async def go():
+            a, local = self.store("Claudebot")
+            await a.start()
+            await a.claim_lease(600)
+            self.server.t += 900                          # the lease ran out, by the log
+            local.offset = -900                           # ... but not by Claudebot's clock
+            result = await a.claim_lease(600)
+            self.assertTrue(result.applied, result.reason)
+            self.assertEqual(a.lease().term, 2)
+            self.assertTrue(a.holds_lease())
+        run(go())
+
+    def test_a_bot_behind_does_not_think_it_holds_an_expired_lease(self):
+        async def go():
+            a, local = self.store("Claudebot", offset=-20)
+            await a.start()
+            await a.claim_lease(600)
+            self.server.t += 610                          # expired by the log's clock
+            self.assertFalse(a.holds_lease(), "Claudebot's own clock still says 590 s")
+            self.assertFalse(await a.publish_snapshot(force=True))
+        run(go())
+
+    def test_a_snapshot_from_a_bot_that_missed_the_first_claim_of_a_term_loses(self):
+        """Claudebot's stream stalls, DeepSeek takes term 2 first, Claudebot claims term 2 too
+        (it never saw DeepSeek's claim) and pins it: the first claim of the term wins."""
+        async def go():
+            a, _ = self.store("Claudebot", offset=-20)
+            b, _ = self.store("DeepSeek")
+            await a.start()
+            await b.start()
+            await a.claim_lease(600)
+            await b.refresh()
+            b.io.hold_for = {"Claudebot"}                 # Claudebot hears nothing from b
+            self.server.t += 700
+            self.assertTrue((await b.claim_lease(600)).applied)
+            self.assertTrue((await b.write("topic/7", {"by": "b"})).applied)
+            self.assertTrue((await a.claim_lease(600)).applied)   # in Claudebot's own view
+            self.server.t += 60
+            self.assertTrue(await a.publish_snapshot())   # a stale term 2, pinned
+            c, _ = self.store("Codex")
+            await c.start()                               # a fresh bot adopts it, for now
+            self.assertEqual(c.lease().holder, "claudebot")
+            await b.refresh()
+            self.assertEqual(b.lease().holder, "deepseek", "b refuses the later claim")
+            self.server.t += 60
+            self.assertTrue(await b.publish_snapshot())
+            await c._load_snapshot()                      # b's next snapshot heals c
+            self.assertEqual(c.lease().holder, "deepseek")
+            self.assertEqual(c.read("topic/7"), {"by": "b"})
+            self.group.release()                          # Claudebot's stream resumes
+            await a.refresh()
+            self.assertEqual(a.lease().holder, "deepseek")
+            self.assertFalse(a.holds_lease())
+        run(go())
 
 
 class ClassifierTests(unittest.TestCase):

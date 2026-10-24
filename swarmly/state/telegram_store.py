@@ -37,7 +37,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from swarmly.state.log import Op
+from swarmly.state.log import Op, StateLog
 from swarmly.state.store import StateStore, StoreError
 from swarmly.telegram.wire import Envelope, MessageType, format_message, parse_message
 
@@ -120,6 +120,7 @@ class TelegramStore(StateStore):
             return False
         if intent == SNAPSHOT_INTENT:
             return True                                # read through the pin, not here
+        self.observe_time(float(date))
         if read_file is not None:
             self._files.append((int(message_id), float(date), author, read_file))
             return True
@@ -133,9 +134,14 @@ class TelegramStore(StateStore):
     def _ops(payload: Any, message_id: int, date: float, author: str) -> List[Op]:
         """The ops of one message: an object, or a list of them (a batch)."""
         wires = payload if isinstance(payload, list) else [payload]
+        if len(wires) > SLOTS:
+            # More ops than positions: refuse the whole message rather than lose some.
+            logger.warning("state: message %s from %s carries %d ops (at most %d); ignored",
+                           message_id, author, len(wires), SLOTS)
+            return []
         return [Op.from_wire(wire, pos=int(message_id) * SLOTS + index, at=date,
                              writer=author)
-                for index, wire in enumerate(wires[:SLOTS])]
+                for index, wire in enumerate(wires)]
 
     async def _pull(self) -> List[Op]:
         ops, self._inbox = self._inbox, []
@@ -215,18 +221,26 @@ class TelegramStore(StateStore):
 
     async def publish_snapshot(self, *, now: Optional[float] = None,
                                force: bool = False) -> bool:
-        """Post and pin the state (the lease holder only). False when there is nothing new."""
-        moment = self.clock() if now is None else now
+        """Post and pin the state (the lease holder only, by the log's clock). False when
+        there is nothing new."""
+        moment = self.server_now() if now is None else now
         if not self.holds_lease(moment):
             return False
         settled = [o.pos for o in self.log.ops if o.at <= moment - SNAPSHOT_SETTLE_SECONDS]
         upto = settled[-1] if settled else self.log.base_pos
         if upto <= self._snapshot_pos and not force:
             return False
-        data = json.dumps(self.log.snapshot(upto=upto), separators=(",", ":")).encode()
+        snapshot = self.log.snapshot(upto=upto)
+        lease = self.lease()
+        if snapshot["term"] != lease.term or                 str(snapshot.get("holder") or "").lower() != self.alias:
+            # The cut's lease is not this bot's current one (its claim has not settled yet):
+            # publishing it would pin a term this bot does not hold in that cut.
+            return False
+        data = json.dumps(snapshot, separators=(",", ":")).encode()
+        cut = StateLog.from_snapshot(snapshot).state_hash()   # the hash of what is in the file
         caption = format_message(Envelope(type=MessageType.NOTE, to="*",
                                           intent=SNAPSHOT_INTENT, ref=f"p{upto}"),
-                                 f"term={self.lease().term} hash={self.state_hash()}")
+                                 f"term={snapshot['term']} hash={cut}")
         try:
             posted = await self.io.post_file(f"swarm-state-{upto}.json", data, caption)
             await self.io.pin(posted.message_id)
@@ -260,8 +274,9 @@ class TelegramStore(StateStore):
             envelope, _ = parse_message(pinned.caption or "")
             if (envelope.intent or "").upper() == SNAPSHOT_INTENT:
                 return False
-        moment = self.clock()
-        if not any(o.at <= moment - SNAPSHOT_SETTLE_SECONDS for o in self.log.ops)                 and self.log.base_pos == 0:
+        moment = self.server_now()
+        settled = any(o.at <= moment - SNAPSHOT_SETTLE_SECONDS for o in self.log.ops)
+        if not settled and self.log.base_pos == 0:
             return False                               # nothing settled to restore yet
         logger.warning("state: no snapshot is pinned; publishing this bot's state")
         return await self.publish_snapshot(force=True)

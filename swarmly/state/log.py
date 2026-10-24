@@ -86,6 +86,7 @@ class Lease:
     holder: Optional[str]
     term: int
     expires_at: float
+    since: int = 0                 # position of the claim that began this term
 
     def held_by(self, at: float) -> Optional[str]:
         """The holder at server time ``at``, or None once it has expired or was released."""
@@ -107,6 +108,9 @@ class StateLog:
     rejected: Dict[int, str] = field(default_factory=dict)
     #: keys where an op arrived written against a version this reader has not seen
     gaps: Set[str] = field(default_factory=set)
+    #: an op arrived at or below this log's base: something this reader compacted away may
+    #: have missed it, so the caller reads the snapshot again
+    late: bool = False
 
     # -- reading ---------------------------------------------------------------------------
     def get(self, key: str) -> Optional[Entry]:
@@ -131,7 +135,8 @@ class StateLog:
         if not value:
             return NO_LEASE
         return Lease(holder=value.get("holder"), term=int(value.get("term") or 0),
-                     expires_at=float(value.get("expires_at") or 0))
+                     expires_at=float(value.get("expires_at") or 0),
+                     since=int(value.get("since") or 0))
 
     @property
     def last_pos(self) -> int:
@@ -158,7 +163,11 @@ class StateLog:
     def add(self, op: Op) -> bool:
         """Take one op from the log; True if it applies. Duplicates and ops already in the
         snapshot are ignored."""
-        if op.pos <= self.base_pos or any(o.pos == op.pos for o in self._near(op.pos)):
+        if op.pos <= self.base_pos:
+            if op.pos not in self._base_positions():
+                self.late = True
+            return self._applied(op.pos)
+        if any(o.pos == op.pos for o in self._near(op.pos)):
             return self._applied(op.pos)
         if self.ops and op.pos < self.ops[-1].pos:
             index = bisect.bisect_left([o.pos for o in self.ops], op.pos)
@@ -172,6 +181,10 @@ class StateLog:
     def add_all(self, ops: Iterable[Op]) -> None:
         for op in sorted(ops, key=lambda o: o.pos):
             self.add(op)
+
+    def _base_positions(self) -> Set[int]:
+        """Positions of the ops the base's entries came from (a duplicate is not late)."""
+        return {e.pos for e in self.base.values()}
 
     def _near(self, pos: int) -> List[Op]:
         index = bisect.bisect_left([o.pos for o in self.ops], pos)
@@ -196,8 +209,14 @@ class StateLog:
         value = op.value
         if op.key == K.LEASE and value is not None:
             ttl = float(value.get("ttl") or 0)
+            before = self.lease()
+            # ``since``: the position of the claim that began this term. A renewal keeps it,
+            # so two snapshots that disagree about one term can tell the first claim (the
+            # legitimate one) from a later one by a bot that missed it.
+            same = int(value["term"]) == before.term and                 K.norm(value.get("holder") or "") == K.norm(before.holder or "")
             value = {"holder": value.get("holder"), "term": int(value["term"]),
-                     "expires_at": op.at + ttl if value.get("holder") else op.at}
+                     "expires_at": op.at + ttl if value.get("holder") else op.at,
+                     "since": before.since if same and before.since else op.pos}
         self.entries[op.key] = Entry(value=copy.deepcopy(value), version=op.base + 1,
                                      term=op.term, writer=op.writer, pos=op.pos, at=op.at)
 
@@ -312,17 +331,30 @@ class StateLog:
             return False
         if newer.lease().term < self.lease().term:
             return False
+        if newer.lease().term == self.lease().term and self.lease().holder and                 K.norm(newer.lease().holder or "") != K.norm(self.lease().holder or "") and                 newer.lease().since > self.lease().since > 0:
+            # The same term, claimed later by another bot that missed the first claim.
+            return False
         merged = {k: copy.deepcopy(v) for k, v in newer.base.items()}
         for key, mine in self.entries.items():
             if mine.pos > newer.base_pos:
                 continue                               # an op after the snapshot: re-applied
             theirs = merged.get(key)
-            if theirs is None or (mine.term, mine.pos) > (theirs.term, theirs.pos):
+            if theirs is None or self._mine_wins(key, mine, theirs):
                 merged[key] = copy.deepcopy(mine)
         later = [o for o in self.ops if o.pos > newer.base_pos]
         self.base, self.base_pos, self.ops = merged, newer.base_pos, later
         self._refold()
         return True
+
+    @staticmethod
+    def _mine_wins(key: str, mine: Entry, theirs: Entry) -> bool:
+        """Which of two entries for one key a merge keeps: the higher (term, position) --
+        except for two holders of the *same* lease term, where the first claim of that term
+        wins (the lower ``since``): the other bot claimed it without seeing that claim."""
+        if key == K.LEASE and mine.value and theirs.value:
+            if int(mine.value.get("term") or 0) == int(theirs.value.get("term") or 0) and                     K.norm(mine.value.get("holder") or "") !=                     K.norm(theirs.value.get("holder") or ""):
+                return int(mine.value.get("since") or 0) < int(theirs.value.get("since") or 0)
+        return (mine.term, mine.pos) > (theirs.term, theirs.pos)
 
     def compact(self, upto: Optional[int] = None) -> None:
         """Fold the ops up to ``upto`` (default: all) into the base -- after the state was

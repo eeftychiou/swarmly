@@ -21,6 +21,7 @@ sent, and the fold would ignore them anyway.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -54,6 +55,8 @@ class StateStore:
 
     #: How long ``confirm=True`` waits for a competing write to show up.
     CONFIRM_SECONDS = 0.0
+    #: Clock samples older than this no longer count towards the server clock's offset.
+    OFFSET_WINDOW_SECONDS = 600.0
 
     def __init__(self, alias: str, *, clock: Any = time.time,
                  cache: Optional[Path] = None) -> None:
@@ -62,6 +65,27 @@ class StateStore:
         self.log = StateLog()
         self.cache = Path(cache) if cache else None
         self.ready = False
+        #: (local time, server time - local time) per op time seen, for ``server_now``
+        self._offsets: Any = collections.deque(maxlen=256)
+
+    # -- time ------------------------------------------------------------------------------
+    def observe_time(self, at: float) -> None:
+        """An op's server time (Telegram's message date) seen now, by this bot's clock."""
+        local = float(self.clock())
+        self._offsets.append((local, float(at) - local))
+
+    def server_now(self) -> float:
+        """The log's clock, as best this bot can tell: its own clock plus the offset the op
+        times show. Lease decisions use this, never the bot's own clock: the fold judges
+        expiry by op time, so a bot whose clock runs behind must not believe it still holds a
+        lease the log has given away (review, #263). A message date is never later than its
+        arrival, so the largest recent offset is the closest to the truth."""
+        local = float(self.clock())
+        recent = [off for when, off in self._offsets
+                  if local - when <= self.OFFSET_WINDOW_SECONDS]
+        if not recent and self._offsets:
+            recent = [self._offsets[-1][1]]            # a quiet log: the last word stands
+        return local + (max(recent) if recent else 0.0)
 
     # -- reading ---------------------------------------------------------------------------
     def read(self, key: str) -> Optional[Dict[str, Any]]:
@@ -77,7 +101,7 @@ class StateStore:
         return self.log.lease()
 
     def holder(self, now: Optional[float] = None) -> Optional[str]:
-        return self.lease().held_by(self.clock() if now is None else now)
+        return self.lease().held_by(self.server_now() if now is None else now)
 
     def holds_lease(self, now: Optional[float] = None) -> bool:
         return K.norm(self.holder(now) or "") == self.alias
@@ -102,11 +126,13 @@ class StateStore:
     async def refresh(self) -> None:
         ops = await self._pull()
         self.log.add_all(ops)
-        if self.log.gaps:
+        if self.log.gaps or self.log.late:
             # Missed writes: the snapshot has them (on Telegram, updates older than a day are
             # gone; the pin never is).
-            logger.info("state: missed writes for %s; reading the snapshot again",
-                        ", ".join(sorted(self.log.gaps)))
+            logger.info("state: %s; reading the snapshot again",
+                        f"missed writes for {', '.join(sorted(self.log.gaps))}"
+                        if self.log.gaps else "a line older than this bot's snapshot arrived")
+            self.log.late = False
             await self._load_snapshot()
             self.log.add_all(await self._pull())
         self._write_cache()
@@ -117,7 +143,7 @@ class StateStore:
         if not K.valid(key):
             return WriteResult(False, key, reason="unknown key")
         lease = self.lease()
-        holder = lease.held_by(self.clock())
+        holder = lease.held_by(self.server_now())
         if not K.may_write(key, self.alias, holder):
             return WriteResult(False, key, reason=f"{self.alias} may not write {key}")
         term = lease.term if K.norm(holder or "") == self.alias else 0
@@ -132,6 +158,7 @@ class StateStore:
             base = self.version(key)
         wire = {"k": key, "b": int(base), "t": term, "w": self.alias, "v": value}
         pos, at = await self._append(wire)
+        self.observe_time(at)
         op = Op.from_wire(wire, pos=pos, at=at, writer=self.alias)
         self.log.add(op)
         if confirm and self.CONFIRM_SECONDS > 0:
@@ -145,14 +172,21 @@ class StateStore:
     async def write_many(self, items: List[Tuple[str, Optional[Dict[str, Any]]]]
                          ) -> List[WriteResult]:
         """Several writes made together, each a compare-and-set against the version this bot
-        sees now; the backend sends them in as few messages as it can (§1b: batched)."""
+        sees now; the backend sends them in as few messages as it can (§1b: batched). A key
+        may appear once: a second write of it would carry the same base and lose its own
+        compare-and-set, so it is refused here instead."""
         await self.refresh()
         lease = self.lease()
-        holder = lease.held_by(self.clock())
+        holder = lease.held_by(self.server_now())
         term = lease.term if K.norm(holder or "") == self.alias else 0
         results: List[Optional[WriteResult]] = []
         wires: List[Dict[str, Any]] = []
+        seen = set()
         for key, value in items:
+            if key in seen:
+                results.append(WriteResult(False, key, reason="the same key twice in a batch"))
+                continue
+            seen.add(key)
             if not K.valid(key) or key == K.LEASE:
                 results.append(WriteResult(False, key, reason="not a batch key"))
             elif not K.may_write(key, self.alias, holder):
@@ -163,6 +197,7 @@ class StateStore:
                               "v": value})
         placed = await self._append_many(wires) if wires else []
         for wire, (pos, at) in zip(wires, placed):
+            self.observe_time(at)
             self.log.add(Op.from_wire(wire, pos=pos, at=at, writer=self.alias))
         await self.refresh()
         self._write_cache()
@@ -181,10 +216,16 @@ class StateStore:
     async def claim_lease(self, ttl: float, *, confirm: bool = True) -> WriteResult:
         lease = self.lease()
         mine = K.norm(lease.holder or "") == self.alias
-        live = lease.held_by(self.clock()) is not None
+        live = lease.held_by(self.server_now()) is not None
         term = lease.term if (mine and live) else lease.term + 1
-        return await self.write(K.LEASE, {"holder": self.alias, "term": term, "ttl": ttl},
-                                confirm=confirm)
+        result = await self.write(K.LEASE, {"holder": self.alias, "term": term, "ttl": ttl},
+                                  confirm=confirm)
+        if not result.applied and mine and term == lease.term                 and self.lease().held_by(self.server_now()) is None:
+            # The renewal's own message date showed the term had run out by the log's clock
+            # (this bot's clock was behind): claim the next term instead of renewing forever.
+            result = await self.write(K.LEASE, {"holder": self.alias, "term": term + 1,
+                                                "ttl": ttl}, confirm=confirm)
+        return result
 
     async def release_lease(self) -> WriteResult:
         lease = self.lease()
@@ -269,6 +310,7 @@ class MemoryStore(StateStore):
         fresh = [Op.from_wire(w, pos=p, at=a) for p, a, w in self.shared.ops if p > self._seen]
         if fresh:
             self._seen = fresh[-1].pos
+            self.observe_time(fresh[-1].at)
         return fresh
 
     async def _load_snapshot(self) -> None:
