@@ -83,7 +83,7 @@ class StateStore:
         local = float(self.clock())
         recent = [off for when, off in self._offsets
                   if local - when <= self.OFFSET_WINDOW_SECONDS]
-        if not recent and self._offsets:
+        if not recent and self._offsets and local - self._offsets[-1][0] <= 86400:
             recent = [self._offsets[-1][1]]            # a quiet log: the last word stands
         return local + (max(recent) if recent else 0.0)
 

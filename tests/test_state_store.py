@@ -295,7 +295,9 @@ class TwoClockTests(unittest.TestCase):
             self.assertEqual(b.lease().holder, "deepseek", "b refuses the later claim")
             self.server.t += 60
             self.assertTrue(await b.publish_snapshot())
-            await c._load_snapshot()                      # b's next snapshot heals c
+            self.group.deliver("DeepSeek", self.group.pins[-1],
+                               self.group.files[self.group.pins[-1]][0])   # its SNAPSHOT line
+            await c.refresh()                             # b's next snapshot heals c
             self.assertEqual(c.lease().holder, "deepseek")
             self.assertEqual(c.read("topic/7"), {"by": "b"})
             self.group.release()                          # Claudebot's stream resumes

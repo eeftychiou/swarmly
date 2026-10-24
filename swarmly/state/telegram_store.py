@@ -102,6 +102,9 @@ class TelegramStore(StateStore):
         self._files: List[Tuple[int, float, str, Callable[[], Awaitable[bytes]]]] = []
         self.snapshot_message: Optional[int] = None
         self._snapshot_pos = 0
+        #: the newest SNAPSHOT line seen, and how often the pin was re-read for it
+        self._want_pin = 0
+        self._pin_tries = 0
 
     @property
     def snapshot_pos(self) -> int:
@@ -119,7 +122,13 @@ class TelegramStore(StateStore):
         if envelope.type != MessageType.NOTE or intent not in (STATE_INTENT, SNAPSHOT_INTENT):
             return False
         if intent == SNAPSHOT_INTENT:
-            return True                                # read through the pin, not here
+            # Read through the pin, not here -- but a newer snapshot than the one this bot
+            # holds means its next refresh reads the pin again (that is how a bot that adopted
+            # a stale pin heals at the true holder's next snapshot; review, #263).
+            if int(message_id) > int(self.snapshot_message or 0):
+                self.log.late = True
+                self._want_pin = max(self._want_pin, int(message_id))
+            return True
         self.observe_time(float(date))
         if read_file is not None:
             self._files.append((int(message_id), float(date), author, read_file))
@@ -218,6 +227,16 @@ class TelegramStore(StateStore):
             return
         self.snapshot_message = pinned.message_id
         self._snapshot_pos = self.log.base_pos
+
+    async def refresh(self) -> None:
+        await super().refresh()
+        if self._want_pin > int(self.snapshot_message or 0) and self._pin_tries < 3:
+            # The SNAPSHOT line can arrive before its file is pinned: read the pin again on the
+            # next refresh, a few times at most (review).
+            self._pin_tries += 1
+            self.log.late = True
+        elif self._want_pin <= int(self.snapshot_message or 0):
+            self._pin_tries = 0
 
     async def publish_snapshot(self, *, now: Optional[float] = None,
                                force: bool = False) -> bool:

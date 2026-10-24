@@ -134,6 +134,8 @@ class StateLink:
         self._last_beat = float("-inf")
         self._last_snapshot = float("-inf")
         self._starting: Optional[asyncio.Task] = None
+        from swarmly.telegram.registry_shadow import RegistryShadow
+        self.registry = RegistryShadow(channel, clock=clock)
 
     @property
     def enabled(self) -> bool:
@@ -214,6 +216,15 @@ class StateLink:
                     self._last_snapshot = moment
                     done.append("snapshot restored")
             if moment - self._last_beat >= self.beat_seconds:
+                # The registry at the state cadence, not every heartbeat; its own failures
+                # never stop the probe beat or /state's agreement check (review).
+                try:
+                    written = await self.registry.sync(store)
+                    if written:
+                        done.append(f"registry: {len(written)} key(s)")
+                except Exception as exc:               # noqa: BLE001 - shadow: never fatal
+                    logger.warning("state: registry sync failed: %s", exc, exc_info=True)
+                    done.append("registry failed")
                 rev = str(getattr(self.channel, "_running_revision", "") or "")
                 await store.write(K.probe(store.alias, "beat"),
                                   {"at": round(moment), "rev": rev[:12],

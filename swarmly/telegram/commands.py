@@ -36,6 +36,7 @@ MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("drift", "Rule violations this bot made, and its drift score"),
     ("storetest", "Admin: check the Telegram facts the state store relies on (-Alias skips)"),
     ("state", "The shared state store as this bot sees it"),
+    ("topics", "The topic registry: topics, their links, agents and sessions"),
     ("model", "Show or set the model for this topic"),
     ("reasoning", "Show or set the reasoning effort for this topic"),
     ("memory", "Admin: show this bot's memory.md, or clear it"),
