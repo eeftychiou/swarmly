@@ -348,14 +348,59 @@ class DynamicRoleTests(unittest.TestCase):
         self.assertIn(who, ("Antigravity", "Reasonix"))         # nobody else develops
         self.assertNotEqual(who, "Hermes")                      # never the coordinator
 
+    def back(self, channel, alias):
+        """Run _peer_back and its settle task inside one loop."""
+        async def go():
+            channel._peer_back(alias)
+            for task in list(channel._self_tasks):
+                await task
+        run(go())
+
     def test_a_peer_that_comes_back_gives_the_coordinator_a_turn(self):
         channel = self.channel()
         channel.is_coordinator = lambda now=None: True
         briefs = []
         channel._run_own_task = lambda text, chat, thread, name: briefs.append((text, thread))
         channel._last_turn_place = (GROUP, 9400)
-        channel._peers_frozen["Antigravity"] = {"ref": "pause", "until": None}
-        channel._peer_back("Antigravity")
+        self.back(channel, "Antigravity")
         self.assertEqual(len(briefs), 1)
         self.assertIn("Antigravity (qa-tester) can act again", briefs[0][0])
         self.assertEqual(briefs[0][1], 9400)
+
+    def test_a_peer_that_froze_again_within_the_settle_window_wakes_nobody(self):
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: True
+        briefs = []
+        channel._run_own_task = lambda *args: briefs.append(args)
+        channel._last_turn_place = (GROUP, 9400)
+
+        def refreeze(_seconds):
+            channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        channel._sleep = refreeze
+        self.back(channel, "Codex")
+        self.assertEqual(briefs, [])
+
+    def test_no_work_topic_means_no_turn_in_general(self):
+        """Live, 24 Oct 14:14: right after a restart the coordinator had no place, and the
+        hand-out went to General."""
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: True
+        briefs = []
+        channel._run_own_task = lambda *args: briefs.append(args)
+        self.back(channel, "Antigravity")
+        self.assertEqual(briefs, [])
+
+    def test_an_online_hello_is_not_a_return(self):
+        """A restarted frozen peer says ONLINE, then FROZEN a second later."""
+        channel = self.channel()
+        calls = []
+        channel._peer_back = lambda alias: calls.append(alias)
+        channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        from swarmly.telegram.wire import Envelope, MessageType
+        hello = Envelope(type=MessageType.HELLO, to="*", intent="ONLINE", ref="Codex")
+        channel._track_peer_freeze(hello, event("hi", username="CodexBot", is_bot=True))
+        self.assertEqual(calls, [])
+        resumed = Envelope(type=MessageType.STATUS, to="*", intent="RESUMED", ref="pause")
+        channel._peers_frozen["Codex"] = {"ref": "pause", "until": None}
+        channel._track_peer_freeze(resumed, event("hi", username="CodexBot", is_bot=True))
+        self.assertEqual(calls, ["Codex"])
