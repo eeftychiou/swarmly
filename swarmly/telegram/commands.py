@@ -34,6 +34,7 @@ MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("wakes", "Retired: a promise is a row now -- see /owed"),
     ("owed", "What is owed right now: the open rows"),
     ("drift", "Rule violations this bot made, and its drift score"),
+    ("storetest", "Admin: check the Telegram facts the shared state store relies on"),
     ("model", "Show or set the model for this topic"),
     ("reasoning", "Show or set the reasoning effort for this topic"),
     ("memory", "Admin: show this bot's memory.md, or clear it"),
