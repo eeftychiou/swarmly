@@ -98,6 +98,10 @@ logger = logging.getLogger("swarmly.telegram")
 #: The inbox entries one handle_event call recorded, marked done when that call returns.
 _INBOX_KEYS: "contextvars.ContextVar[List[Tuple[Any, Any]]]" = contextvars.ContextVar(
     "swarmly_inbox_keys")
+#: The adapter's replies for a turn the transport started itself (:meth:`run_transport_turn`),
+#: so its caller still learns whether the turn failed and can retry it (#246).
+_TRANSPORT_REPLIES: "contextvars.ContextVar[Optional[List[Any]]]" = contextvars.ContextVar(
+    "swarmly_transport_replies", default=None)
 
 
 class _ReceiptSuperseded(Exception):
@@ -609,7 +613,7 @@ class AgentChannel:
         # (A test that injects its own clock drives the lease with it too.)
         self._lease_clock: Callable[[], float] = (time.time if clock is time.monotonic
                                                   else clock)
-        self._frozen_told: Dict[Tuple[int, Optional[int]], float] = {}   # topic -> clock
+        self._frozen_told: Dict[Tuple[Any, ...], float] = {}   # topic (, peer) -> clock
         self._announce_resumed = False             # a /model lifted a quota freeze
         # Peers that said they are frozen: alias -> {"ref", "until"} (wall time or None).
         self._peers_frozen_path = _state_file(config, "peer-freezes")
@@ -2109,10 +2113,10 @@ class AgentChannel:
         for book in (self._peer_turns, self._pause_reminded, self._busy_since,
                      self._busy_noticed, self._busy_waiting_by, self._queue_seq,
                      self._folded, self._progress_marks, self._handoff_notes,
-                     self._topic_recent_mentions, self._topic_origins, self._frozen_told,
+                     self._topic_recent_mentions, self._topic_origins,
                      self._last_turn_at, self._stop_topic_generation, self._turn_locks):
             book.pop(key, None)
-        for book in (self._cooldown_notices, self._drop_notices):
+        for book in (self._cooldown_notices, self._drop_notices, self._frozen_told):
             for gone in [k for k in book if k[:2] == key]:
                 del book[gone]
         for book in (self._topic_send_locks, self._topic_paces):
@@ -2323,20 +2327,40 @@ class AgentChannel:
         return True
 
     async def _tell_frozen(self, event: ChannelEvent) -> None:
-        """A person who addresses a frozen bot is told so, once per topic in a while,
-        instead of silence."""
-        if event.author_is_bot or not self._frozen or not self._may_start_turns(event):
+        """Whoever addresses a frozen bot is told so, once per topic in a while,
+        instead of silence.
+
+        A peer bot is told too, and in machine form (#246): the line is a ``STATUS FROZEN``
+        addressed to the sender, so its transport records the freeze before its next turn,
+        and the words say the work was not delivered. Live, 24 Oct: the coordinator asked a
+        paused Antigravity for QA on #245, heard nothing, and the round sat for seven hours.
+        """
+        if event.self_task or not self._frozen or not self._may_start_turns(event):
             return
         if not (self.mentions_me(event.text or "") or event.replies_to_bot
                 or self._direct_chat(event)):
             return
-        key = (event.chat_id, event.thread_id)
+        sender = self._alias_for(event) if event.author_is_bot else ""
+        key = (event.chat_id, event.thread_id, sender) if sender else \
+            (event.chat_id, event.thread_id)
         if self._clock() - self._frozen_told.get(key, float("-inf")) < FROZEN_REMINDER_SECONDS:
             return
         self._frozen_told[key] = self._clock()
-        await self.send(self._frozen_line(), reply_to_message_id=event.message_id,
+        text = self._not_delivered_notice(sender, event) if sender else self._frozen_line()
+        await self.send(text, reply_to_message_id=event.message_id,
                         chat_id=event.chat_id, thread_id=event.thread_id,
                         allow_when_frozen=True, notice=True)
+
+    def _not_delivered_notice(self, sender: str, event: ChannelEvent) -> str:
+        """What a frozen bot answers a peer that hands it work (#246): refused, and why."""
+        alias = self.config.identity.alias
+        handle = self.config.peer_username_for(sender) or event.author_username or sender
+        words = (f"@{str(handle).lstrip('@')}: ⛔ not delivered to {alias}: it is frozen "
+                 f"({self._freeze_reason()}) and takes no work until it is back. Give its "
+                 f"part to another peer, or tell the admin.")
+        return format_message(Envelope(
+            type=MessageType.STATUS, to=sender or "*", intent="FROZEN", ref=self._freeze_ref,
+            ttl=ttl_for(self._freeze_until, self._wall()), rev=self._running_revision), words)
 
     async def _note_adapter_failure(self, detail: str) -> None:
         """#49.E: repeated quota-signature failures freeze the channel before the ticket storm.
@@ -2412,19 +2436,77 @@ class AgentChannel:
         return {alias: dict(entry) for alias, entry in self._peers_frozen.items()
                 if entry.get("until") is None or float(entry["until"]) > now}
 
+    def unavailable_peers(self) -> Dict[str, str]:
+        """Peers that cannot act now, keyed by lower-cased alias, with why (#246).
+
+        Frozen (paused by the admin, or out of quota) from the freeze table the pulses keep,
+        and DOWN from the liveness table. This bot itself is never in it: a frozen bot does
+        not take turns, so it never asks itself for anything.
+        """
+        me = str(self.config.identity.alias or "").strip().lower()
+        away: Dict[str, str] = {}
+        for alias, entry in self.frozen_peers().items():
+            why = {"quota": "out of quota", "pause": "paused"}.get(
+                str(entry.get("ref") or ""), "frozen")
+            until = describe_until(entry.get("until"))
+            away[str(alias).strip().lower()] = why + (f", {until}" if until else "")
+        try:
+            for alias in self.presence().down_peers(self.presence_clock()):
+                away.setdefault(str(alias).strip().lower(), "down")
+        except Exception:                          # noqa: BLE001 - liveness is best effort
+            logger.debug("presence: cannot read the DOWN peers", exc_info=True)
+        away.pop(me, None)
+        away.pop("", None)
+        return away
+
+    def away_reason(self, alias: Any) -> str:
+        """Why *alias* cannot act now, or "" when it can (#246)."""
+        return self.unavailable_peers().get(str(alias or "").strip().lstrip("@").lower(), "")
+
+    def role_stand_ins(self) -> Dict[str, Tuple[str, str]]:
+        """``{kind: (holder, stand_in)}`` for each verdict role whose holder is away (#246).
+
+        The reviewer and the QA tester cover for each other: a change still gets an independent
+        check, and the stand-in is never the PR's author because the author is a developer.
+        Live, 24 Oct: the admin said "Reasonix covers QA while Antigravity is out" in chat, the
+        roster still said QA = Antigravity, and a fresh coordinator turn asked the paused bot
+        for QA and waited on it for seven hours. A stand-in derived from the pulses holds in
+        every turn, the owed table and the CI wake alike, and ends when the holder is back.
+        """
+        roles = self._roster_roles()
+        away = self.unavailable_peers()
+        out: Dict[str, Tuple[str, str]] = {}
+        for kind, other in (("qa", "review"), ("review", "qa")):
+            holder, cover = roles.get(kind, ""), roles.get(other, "")
+            if holder and cover and holder.lower() in away and cover.lower() not in away:
+                out[kind] = (holder, cover)
+        return out
+
     def _frozen_peers_note(self) -> str:
         """A line for every turn naming the frozen peers, so work is not handed to them."""
         peers = self.frozen_peers()
-        if not peers:
+        stand_ins = self.role_stand_ins()
+        if not peers and not stand_ins:
             return ""
-        parts = []
-        for alias, entry in sorted(peers.items()):
-            why = {"quota": "quota ran out", "pause": "paused"}.get(
-                str(entry.get("ref") or ""), "frozen")
-            until = describe_until(entry.get("until"))
-            parts.append(f"{alias} ({why}{', ' + until if until else ''})")
-        return (f"\n\n[Frozen peers take no work until they resume: {'; '.join(parts)}. "
-                "Give their part to another peer; if no one else can do it, tell the admin.]")
+        note = ""
+        if peers:
+            parts = []
+            for alias, entry in sorted(peers.items()):
+                why = {"quota": "quota ran out", "pause": "paused"}.get(
+                    str(entry.get("ref") or ""), "frozen")
+                until = describe_until(entry.get("until"))
+                parts.append(f"{alias} ({why}{', ' + until if until else ''})")
+            note = (f"Frozen peers take no work until they resume: {'; '.join(parts)}. "
+                    "Never ask them for anything and never WAIT on them: the transport refuses "
+                    "both. Give their part to another peer; if no one else can do it, tell "
+                    "the admin.")
+        counts = {"review": "the review verdict", "qa": "the QA pass or fail"}
+        for kind, (holder, cover) in sorted(stand_ins.items()):
+            name = "QA" if kind == "qa" else "review"
+            note += (f"{' ' if note else ''}Stand-in: {cover} holds {name} while {holder} is "
+                     f"away. Ask {cover}; its verdict on the head, with the tests it ran, "
+                     f"counts as {counts[kind]}.")
+        return f"\n\n[{note}]"
 
     # -- peer liveness: the pulse, and DOWN (issue #82) -----------------------------------
 
@@ -4821,6 +4903,29 @@ class AgentChannel:
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
 
+    def _away_debtors(self, rows: Iterable[Any]) -> Dict[str, str]:
+        """``{row id: why it is refused}`` for rows owed by a peer that cannot act (#246).
+
+        A row against a paused, frozen or DOWN bot is a debt nobody will pay: its ladder's
+        first rung is the debtor's own, so it never even reminds (24 Oct, #245 sat seven hours
+        on ``WAIT merge … from Antigravity``). CI and the admin are not peers and always pass.
+        """
+        from swarmly.telegram.owed import ADMIN, CI
+        stand_ins = {holder.lower(): cover for holder, cover in self.role_stand_ins().values()}
+        out: Dict[str, str] = {}
+        for row in rows:
+            debtor = str(getattr(row, "debtor", "") or "").strip()
+            if not debtor or debtor in (CI, ADMIN):
+                continue
+            why = self.away_reason(debtor)
+            if not why:
+                continue
+            cover = stand_ins.get(debtor.lower())
+            ask = f"ask {cover}, its stand-in" if cover else "give it to a peer who can act"
+            out[row.id] = (f"{debtor} is {why} and takes no work until it is back: {ask}, "
+                           f"or tell the admin.")
+        return out
+
     def apply_wait_lines(self, text: str, event: ChannelEvent) -> str:
         """Record the ``WAIT`` lines in a reply as rows, and strip them from it (#165).
 
@@ -4835,6 +4940,10 @@ class AgentChannel:
             place=self._place_key(event.chat_id, event.thread_id))
         if not rows and not reasons:
             return text
+        refused = self._away_debtors(rows)
+        if refused:
+            rows = [row for row in rows if row.id not in refused]
+            reasons = [*reasons, *refused.values()]
         notes: List[str] = []
         if rows:
             try:
@@ -4951,8 +5060,17 @@ class AgentChannel:
 
         ``agent.role`` for this bot and ``peers[*].role`` for the rest (``config.peer_roles``),
         the same roster ``/role`` prints. A role nobody was given simply opens no row: a debt
-        with no holder is a line to post, not a row to wake.
+        with no holder is a line to post, not a row to wake. A verdict role whose holder is
+        away goes to its stand-in (:meth:`role_stand_ins`, #246), so no row is opened against
+        a bot that cannot act.
         """
+        roles = self._roster_roles()
+        for kind, (_holder, cover) in self.role_stand_ins().items():
+            roles[kind] = cover
+        return roles
+
+    def _roster_roles(self) -> Dict[str, str]:
+        """The configured roster's roles, before any stand-in: ``{kind: alias}``."""
         roles: Dict[str, str] = {}
         names = {"reviewer": "review", "qa-tester": "qa", "qa": "qa",
                  "developer": "developer", "coordinator": "coordinator"}
@@ -5594,7 +5712,7 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - a tick must survive
             logger.warning("owed guard: the table could not be read", exc_info=True)
             return []
-        decided = stalls(rows, now=moment, minutes=minutes)
+        decided = stalls(rows, now=moment, minutes=minutes, away=self.unavailable_peers())
         if not decided:
             return []
         # Who may deliver a rung. The table folds every writer's documents, so a bot that
@@ -5648,7 +5766,9 @@ class AgentChannel:
         book-keeping failure is logged and never fails the hand-off itself.
         """
         from swarmly.telegram.owed import handoff_rows
-        asked = [peer for peer in peers if peer]
+        # A paused, frozen or DOWN peer gets no row (#246): it answers the mention itself with
+        # a "not delivered" line, and a row against it would only wait for ever.
+        asked = [peer for peer in peers if peer and not self.away_reason(peer)]
         if not asked or self.bot is None:
             return
         topic = self._topic_token(chat_id, thread_id)
@@ -7283,6 +7403,9 @@ class AgentChannel:
                 self._turns.add(turn)
                 self._turn_keys[turn] = (event.chat_id, event.thread_id)
                 reply = await turn
+            captured = _TRANSPORT_REPLIES.get()
+            if captured is not None and reply is not None:
+                captured.append(reply)
             if reply is None:
                 logger.info("turn end: message %s, no reply (%.1fs)", event.message_id,
                             time.monotonic() - started)
@@ -8297,6 +8420,31 @@ class AgentChannel:
         for adapter in {id(a): a for a in [self.adapter, *self._project_adapters.values()]
                         }.values():
             apply_role(adapter, self.config)
+
+    async def run_transport_turn(self, text: str, chat_id: int, thread_id: Optional[int],
+                                 *, source: str = "GitHub") -> Optional[AdapterReply]:
+        """One turn the transport starts itself (a CI result, a GitHub notification), run the
+        way a chat turn is (#246).
+
+        These turns used to go straight to the adapter as a bare message: no topic recap, no
+        frozen-peer, stand-in or hold note, no memory, and the reply was posted without its
+        machine lines being applied. Live, 24 Oct: the CI wake on #245 never saw that Reasonix
+        covered QA, asked a paused bot instead, and its ``WAIT`` line reached the chat as text
+        and opened no row. As this agent's own brief, the turn takes the same path as any
+        other: the notes go in, ``WAIT``/``ROLE``/``ROUND_STATE`` come out, and the reply is
+        posted where the work lives. Returns the adapter's reply (``ok``/``error``, so a failed
+        turn is retried like before), or None when the turn was queued or chose no turn.
+        """
+        event = ChannelEvent(text=f"[{source}] {text}", chat_id=chat_id, thread_id=thread_id,
+                             topic_name=self.topics.name(chat_id, thread_id), self_task=True,
+                             author_username=f"{self.config.identity.alias} (own brief)")
+        replies: List[Any] = []
+        token = _TRANSPORT_REPLIES.set(replies)
+        try:
+            await self.handle_event(event)
+        finally:
+            _TRANSPORT_REPLIES.reset(token)
+        return replies[-1] if replies else None
 
     def _run_own_task(self, text: str, chat_id: int, thread_id: Optional[int],
                       name: Optional[str]) -> None:
