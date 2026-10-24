@@ -895,6 +895,7 @@ class GitHubWatcher:
             # CI on the repo itself, before and apart from the notifications: a failed
             # notification fetch must not also blind the swarm to finished runs.
             await self._poll_repo_ci(project, router, outcome)
+            await self._check_new_prs(project, router, outcome)
             try:
                 notifs = self.client.notifications(repo=repo)
             except GitHubError as exc:
@@ -1254,6 +1255,85 @@ class GitHubWatcher:
             self._save_ci_state({_ci_key(repo, c.number) for _w, c in wakes})  # before turns
         for watch, checks in wakes:
             await self._wake_on_ci(watch, checks, outcome, router)
+
+    #: A PR's body must name the issue it closes.
+    _CLOSES = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)")
+    #: Test removal and skipping a PR adds (unified diff lines).
+    _TEST_REMOVED = re.compile(r"^-\s*(?:async\s+)?def\s+test_", re.M)
+    _TEST_ADDED = re.compile(r"^\+\s*(?:async\s+)?def\s+test_", re.M)
+    _SKIP_ADDED = re.compile(r"^\+.*(?:@unittest\.skip|@pytest\.mark\.skip|\.skipTest\()", re.M)
+
+    async def _check_new_prs(self, project: Any, router: Optional[ProjectRouter],
+                             outcome: GitHubPollOutcome) -> None:
+        """The rulebook's PR rules, checked once per PR head on the lease holder's poll
+        (admin, 24 Oct): the PR names the issue it closes, one open PR per issue, and no test
+        is deleted or skipped without a word. A finding is a PR comment and a line in the PR's
+        topic, so it reaches the author's and the coordinator's token space."""
+        lister = getattr(self.client, "open_prs", None)
+        repo = str(getattr(project, "repo", "") or "")
+        if not callable(lister) or not repo:
+            return
+        try:
+            prs = lister(repo) or []
+        except Exception as exc:                          # noqa: BLE001 - a poll must survive
+            outcome.errors.append(f"PR checks {repo}: {exc}")
+            return
+        closes: Dict[str, List[int]] = {}
+        for pr in prs:
+            for ref in set(self._CLOSES.findall(str(pr.get("body") or ""))):
+                closes.setdefault(ref, []).append(int(pr["number"]))
+        changed = False
+        for pr in prs:
+            number, head = int(pr["number"]), str(pr.get("headRefOid") or "")
+            key = f"check:{_ci_key(repo, number)}"
+            if not head or self.ci_state.reported_result(key) == head:
+                continue
+            self.ci_state.mark_reported(key, head)
+            changed = True
+            findings: List[str] = []
+            refs = sorted(set(self._CLOSES.findall(str(pr.get("body") or ""))), key=int)
+            if not refs:
+                findings.append("it names no issue it closes (`Closes #N` in the body)")
+            for ref in refs:
+                others = [n for n in closes.get(ref, []) if n != number]
+                if others:
+                    findings.append(f"#{ref} already has open PR(s) "
+                                    + ", ".join(f"#{n}" for n in others)
+                                    + ": one issue, one pull request")
+            differ = getattr(self.client, "pr_diff", None)
+            diff = differ(repo, number) if callable(differ) else ""
+            removed = len(self._TEST_REMOVED.findall(diff or ""))
+            added = len(self._TEST_ADDED.findall(diff or ""))
+            if removed > added:
+                findings.append(f"it removes {removed - added} more test function(s) than it adds")
+            if self._SKIP_ADDED.search(diff or ""):
+                findings.append("it adds a test skip")
+            if not findings:
+                continue
+            text = (f"Transport check on #{number} at {head[:7]}: " + "; ".join(findings)
+                    + ". (The rulebook, checked in transport space.)")
+            try:
+                self.client.comment(repo, number, text)
+            except Exception:                             # noqa: BLE001 - the topic line stays
+                logger.warning("PR check: could not comment on %s#%s", repo, number)
+            if self.channel is not None:
+                where = None
+                finder = getattr(self.channel, "topic_for_text", None)
+                if callable(finder):
+                    try:
+                        hit = finder(f"#{number}")
+                        where = hit if isinstance(hit, tuple) and len(hit) == 2 else None
+                    except Exception:                     # noqa: BLE001
+                        where = None
+                home = int(self.config.identity.home_channel_id or 0)
+                chat, thread = where or (home, None)
+                try:
+                    await self.channel.send(f"🔎 {text}", chat_id=chat, thread_id=thread,
+                                            silent=True, notice=True)
+                except Exception:                         # noqa: BLE001
+                    logger.warning("PR check: could not post the finding for #%s", number)
+        if changed:
+            self._save_ci_state()
 
     async def _poll_ci_watches(self, outcome: GitHubPollOutcome,
                                router: Optional[ProjectRouter] = None) -> None:

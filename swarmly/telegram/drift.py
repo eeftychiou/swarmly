@@ -31,6 +31,14 @@ RULES: Dict[str, Tuple[int, str]] = {
                               "CI are all on the PR's current head."),
     "merge_gate_bypassed": (2, "Do not switch the merge gate off: merge when the gate is met, "
                                "or ask the admin."),
+    "secret_in_push": (3, "Never commit secrets: no token, key or password in any commit."),
+    "foreign_force_push": (3, "Never force-push or reset another agent's branch."),
+    "coordinator_code_push": (2, "The coordinator does not write product code: it merges, a "
+                                 "developer writes the change."),
+    "duplicate_reply": (1, "Do not repeat a reply you already posted; answer only what is new, "
+                           "or NO_REPLY."),
+    "deploy_instruction": (2, "The admin deploys: never tell a peer to install, upgrade, pull "
+                              "or restart the swarmly it runs on."),
     "unknown": (1, "Follow the rulebook."),
 }
 

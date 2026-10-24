@@ -2632,6 +2632,43 @@ class AgentChannel:
             self._tell_sender_undelivered(alias, why, cover, event)
         return body + ("\n\n" + "\n".join(notes) if notes else "")
 
+    #: A reply this close to this bot's last post in the topic, this soon, is a repeat.
+    DUPLICATE_RATIO = 0.9
+    DUPLICATE_SECONDS = 900.0
+    #: Short replies ("Thanks.", "On it.") look alike by nature; only a substantial repeat is.
+    DUPLICATE_MIN_CHARS = 80
+    _DEPLOY = re.compile(
+        r"(?i)\b(?:pip3? install|pipx (?:install|upgrade|reinstall)|uv (?:pip|tool) install"
+        r"|swarmly (?:upgrade|update))\b"
+        r"|\b(?:reinstall|redeploy|restart|upgrade) (?:your|the) (?:swarmly|transport|bot)\b")
+
+    def _check_outbound(self, body: str, event: ChannelEvent) -> str:
+        """Two rules a reply can be checked against before it is posted (admin, 24 Oct):
+        a near-copy of this bot's own last post in the topic is dropped (round 5.5: a third of
+        a topic was second answers), and telling a peer to install or upgrade its swarmly is
+        charged (the admin deploys). Returns the body to post, "" to stay silent."""
+        last = self.__dict__.get("_own_last", {}).get((event.chat_id, event.thread_id))
+        # An own turn (a restart's replay, a brief, a transport notice) restates its task by
+        # design; the repeats this catches are second answers to a peer's message.
+        if event.self_task:
+            last = None
+        if last and self._clock() - last[0] <= self.DUPLICATE_SECONDS \
+                and len(body.strip()) >= self.DUPLICATE_MIN_CHARS and last[1].strip():
+            import difflib
+            ratio = difflib.SequenceMatcher(None, " ".join(last[1].split()).lower(),
+                                            " ".join(body.split()).lower()).ratio()
+            if ratio >= self.DUPLICATE_RATIO:
+                logger.info("drift: dropped a repeat of the last post (%.2f similar)", ratio)
+                self.record_violation("duplicate_reply", f"{ratio:.2f} similar to the last post",
+                                      event.chat_id, event.thread_id)
+                return ""
+        if self._DEPLOY.search(body) and any(
+                f"@{str(h).lstrip('@').lower()}" in body.lower()
+                for h in (self.config.peers or {}).values() if h):
+            self.record_violation("deploy_instruction", self._DEPLOY.search(body).group(0),
+                                  event.chat_id, event.thread_id)
+        return body
+
     #: One undelivered notice per peer and topic in this many seconds: a bot that keeps
     #: addressing a frozen peer is charged every time, but not woken in a loop.
     UNDELIVERED_REPEAT_SECONDS = 600.0
@@ -7851,6 +7888,7 @@ class AgentChannel:
         body = drop_stray_silence(body)
         if body and not is_silent_reply(body):
             body = self._refuse_frozen_addressees(body, event)
+            body = self._check_outbound(body, event)
         if not body or is_silent_reply(body):
             if body:
                 logger.info("turn for message %s chose to stay silent", event.message_id)
