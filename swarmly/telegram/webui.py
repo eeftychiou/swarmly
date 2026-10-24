@@ -27,11 +27,15 @@ first, light and dark by ``prefers-color-scheme`` -- ready to be the Mini App's 
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import logging
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from urllib.parse import parse_qsl
 
 from swarmly.telegram.snapshot import (BUSY, DOWN, FROZEN, IDLE, PAUSED, STUCK, Snapshot)
 
@@ -45,8 +49,20 @@ BADGES: Dict[str, str] = {
 PAGE_PATH = "/"
 STATE_PATH = "/state.json"
 
-#: Where the server binds. Loopback only: slice 1 is local, by the issue's own design.
+#: Where the server binds. Loopback only: the page is reached through a tunnel, not a bind
+#: (#240 slice 2). The bind stays local so nothing on the network can talk to it directly.
 HOST = "127.0.0.1"
+
+logger = logging.getLogger(__name__)
+
+#: The ``Host`` values that are always allowed. A request naming anything else is refused
+#: unless the operator configured that name -- see :func:`allowed_hosts` and the DNS-rebinding
+#: note in :class:`DashboardServer`.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+#: The header a Mini App's page sends its ``initData`` in, and how long a known-good one lasts.
+INIT_HEADER = "X-Telegram-Init-Data"
+INIT_MAX_AGE = 300.0
 
 
 # ------------------------------------------------------------------------------------
@@ -230,6 +246,75 @@ def _round_items(round_state: Optional[Any]) -> List[Dict[str, Any]]:
 
 
 # ------------------------------------------------------------------------------------
+# Who may read it (slice 2: the Telegram Mini App)
+# ------------------------------------------------------------------------------------
+
+
+def allowed_hosts(*, public_host: str = "") -> List[str]:
+    """The ``Host`` values the server answers for: the loopback, plus the configured one.
+
+    Binding the loopback is not enough on its own: a page served from a name that *resolves*
+    to ``127.0.0.1`` is same-origin with this one, so its script could read ``/state.json``.
+    Refusing every ``Host`` but these is what stops it (review, #256 — DNS rebinding).
+    """
+    hosts = list(LOOPBACK_HOSTS)
+    public = str(public_host or "").strip().lower()
+    if public:
+        hosts.append(public)
+        public_host_only = public.split(":", 1)[0]
+        hosts.append(public_host_only)
+    return hosts
+
+
+def verify_init_data(raw: str, *, bot_token: str, admin_id: Any = 0,
+                     now: Optional[float] = None, max_age: float = INIT_MAX_AGE
+                     ) -> tuple[bool, str]:
+    """``(ok, why not)`` for a Telegram Mini App's ``initData`` string.
+
+    The check is Telegram's own (Web App docs): the payload is ``key=value`` pairs, and the
+    ``hash`` field is ``HMAC-SHA256`` of the rest -- sorted, newline-joined -- under a secret
+    that is itself ``HMAC-SHA256`` of the bot token keyed by ``"WebAppData"``. On top of that
+    this refuses a signature older than *max_age* (a replayed one), one dated in the future,
+    and any user that is not the ``admin_user_id``: the page is the admin's, so a member who
+    somehow holds a valid payload still reads nothing.
+    """
+    moment = time.time() if now is None else float(now)
+    text = str(raw or "").strip()
+    if not text:
+        return False, "no init data"
+    if not bot_token:
+        return False, "no bot token to check it against"
+    pairs = parse_qsl(text, keep_blank_values=True, strict_parsing=False)
+    fields = dict(pairs)
+    given = fields.pop("hash", "")
+    if not given:
+        return False, "no hash in the payload"
+    check = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256).digest()
+    expected = hmac.new(secret, check.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, given):
+        return False, "the hash does not match the payload"
+    try:
+        signed_at = float(fields.get("auth_date") or "")
+    except (TypeError, ValueError):
+        return False, "no auth_date"
+    if max_age > 0 and moment - signed_at > max_age:
+        return False, "the payload is older than %ds" % int(max_age)
+    if signed_at - moment > 60:
+        return False, "the payload is dated in the future"
+    try:
+        user = json.loads(fields.get("user") or "{}")
+    except ValueError:
+        return False, "the user field is unreadable"
+    wanted = int(admin_id or 0)
+    if not wanted:
+        return False, "no admin_user_id to check against"
+    if int(user.get("id") or 0) != wanted:
+        return False, "not the admin"
+    return True, "ok"
+
+
+# ------------------------------------------------------------------------------------
 # The page
 # ------------------------------------------------------------------------------------
 
@@ -402,9 +487,18 @@ function render(state) {
   }
 }
 
+// Opened as a Telegram Mini App, the page arrives with initData in its URL hash. It is sent
+// back on every poll so the server can check it; opened locally there is none, and none is
+// asked for. Nothing here loads Telegram's script: the page stays self-contained (#242).
+const INIT = (() => {
+  const match = location.hash.match(/tgWebAppData=([^&]*)/);
+  return match ? decodeURIComponent(match[1]) : "";
+})();
+
 async function tick() {
   try {
-    const response = await fetch(STATE, {cache: "no-store"});
+    const headers = INIT ? {"X-Telegram-Init-Data": INIT} : {};
+    const response = await fetch(STATE, {cache: "no-store", headers});
     if (!response.ok) throw new Error("status " + response.status);
     render(await response.json());
   } catch (err) {
@@ -435,19 +529,42 @@ class DashboardServer:
     """
 
     def __init__(self, provider: Callable[[], Mapping[str, Any]], *, port: int = 0,
-                 host: str = HOST, title: str = "Swarm", every: float = 3.0) -> None:
+                 host: str = HOST, title: str = "Swarm", every: float = 3.0,
+                 public_host: str = "", bot_token: str = "", admin_id: Any = 0,
+                 init_max_age: float = INIT_MAX_AGE) -> None:
         self.provider = provider
         self.host = host
         self.requested_port = int(port)
         self.title = title
         self.every = every
+        #: The name the page is reached under behind a tunnel (#240 slice 2). Empty means the
+        #: server only answers for the loopback, and every request is local.
+        self.public_host = str(public_host or "").strip().lower()
+        #: The Mini App's ``initData`` is checked against these. Empty token or admin means
+        #: "no public host", which never asks for one.
+        self.bot_token = str(bot_token or "")
+        self.admin_id = admin_id
+        self.init_max_age = float(init_max_age)
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self._last_refusal: Optional[tuple] = None
 
     # -- reading it ------------------------------------------------------------------
     @property
     def running(self) -> bool:
-        return self._httpd is not None
+        """Whether the server is up. The thread's own liveness counts: a serve thread that
+        died would otherwise be reported as "serving" forever (review, #256)."""
+        return bool(self._httpd is not None and self._thread is not None
+                    and self._thread.is_alive())
+
+    @property
+    def requires_init(self) -> bool:
+        """A page reachable under a public name is the admin's alone: it asks for ``initData``."""
+        return bool(self.public_host)
+
+    @property
+    def hosts(self) -> List[str]:
+        return allowed_hosts(public_host=self.public_host)
 
     @property
     def port(self) -> int:
@@ -474,7 +591,14 @@ class DashboardServer:
         self._thread.start()
         return self.url
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = 0.5) -> None:
+        """Close the port. Bounded, because this can run on the event loop (#256 review).
+
+        ``shutdown()`` waits for the serve loop to notice, and the join waits for the thread;
+        both are capped so a failover or a shutdown cannot stall the transport behind a
+        request that is mid-flight. A thread that outlives the timeout is a daemon and dies
+        with the process.
+        """
         httpd, self._httpd = self._httpd, None
         if httpd is None:
             return
@@ -483,8 +607,8 @@ class DashboardServer:
         finally:
             httpd.server_close()
         thread, self._thread = self._thread, None
-        if thread is not None:
-            thread.join(timeout=2.0)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, float(timeout)))
 
     def __enter__(self) -> "DashboardServer":
         self.start()
@@ -520,13 +644,50 @@ class DashboardServer:
             def _not_found(self) -> None:
                 self._send(404, b'{"error":"not found"}', "application/json")
 
+            def _host_ok(self) -> bool:
+                """Whether the request's ``Host`` is one this server answers for (#256 review).
+
+                A page on a name that resolves to ``127.0.0.1`` is *same-origin* with this one,
+                so it could read ``/state.json``; the bind address cannot tell them apart, and
+                only the ``Host`` header can. Anything else is a 404 -- the same answer an
+                unknown path gets, so the page's existence is not confirmed either.
+                """
+                given = str(self.headers.get("Host", "") or "").strip().lower()
+                name = given.rsplit(":", 1)[0] if given.count(":") == 1 else given
+                if server.requires_init and given in server.hosts:
+                    return True
+                return name in server.hosts or given in server.hosts
+
+            def _init_ok(self, query: str) -> bool:
+                """Whether this request carries a valid Mini App ``initData`` for the admin."""
+                if not server.requires_init:
+                    return True
+                raw = str(self.headers.get(INIT_HEADER, "") or "")
+                if not raw:
+                    for key, value in parse_qsl(query, keep_blank_values=True):
+                        if key == "init":
+                            raw = value
+                ok, why = verify_init_data(raw, bot_token=server.bot_token,
+                                           admin_id=server.admin_id,
+                                           now=time.time(), max_age=server.init_max_age)
+                if not ok:
+                    logger.info("web dashboard: refused a request from %s (%s)",
+                                self.headers.get("Host", "?"), why)
+                return ok
+
             def do_GET(self) -> None:                       # noqa: N802 - http.server's name
-                path = self.path.split("?", 1)[0]
+                path, _, query = self.path.partition("?")
+                if not self._host_ok():
+                    self._not_found()
+                    return
                 if path in (PAGE_PATH, "/index.html"):
                     body = page_html(title=server.title, every=server.every)
                     self._send(200, body.encode("utf-8"), "text/html; charset=utf-8")
                     return
                 if path == STATE_PATH:
+                    if not self._init_ok(query):
+                        self._send(403, b'{"error":"not the admin"}', "application/json")
+                        return
                     try:
                         payload = server.state()
                     except Exception:                       # noqa: BLE001 - never on the wire

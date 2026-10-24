@@ -1235,7 +1235,54 @@ The page follows the lease like the pin: the first heartbeat that finds this bot
 starts the server, and the first that finds another bot coordinating stops it — so a failover
 moves the page with the role instead of leaving a stale one answering on an old host. The
 server is one daemon thread; `stop()` closes the port, so a restart never leaves two answers
-on one port. Slice 2 needs a public HTTPS address for the host, and that is the admin's call.
+on one port.
+
+**The same page as a Telegram Mini App (#240, slice 2).** Name the host the page is reached
+under and the page becomes a Mini App: the pinned card grows an **Open dashboard** button, and
+`/state.json` answers only the admin.
+
+```yaml
+web:
+  enabled: true
+  port: 8787
+  public_host: swarm.example.ts.net   # the name a tunnel gives you, no scheme, no path
+  init_max_age: 300                   # optional: how old initData may be, in seconds
+```
+
+Three things change when `public_host` is set, and only then.
+
+- **The `Host` check.** The server answers for `127.0.0.1`, `localhost`, `[::1]` and the
+  configured name, and answers `404` to anything else. Binding the loopback is not enough on
+  its own: a page served from a name that resolves to `127.0.0.1` is *same-origin* with this
+  one, so its script could read `/state.json` — that is DNS rebinding, and the `Host` header is
+  the only thing that tells the two apart (review, #256).
+- **`initData`.** Telegram appends a signed payload to the Mini App's URL; the page passes it
+  back on every poll (`X-Telegram-Init-Data`, or `?init=`), and the server checks it the way
+  Telegram says to: `HMAC-SHA256` of the sorted `key=value` pairs under a secret that is
+  itself `HMAC-SHA256` of the bot token keyed by `WebAppData`. A payload older than
+  `init_max_age`, one dated in the future, one signed by another bot, or one whose `user.id` is
+  not this bot's `admin_user_id` is a `403`. The page itself is served without it — it holds no
+  state — and it loads no Telegram script: the payload is read from the URL hash, so the page
+  stays self-contained and works on a LAN.
+- **The button.** A `web_app` button is the only kind that opens a Mini App, so it appears only
+  when `public_host` is set, first row, above the controls; its URL is
+  `https://<public_host>:<port>/` (port omitted for 443).
+
+Exposing the port is the admin's job, not the transport's: the tunnel terminates TLS and
+forwards to `127.0.0.1:8787`, so the bind stays local and nothing on the LAN can reach it
+directly. Either of these gives a host to put in `public_host`:
+
+```bash
+# Cloudflare Tunnel: a stable name for one local port
+cloudflared tunnel --url http://127.0.0.1:8787          # prints https://<name>.trycloudflare.com
+
+# Tailscale Funnel: only reachable inside your tailnet, unless you open it
+tailscale funnel 8787                                   # prints https://<host>.<tailnet>.ts.net
+```
+
+Point the tunnel at the loopback, put the name it prints in `web.public_host`, and open the
+card's button. Without a tunnel the page stays exactly what slice 1 shipped: local, and every
+request is the operator's own.
 
 A swarm-wide control — pause everything — holds the bot that owns the message and broadcasts
 `target=*`, so every peer applies it: one press stops the swarm, and each bot keeps its own

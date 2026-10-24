@@ -211,7 +211,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     # issue #117: where the pinned dashboard lives -- it rides the heartbeat, so no interval
     "control": ("chat_id", "topic_id"),
     # issue #240: the local read-only web page, off unless the operator turns it on
-    "web": ("enabled", "port"),
+    "web": ("enabled", "port", "public_host", "init_max_age"),
     "swarm": ("succession",),
 }
 
@@ -993,6 +993,15 @@ class WebSettings:
     enabled: bool = False
     #: The port on ``127.0.0.1``. ``0`` asks the OS for a free one, which tests use.
     port: int = 8787
+    #: Issue #240 slice 2: the name the page is reached under behind a tunnel, e.g.
+    #: ``swarm.example.ts.net``. Setting it turns the page into a Telegram Mini App: that
+    #: ``Host`` is allowed (and only that one, plus the loopback), ``initData`` is required for
+    #: ``/state.json``, and the pinned card grows a button that opens the page. Empty keeps the
+    #: local page exactly as slice 1 shipped it.
+    public_host: str = ""
+    #: How old a Mini App ``initData`` may be and still be accepted, in seconds. Telegram signs
+    #: it when the app opens; a replayed one is refused after this window.
+    init_max_age: float = 300.0
 
 
 @dataclass
@@ -1370,9 +1379,17 @@ class AgentConfig:
         web_raw = data.get("web")
         web: Optional[WebSettings] = None
         if isinstance(web_raw, dict):
+            public_host = str(web_raw.get("public_host") or "").strip().lower()
+            if public_host.startswith(("http://", "https://", "/")):
+                raise ConfigError(
+                    "web.public_host is a host name and optional port, not a URL "
+                    f"(got {public_host!r}): web.mini_app_url is built from it")
             web = WebSettings(
                 enabled=_parse_bool("web.enabled", web_raw.get("enabled", False)),
                 port=_parse_int("web.port", web_raw.get("port", 8787), 8787),
+                public_host=public_host,
+                init_max_age=_parse_float("web.init_max_age",
+                                          web_raw.get("init_max_age", 300.0), 300.0),
             )
             if web.port < 0 or web.port > 65535:
                 raise ConfigError(f"web.port must be 0-65535 (got {web.port})")

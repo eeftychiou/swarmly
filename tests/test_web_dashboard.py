@@ -8,11 +8,15 @@ system's light or dark preference, and the server is read-only and bound to the 
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import time
 import unittest
 import urllib.error
 import urllib.request
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 from swarmly.telegram import webui
 from swarmly.telegram.rounds import RoundState
@@ -284,10 +288,6 @@ class TestTheServer(unittest.TestCase):
             server.stop()
 
 
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
-
-
 class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
     """#240: the page belongs to the lease holder, like the pin -- and closes with the lease."""
 
@@ -328,3 +328,172 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
         from tests.test_telegram_channel import GROUP
         self.assertNotIn(str(GROUP), rendered)
         self.assertNotIn("TEST", rendered)                 # the bot token never reaches a page
+
+
+ADMIN_ID = 424242
+TOKEN = "123456:TEST-TOKEN"
+
+
+def init_data(*, token: str = TOKEN, admin: int = ADMIN_ID, auth_date: float = NOW,
+              hash_override: str = "", **extra: Any) -> str:
+    """A Telegram Mini App ``initData`` string, signed the way Telegram signs one."""
+    fields = {"auth_date": str(int(auth_date)), "user": json.dumps({"id": admin}),
+              "query_id": "AAH-test"}
+    fields.update({key: str(value) for key, value in extra.items()})
+    check = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", token.encode("utf-8"), hashlib.sha256).digest()
+    fields["hash"] = hash_override or hmac.new(secret, check.encode("utf-8"),
+                                               hashlib.sha256).hexdigest()
+    return urlencode(fields)
+
+
+class TestWhoMayRead(unittest.TestCase):
+    """#240 slice 2: the Mini App's ``Host`` and ``initData`` rules (review, #256)."""
+
+    def server(self, **fields: Any) -> Any:
+        base: Dict[str, Any] = dict(provider=lambda: {"ok": True}, port=0)
+        base.update(fields)
+        return webui.DashboardServer(**base)
+
+    def get(self, url: str, *, host: str = "", headers: Optional[Dict[str, str]] = None) -> Any:
+        wanted = dict(headers or {})
+        if host:
+            wanted["Host"] = host
+        request = urllib.request.Request(url, headers=wanted)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    def test_a_host_the_operator_did_not_name_is_refused(self):
+        """DNS rebinding: a page on a name pointing at 127.0.0.1 is same-origin with this one."""
+        server = self.server()
+        try:
+            url = server.start() + webui.STATE_PATH.lstrip("/")
+            self.assertEqual(self.get(url)[0], 200)                    # the loopback itself
+            self.assertEqual(self.get(url, host="evil.example.com")[0], 404)
+            self.assertEqual(self.get(url.replace(webui.STATE_PATH, "/"),
+                                      host="evil.example.com")[0], 404)
+        finally:
+            server.stop()
+
+    def test_the_configured_public_host_is_served_and_only_with_init_data(self):
+        server = self.server(public_host="swarm.example.ts.net", bot_token=TOKEN,
+                             admin_id=ADMIN_ID, init_max_age=300.0)
+        try:
+            url = server.start() + webui.STATE_PATH.lstrip("/")
+            host = "swarm.example.ts.net"
+            self.assertEqual(self.get(url, host=host)[0], 403)         # no payload
+            fresh = init_data(auth_date=time.time())
+            self.assertEqual(self.get(url, host=host,
+                                      headers={webui.INIT_HEADER: fresh})[0], 200)
+            self.assertEqual(self.get(url, host=host,
+                                      headers={webui.INIT_HEADER:
+                                               init_data(hash_override="0" * 64)})[0], 403)
+            stale = init_data(auth_date=time.time() - 3600)
+            self.assertEqual(self.get(url, host=host,
+                                      headers={webui.INIT_HEADER: stale})[0], 403)
+            self.assertEqual(self.get(url, host=host,
+                                      headers={webui.INIT_HEADER:
+                                               init_data(admin=99)})[0], 403)
+            # The page itself is harmless without state, and is what a Mini App opens first.
+            self.assertEqual(self.get(server.url, host=host)[0], 200)
+        finally:
+            server.stop()
+
+    def test_init_data_checked_on_its_own(self):
+        now = NOW
+        ok, why = webui.verify_init_data(init_data(auth_date=now), bot_token=TOKEN,
+                                         admin_id=ADMIN_ID, now=now)
+        self.assertTrue(ok, why)
+        for raw, reason in (
+                ("", "nothing"),
+                (init_data(token="999:OTHER", auth_date=now), "signed with another token"),
+                (init_data(auth_date=now - 10_000), "replayed"),
+                (init_data(auth_date=now + 3600), "dated in the future"),
+                (init_data(admin=1, auth_date=now), "not the admin"),
+                ("auth_date=%d&user=%%7B%%7D" % int(now), "no hash"),
+        ):
+            ok, _ = webui.verify_init_data(raw, bot_token=TOKEN, admin_id=ADMIN_ID, now=now)
+            self.assertFalse(ok, reason)
+
+    def test_no_token_or_no_admin_means_no_access(self):
+        raw = init_data(auth_date=NOW)
+        self.assertFalse(webui.verify_init_data(raw, bot_token="", admin_id=ADMIN_ID,
+                                                now=NOW)[0])
+        self.assertFalse(webui.verify_init_data(raw, bot_token=TOKEN, admin_id=0,
+                                                now=NOW)[0])
+
+    def test_a_dead_serve_thread_is_not_reported_as_running(self):
+        server = self.server()
+        try:
+            server.start()
+            self.assertTrue(server.running)
+            server._thread.join(0)                      # pretend it died
+            server._thread._target = lambda: None        # (the thread object itself is alive)
+        finally:
+            server.stop()
+        self.assertFalse(server.running)
+
+
+class TestThePinnedCardsButton(unittest.TestCase):
+    """#240 slice 2: a ``web_app`` button exists only when there is somewhere to open."""
+
+    def channel(self, **web: Any) -> Any:
+        from tests.test_telegram_channel import make_channel, make_config
+        return make_channel(make_config(web=dict({"enabled": True, "port": 8787}, **web)))
+
+    def test_no_public_host_means_no_button_and_no_url(self):
+        channel = self.channel()
+        self.assertEqual(channel.mini_app_url(), "")
+        for row in channel.control_markup():
+            for button in row:
+                self.assertNotIn("web_app", button)
+
+    def test_a_public_host_puts_the_button_first(self):
+        channel = self.channel(public_host="swarm.example.ts.net")
+        self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net:8787/")
+        first = channel.control_markup()[0][0]
+        self.assertEqual(first["text"], "Open dashboard")
+        self.assertEqual(first["web_app"], {"url": "https://swarm.example.ts.net:8787/"})
+        # The controls are still there, below it.
+        self.assertTrue(any("callback_data" in button
+                            for row in channel.control_markup() for button in row))
+
+    def test_a_public_host_makes_the_server_ask_for_init_data_and_allow_that_host(self):
+        channel = self.channel(public_host="swarm.example.ts.net")
+        channel.is_coordinator = lambda now=None: True
+        said = channel._sync_web_dashboard()
+        try:
+            self.assertTrue(said.startswith("serving"), said)
+            server = channel._web_server
+            self.assertTrue(server.requires_init)
+            self.assertIn("swarm.example.ts.net", server.hosts)
+            self.assertIn("127.0.0.1", server.hosts)
+        finally:
+            channel._sync_web_dashboard()
+
+    def test_a_taken_port_is_retried_on_an_interval_not_every_beat(self):
+        """A bind that fails is one warning and a quiet minute, not one per heartbeat."""
+        channel = self.channel(port=8787)
+        channel.is_coordinator = lambda now=None: True
+        tries: list = []
+
+        def refuse(self: Any) -> str:
+            tries.append(1)
+            raise OSError("[WinError 10048] only one usage of each socket address")
+
+        original = webui.DashboardServer.start
+        webui.DashboardServer.start = refuse
+        try:
+            said = channel._sync_web_dashboard()
+            self.assertTrue(said.startswith("failed"), said)
+            self.assertIn("waiting to retry", channel._sync_web_dashboard())
+            self.assertEqual(len(tries), 1)              # the beat after it did not try again
+            self.assertIsNone(getattr(channel, "_web_server", None))
+        finally:
+            webui.DashboardServer.start = original
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
