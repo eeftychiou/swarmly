@@ -162,7 +162,8 @@ class TestTheMergeThroughTheGuardedPath(unittest.TestCase):
             env = prepare(Path(tmp) / "guard", "coordinator",
                           {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
                           alias="DeepSeek", term=4)
-            env = {**env, "GH_LOG": str(log)}
+            # The merge gate (#247) reads the PR first; this test is about the attribution.
+            env = {**env, "GH_LOG": str(log), "SWARMLY_MERGE_GATE": "off"}
             done = subprocess.run(["gh", "pr", "merge", "8", "--squash"], env=env,
                                   capture_output=True, text=True)
             self.assertEqual(done.returncode, 0, done.stderr)

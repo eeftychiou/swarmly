@@ -208,7 +208,15 @@ def overdue(row: Row, *, now: float, limit: float) -> Optional[float]:
     return None
 
 
-def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float) -> List[Stall]:
+def away_text(row: Row, why: str, *, minutes: float) -> str:
+    """The rung for a debt whose debtor cannot act: straight to the coordinator (#246)."""
+    return (f"{row.debtor} owes {row.owes} on {row.subject}, but {row.debtor} is {why} and "
+            f"cannot act (nothing has moved for {_wait_words(minutes)}). Coordinator: give it "
+            f"to a peer who can, or tell the admin.")
+
+
+def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float,
+           away: Optional[Mapping[str, str]] = None) -> List[Stall]:
     """The rungs due now: a row that is overdue, one rung at a time.
 
     Overdue is :func:`overdue`: the row's own ``deadline`` first, then ``updated_at`` plus
@@ -222,9 +230,16 @@ def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float) 
     That is what "ladder off" means -- a swarm that does not want to be chased still gets the
     one reminder it promised itself -- and it is written down in ``docs/telegram-channel.md``
     rather than papered over (#213 review).
+
+    **A debtor that cannot act skips its own rung** (#246). The reminder is the debtor's to
+    deliver, so a paused, frozen or DOWN debtor never sent it and the ladder never climbed:
+    #245 waited seven hours on a paused Antigravity with every bot idle. *away* maps the
+    lower-cased aliases that cannot act to why; such a row goes to the coordinator rung at
+    once, without waiting out *minutes* (when the ladder is on at all).
     """
     moment = time.time() if now is None else float(now)
     limit = max(0.0, float(minutes or 0)) * 60.0
+    gone = {str(alias).strip().lower(): str(why) for alias, why in (away or {}).items()}
     out: List[Stall] = []
     for row in sorted(rows, key=lambda item: item.id):
         if not row.is_open:
@@ -232,8 +247,15 @@ def stalls(rows: Iterable[Row], *, now: Optional[float] = None, minutes: float) 
         rung = int(row.stalls or 0)
         if rung >= len(STALL_STEPS):
             continue                      # the ladder is done: nothing left to climb
+        why = gone.get(str(row.debtor or "").strip().lower(), "") if rung == 0 else ""
         waited = overdue(row, now=moment, limit=limit)
+        if waited is None and why and limit > 0:
+            waited = max(0.0, moment - float(row.updated_at or row.created_at or 0.0))
         if waited is None:
+            continue
+        if why:
+            out.append(Stall(row=row.id, step=STALL_COORDINATOR, debtor=row.debtor,
+                             text=away_text(row, why, minutes=waited / 60.0)))
             continue
         step = STALL_STEPS[rung]
         out.append(Stall(row=row.id, step=step, debtor=row.debtor,
@@ -251,7 +273,9 @@ def advance(rows: Sequence[Row], decided: Sequence[Stall], *,
         row = by_id.get(stall.row)
         if row is None:
             continue
-        row.stalls = int(row.stalls or 0) + 1
+        # A skipped rung counts as climbed: the next one is the rung after the one delivered.
+        delivered = STALL_STEPS.index(stall.step) + 1 if stall.step in STALL_STEPS else 0
+        row.stalls = max(int(row.stalls or 0) + 1, delivered)
         row.updated_at = moment
         touched.append(row)
     return touched

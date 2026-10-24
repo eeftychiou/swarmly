@@ -97,6 +97,10 @@ def pr_target(args: Sequence[str]) -> Optional[Dict[str, Any]]:
             repo_args = [word, args[i + 1]]
             i += 2
             continue
+        if word in ("--match-head-commit", "-t", "--subject", "-b", "--body", "-F",
+                    "--body-file", "-A", "--author-email") and i + 1 < len(args):
+            i += 2                                         # an option's value, not the PR
+            continue
         if word.startswith("--repo="):
             repo_args = [word]
         elif not word.startswith("-"):

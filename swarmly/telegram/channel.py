@@ -99,6 +99,10 @@ logger = logging.getLogger("swarmly.telegram")
 #: The inbox entries one handle_event call recorded, marked done when that call returns.
 _INBOX_KEYS: "contextvars.ContextVar[List[Tuple[Any, Any]]]" = contextvars.ContextVar(
     "swarmly_inbox_keys")
+#: The adapter's replies for a turn the transport started itself (:meth:`run_transport_turn`),
+#: so its caller learns whether *that* turn failed, not whether any turn did.
+_TRANSPORT_REPLIES: "contextvars.ContextVar[Optional[List[Any]]]" = contextvars.ContextVar(
+    "swarmly_transport_replies", default=None)
 
 
 class _ReceiptSuperseded(Exception):
@@ -2434,7 +2438,10 @@ class AgentChannel:
         cover = ("; ".join(f"{alias}'s {role} work goes to {who}"
                            for alias, (role, who) in sorted(covers.items())))
         return (f"\n\n[Frozen peers take no work until they resume: {'; '.join(parts)}. "
-                + (f"Stand-ins the transport applies: {cover}. " if cover else "")
+                + (f"Stand-ins the transport applies: {cover}. A stand-in for QA writes "
+                   "`QA: pass` or `QA: fail` at the head in its verdict comment, beside its "
+                   "review verdict: the merge gate reads the words, not the role. "
+                   if cover else "")
                 + "A message addressed to a frozen peer is not delivered to it. Give their part "
                 "to another peer; if no one else can do it, tell the admin.]")
 
@@ -2528,6 +2535,28 @@ class AgentChannel:
                                 "in 24 hours for rule violations (/drift). Consider giving its "
                                 "role to another bot or changing its model.",
                                 chat_id=int(home), silent=True, notice=True)
+
+    def away_reason(self, alias: Any) -> str:
+        """Why *alias* cannot take work now -- paused, out of quota, frozen, DOWN -- or ""."""
+        name = str(alias or "").strip().lstrip("@").lower()
+        if not name or name == str(self.config.identity.alias or "").strip().lower():
+            return ""
+        for peer, entry in self.frozen_peers().items():
+            if str(peer).strip().lower() == name:
+                return {"quota": "out of quota", "pause": "paused by the admin"}.get(
+                    str((entry or {}).get("ref") or ""), "frozen")
+        try:
+            down = self.presence().down_peers(self.presence_clock())
+        except Exception:                                  # noqa: BLE001 - frozen is enough
+            down = []
+        return "DOWN" if any(str(peer).strip().lower() == name for peer in down) else ""
+
+    def _stand_in_for(self, alias: str) -> Tuple[str, str]:
+        """``(role, stand-in alias)`` covering *alias*, or ``("", "")``."""
+        for peer, cover in self.stand_ins().items():
+            if str(peer).strip().lower() == str(alias or "").strip().lower():
+                return cover
+        return "", ""
 
     def _refuse_frozen_addressees(self, body: str, event: ChannelEvent) -> str:
         """A reply that addresses a paused, frozen or DOWN peer: the peer's handle is taken
@@ -5008,6 +5037,24 @@ class AgentChannel:
             place=self._place_key(event.chat_id, event.thread_id))
         if not rows and not reasons:
             return text
+        # A WAIT on a peer that cannot act is a debt nobody pays (24 Oct: `WAIT merge #245 ...
+        # from Antigravity` on a paused bot sat seven hours). It is refused like a message to
+        # that peer, and bounced back to this bot as a turn.
+        from swarmly.telegram.owed import ADMIN, CI
+        kept = []
+        for row in rows:
+            debtor = str(getattr(row, "debtor", "") or "").strip()
+            why = "" if debtor in (CI, ADMIN) else self.away_reason(debtor)
+            if not why:
+                kept.append(row)
+                continue
+            reasons = [*reasons, f"{debtor} is {why} and takes no work until it is back"]
+            self.record_violation("addressed_frozen_peer",
+                                  f"WAIT {row.kind} {row.subject} from {debtor} ({why})",
+                                  event.chat_id, event.thread_id)
+            role, who = self._stand_in_for(debtor)
+            self._tell_sender_undelivered(debtor, why, (role, who) if who else None, event)
+        rows = kept
         notes: List[str] = []
         if rows:
             try:
@@ -5774,7 +5821,12 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - a tick must survive
             logger.warning("owed guard: the table could not be read", exc_info=True)
             return []
-        decided = stalls(rows, now=moment, minutes=minutes)
+        away: Dict[str, str] = {}
+        for row in rows:
+            why = self.away_reason(row.debtor)
+            if why:
+                away[str(row.debtor).lower()] = why
+        decided = stalls(rows, now=moment, minutes=minutes, away=away)
         if not decided:
             return []
         # Who may deliver a rung. The table folds every writer's documents, so a bot that
@@ -5828,7 +5880,8 @@ class AgentChannel:
         book-keeping failure is logged and never fails the hand-off itself.
         """
         from swarmly.telegram.owed import handoff_rows
-        asked = [peer for peer in peers if peer]
+        # A peer that cannot act gets no row: the hand-off was refused and bounced (#237).
+        asked = [peer for peer in peers if peer and not self.away_reason(peer)]
         if not asked or self.bot is None:
             return
         topic = self._topic_token(chat_id, thread_id)
@@ -7465,6 +7518,9 @@ class AgentChannel:
                 self._turns.add(turn)
                 self._turn_keys[turn] = (event.chat_id, event.thread_id)
                 reply = await turn
+            captured = _TRANSPORT_REPLIES.get()
+            if captured is not None and reply is not None:
+                captured.append(reply)
             if reply is None:
                 logger.info("turn end: message %s, no reply (%.1fs)", event.message_id,
                             time.monotonic() - started)
@@ -8504,11 +8560,17 @@ class AgentChannel:
         task = ChannelEvent(text=text, chat_id=chat_id, thread_id=thread_id,
                             topic_name=self.topics.name(chat_id, thread_id), self_task=True,
                             author_username=f"{self.config.identity.alias} (own brief)")
-        errors = self.stats.errors
-        result = await self.handle_event(task)
-        failed = self.stats.errors > errors
-        return types.SimpleNamespace(ok=not failed, text=str(result or ""),
-                                     error="the turn failed" if failed else "")
+        replies: List[Any] = []
+        token = _TRANSPORT_REPLIES.set(replies)
+        try:
+            result = await self.handle_event(task)
+        finally:
+            _TRANSPORT_REPLIES.reset(token)
+        reply = replies[-1] if replies else None
+        failed = reply is not None and not getattr(reply, "ok", True)
+        return types.SimpleNamespace(
+            ok=not failed, text=str(result or ""),
+            error=(str(getattr(reply, "error", "") or "the turn failed") if failed else ""))
 
     def _ask_for_report(self, event: ChannelEvent) -> None:
         """A topic this agent opened went quiet (its turn chose silence) before it reported
