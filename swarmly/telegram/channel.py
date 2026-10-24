@@ -7077,6 +7077,19 @@ class AgentChannel:
                                    chat_id=event.chat_id, thread_id=event.thread_id,
                                    allow_when_frozen=True)
 
+        # Topic registry, phase 5: /link, /unlink, /phase -- the store lease holder answers.
+        parsed_command = parse_command(event.text or "")
+        registry_reply = (await self.state_link.registry_command(event)
+                          if parsed_command and parsed_command[0] in ("link", "unlink", "phase")
+                          else None)
+        if registry_reply == "":
+            return None
+        if registry_reply is not None:
+            self.stats.handled += 1
+            return await self.send(registry_reply, reply_to_message_id=event.message_id,
+                                   chat_id=event.chat_id, thread_id=event.thread_id,
+                                   allow_when_frozen=True)
+
         # /hold before /pause: a message is only ever one command, so the order is not a
         # precedence, just where the hold's own reply is decided.
         hold_reply = self._handle_hold(event)
@@ -7951,6 +7964,9 @@ class AgentChannel:
                 # Topic registry, phase 2 (shadow): count the turn for this topic's session.
                 self.state_link.registry.turn_done(
                     self.topics.context(event.chat_id, event.thread_id), event.thread_id)
+                if reply.ok and reply.text:
+                    # Phase 5: the coordinator's LINK/ASSIGN/PHASE lines (holder only).
+                    self.state_link.note_reply(event.chat_id, event.thread_id, reply.text)
             if reply is None:
                 logger.info("turn end: message %s, no reply (%.1fs)", event.message_id,
                             time.monotonic() - started)
