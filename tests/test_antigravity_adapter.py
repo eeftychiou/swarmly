@@ -660,6 +660,24 @@ class TestJsonOutputTests(unittest.TestCase):
         self.assertEqual((reply.meta["tokens_in"], reply.meta["tokens_out"]), (13282, 12))
         self.assertEqual(reply.meta["conversation"], "818fc5b5")
 
+    def test_a_total_that_counts_cache_and_thinking_inside_adds_neither(self):
+        # The shape agy's headless docs show: total = input + output (10522 + 354).
+        out = ('{"status":"SUCCESS","response":"ok","usage":{"input_tokens":10522,'
+               '"output_tokens":354,"thinking_tokens":329,"cache_read_tokens":8112,'
+               '"total_tokens":10876}}')
+        reply = self.adapter().parse_output(out, 1.0)
+        self.assertEqual((reply.meta["tokens_in"], reply.meta["tokens_out"]), (10522, 354))
+
+    def test_the_total_decides_each_part_on_its_own(self):
+        from swarmly.telegram.adapters.antigravity import _agy_tokens
+        thinking_apart = {"input_tokens": 900, "output_tokens": 50, "thinking_tokens": 30,
+                          "cache_read_tokens": 600, "total_tokens": 980}
+        self.assertEqual(_agy_tokens(thinking_apart), {"tokens_in": 900, "tokens_out": 80})
+        no_total = {"input_tokens": 900, "output_tokens": 50, "thinking_tokens": 30,
+                    "cache_read_tokens": 600}
+        self.assertEqual(_agy_tokens(no_total), {"tokens_in": 1500, "tokens_out": 80})
+        self.assertEqual(_agy_tokens({}), {})
+
     def test_a_failed_status_is_a_failed_turn(self):
         reply = self.adapter().parse_output('{"status":"ERROR","response":"quota exceeded"}', 1)
         self.assertFalse(reply.ok)

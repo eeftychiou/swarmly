@@ -638,6 +638,37 @@ def _cli_conversations() -> Set[str]:
     return found
 
 
+def _agy_tokens(usage: Dict[str, Any]) -> Dict[str, int]:
+    """``tokens_in``/``tokens_out`` from agy's JSON ``usage``, with the cache read and the
+    thinking counted once.
+
+    Two shapes are seen: agy's headless docs show ``total_tokens = input + output`` (the cache
+    read is part of the input, the thinking part of the output), while a live 1.x reply had
+    ``total = input + output + thinking + cache_read``. ``total_tokens`` says which one a reply
+    is: the cache read and the thinking are added only where the total adds them. With no
+    total (or one neither shape gives) they are added, as the fields are named.
+    """
+    def number(key: str) -> Optional[int]:
+        value = usage.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    inp, out = number("input_tokens"), number("output_tokens")
+    think, cache, total = number("thinking_tokens"), number("cache_read_tokens"), \
+        number("total_tokens")
+    add_cache, add_think = cache is not None, think is not None
+    if total is not None and inp is not None and out is not None:
+        for with_cache, with_think in ((True, True), (False, True), (True, False),
+                                       (False, False)):
+            if inp + out + (cache or 0) * with_cache + (think or 0) * with_think == total:
+                add_cache, add_think = with_cache, with_think
+                break
+    found: Dict[str, int] = {}
+    if inp is not None or cache is not None:
+        found["tokens_in"] = (inp or 0) + ((cache or 0) if add_cache else 0)
+    if out is not None or think is not None:
+        found["tokens_out"] = (out or 0) + ((think or 0) if add_think else 0)
+    return found
+
+
 class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
     """Drive the Antigravity CLI in print mode, one process per incoming message.
 
@@ -872,17 +903,7 @@ class AntigravityAdapter(AntigravityContextMixin, SubprocessAdapter):
         if not isinstance(data, dict) or "response" not in data:
             return super().parse_output(out, duration)
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        meta: Dict[str, Any] = {}
-
-        def count(*keys: str) -> Optional[int]:
-            values = [usage.get(k) for k in keys if isinstance(usage.get(k), int)]
-            return sum(values) if values else None
-        tokens_in = count("input_tokens", "cache_read_tokens")
-        tokens_out = count("output_tokens", "thinking_tokens")
-        if tokens_in is not None:
-            meta["tokens_in"] = tokens_in
-        if tokens_out is not None:
-            meta["tokens_out"] = tokens_out
+        meta: Dict[str, Any] = dict(_agy_tokens(usage))
         if data.get("conversation_id"):
             meta["conversation"] = str(data["conversation_id"])
         status = str(data.get("status") or "SUCCESS").upper()
