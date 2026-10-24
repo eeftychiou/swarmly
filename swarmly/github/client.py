@@ -386,6 +386,26 @@ class GitHubClient:
                 rollup=entry.get("statusCheckRollup") or [], pr_state="OPEN"))
         return found
 
+    def open_prs(self, repo: str, limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+        """Open pull requests with ``number``, ``body`` and ``headRefOid``, or None."""
+        code, out, err = self._run(["pr", "list", "--repo", repo, "--state", "open",
+                                    "--limit", str(int(limit)), "--json",
+                                    "number,body,headRefOid,title"])
+        if code != 0:
+            logger.warning("open_prs(%s) failed (code %d): %s", repo, code, err.strip())
+            return None
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return None
+        return [d for d in data if isinstance(d, dict) and d.get("number")] \
+            if isinstance(data, list) else None
+
+    def pr_diff(self, repo: str, number: int) -> str:
+        """The PR's unified diff, or "" when gh cannot say."""
+        code, out, _err = self._run(["pr", "diff", str(number), "--repo", repo], timeout=60.0)
+        return out if code == 0 else ""
+
     def notifications(self, repo: Optional[str] = None) -> List[Notification]:
         """Fetch the token owner's unread notifications, optionally scoped to a repository.
 
