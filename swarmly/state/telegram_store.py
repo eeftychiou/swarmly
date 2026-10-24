@@ -119,7 +119,12 @@ class TelegramStore(StateStore):
         if envelope.type != MessageType.NOTE or intent not in (STATE_INTENT, SNAPSHOT_INTENT):
             return False
         if intent == SNAPSHOT_INTENT:
-            return True                                # read through the pin, not here
+            # Read through the pin, not here -- but a newer snapshot than the one this bot
+            # holds means its next refresh reads the pin again (that is how a bot that adopted
+            # a stale pin heals at the true holder's next snapshot; review, #263).
+            if int(message_id) > int(self.snapshot_message or 0):
+                self.log.late = True
+            return True
         self.observe_time(float(date))
         if read_file is not None:
             self._files.append((int(message_id), float(date), author, read_file))
