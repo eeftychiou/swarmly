@@ -33,6 +33,12 @@ logger = logging.getLogger("swarmly.telegram.state_link")
 
 #: The store lease's time to live, as today's lease.
 LEASE_TTL_SECONDS = 600.0
+#: A new snapshot at most this often, unless many writes piled up since the last one: each
+#: is a message and a pin in Swarm pulse.
+SNAPSHOT_EVERY_SECONDS = 900.0
+SNAPSHOT_AFTER_OPS = 25
+#: Telegram's flood control: wait what it asks, this many times, before giving up.
+RETRIES = 3
 
 
 def _date(message: Any) -> float:
@@ -56,21 +62,34 @@ class ChannelIO(TelegramIO):
         chat = int(self.channel.config.identity.home_channel_id or 0)
         return chat, await self.channel._ensure_pulse_topic()
 
+    async def _call(self, method: Any, **kwargs: Any) -> Any:
+        """One Bot API call, waiting out Telegram's flood control (``retry_after``)."""
+        for attempt in range(RETRIES + 1):
+            try:
+                return await method(**kwargs)
+            except Exception as exc:                   # noqa: BLE001 - re-raised below
+                wait = getattr(exc, "retry_after", None)
+                if not isinstance(wait, (int, float)) or attempt == RETRIES:
+                    raise
+                logger.info("state: Telegram asks to wait %ss", wait)
+                await asyncio.sleep(float(wait) + 0.5)
+        raise RuntimeError("unreachable")
+
     async def post_line(self, text: str) -> Posted:
         chat, topic = await self._place()
-        sent = await self.channel.bot.send_message(chat_id=chat, message_thread_id=topic,
-                                                   text=text, disable_notification=True,
-                                                   disable_web_page_preview=True,
-                                                   parse_mode=None)
+        sent = await self._call(self.channel.bot.send_message, chat_id=chat,
+                                message_thread_id=topic, text=text,
+                                disable_notification=True, disable_web_page_preview=True,
+                                parse_mode=None)
         return Posted(int(sent.message_id), _date(sent))
 
     async def post_file(self, name: str, data: bytes, caption: str) -> Posted:
         from aiogram.types import BufferedInputFile
         chat, topic = await self._place()
-        sent = await self.channel.bot.send_document(chat_id=chat, message_thread_id=topic,
-                                                    document=BufferedInputFile(data, name),
-                                                    caption=caption, disable_notification=True,
-                                                    parse_mode=None)
+        sent = await self._call(self.channel.bot.send_document, chat_id=chat,
+                                message_thread_id=topic,
+                                document=BufferedInputFile(data, name), caption=caption,
+                                disable_notification=True, parse_mode=None)
         return Posted(int(sent.message_id), _date(sent))
 
     async def pin(self, message_id: int) -> None:
@@ -113,6 +132,7 @@ class StateLink:
         self.store: Optional[TelegramStore] = None
         self.error = ""
         self._last_beat = float("-inf")
+        self._last_snapshot = float("-inf")
         self._starting: Optional[asyncio.Task] = None
 
     @property
@@ -179,9 +199,14 @@ class StateLink:
                     result = await store.claim_lease(LEASE_TTL_SECONDS, confirm=False)
                     done.append(f"lease {'claimed' if result.applied else 'refused'} "
                                 f"(term {store.lease().term})")
-                if await store.publish_snapshot(now=moment):
+                fresh = sum(1 for o in store.log.ops if o.pos > store.snapshot_pos)
+                due = (moment - self._last_snapshot >= SNAPSHOT_EVERY_SECONDS
+                       or fresh >= SNAPSHOT_AFTER_OPS)
+                if due and await store.publish_snapshot(now=moment):
+                    self._last_snapshot = moment
                     done.append(f"snapshot to p{store.snapshot_pos}")
-                elif await store.restore_from_cache():
+                elif store.snapshot_message is None and await store.restore_from_cache():
+                    self._last_snapshot = moment
                     done.append("snapshot restored")
             if moment - self._last_beat >= self.beat_seconds:
                 rev = str(getattr(self.channel, "_running_revision", "") or "")

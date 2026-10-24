@@ -70,6 +70,33 @@ class StateLinkTests(unittest.TestCase):
         self.assertIn("unreachable", claude.describe())
 
 
+class FloodWaitTests(unittest.TestCase):
+    def test_a_flood_wait_is_waited_out(self):
+        from unittest import mock
+        from swarmly.telegram import state_link
+
+        class Flood(Exception):
+            retry_after = 0
+
+        calls = []
+
+        class Bot:
+            async def send_message(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    raise Flood("Too Many Requests: retry after 0")
+                return SimpleNamespace(message_id=42, date=1000.0)
+
+        async def topic():
+            return 3418
+        channel = SimpleNamespace(bot=Bot(), _ensure_pulse_topic=topic,
+                                  config=SimpleNamespace(identity=SimpleNamespace(
+                                      home_channel_id=-100)))
+        with mock.patch.object(state_link.asyncio, "sleep", mock.AsyncMock()):
+            posted = asyncio.run(state_link.ChannelIO(channel).post_line("x"))
+        self.assertEqual((posted.message_id, len(calls)), (42, 2))
+
+
 class StateConfigTests(unittest.TestCase):
     def load(self, extra):
         with tempfile.TemporaryDirectory() as tmp:

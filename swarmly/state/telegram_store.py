@@ -222,5 +222,8 @@ class TelegramStore(StateStore):
             envelope, _ = parse_message(pinned.caption or "")
             if (envelope.intent or "").upper() == SNAPSHOT_INTENT:
                 return False
+        moment = self.clock()
+        if not any(o.at <= moment - SNAPSHOT_SETTLE_SECONDS for o in self.log.ops)                 and self.log.base_pos == 0:
+            return False                               # nothing settled to restore yet
         logger.warning("state: no snapshot is pinned; publishing this bot's state")
         return await self.publish_snapshot(force=True)
