@@ -23,7 +23,7 @@ def link_for(group, alias, clock, coordinator=False, backend="telegram"):
                                projects={}),
         is_coordinator=lambda: coordinator, _running_revision="abc123",
         topics=TopicMap(None, home_chat_id=-100), adapter=None, _models={}, _efforts={},
-        _ref_topics={})
+        _ref_topics={}, owed_store=lambda: SimpleNamespace(load=lambda: []))
     link = StateLink(channel, clock=clock)
     if link.enabled:
         link.store = TelegramStore(alias, FakeIO(group, alias), clock=clock)
@@ -90,6 +90,36 @@ class StateLinkTests(unittest.TestCase):
             return await claude.beat()
         self.assertEqual(asyncio.run(go()), "failed")
         self.assertIn("unreachable", claude.describe())
+
+
+class OwedShadowTests(unittest.TestCase):
+    def test_each_bot_writes_its_own_rows_and_the_store_folds_them(self):
+        from swarmly.telegram.owed import Row
+        clock = Clock()
+        group = FakeGroup(clock)
+        claude = link_for(group, "Claudebot", clock, coordinator=True)
+        deepseek = link_for(group, "DeepSeek", clock)
+        mine = Row(kind="handoff", item="#12", debtor="deepseek", owes="a review",
+                   writer="claudebot", key_extra="tg-7")
+        theirs = Row(kind="handoff", item="#13", debtor="claudebot", owes="a merge",
+                     writer="deepseek", key_extra="tg-7")
+        both = [mine, theirs]
+        for link in (claude, deepseek):
+            link.channel.owed_store = lambda: SimpleNamespace(load=lambda: list(both))
+
+        async def go():
+            await claude.store.start()
+            await deepseek.store.start()
+            self.assertTrue(await claude.sync_owed(claude.store, clock()))
+            self.assertTrue(await deepseek.sync_owed(deepseek.store, clock()))
+            self.assertFalse(await claude.sync_owed(claude.store, clock()), "unchanged")
+            await claude.store.refresh()
+        asyncio.run(go())
+        stored = claude.store.read("agent/claudebot/owed")["rows"]
+        self.assertEqual([r["item"] for r in stored], ["#12"])     # only its own rows
+        self.assertEqual(sorted(r.id for r in claude.owed_from_store()),
+                         sorted([mine.id, theirs.id]))
+        self.assertIn("2 open row(s) in the store, 2 here (agree)", claude.describe())
 
 
 class FloodWaitTests(unittest.TestCase):
