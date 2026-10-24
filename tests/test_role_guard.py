@@ -453,6 +453,32 @@ class TestTheReviewOnTwoThreeTwo(unittest.TestCase):
             self.assertIn(f'set "{ALIAS_ENV}=DeepSeek"', cmd)
             self.assertIn(f'set "{TERM_ENV}=4"', cmd)
 
+    def test_a_later_prepare_does_not_erase_the_baked_term(self):
+        """#245 review: a /model-time `prepare()` rewrote the wrapper at term 0.
+
+        That took the term away from a merge already in flight, and its attribution comment
+        lost the term it had earned. The term is only ever raised, never reset by a caller who
+        does not know it.
+        """
+        from swarmly.telegram.guard import TERM_ENV
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "guard"
+            env = prepare(folder, "developer", {"PATH": os.environ.get("PATH", "")},
+                          alias="DeepSeek", term=4)
+            if not env.get("SWARMLY_REAL_GH"):
+                self.skipTest("gh is not on PATH: the wrapper is not installed")
+            again = prepare(folder, "developer", {"PATH": os.environ.get("PATH", "")},
+                            alias="DeepSeek", term=0)
+            self.assertIn(f"{TERM_ENV}=4", (folder / "gh").read_text(encoding="utf-8"))
+            self.assertIn(f'set "{TERM_ENV}=4"',
+                          (folder / "gh.cmd").read_text(encoding="utf-8"))
+            self.assertEqual(again[TERM_ENV], "4")      # the environment too, not just the file
+            # ... and a real term still wins over the baked one.
+            newer = prepare(folder, "developer", {"PATH": os.environ.get("PATH", "")},
+                            alias="DeepSeek", term=5)
+            self.assertIn(f"{TERM_ENV}=5", (folder / "gh").read_text(encoding="utf-8"))
+            self.assertEqual(newer[TERM_ENV], "5")
+
     def test_the_cmd_wrapper_quotes_the_assignment_and_doubles_percent(self):
         """#245 review: `set VAR="x"` keeps the quotes in the value; `set "VAR=x"` does not.
 
@@ -499,6 +525,9 @@ class TestTheReviewOnTwoThreeTwo(unittest.TestCase):
 
         prefix, tail = split_gh(["-R", "other/repo", "pr", "merge", "5"])
         self.assertEqual(prefix, ["-R", "other/repo"])
+        # #245 review: drive the split honestly -- assert what it *left* as well as what it
+        # took, or a split that kept its prefix in the tail would still pass this test.
+        self.assertEqual(tail, ["pr", "merge", "5"])
         body = comment_merge("/bin/gh", tail, {"SWARMLY_ALIAS": "DeepSeek",
                                                "SWARMLY_LEASE_TERM": "4"}, run,
                              global_options=prefix)

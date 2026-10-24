@@ -19,6 +19,13 @@ All notable changes to this project are documented here. The format follows
   `github.login` — does not either. Both of the last two are posted instead as one short line
   in the topic that owns the item, as an ephemeral notice. A comment from a person still gets
   its turn, and the poll outcome counts what it skipped (`backlog_skipped`, `quiet_skipped`).
+  The actor is the pull request's **last commenter** (`PR.comments`, new), not its author: a
+  person's comment on a swarm-opened PR was quieted, because the author was the bot itself.
+
+- A `/model`-time `prepare()` no longer erases the lease term baked into the `gh` wrapper
+  (`#245` review). Rewriting it at term 0 took the term away from a merge already in flight, and
+  its attribution comment lost the term it had earned; `prepare()` now keeps the term already
+  in the wrapper unless the caller brings a higher one.
 
 - The pinned dashboard no longer draws a ghost row for a bot it lists twice (`#246`). The
   presence table is keyed by whatever name a beat arrived under, so the coordinator's Telegram

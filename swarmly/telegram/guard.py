@@ -23,6 +23,7 @@ guard.py``) and stay fast.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -361,6 +362,27 @@ def _sh_quote(value: str) -> str:
     return "'" + text.replace("'", "'\\''") + "'"
 
 
+def _baked_term(folder: Path) -> int:
+    """The lease term already baked into this folder's wrapper, or 0 when there is none.
+
+    #245 review: ``prepare()`` is called again for reasons that have nothing to do with the
+    lease -- a ``/model`` change rewrites the environment, and the adapter it builds may not
+    know the term yet. Rewriting the wrapper with ``SWARMLY_LEASE_TERM=0`` then took the term
+    away from a merge already in flight, and its attribution comment lost the term it had
+    earned. The term is only ever raised here, never lowered back to 0 by a caller who does not
+    know it.
+    """
+    for name in ("gh", "gh.cmd"):
+        try:
+            text = (folder / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        match = re.search(rf"{re.escape(TERM_ENV)}=(\d+)", text)
+        if match:
+            return int(match.group(1))
+    return 0
+
+
 def _gh_wrapper(run: str, alias: str, term: int) -> str:
     """The POSIX ``gh`` wrapper, with **who it speaks for baked in** (#232).
 
@@ -398,6 +420,9 @@ def prepare(folder: Path, role: str, env: Dict[str, str], *, alias: str = "",
     ``alias`` and ``term`` say who this agent is and at which lease term it runs, so a merge
     the guard runs can post its attribution comment (#228)."""
     path = env.get("PATH", os.environ.get("PATH", ""))
+    # #245 review: a caller that does not know the term (a /model rewrite, a restart before
+    # the lease is read) must not erase the one the wrapper already carries.
+    term = int(term or 0) or _baked_term(folder)
     real = {tool: shutil.which(tool, path=path) for tool in TOOLS}
     if not any(real.values()):
         return env

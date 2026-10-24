@@ -540,6 +540,67 @@ class TestBackstopFixes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.turns_queued, 1)
         self.assertEqual(outcome.quiet_skipped, 0)
 
+    async def test_a_persons_comment_on_a_swarm_opened_pr_is_still_a_turn(self):
+        """#252 review: the actor is the last commenter, not the PR's author.
+
+        Reproduced there as `turns 0, notice "eeftychiou is one of the swarm's bots"`: the PR
+        was opened by the agent's own login, so reading the *author* quieted the very reply it
+        owed. The author only decides when nobody has spoken since.
+        """
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.pr_view.return_value = PR(
+                number=252, title="a swarm PR", body="x", author="test-bot", state="OPEN",
+                comments=[IssueComment(author="eeftychiou",
+                                       body="one blocker: fix the actor", created_at="")])
+            client.notifications.return_value = [
+                Notification(id="n252", reason="comment", repo="example-org/webapp",
+                             subject_title="a swarm PR", subject_type="PullRequest",
+                             subject_url="https://api.github.com/repos/example-org/webapp/pulls/252",
+                             number=252, updated_at=_stamp(60))]
+            ch = self.channel()
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+        self.assertEqual(outcome.turns_queued, 1, outcome.errors)
+        self.assertEqual(outcome.quiet_skipped, 0)
+        said = ch._adapter_for.return_value.received[0].text
+        self.assertIn("eeftychiou", said)
+
+    async def test_a_swarm_comment_on_its_own_pr_is_still_quiet(self):
+        """... and a bot answering on that same PR stays quiet."""
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.pr_view.return_value = PR(
+                number=252, title="a swarm PR", body="x", author="test-bot", state="OPEN",
+                comments=[IssueComment(author="DeepSeek", body="pushed a fix", created_at="")])
+            client.notifications.return_value = [
+                Notification(id="n252", reason="comment", repo="example-org/webapp",
+                             subject_title="a swarm PR", subject_type="PullRequest",
+                             subject_url="https://api.github.com/repos/example-org/webapp/pulls/252",
+                             number=252, updated_at=_stamp(60))]
+            ch = self.channel()
+            cfg = make_test_config(tmp)
+            cfg.peers["DeepSeek"] = "@DeepSeek_dd_bot"
+            w = GitHubWatcher(cfg, client=client, state_path=Path(tmp) / "s.json", channel=ch)
+            outcome = await w.poll_once()
+        self.assertEqual(outcome.turns_queued, 0)
+        self.assertEqual(outcome.quiet_skipped, 1)
+
+    async def test_a_pr_with_no_comments_still_names_its_author(self):
+        """The old reading, kept for the case it was right about."""
+        with TemporaryDirectory() as tmp:
+            client = MagicMock(spec=GitHubClient)
+            client.pr_view.return_value = PR(number=20, title="Add new api", body="x",
+                                             author="alice", state="OPEN")
+            client.notifications.return_value = [
+                Notification(id="n20", reason="review_requested", repo="example-org/webapp",
+                             subject_title="Add new api", subject_type="PullRequest",
+                             subject_url="https://api.github.com/repos/example-org/webapp/pulls/20",
+                             number=20, updated_at=_stamp(60))]
+            ch = self.channel()
+            outcome = await self.watcher(tmp, client, ch).poll_once()
+        self.assertEqual(outcome.turns_queued, 1, outcome.errors)
+        self.assertIn("alice", ch._adapter_for.return_value.received[0].text)
+
     def test_backlog_hours_zero_answers_everything(self):
         """An operator who wants the whole backlog answered can say so."""
         with TemporaryDirectory() as tmp:

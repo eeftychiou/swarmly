@@ -951,8 +951,12 @@ class GitHubWatcher:
                 if notif.subject_type == "PullRequest" and num is not None:
                     pr = self.client.pr_view(repo, num)
                     if pr:
-                        user = pr.author or "a contributor"
-                        snippet = pr.title or snippet
+                        # #87 review: the *actor* is whoever spoke last, not the PR's author.
+                        # Taking the author quieted a person's comment on a swarm-opened PR --
+                        # the author was the bot, so the reply it owed was never written.
+                        last = pr.comments[-1] if pr.comments else None
+                        user = (last.author if last and last.author else "") or pr.author                             or "a contributor"
+                        snippet = (last.body[:200] if last and last.body else "") or                             pr.title or snippet
                 elif num is not None:
                     issue = self.client.issue_view(repo, num)
                     if issue:
