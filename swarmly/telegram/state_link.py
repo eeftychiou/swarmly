@@ -258,6 +258,95 @@ class StateLink:
             return "failed"
         return ", ".join(done) or "nothing to do"
 
+    # -- links and work items (phase 5) -------------------------------------------------------
+    def _ops(self) -> Any:
+        from swarmly.telegram.registry_ops import RegistryOps
+        return RegistryOps(self.store, home=int(self.channel.config.identity.home_channel_id
+                                                or 0),
+                           repo=self.registry._repo(), clock=self.clock)
+
+    def note_reply(self, chat_id: int, thread_id: Optional[int], text: str) -> None:
+        """The coordinator's reply in a topic: record its LINK/ASSIGN/PHASE lines (the lease
+        holder only -- it alone writes topic records)."""
+        from swarmly.state.links import parse_lines
+        store = self.store
+        if store is None or not store.ready or thread_id is None or not text:
+            return
+        if int(chat_id) != int(self.channel.config.identity.home_channel_id or 0):
+            return
+        lines = parse_lines(text)
+        if not lines or not store.holds_lease():
+            return
+        name = self.channel.topics.name(chat_id, thread_id) or ""
+
+        async def record() -> None:
+            try:
+                ops = self._ops()
+                topic = ops.topic(thread_id, name)
+                done = ops.apply(topic, lines, K.norm(self.channel.config.identity.alias))
+                if await ops.save(thread_id, topic):
+                    logger.info("registry: topic %s: %s", thread_id, "; ".join(done))
+            except Exception:                          # noqa: BLE001 - shadow: never fatal
+                logger.warning("registry: the reply's lines were not recorded", exc_info=True)
+        task = asyncio.get_running_loop().create_task(record())
+        self._tasks = getattr(self, "_tasks", set())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    REGISTRY_COMMANDS = ("link", "unlink", "phase")
+
+    async def registry_command(self, event: Any) -> Optional[str]:
+        """``/link @bot``, ``/unlink @bot``, ``/phase <ref|L1> <phase>`` from the admin, in a
+        topic. None: not one of them; "": another bot answers; else the reply to post. The
+        lease holder answers a bare one; a targeted one is answered by its target."""
+        from swarmly.telegram.commands import parse_command
+        parsed = parse_command(event.text or "")
+        if not parsed or parsed[0] not in self.REGISTRY_COMMANDS:
+            return None
+        command, target = parsed
+        me = str(self.channel.config.identity.name or "").lstrip("@").lower()
+        store = self.store
+        holder = store is not None and store.ready and store.holds_lease()
+        if target is not None and target.lstrip("@").lower() != me:
+            return ""
+        if target is None and not holder:
+            return ""
+        if event.author_is_bot or not self.channel.config.is_admin(event.author_id):
+            return "Only the admin changes a topic's links."
+        if store is None or not store.ready:
+            return "The state store is not running here (state.backend), so nothing is kept."
+        if not holder:
+            return "Only the bot holding the store's lease writes topic records; ask it."
+        if event.thread_id is None:
+            return f"/{command} works inside a topic."
+        args = (event.text or "").split()[1:]            # the bot named in /link @bot stays
+        ops = self._ops()
+        topic = ops.topic(event.thread_id,
+                          self.channel.topics.name(event.chat_id, event.thread_id) or "")
+        by = "admin"
+        from swarmly.state.links import PhaseLine, parse_lines
+        try:
+            if command == "link" and args:
+                if args[0].startswith("@"):
+                    said = ops.link_agent(topic, args[0].lstrip("@"), by)
+                else:
+                    said = "; ".join(ops.apply(topic, parse_lines("LINK: " + " ".join(args)),
+                                               by)) or "nothing to link"
+            elif command == "unlink" and args:
+                said = ops.unlink_agent(topic, args[0].lstrip("@"), by)
+            elif command == "phase" and len(args) == 2:
+                said = "; ".join(ops.apply(topic, [PhaseLine(args[0], args[1].lower())], by))
+            else:
+                return ("Usage: /link @bot | /link <ref> [as work|reference|tracking], "
+                        "/unlink @bot, /phase <ref|L1> <phase>")
+        except ValueError as exc:
+            return f"Not changed: {exc}"
+        if said.startswith("refused"):
+            return f"Not changed: {said}"
+        if await ops.save(event.thread_id, topic):
+            return f"Recorded: {said}"
+        return "The store did not take the change; try again in a moment."
+
     # -- the owed table (phase 3, part 2: shadow) --------------------------------------------
     #: Closed rows stay in the store this long, so a reader sees how a debt ended.
     OWED_KEEP_CLOSED_SECONDS = 24 * 3600.0

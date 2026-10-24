@@ -235,7 +235,8 @@ class RegistryShadow:
         repo = self._repo()
         if repo is None:
             return
-        known = {link.ref for link in topic.links}
+        known = {link.ref for link in topic.links} | \
+            {link.title for link in topic.links if link.provider == "github" and link.title}
         for ref, place in sorted((getattr(self.channel, "_ref_topics", {}) or {}).items()):
             if place[0] != self._home() or place[1] != thread:
                 continue
@@ -243,7 +244,7 @@ class RegistryShadow:
             if not number.isdigit():
                 continue
             url = f"https://github.com/{repo}/issues/{number}"
-            if url in known:
+            if url in known or f"#{number}" in known:
                 continue
             # A guess from a mention is a pointer, not a work item: phase 5's explicit links
             # carry the status, phase and assignees a work item needs.
@@ -260,6 +261,14 @@ class RegistryShadow:
         self.turns[key] = self.turns.get(key, 0) + 1
 
     # -- /topics ---------------------------------------------------------------------------
+    @staticmethod
+    def _link_text(link: Dict[str, Any]) -> str:
+        """``L2 #256 review [DeepSeek developer]`` for a work item, the title otherwise."""
+        name = f"{link.get('id', '?')} {link.get('title') or link.get('ref', '?')}"
+        if link.get("role") != "work":
+            return name if link.get("added_by") != "legacy" else str(link.get("title") or name)
+        who = ", ".join(f"{a.get('agent')} {a.get('as')}" for a in link.get("assignees") or [])
+        return f"{name} {link.get('phase')}" + (f" [{who}]" if who else "")
     def describe(self, store: Optional["StateStore"]) -> str:
         if store is None or not store.ready:
             return "Topic registry: the state store is not running (state.backend)."
@@ -279,8 +288,7 @@ class RegistryShadow:
                 what = (f"{binding.get('role')} {binding.get('model')}/{binding.get('effort')}"
                         if binding else "not linked")
                 agents.append(f"{alias} {what} s={sid} t={session.get('turns', 0)}")
-            links = ", ".join(link.get("title") or link.get("ref", "?")
-                              for link in data.get("links") or [])
+            links = ", ".join(self._link_text(link) for link in data.get("links") or [])
             lines.append(f"• {data.get('title')} ({place[0]})"
                          + (f" — {links}" if links else "")
                          + ("".join(f"\n    {a}" for a in agents)))

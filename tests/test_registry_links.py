@@ -1,0 +1,189 @@
+"""Work items and links (topic registry, phase 5)."""
+
+import asyncio
+import unittest
+from types import SimpleNamespace
+
+from swarmly.state import keys as K
+from swarmly.state.links import AssignLine, LinkLine, PhaseLine, parse_lines, parse_ref
+from swarmly.state.records import Topic
+from swarmly.state.store import MemoryLog, MemoryStore
+from swarmly.telegram.registry_ops import RegistryOps
+from tests.test_registry_shadow import HOME, Clock, channel_for, seen
+
+
+class ParseRefTests(unittest.TestCase):
+    def test_each_provider(self):
+        cases = {
+            "#12": ("github", "issue", "https://github.com/o/r/issues/12", "#12"),
+            "x/y#7": ("github", "issue", "https://github.com/x/y/issues/7", "#7"),
+            "https://github.com/o/r/pull/256": ("github", "pr",
+                                               "https://github.com/o/r/pull/256", "#256"),
+            "https://github.com/o/r/issues/3.": ("github", "issue",
+                                                "https://github.com/o/r/issues/3", "#3"),
+            "https://gitlab.com/g/p/-/merge_requests/9": ("gitlab", "pr",
+                                                         "https://gitlab.com/g/p/-/merge_requests/9",
+                                                         "!9"),
+            "https://drive.google.com/drive/folders/abc": ("gdrive", "folder",
+                                                          "https://drive.google.com/drive/folders/abc",
+                                                          ""),
+            "https://docs.google.com/document/d/x": ("gdrive", "doc",
+                                                    "https://docs.google.com/document/d/x", ""),
+            "https://example.org/spec.pdf": ("cloud", "doc", "https://example.org/spec.pdf", ""),
+            "T-10134-1": ("topic", "task", "T-10134-1", ""),
+            "C:\\data\\run1\\": ("local", "folder", "C:\\data\\run1\\", ""),
+            "./notes.md": ("local", "file", "./notes.md", ""),
+        }
+        for text, want in cases.items():
+            ref = parse_ref(text, repo="o/r")
+            self.assertEqual((ref.provider, ref.kind, ref.ref, ref.title), want, text)
+        self.assertIsNone(parse_ref("#12"))                  # no repo to resolve it
+        self.assertIsNone(parse_ref("hello"))
+
+    def test_lines(self):
+        text = ("Plan for the round.\nLINK: #256 as work — dashboard slice 2\n"
+                "ASSIGN: @DeepSeek #256 as developer\nPHASE: L1 review\n"
+                "LINK: https://docs.google.com/document/d/x as reference\n"
+                "PHASE: L1 dreaming\nLINK: #9 as nonsense")
+        self.assertEqual(parse_lines(text), [
+            LinkLine("#256", "work", "dashboard slice 2"),
+            AssignLine("DeepSeek", "#256", "developer"),
+            PhaseLine("L1", "review"),
+            LinkLine("https://docs.google.com/document/d/x", "reference", ""),
+        ])
+
+
+class RegistryOpsTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.shared = MemoryLog(clock=self.clock)
+        self.store = MemoryStore("Claudebot", self.shared, clock=self.clock)
+        asyncio.run(self.store.start())
+        asyncio.run(self.store.claim_lease(10 ** 6))
+        asyncio.run(self.store.write(K.agent("Claudebot", "profile"), {"x": 1}))
+        deepseek = MemoryStore("DeepSeek", self.shared, clock=self.clock)
+        asyncio.run(deepseek.start())
+        asyncio.run(deepseek.write(K.agent("DeepSeek", "profile"), {
+            "alias": "DeepSeek", "handle": "@d", "runtime": "reasonix",
+            "default_model": "deepseek-flash", "default_effort": "low"}))
+        asyncio.run(self.store.refresh())
+        self.ops = RegistryOps(self.store, home=HOME, repo="o/r", clock=self.clock)
+
+    def test_a_round_of_lines(self):
+        topic = self.ops.topic(10134, "Stability round")
+        done = self.ops.apply(topic, parse_lines(
+            "LINK: #237 as tracking\nLINK: https://github.com/o/r/pull/256\n"
+            "ASSIGN: @DeepSeek #256 as developer\nPHASE: #256 review"), "claudebot")
+        self.assertEqual(len(done), 4, done)
+        tracking, work = topic.links
+        self.assertEqual((tracking.role, tracking.status), ("tracking", None))
+        self.assertEqual((work.id, work.kind, work.status, work.phase), ("L2", "pr", "open",
+                                                                        "review"))
+        self.assertEqual([(a.agent, a.role) for a in work.assignees], [("DeepSeek", "developer")])
+        binding = topic.agents["DeepSeek"]
+        self.assertEqual((binding.role, binding.runtime, binding.model, binding.effort),
+                         ("developer", "reasonix", "deepseek-flash", "low"))
+        self.assertEqual([c.field for c in topic.history], ["assignees", "phase"])
+        self.assertTrue(asyncio.run(self.ops.save(10134, topic)))
+        again = Topic.from_dict(self.store.read("topic/10134"))
+        self.assertEqual(again.link("L2").phase, "review")
+
+    def test_done_closes_the_item_and_bad_lines_are_refused(self):
+        topic = self.ops.topic(7)
+        self.ops.apply(topic, parse_lines("LINK: #5"), "claudebot")
+        self.ops.apply(topic, [PhaseLine("L1", "done")], "claudebot")
+        self.assertEqual(topic.link("L1").status, "closed")
+        done = self.ops.apply(topic, [PhaseLine("#99", "qa"),
+                                      AssignLine("DeepSeek", "L9", "qa-tester")], "claudebot")
+        self.assertTrue(all(d.startswith("refused") for d in done), done)
+
+    def test_a_legacy_link_becomes_explicit(self):
+        topic = self.ops.topic(7)
+        topic.links.append(__import__("swarmly.state.records", fromlist=["Link"]).Link(
+            id="L1", provider="github", kind="issue", ref="https://github.com/o/r/issues/5",
+            role="reference", title="#5", added_by="legacy", added_at="t"))
+        self.ops.apply(topic, parse_lines("LINK: #5 as work"), "claudebot")
+        link = topic.link("L1")
+        self.assertEqual((link.role, link.added_by, link.status), ("work", "claudebot", "open"))
+        self.assertEqual(len(topic.links), 1)
+
+    def test_unlink_keeps_the_coordinator(self):
+        topic = self.ops.topic(7)
+        self.ops.link_agent(topic, "DeepSeek", "admin")
+        self.assertIn("DeepSeek", topic.agents)
+        self.ops.unlink_agent(topic, "deepseek", "admin")
+        self.assertNotIn("DeepSeek", topic.agents)
+        self.ops.link_agent(topic, "Claudebot", "admin", role="coordinator")
+        with self.assertRaises(ValueError):
+            self.ops.unlink_agent(topic, "Claudebot", "admin")
+
+
+class LinkFlowTests(unittest.TestCase):
+    """Through the state link: the coordinator's reply, and the admin's commands."""
+
+    def link(self, holder=True):
+        from tests.test_state_link import FakeGroup, link_for
+        from tests.test_state_store import Clock as StoreClock
+        clock = StoreClock()
+        group = FakeGroup(clock)
+        link = link_for(group, "Claudebot", clock, coordinator=True)
+        link.channel.config.projects = {"p": SimpleNamespace(repo="o/r")}
+        link.channel.config.is_admin = lambda author: author == 1
+        link.channel.config.identity.name = "Claude_obot"
+
+        async def start():
+            await link.store.start()
+            if holder:
+                await link.store.claim_lease(10 ** 6)
+        asyncio.run(start())
+        return link
+
+    def test_the_coordinators_lines_are_recorded(self):
+        link = self.link()
+
+        async def go():
+            link.note_reply(-100, 55, "Opening the round.\nLINK: #12\nPHASE: #12 research")
+            await asyncio.gather(*list(link._tasks))
+        asyncio.run(go())
+        topic = Topic.from_dict(link.store.read("topic/55"))
+        self.assertEqual((topic.links[0].title, topic.links[0].phase), ("#12", "research"))
+
+    def test_a_bot_without_the_lease_records_nothing(self):
+        link = self.link(holder=False)
+        link.note_reply(-100, 55, "LINK: #12")
+        self.assertFalse(getattr(link, "_tasks", None))
+
+    def test_admin_commands(self):
+        link = self.link()
+
+        def command(text, author=1, thread=55):
+            return asyncio.run(link.registry_command(SimpleNamespace(
+                text=text, author_id=author, author_is_bot=False, chat_id=-100,
+                thread_id=thread)))
+        self.assertIn("Recorded", command("/link #12 as work"))
+        self.assertIn("Recorded", command("/phase L1 qa"))
+        self.assertIn("Recorded", command("/link @DeepSeek"))
+        self.assertIn("Only the admin", command("/phase L1 done", author=2))
+        self.assertIn("inside a topic", command("/phase L1 done", thread=None))
+        self.assertEqual(command("/phase@OtherBot L1 done"), "")
+        self.assertIsNone(command("/ping"))
+        topic = Topic.from_dict(link.store.read("topic/55"))
+        self.assertEqual(topic.link("L1").phase, "qa")
+        self.assertIn("DeepSeek", topic.agents)
+
+
+class TopicsShowWorkItemsTests(unittest.TestCase):
+    def test_describe(self):
+        from swarmly.telegram.registry_shadow import RegistryShadow
+        clock = Clock()
+        claude = channel_for("Claudebot", clock)
+        seen(claude, 7, "t")
+        text = RegistryShadow._link_text({"id": "L2", "title": "#256", "role": "work",
+                                          "phase": "review",
+                                          "assignees": [{"agent": "DeepSeek",
+                                                         "as": "developer"}]})
+        self.assertEqual(text, "L2 #256 review [DeepSeek developer]")
+
+
+if __name__ == "__main__":
+    unittest.main()
