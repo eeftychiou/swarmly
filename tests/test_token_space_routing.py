@@ -97,9 +97,25 @@ class RepliesAreNotMovedByWhatTheyNameTests(unittest.TestCase):
         return channel._topic_elsewhere(event("@HermesBot status?", thread_id=9400), body)
 
     def test_transport_only_keeps_a_reply_where_its_turn_ran(self):
-        channel = channel_for(work_in_topics=True)
+        channel = channel_for(work_in_topics=True,
+                              adapter=Scripted("Reviewing #300 now; verdict to follow."))
         channel._learn_topic_refs(GROUP, 9500, "PR #300 lives here")
-        self.assertIsNone(self.reply_in_a_topic(channel))
+        spy = Spy(channel)
+        run(channel.handle_event(event("@HermesBot please review #300", thread_id=9400)))
+        self.assertEqual([(chat, thread) for chat, thread, _ in spy.posts], [(GROUP, 9400)])
+        self.assertIn("Reviewing #300", spy.posts[0][2])
+
+    def test_a_reply_that_gets_past_the_gate_is_neither_posted_nor_remembered(self):
+        channel = channel_for(adapter=Scripted("the answer"))
+
+        async def no_gate(ev):
+            return None
+        channel._general_gate = channel._general_request = no_gate
+        run(channel.handle_event(admin("@HermesBot hello")))
+        self.assertTrue(channel.adapter.seen, "the turn ran")
+        self.assertFalse(any("the answer" in s["text"] for s in channel._test_sender.sent))
+        log = channel._topic_memory._topics.get((GROUP, None), {}).get("log", [])
+        self.assertFalse(any(text == "the answer" for _id, _who, text in log), log)
 
     def test_today_a_reply_still_moves_but_never_into_the_pulse(self):
         channel = channel_for(general_turns="allow", work_in_topics=True)
@@ -113,6 +129,32 @@ class RepliesAreNotMovedByWhatTheyNameTests(unittest.TestCase):
     def test_nothing_is_learned_in_the_pulse(self):
         channel = channel_for(general_turns="allow")
         channel._learn_topic_refs(GROUP, PULSE, "Codex is busy on #300")
+        self.assertNotIn("#300", channel._ref_topics)
+
+    def test_a_second_pulse_topic_is_the_pulse_too(self):
+        channel = channel_for()
+        channel.topics.remember(GROUP, 3500, "\U0001f4e1 Swarm pulse")
+        self.assertEqual(channel.token_barred(GROUP, 3500), "Swarm pulse")
+        channel._learn_topic_refs(GROUP, 3500, "Codex is busy on #300")
+        self.assertNotIn("#300", channel._ref_topics)
+
+
+class TopicPinTests(unittest.TestCase):
+
+    def pin(self, channel, thread_id):
+        channel.is_coordinator = lambda now=None: True
+        return channel._handle_topic_pin(admin("/topic #300", thread_id=thread_id))
+
+    def test_transport_only_says_only_notices_follow(self):
+        answer = self.pin(channel_for(), 9400)
+        self.assertIn("notices about them", answer)
+
+    def test_today_replies_follow(self):
+        self.assertIn("replies about them", self.pin(channel_for("allow"), 9400))
+
+    def test_the_pulse_takes_no_items(self):
+        channel = channel_for()
+        self.assertIn("works inside a work topic", self.pin(channel, PULSE))
         self.assertNotIn("#300", channel._ref_topics)
 
 
@@ -173,6 +215,15 @@ class ReportBackToGeneralTests(unittest.TestCase):
         texts = [s["text"] for s in channel._test_sender.sent]
         self.assertEqual(sum("API B is better." in t for t in texts), 1, texts)   # the topic
 
+    def test_a_topic_origin_still_gets_the_summary(self):
+        adapter = Scripted("Compared them.\nREPORT_BACK: API B is better.")
+        channel = channel_for(adapter=adapter)
+        channel._topic_origins[(GROUP, 41)] = (GROUP, 9400)
+        spy = Spy(channel)
+        run(channel.handle_event(admin("@HermesBot which API?", thread_id=41)))
+        there = [text for chat, thread, text in spy.posts if thread == 9400]
+        self.assertTrue(any("API B is better." in t and "↩ from" in t for t in there), spy.posts)
+
     def test_today_general_gets_the_summary(self):
         adapter = Scripted("Compared them.\nREPORT_BACK: API B is better.")
         channel = channel_for("allow", adapter=adapter)
@@ -197,22 +248,36 @@ class ARequestInGeneralWithNoTopicTests(unittest.TestCase):
 
 class BusEchoesTests(unittest.TestCase):
 
-    def echo(self, channel, text="Done: #300 is fixed."):
+    def echo(self, channel, text="Done: #300 is fixed.", **kw):
         from swarmly.telegram.poll import PollOutcome, _echo_reply
         channel._sender = None
         channel.bot = object()
         spy = Spy(channel)
+        self.outcome = PollOutcome()
 
         async def record(*args, **kw):
             return None
         with mock.patch.object(type(channel), "_send_locked", record):
-            run(_echo_reply(channel, "codex", AdapterReply(text=text), PollOutcome()))
+            run(_echo_reply(channel, "codex", AdapterReply(text=text), self.outcome, **kw))
         return spy.posts
 
     def test_transport_only_neither_picks_a_topic_by_its_words_nor_posts_in_general(self):
         channel = channel_for()
         channel._learn_topic_refs(GROUP, 9400, "PR #300 lives here")
         self.assertEqual(self.echo(channel), [])
+        self.assertEqual(self.outcome.replies_unposted, 1)          # counted, not lost quietly
+
+    def test_an_answer_to_a_mirrored_hand_off_goes_where_the_hand_off_was(self):
+        channel = channel_for()
+        channel._log_topic(GROUP, 9400, "Codex", "@HermesBot please run the suite", 77)
+        posts = self.echo(channel, message_id=77)
+        self.assertEqual([(chat, thread) for chat, thread, _ in posts], [(GROUP, 9400)])
+        self.assertEqual(self.outcome.replies_posted, 1)
+
+    def test_a_hand_off_seen_in_the_pulse_is_not_answered_there(self):
+        channel = channel_for()
+        channel._log_topic(GROUP, PULSE, "Codex", "pulse chatter", 78)
+        self.assertEqual(self.echo(channel, message_id=78), [])
 
     def test_today_the_echo_goes_to_the_topic_its_items_name(self):
         channel = channel_for(general_turns="allow")
@@ -252,6 +317,66 @@ class RelayPointerTests(unittest.TestCase):
         result = self.relay(channel)
         self.assertEqual(result.telegram, "sent")
         self.assertIn("please review #300", channel._test_sender.last)
+
+
+class RoleReasonTests(unittest.TestCase):
+
+    def test_the_coordinators_reason_stays_out_of_general(self):
+        from tests.test_membership import TrustTests, _Scripted
+        for general_turns, shown in (("never", False), ("allow", True)):
+            with self.subTest(general_turns=general_turns), TemporaryDirectory() as folder:
+                channel = TrustTests().coordinator(folder, adapter=_Scripted(
+                    "ROLE: @codex_x_bot reviewer: MODEL WORDS here\nCodex, please review."))
+                channel.config.limits.general_turns = general_turns
+                run(channel.handle_event(event("@HermesBot who reviews?", author_id=ADMIN_ID,
+                                               username="alice", is_bot=False,
+                                               thread_id=9400)))
+                change = next(r["text"] for r in channel._test_sender.sent
+                              if "intent=ROLE" in r["text"])
+                self.assertEqual("MODEL WORDS" in change, shown, change)
+
+
+class CliOutputTests(unittest.TestCase):
+
+    def run_edit(self, error):
+        channel = channel_for()
+
+        class Bot:
+            async def edit_message_text(self, **kw):
+                raise RuntimeError(error)
+        channel.bot = Bot()
+        spy = Spy(channel)
+        run(channel._edit_native(GROUP, 5, "the CLI's output", 9400))
+        return spy.posts
+
+    def test_a_failed_edit_posts_in_the_runs_topic(self):
+        self.assertEqual([(c, t) for c, t, _ in self.run_edit("Bad Request: message to edit "
+                                                              "not found")], [(GROUP, 9400)])
+
+    def test_an_unchanged_screen_posts_nothing(self):
+        self.assertEqual(self.run_edit("Bad Request: message is not modified"), [])
+
+
+class TicketRepliesTests(unittest.TestCase):
+
+    def flush(self, general_turns, thread_id):
+        from swarmly.telegram.replies import ReplyStore
+        with TemporaryDirectory() as folder:
+            channel = channel_for(general_turns)
+            channel.replies = ReplyStore(Path(folder) / "replies.db")
+            ticket, _ = channel.replies.register(chat_id=GROUP, message_id=5,
+                                                 recipient="alice", text="q?",
+                                                 thread_id=thread_id)
+            channel.replies.submit(ticket["id"], text="the answer")
+            spy = Spy(channel)
+            run(channel.flush_replies())
+            return spy.posts
+
+    def test_the_answer_goes_to_the_tickets_topic(self):
+        self.assertEqual([(c, t) for c, t, _ in self.flush("never", 9400)], [(GROUP, 9400)])
+
+    def test_an_older_ticket_follows_its_message_as_before(self):
+        self.assertEqual([(c, t) for c, t, _ in self.flush("never", None)], [(GROUP, None)])
 
 
 class TheSendCommandTests(unittest.TestCase):

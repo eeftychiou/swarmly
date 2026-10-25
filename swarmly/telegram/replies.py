@@ -106,6 +106,9 @@ class ReplyStore:
                 ("receipt_notified", "INTEGER NOT NULL DEFAULT 0"),
                 ("receipt_message_id", "INTEGER"),
                 ("alerts", "INTEGER NOT NULL DEFAULT 0"),
+                # The topic the message was in: its answer is posted there (and refused in
+                # General and Swarm pulse when they are transport-only). NULL: an older ticket.
+                ("thread_id", "INTEGER"),
             ):
                 if column not in columns:
                     try:
@@ -141,7 +144,7 @@ class ReplyStore:
             db.close()
 
     def register(self, *, chat_id, message_id, recipient, text, timeout=600, now=None,
-                 reply_chars: Optional[int] = None):
+                 reply_chars: Optional[int] = None, thread_id: Optional[int] = None):
         if message_id is None:
             raise ValueError("reply tickets require a Telegram message_id for deduplication")
         now = time.time() if now is None else now
@@ -151,10 +154,11 @@ class ReplyStore:
         request_id = uuid.uuid4().hex
         with self._db() as db:
             cursor = db.execute("""INSERT OR IGNORE INTO replies
-                (id,chat_id,message_id,recipient,original,created,deadline,state,reply_chars)
-                VALUES (?,?,?,?,?,?,?,'pending',?)""",
+                (id,chat_id,message_id,recipient,original,created,deadline,state,reply_chars,
+                 thread_id)
+                VALUES (?,?,?,?,?,?,?,'pending',?,?)""",
                 (request_id, chat_id, message_id, recipient, text, now, now + timeout,
-                 reply_chars))
+                 reply_chars, thread_id))
             if cursor.rowcount:
                 return dict(db.execute("SELECT * FROM replies WHERE id=?", (request_id,)).fetchone()), True
             row = db.execute("SELECT * FROM replies WHERE chat_id=? AND message_id=?",
