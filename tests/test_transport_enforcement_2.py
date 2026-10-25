@@ -152,7 +152,7 @@ class PRCheckTests(unittest.IsolatedAsyncioTestCase):
     def test_part_of_is_read_in_the_forms_pr_bodies_use(self):
         """Review of #307: bold, a quote or a colon around "Part of #N" still names it."""
         for body in ("Part of #260.", "**Part of #260**", "> Part of #260", "Part of: #260",
-                     "- part of #260, phase 3"):
+                     "- part of #260, phase 3", "## Part of #260", "1. Part of #260"):
             with self.subTest(body=body):
                 self.assertIsNotNone(GitHubWatcher._PART_OF.search(body))
         for body in ("Builds on work done as part of #120.", "Part of the plan, see #260"):

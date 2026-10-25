@@ -246,29 +246,32 @@ class Lessons:
         """The outcome kept by :meth:`tell`, for a prompt; it stays until a turn ran."""
         return self.said
 
-    def turn_ran(self, seq: Optional[int] = None) -> None:
+    def turn_ran(self, seq: Optional[int] = None, *, due: bool = False) -> None:
         """A turn whose prompt was built at *seq* reached the model and answered: the
         outcome it carried is told, and a re-ask it carried is spent. A newer outcome (a
-        parallel turn's block, told since) stays for the next turn."""
-        if seq is not None and seq != self.seq:
-            return
-        if not (self.said or self.again):
-            return
-        self.said = ""
-        self.again = False
-        self._save_counter()
+        parallel turn's block, told since) stays for the next turn. *due*: the prompt asked
+        for the update, so the count starts again."""
+        changed = False
+        if due and self.since_asked:
+            # Reset on the *ask*, not on the write: a bot that ignores the instruction must
+            # not be asked on every turn from then on.
+            self.since_asked = 0
+            changed = True
+        if (seq is None or seq == self.seq) and (self.said or self.again):
+            self.said = ""
+            self.again = False
+            changed = True
+        if changed:
+            self._save_counter()
 
     # -- the turn counter ---------------------------------------------------------------
     def note_turn(self) -> bool:
         """Count this turn; True when an update is due: every N turns, or right after a
-        refused block (once)."""
+        refused block (once). The ask is spent by :meth:`turn_ran` once a turn carrying it
+        has run, so a turn that never reached the model does not use it up."""
         self.turns += 1
         self.since_asked += 1
         due = self.again or self.since_asked >= self.every_turns
-        if due:
-            # Reset on the *ask*, not on the write: a bot that ignores the instruction must
-            # not be asked on every turn from then on. A re-ask is spent by turn_ran().
-            self.since_asked = 0
         self._save_counter()
         return due
 

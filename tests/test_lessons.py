@@ -174,13 +174,32 @@ class TestTheTurnPrompt(unittest.TestCase):
             self.assertIn(LESSON, channel._memory_note())     # and the turn after it
             self.assertIn("Your lessons so far", channel._memory_note())
 
+    @staticmethod
+    def turn(channel, ran=True):
+        """One turn's prompt note; *ran*: the model answered, which spends what it carried."""
+        ev = event("@HermesBot: next")
+        note = channel._memory_note(ev)
+        if ran:
+            channel.lessons.turn_ran(ev.__dict__["memory_seq"], due=ev.__dict__["memory_due"])
+        return note
+
     def test_the_update_is_asked_every_n_turns_and_not_more_often(self):
         with TemporaryDirectory() as tmp:
             channel = self.channel(tmp, memory_every_turns=3)
-            notes = [channel._memory_note() for _ in range(9)]
+            notes = [self.turn(channel) for _ in range(9)]
             self.assertEqual(["MEMORY:" in note for note in notes], [False, False, True] * 3)
             self.assertIn("Update your memory now", notes[2])
             self.assertIn("lessons, not a log", notes[2])
+
+    def test_a_due_ask_on_a_turn_that_never_ran_is_asked_again(self):
+        """Reasonix's review of #307: the every-N ask was spent when the prompt was built."""
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, memory_every_turns=3)
+            self.turn(channel)
+            self.turn(channel)
+            self.assertIn("Update your memory now", self.turn(channel, ran=False))  # failed
+            self.assertIn("Update your memory now", self.turn(channel))
+            self.assertNotIn("Update your memory now", self.turn(channel))
 
     def test_the_count_survives_a_restart(self):
         with TemporaryDirectory() as tmp:
@@ -265,6 +284,8 @@ class TestTheTurnPrompt(unittest.TestCase):
             channel.lessons.turn_ran(one.__dict__["memory_seq"])
             channel.apply_memory_block(f"ok\n\nMEMORY:\n{LESSON}\n{END_MARKER}", one)  # saved
             channel.lessons.turn_ran(two.__dict__["memory_seq"])       # stale: a no-op
+            # The newer outcome, A's save, is still there for the next turn.
+            self.assertIn("After your last reply: Memory updated", channel._memory_note())
             self.oversize(channel, ev=two)
             note = channel._memory_note()
             self.assertIn("Memory refused", note)

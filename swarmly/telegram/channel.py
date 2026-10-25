@@ -3547,6 +3547,7 @@ class AgentChannel:
                 # the re-ask, so its refusal is not re-asked (review of #307).
                 event.__dict__["memory_seq"] = self.lessons.seq
                 event.__dict__["memory_reask"] = reask
+                event.__dict__["memory_due"] = due
             instruction = self.lessons_update_instruction() if due else ""
             parts = [part for part in (block, told, instruction) if part]
             return "\n\n[" + "\n".join(parts) + "]" if parts else ""
@@ -8685,8 +8686,10 @@ class AgentChannel:
                                    self.topics.name(event.chat_id, event.thread_id))
             return None
 
-        # The model answered: the memory outcome and any re-ask in this turn's prompt are told.
-        self.lessons.turn_ran(event.__dict__.get("memory_seq"))
+        # The model answered, or took the prompt into its running task (queued): the memory
+        # outcome and any update ask in this turn's prompt are spent.
+        self.lessons.turn_ran(event.__dict__.get("memory_seq"),
+                              due=bool(event.__dict__.get("memory_due")))
 
         if reply.meta.get("queued"):
             if ticket:

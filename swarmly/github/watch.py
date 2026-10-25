@@ -1261,7 +1261,7 @@ class GitHubWatcher:
     #: ...or the larger issue it is one step of: a phase PR must not close the whole roadmap
     #: issue (live, 25 Oct: #298, "Part of #260", was flagged). One issue may have several.
     #: A line of its own, so "as part of #120" in passing does not count.
-    _PART_OF = re.compile(r"(?im)^[\s>*_-]*part\s+of:?\s+#\d+\b")
+    _PART_OF = re.compile(r"(?im)^[\s>*_#-]*(?:\d+[.)]\s*)?part\s+of:?\s+#\d+\b")
     #: Test removal and skipping a PR adds (unified diff lines).
     _TEST_REMOVED = re.compile(r"^-\s*(?:async\s+)?def\s+test_", re.M)
     _TEST_ADDED = re.compile(r"^\+\s*(?:async\s+)?def\s+test_", re.M)
