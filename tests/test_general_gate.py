@@ -155,3 +155,22 @@ class RegistryRoutingMakesThemTransportOnlyTests(unittest.TestCase):
         self.assertIsNone(channel.topic_for_text("progress on #300"))
         channel._learn_topic_refs(GROUP, 9400, "work on #301")
         self.assertEqual(channel.topic_for_text("progress on #301"), (GROUP, 9400))
+
+
+class TheWorkPlaceIsNeverThePulseTests(unittest.TestCase):
+    """Live, 25 Oct: own briefs went to Swarm pulse, the last place a turn had run."""
+
+    def test_an_own_brief_never_goes_to_the_pulse(self):
+        channel, adapter, _ = channel_for()
+        channel._last_turn_place = (GROUP, PULSE)
+        channel.topics.remember(GROUP, 9400, "work")
+        channel.topics.touch(GROUP, 9400)
+        self.assertEqual(channel._work_place(), (GROUP, 9400))
+        channel._last_turn_place = (GROUP, 9400)
+        channel._remember_work_place(GROUP, PULSE)
+        self.assertEqual(channel._last_turn_place, (GROUP, 9400))
+
+    def test_no_work_topic_means_none(self):
+        channel, _, _ = channel_for()
+        channel._last_turn_place = (GROUP, PULSE)
+        self.assertIsNone(channel._work_place())
