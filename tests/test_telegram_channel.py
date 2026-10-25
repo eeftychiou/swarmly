@@ -2085,10 +2085,15 @@ class TestBusyDropVisibility(unittest.TestCase):
 
     def test_status_reports_the_busy_drop_counter(self):
         """#93(1): /diag carried it; /status is where a loss anomaly is first noticed."""
+        from swarmly.telegram import channel as channel_mod
         channel, adapter = gated_channel()
-        _, status = self._drive(
-            channel, adapter, self.ADDRESSED,
-            after=lambda ch: ch.handle_event(event("/status@HermesBot", message_id=98)))
+        # The checkout reads as the revision this process runs. On a loaded runner (CI runs one
+        # worker per core) `git rev-parse` can pass its 5 s timeout, and the line then gains
+        # `checkout=v… drift=restart-needed` and breaks the bound below on timing alone.
+        with patch.object(channel_mod, "_local_revision", return_value=channel._running_revision):
+            _, status = self._drive(
+                channel, adapter, self.ADDRESSED,
+                after=lambda ch: ch.handle_event(event("/status@HermesBot", message_id=98)))
 
         self.assertIn("STATUS Hermes", status)
         self.assertEqual(_token(status, "busy_dropped"), channel.stats.busy_dropped,

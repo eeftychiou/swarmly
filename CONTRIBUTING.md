@@ -10,10 +10,11 @@ git clone https://github.com/eeftychiou/swarmly.git
 cd swarmly
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[test]"                  # the package plus the test tools
-python -m unittest discover tests          # what CI runs (plus ruff, mypy and a link check)
+python -m pytest -n auto tests             # what CI runs (plus ruff, mypy and a link check)
 ```
 
-`uv sync --extra test` works too, because `uv.lock` is committed. If you change
+`-n auto` runs one worker per core; `python -m unittest discover tests` runs the same suite one
+test at a time. `uv sync --extra test` works too, because `uv.lock` is committed. If you change
 dependencies, regenerate the lock with `uv lock` in the same pull request.
 
 ## Making a change
