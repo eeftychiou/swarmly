@@ -174,3 +174,24 @@ class TheWorkPlaceIsNeverThePulseTests(unittest.TestCase):
         channel, _, _ = channel_for()
         channel._last_turn_place = (GROUP, PULSE)
         self.assertIsNone(channel._work_place())
+
+
+class RepliesStayInTheirTopicTests(unittest.TestCase):
+    """Admin, 25 Oct: a reply that named an item was moved into Swarm pulse. Where a post goes
+    is the transport's decision; with registry routing a reply stays in its turn's topic."""
+
+    def test_a_reply_naming_another_topics_item_stays(self):
+        from swarmly.telegram.adapters import EchoAdapter
+        from swarmly.telegram.adapters.base import AdapterReply
+
+        class Fixed(EchoAdapter):
+            async def respond(self, message):
+                return AdapterReply(text="Reviewing #300 now; verdict to follow.")
+        channel = make_channel(make_config(), adapter=Fixed("Hermes"))
+        channel.state_link.routing_mode = "registry"
+        channel._learn_topic_refs(GROUP, 9500, "PR #300 lives here")
+        channel._topic_elsewhere = lambda ev, body: (GROUP, 9500)     # what refs would pick
+        run(channel.handle_event(event("@HermesBot please review #300", thread_id=9400)))
+        texts = [s["text"] for s in channel._test_sender.sent]
+        self.assertFalse(any("moved this to" in t for t in texts), texts)
+        self.assertTrue(any("Reviewing #300" in t for t in texts), texts)
