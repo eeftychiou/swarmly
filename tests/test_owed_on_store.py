@@ -316,6 +316,44 @@ class StoreModeLinkTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class OwnBusDocumentTests(unittest.TestCase):
+    """#328 review: an own bus document closed before the switch, a re-open published after
+    it, then a state directory that lost the row (a rebuilt host)."""
+
+    def store(self, tmp, published):
+        import json
+        bus = Path(tmp) / "bus"
+        folder = bus / ".agents" / "owed" / "claudebot"
+        folder.mkdir(parents=True)
+        closed = row("#291", "antigravity", "claudebot", state="closed")
+        closed.created_at, closed.updated_at = 1000.0, 2000.0
+        (folder / "x.json").write_text(json.dumps(closed.to_dict()))
+        return OwedStore("Claudebot", state_dir=Path(tmp) / "state", root=bus,
+                         clock=lambda: 4000.0, shared=lambda: [], published=lambda: published)
+
+    def test_a_published_re_open_beats_the_old_closed_document(self):
+        again = row("#291", "antigravity", "claudebot")
+        again.created_at = again.updated_at = 3000.0               # after the close
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual([r.state for r in self.store(tmp, [again]).load()], ["open"])
+
+    def test_an_older_published_open_copy_still_loses_to_the_close(self):
+        stale = row("#291", "antigravity", "claudebot")
+        stale.created_at, stale.updated_at = 500.0, 3000.0          # opened before the close
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual([r.state for r in self.store(tmp, [stale]).load()], ["closed"])
+
+    def test_only_a_store_not_ready_is_logged_without_a_traceback(self):
+        def broken():
+            raise RecursionError("a bug, not a start-up moment")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = OwedStore("Claudebot", state_dir=Path(tmp), shared=broken)
+            with self.assertLogs("swarmly.telegram.owed", level="WARNING") as logs:
+                store.load()
+        self.assertIn("state store", store.unreadable)
+        self.assertTrue(any(record.exc_info for record in logs.records))
+
+
 class ChannelTests(unittest.TestCase):
     def test_store_mode_reads_no_gitbus(self):
         channel = make_channel(make_config(state={"backend": "telegram", "owed": "store"}))
