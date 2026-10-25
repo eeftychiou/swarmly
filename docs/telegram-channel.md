@@ -1237,7 +1237,11 @@ config flag. **No identifiers, no external references:** every field is picked b
 record carrying a chat id, a token or a path shows none of them, and the page loads nothing
 from anywhere (no CDN, no font host), so it works on a LAN with no route out. It follows the
 system's light or dark preference and is built phone-width first, ready to be the Mini App's
-page unchanged.
+page unchanged. As a Mini App it also takes the chat's own theme: `tgWebAppColorScheme` becomes
+the page's `data-theme`, which selects a **whole palette** (every colour token, not a hint), so
+no status colour is left over from the other scheme, and the chat's `tgWebAppThemeParams`
+colours go on top of it as overrides. A chat that sends colours but no scheme gets its palette
+from the luminance of `bg_color`.
 
 The page follows the lease like the pin: the first heartbeat that finds this bot coordinating
 starts the server, and the first that finds another bot coordinating stops it — so a failover
