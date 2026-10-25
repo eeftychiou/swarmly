@@ -214,7 +214,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "web": ("enabled", "port", "public_host", "init_max_age"),
     "swarm": ("succession",),
     # topic registry, phase 1: the shared state store, in shadow unless the operator says
-    "state": ("backend", "mode", "heartbeat_minutes", "lease", "links"),
+    "state": ("backend", "mode", "heartbeat_minutes", "lease", "links", "routing"),
 }
 
 
@@ -1010,6 +1010,10 @@ class StateSettings:
     #: Phase 5: ``legacy`` -- GitHub notices find their topic by today's ref-learning;
     #: ``registry`` -- by the topics' explicit links first (ref-learning only as a fallback).
     links: str = "legacy"
+    #: Phase 6: ``legacy`` -- each bot's mention rules decide who answers in a topic;
+    #: ``registry`` -- the topic registry does: the coordinator takes the topic's messages,
+    #: linked agents when named or handed work, an unlinked mention is refused.
+    routing: str = "legacy"
 
 
 @dataclass
@@ -1431,8 +1435,13 @@ class AgentConfig:
                 raise ConfigError(f"state.links must be legacy or registry (got {links!r})")
             if links == "registry" and backend != "telegram":
                 raise ConfigError("state.links: registry needs state.backend: telegram")
+            routing = str(state_raw.get("routing") or "legacy").strip().lower()
+            if routing not in ("legacy", "registry"):
+                raise ConfigError(f"state.routing must be legacy or registry (got {routing!r})")
+            if routing == "registry" and backend != "telegram":
+                raise ConfigError("state.routing: registry needs state.backend: telegram")
             state = StateSettings(backend=backend, mode=mode, heartbeat_minutes=minutes,
-                                  lease=lease, links=links)
+                                  lease=lease, links=links, routing=routing)
         elif state_raw is not None:
             raise ConfigError("'state' must be a mapping")
 
