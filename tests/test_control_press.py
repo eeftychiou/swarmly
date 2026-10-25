@@ -985,6 +985,21 @@ class TestTheLeaseControls(unittest.TestCase):
         self.assertIn("value=take", notes[0])
         self.assertIn("by=%d" % self.ADMIN, notes[0])
 
+    def test_a_picked_hand_over_from_the_page_carries_the_marker(self):
+        """Review #347: a picker value reaches _apply_pick, so *via* has to follow it."""
+        channel = self.channel()
+        asked = asyncio.run(channel.dashboard_action(
+            {"action": "swarm.lease", "value": "Codex"}))
+        self.assertEqual(asked["verdict"], cp.CONFIRM)
+        done = asyncio.run(channel.dashboard_action(
+            {"action": "swarm.lease", "value": "Codex", "code": asked["confirm"]}))
+        self.assertTrue(done["ok"])
+        self.assertEqual(len(channel.store.yielded), 1)        # the hand-over really ran
+        notes = self.notes(channel)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("value=take", notes[0])
+        self.assertIn("via=dashboard", notes[0])
+
     def test_a_bot_that_does_not_hold_the_lease_cannot_hand_it_on(self):
         # Still the coordinator as far as the press gate is concerned, but its lease lapsed:
         # the fence is what says so, and that is the rule a hand-over must obey.

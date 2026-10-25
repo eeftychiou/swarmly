@@ -4311,7 +4311,7 @@ class AgentChannel:
             logger.warning("control centre: could not post the confirm button", exc_info=True)
 
     async def _apply_pick(self, action: str, value: str, target: str = "",
-                          presser: str = "") -> str:
+                          presser: str = "", via: str = "") -> str:
         """Set what a picker chose -- through the same function the typed command runs.
 
         ``/model <name>`` and ``/reasoning <level>`` are the transport's own answers, so a
@@ -4323,7 +4323,8 @@ class AgentChannel:
         if action == "bot.effort":
             return self._reasoning_command(self._control_event("reasoning", value))
         if action == "swarm.lease":
-            return await self.hand_over_lease(value, presser=presser)
+            # A hand-over posts its own CONTROL note, so the marker has to reach it (#347).
+            return await self.hand_over_lease(value, presser=presser, via=via)
         if action == "swarm.role":
             who = str(target or "").strip()
             if not who:
@@ -4771,7 +4772,7 @@ class AgentChannel:
         (None otherwise, and the policy's own line is the answer).
         """
         if value:
-            return await self._apply_pick(action, value, target, presser=presser)
+            return await self._apply_pick(action, value, target, presser=presser, via=via)
         if action == "swarm.failback":
             return await self.fail_back_lease(presser=presser, via=via)
         if action == "swarm.role" and target:
