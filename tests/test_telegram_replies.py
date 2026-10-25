@@ -66,8 +66,9 @@ class ReplyTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaisesRegex(ValueError, '--skip'):
                 self.store.submit(row['id'], text=text)
         self.assertEqual(self.store.get(row['id'])['state'], 'queued')
+        # The sentinel line goes before the tag does: a leading one used to take the tag with it.
         self.assertEqual(self.store.submit(row['id'], text='NO_REPLY\nLGTM, merged.')['text'],
-                         '@example_hermes_bot: NO_REPLY\nLGTM, merged.')
+                         '@example_hermes_bot: LGTM, merged.')
 
     def test_an_unposted_ticket_says_so_when_answered_again(self):
         row = self.unposted()

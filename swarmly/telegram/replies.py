@@ -230,16 +230,15 @@ class ReplyStore:
                     raise ValueError("silence requires a reason (pure ACK/status only)")
                 body, state, detail = "", "skipped", skip_reason.strip()
             else:
-                body, state, detail = (text or "").strip(), "ready", ""
+                # NO_REPLY lines are never posted (send drops them), so they are dropped here,
+                # before the tag: a leading one would otherwise take the tag with it.
+                body, state, detail = drop_stray_silence((text or "").strip()).strip(), "ready", ""
                 if not body:
-                    raise ValueError("reply cannot be empty; use --skip with a reason for non-actionable messages")
+                    raise ValueError("reply cannot be empty (NO_REPLY is not an answer); use "
+                                     "--skip with a reason for non-actionable messages")
                 tag = f"@{row['recipient']}" if row['recipient'] else ""
                 if tag and not body.lower().startswith(tag.lower() + ":"):
                     body = f"{tag}: {body}"
-                if not drop_stray_silence(body).strip():
-                    # The transport never posts the sentinel, so this answer would post nothing.
-                    raise ValueError("NO_REPLY is not an answer; use --skip with a reason for a "
-                                     "pure ACK/status")
                 limit = self.budget_for(row)
                 if len(body) >= limit:
                     # The budget is "under N": N itself is already over it, as it always was
@@ -252,8 +251,8 @@ class ReplyStore:
                     return dict(row)  # idempotent submission, never a second send
                 raise ValueError("ticket already has a different response")
             if row['state'] == 'unposted':
-                raise ValueError(f"ticket is unposted ({row['detail']}); the transport will not "
-                                 "post an answer for it")
+                raise ValueError(f"ticket is unposted ({row['detail']}); it takes no further "
+                                 "answer")
             if row['state'] not in ('pending', 'queued', 'overdue'):
                 raise ValueError(f"ticket is {row['state']}; inspect delivery before retrying")
             db.execute("UPDATE replies SET state=?, text=?, detail=?, notified=0 WHERE id=?", (state, body, detail, request_id))
@@ -287,15 +286,16 @@ class ReplyStore:
         Nothing was posted, and a retry would be refused the same way, so the ticket stops
         here. Its overdue alert then tells the admin the answer was not posted -- with a fresh
         alert count: a late answer to a ticket whose overdue alerts were already spent must
-        still say it was not posted.
+        still say it was not posted. ``sending`` too: Telegram may answer that the topic is gone.
         """
         with self._db() as db:
             db.execute("UPDATE replies SET state='unposted', notified=0, alerts=0, detail=? "
-                       "WHERE id=? AND state='claimed'", (detail, request_id))
+                       "WHERE id=? AND state IN ('claimed','sending')", (detail, request_id))
 
     def uncertain(self, request_id):
         with self._db() as db:
-            db.execute("UPDATE replies SET state='delivery_unknown', notified=0, detail='send interrupted or failed; inspect Telegram before retry' WHERE id=? AND state='sending'",
+            # A fresh alert count, as for `unposted`: a late answer must still be reported.
+            db.execute("UPDATE replies SET state='delivery_unknown', notified=0, alerts=0, detail='send interrupted or failed; inspect Telegram before retry' WHERE id=? AND state='sending'",
                        (request_id,))
 
     def recover(self):
@@ -304,7 +304,7 @@ class ReplyStore:
                          receipt_detail='bridge restarted during receipt send; inspect Telegram before retry',
                          receipt_notified=0
                          WHERE receipt_state='attempted'""")
-            db.execute("UPDATE replies SET state='delivery_unknown', notified=0, detail='bridge restarted during send; inspect Telegram before retry' WHERE state='sending'")
+            db.execute("UPDATE replies SET state='delivery_unknown', notified=0, alerts=0, detail='bridge restarted during send; inspect Telegram before retry' WHERE state='sending'")
             db.execute("UPDATE replies SET state='ready' WHERE state='claimed'")
             # A crash between queue submission and recording success is ambiguous too.
             db.execute("UPDATE replies SET state='overdue', detail='bridge restarted before queue confirmation' WHERE state='pending'")
