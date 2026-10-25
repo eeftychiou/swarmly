@@ -54,7 +54,7 @@ class FakeStore:
 
 
 def records(*, phase_at: float = NOW - 3600, last_activity: Optional[str] = None,
-            max_turns: int = 50) -> Dict[str, Any]:
+            max_turns: int = 50, max_age_hours: Optional[float] = None) -> Dict[str, Any]:
     """Two open topics: a stalled item, closed work, a local path, a task ref, a due binding."""
     def work(link_id: str, ref: str, kind: str, phase: str, at: float,
              status: str = "open") -> Link:
@@ -93,7 +93,8 @@ def records(*, phase_at: float = NOW - 3600, last_activity: Optional[str] = None
     session = AgentInTopic(session_id="20261025-deepseek", started_at=iso(NOW - 3600),
                            turns=7, rotations=1)
     profile = Profile(alias="DeepSeek", handle="@DeepSeek_dd_bot", runtime="reasonix",
-                      default_model="deepseek", max_turns=max_turns)
+                      default_model="deepseek", max_turns=max_turns,
+                      max_age_hours=max_age_hours)
     return {
         K.topic(THREAD): dashboard.to_dict(),
         K.topic(OTHER): registry.to_dict(),
@@ -448,6 +449,22 @@ class TestTheTopicsPanel(unittest.TestCase):
         cards = webui.registry_panel(now=NOW, store=FakeStore(asked))["topics"]
         binding = [b for b in cards[0]["bindings"] if b["agent"] == "DeepSeek"][0]
         self.assertEqual(binding["rotation_due"], "turns")
+
+    def test_a_profiles_age_limit_also_makes_a_rotation_due(self):
+        # The session started an hour ago; half an hour of age is the limit (QA, #337).
+        old = records(max_age_hours=0.5)
+        cards = webui.registry_panel(now=NOW, store=FakeStore(old))["topics"]
+        binding = [b for b in cards[0]["bindings"] if b["agent"] == "DeepSeek"][0]
+        self.assertEqual(binding["session_age"], 3600.0)
+        self.assertEqual(binding["rotation_due"], "age")
+        # A limit the session has not reached trips nothing, and drift outranks both.
+        young = records(max_age_hours=4)
+        cards = webui.registry_panel(now=NOW, store=FakeStore(young))["topics"]
+        self.assertIsNone(cards[0]["bindings"][1]["rotation_due"])
+        cards = webui.registry_panel(now=NOW, store=FakeStore(old),
+                                     drift={(THREAD, "deepseek"): {"score": 6, "hard": 0}}
+                                     )["topics"]
+        self.assertEqual(cards[0]["bindings"][1]["rotation_due"], "drift")
 
     def test_a_store_that_is_not_ready_says_not_ready_and_not_an_empty_panel(self):
         self.assertEqual(self.panel(store=self.store(ready=False)),
