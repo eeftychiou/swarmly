@@ -596,12 +596,26 @@ _PAGE = """<!doctype html>
   --font-title: 600 19px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-head: 600 13px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
+/* Two palettes, and three ways to be in one of them: the phone's own preference, what the
+   Mini App's chat says (the data-theme attribute), and the chat's own colours (#347 review).
+   An attribute is a *whole* palette, not a hint: an explicit one wins over the system's, so
+   no token is ever left over from the other scheme. */
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #0d1117; --card: #161b22; --ink: #eef2f7; --dim: #a7b2c0; --line: #29313c;
     --accent: #8fbaff; --ok: #5ad597; --warn: #f0b429; --bad: #ff9a94; --frozen: #b8a9ff;
     --shadow: 0 1px 2px rgba(0, 0, 0, .5);
   }
+}
+:root[data-theme="dark"] {
+  --bg: #0d1117; --card: #161b22; --ink: #eef2f7; --dim: #a7b2c0; --line: #29313c;
+  --accent: #8fbaff; --ok: #5ad597; --warn: #f0b429; --bad: #ff9a94; --frozen: #b8a9ff;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .5);
+}
+:root[data-theme="light"] {
+  --bg: #f4f6f9; --card: #ffffff; --ink: #10151c; --dim: #4b5563; --line: #d7dde6;
+  --accent: #1f5fd1; --ok: #14683f; --warn: #7a4f00; --bad: #b3261e; --frozen: #4c3aa8;
+  --shadow: 0 1px 2px rgba(16, 21, 28, .07);
 }
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
@@ -952,26 +966,44 @@ const INIT = (() => {
   return match ? decodeURIComponent(match[1]) : "";
 })();
 
-// A Mini App also hands its own theme colours in the hash. When they are there they win over
-// both built-in palettes (they are the chat's colours); nothing is loaded to read them.
-document.documentElement.dataset.theme = (() => {
-  const match = location.hash.match(/tgWebAppColorScheme=(dark|light)/);
-  return match ? match[1] : "";
-})();
-(() => {
+// A Mini App also hands its chat's theme in the hash: which scheme it is, and some of its
+// colours. Nothing is loaded to read them.
+//
+// The scheme becomes the data-theme attribute, which is a *whole* palette in the stylesheet --
+// the six tokens the chat does not send (line, ok, warn, bad, frozen, shadow) come from that
+// palette, so a status badge never ends up in the other scheme's colours (review, #347). The
+// colours the chat does send are set on top, as inline overrides.
+const THEME_PARAMS = (() => {
   const match = location.hash.match(/tgWebAppThemeParams=([^&]*)/);
-  if (!match) return;
+  if (!match) return {};
   try {
-    const raw = JSON.parse(decodeURIComponent(match[1]));
-    const root = document.documentElement.style;
-    [["bg_color", "--bg"], ["secondary_bg_color", "--card"], ["text_color", "--ink"],
-     ["hint_color", "--dim"], ["button_color", "--accent"]].forEach(([key, token]) => {
-      if (raw[key]) root.setProperty(token, raw[key]);
-    });
+    return JSON.parse(decodeURIComponent(match[1])) || {};
   } catch (err) {
-    return;
+    return {};
   }
 })();
+
+// #rrggbb -> how light it is, so a chat that sends colours but no scheme still gets the right
+// palette. A colour that is not 6-digit hex says nothing, and the system's preference stands.
+function luma(color) {
+  const hex = String(color || "").trim().replace("#", "");
+  if (hex.length !== 6) return null;
+  const parts = [0, 2, 4].map((at) => parseInt(hex.slice(at, at + 2), 16) / 255);
+  if (parts.some((part) => Number.isNaN(part))) return null;
+  return 0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2];
+}
+
+const SCHEME = (() => {
+  const named = (location.hash.match(/tgWebAppColorScheme=(dark|light)/) || [])[1];
+  if (named) return named;
+  const light = luma(THEME_PARAMS.bg_color);
+  return light === null ? "" : (light < 0.45 ? "dark" : "light");
+})();
+document.documentElement.dataset.theme = SCHEME;
+[["bg_color", "--bg"], ["secondary_bg_color", "--card"], ["text_color", "--ink"],
+ ["hint_color", "--dim"], ["button_color", "--accent"]].forEach(([key, token]) => {
+  if (THEME_PARAMS[key]) document.documentElement.style.setProperty(token, THEME_PARAMS[key]);
+});
 
 async function tick() {
   try {

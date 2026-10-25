@@ -745,14 +745,37 @@ class TestTheLookAndLayout(unittest.TestCase):
         return webui.page_html(title="Swarm")
 
     def blocks(self) -> Tuple[str, str]:
-        """The light token block and the dark one, so both can be checked as sets."""
+        """The base token block and the ``prefers-color-scheme`` dark one."""
+        palettes = self.palettes()
+        return palettes[":root"], palettes["@media dark"]
+
+    def palettes(self) -> Dict[str, str]:
+        """Every block that defines tokens, by the selector (or media query) that holds it.
+
+        Four in all: the base ``:root`` palette, the same palette under
+        ``prefers-color-scheme: dark``, and the two the Mini App's scheme attribute selects
+        (review, #347).
+        """
         page = self.page()
-        light = re.search(r":root\s*\{(.*?)\}", page, re.S)
-        dark = re.search(r"@media \(prefers-color-scheme: dark\)\s*\{\s*:root\s*\{(.*?)\}",
-                         page, re.S)
-        self.assertIsNotNone(light, "the light token block is missing")
-        self.assertIsNotNone(dark, "the dark token block is missing")
-        return light.group(1), dark.group(1)
+        wanted = {
+            ":root": r"(?<!\])\:root\s*\{(.*?)\}",
+            "@media dark": r"@media \(prefers-color-scheme: dark\)\s*\{\s*:root\s*\{(.*?)\}",
+            'attribute dark': r':root\[data-theme="dark"\]\s*\{(.*?)\}',
+            'attribute light': r':root\[data-theme="light"\]\s*\{(.*?)\}',
+        }
+        found: Dict[str, str] = {}
+        for name, pattern in wanted.items():
+            match = re.search(pattern, page, re.S)
+            self.assertIsNotNone(match, "the %s token block is missing" % name)
+            found[name] = match.group(1) if match else ""
+        return found
+
+    @staticmethod
+    def colours(block: str) -> Dict[str, str]:
+        """The colour tokens of a block: anything whose value holds a colour literal."""
+        return {name: value.strip() for name, value in
+                dict(re.findall(r"(--[\w-]+):\s*([^;]+);", block)).items()
+                if "#" in value or "rgb" in value}
 
     @staticmethod
     def tokens(block: str) -> Dict[str, str]:
@@ -781,12 +804,28 @@ class TestTheLookAndLayout(unittest.TestCase):
         missing = sorted(set(colours) - set(self.tokens(dark)))
         self.assertEqual(missing, [], "the dark scheme leaves these undefined")
 
-    def test_every_token_the_stylesheet_uses_is_defined_once(self):
+    def test_every_token_the_stylesheet_uses_is_defined(self):
         page = self.page()
         light, _dark = self.blocks()
         defined = set(self.tokens(light))
         used = set(re.findall(r"var\((--[\w-]+)\)", page))
         self.assertEqual(sorted(used - defined), [], "a var() names a token nothing defines")
+
+    def test_every_scheme_block_is_a_whole_palette(self):
+        """Review #347: a scheme must never inherit a token from the other one."""
+        palettes = self.palettes()
+        base = self.colours(palettes[":root"])
+        dark = self.colours(palettes["@media dark"])
+        self.assertTrue(base and dark, "no colour tokens found")
+        for name in ("attribute dark", "attribute light"):
+            self.assertTrue(self.colours(palettes[name]), name)
+        # The two dark blocks and the two light blocks are the same palettes.
+        self.assertEqual(self.colours(palettes['attribute dark']), dark,
+                         "the data-theme=dark palette drifted from prefers-color-scheme")
+        self.assertEqual(self.colours(palettes['attribute light']), base,
+                         "the data-theme=light palette drifted from the base palette")
+        # Every colour token of one palette exists in the other: no leftovers, no gaps.
+        self.assertEqual(sorted(base), sorted(dark))
 
     def test_it_stays_phone_width_first_and_two_columns_when_there_is_room(self):
         page = self.page()
@@ -794,13 +833,25 @@ class TestTheLookAndLayout(unittest.TestCase):
         self.assertIn("width=device-width", page)
         self.assertIn("@media (min-width: 760px)", page)
         self.assertIn("grid-template-columns", page)
-        # Nothing may be pinned to a fixed pixel width that a 360px phone cannot hold.
-        self.assertNotIn("width: 3", page)
+        # Nothing is pinned to a fixed pixel width, so nothing can overflow a 360px phone.
+        # (min-width is the breakpoint itself; the only fixed sizes are inline-block badges.)
+        self.assertEqual(re.findall(r"(?<!min-)(?<!max-)width:\s*[\d.]+px", page), [])
 
     def test_the_telegram_theme_params_are_read_without_loading_anything(self):
         page = self.page()
         self.assertIn("tgWebAppThemeParams", page)
         self.assertIn("tgWebAppColorScheme", page)
+        # The scheme a Mini App reports is *applied*, not only mentioned: it lands on the
+        # attribute the stylesheet gives a whole palette to (review, #347).
+        self.assertIn("document.documentElement.dataset.theme = SCHEME", page)
+        for name in ('[data-theme="dark"]', '[data-theme="light"]'):
+            self.assertIn(name, page)
+        # ... and a chat that sends colours but no scheme still gets the right palette.
+        self.assertIn("function luma(", page)
+        self.assertIn("light < 0.45 ? \"dark\" : \"light\"", page)
+        # The chat's own colours go on top of that palette, as inline overrides.
+        self.assertIn("--bg", page)
+        self.assertIn("style.setProperty(token, THEME_PARAMS[key])", page)
         for marker in ("http://", "https://", "<script src", "<link rel=\"stylesheet\""):
             self.assertNotIn(marker, page)
 
