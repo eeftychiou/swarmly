@@ -292,10 +292,10 @@ class Cleanup:
             logger.warning("/cleanup ignored: only the admin tidies the group")
             return f"⛔ {self._me()}: only the admin runs /cleanup."
         words = [str(word).lower() for word in argv]
-        home = chat_id if chat_id is not None else self.host.cleanup_home_chat()
+        home = self.host.cleanup_home_chat()
         if home is None:
             return f"{self._me()}: /cleanup needs agent.home_channel_id."
-        home = int(home)
+        home = int(home)                 # always the home group, wherever it was asked
         if not words:
             finished, kept = self.plan(self.host.cleanup_topics())
             return await self._delete_topics(home, finished, kept)
@@ -322,8 +322,9 @@ class Cleanup:
                 kept.append((topic, "protected"))
             elif topic.open_reason:
                 kept.append((topic, topic.open_reason))
-            elif topic.last_activity is not None and \
-                    moment - float(topic.last_activity) < self.idle_seconds:
+            elif topic.last_activity is None:
+                kept.append((topic, "no activity recorded"))      # never guess: keep it
+            elif moment - float(topic.last_activity) < self.idle_seconds:
                 kept.append((topic, f"active {_age(moment - float(topic.last_activity))} ago"))
             else:
                 finished.append(topic)
@@ -355,7 +356,15 @@ class Cleanup:
                              kept: Sequence[Tuple[TopicInfo, str]]) -> str:
         deleted: List[str] = []
         failed: List[str] = []
+        kept = list(kept)
         for topic in topics:
+            if len(topics) > 1:
+                # Asked again just before each delete: work may have started meanwhile.
+                fresh = {t.thread_id: t for t in self.host.cleanup_topics()}.get(topic.thread_id)
+                stays = self.plan([fresh])[1] if fresh is not None else []
+                if stays:
+                    kept.extend(stays)
+                    continue
             try:
                 ok = await self.host.cleanup_delete_topic(chat_id, topic.thread_id)
             except Exception:                              # noqa: BLE001 - report, go on

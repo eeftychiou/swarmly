@@ -1845,7 +1845,9 @@ class AgentChannel:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
                 return None
         elif not (self.mentions_me(event.text or "") or event.replies_to_bot
-                  or self._direct_chat(event) or self._answers_for_swarm()):
+                  or self._direct_chat(event)
+                  or (self._answers_for_swarm() and not self._peer_handles_named(event.text or "")
+                      and not event.replies_to_peer and not event.replies_to_bot)):
             return None
         return await self.cleanup.handle_args(
             command_args(event.text or ""),
@@ -2065,10 +2067,13 @@ class AgentChannel:
         """Topic token (``tg-<id>``) -> one open owed row in it, as a short line."""
         out: Dict[str, str] = {}
         try:
-            rows = self.owed_store().load()
+            store = self.owed_store()
+            rows = store.load()
         except Exception:                                  # noqa: BLE001 - keep, do not guess
             logger.warning("cleanup: the owed table could not be read", exc_info=True)
             return {"*": "the owed table could not be read"}
+        if getattr(store, "unreadable", None):
+            return {"*": "the owed table is partly unreadable"}   # never guess: keep them all
         for row in rows:
             if row.is_open and row.topic and row.topic not in out:
                 out[row.topic] = f"{row.debtor} owes {row.kind} on {row.subject}"
@@ -2077,9 +2082,11 @@ class AgentChannel:
     def _open_work_in(self, chat_id: int, thread_id: int, owed: Dict[str, str]) -> Optional[str]:
         """Why a topic is not finished, or None: a turn running in it, an open owed row, or
         an open work item in the topic registry."""
-        lock = self._topic_locks.get((chat_id, thread_id)) if hasattr(self, "_topic_locks") \
-            else None
-        if lock is not None and lock.locked():
+        place = (int(chat_id), int(thread_id))
+        running = {tuple(key) for turn, key in (getattr(self, "_turn_keys", {}) or {}).items()
+                   if key and key[1] is not None and not getattr(turn, "done", lambda: False)()}
+        lock = self._turn_locks.get(place)
+        if place in running or (lock is not None and lock.locked()):
             return "a turn is running"
         if "*" in owed:
             return owed["*"]
@@ -2087,14 +2094,18 @@ class AgentChannel:
         if token and token in owed:
             return "open: " + owed[token]
         store = self.state_link.store
-        if store is not None and store.ready:
-            from swarmly.state import keys as K
-            record = store.read(K.topic(thread_id))
-            for link in (record.get("links") if isinstance(record, dict) else None) or []:
-                if not isinstance(link, dict) or link.get("role") != "work":
-                    continue
-                if link.get("status") != "closed" and link.get("phase") != "done":
-                    return f"open work item {link.get('id', '?')} {link.get('title') or ''}".strip()
+        if store is None or not store.ready:
+            if self.state_link.routing_mode == "registry" or \
+                    self.state_link.links_mode == "registry":
+                return "the topic registry is not readable yet"   # never guess: keep it
+            return None
+        from swarmly.state import keys as K
+        record = store.read(K.topic(thread_id))
+        for link in (record.get("links") if isinstance(record, dict) else None) or []:
+            if not isinstance(link, dict) or link.get("role") != "work":
+                continue
+            if link.get("status") not in ("closed", "abandoned") and link.get("phase") != "done":
+                return f"open work item {link.get('id', '?')} {link.get('title') or ''}".strip()
         return None
 
     async def cleanup_delete_topic(self, chat_id: int, thread_id: int) -> bool:
@@ -9102,6 +9113,7 @@ class AgentChannel:
                 chat_id=event.chat_id, thread_id=event.thread_id)
         self._topics_opened.append(now)
         self.topics.remember(home, thread_id, name, current=True)
+        self.topics.touch(home, thread_id)       # opened now: active, never "finished"
         self._learn_topic_refs(home, thread_id, f"{title}\n{brief}\n{event.text or ''}")
         self._topic_origins[(home, thread_id)] = (event.chat_id, event.thread_id)
         logger.info("opened topic %r (thread %s) for message %s", name, thread_id,
@@ -10307,6 +10319,10 @@ class AgentChannel:
         self._note_general_message(destination, self.last_sent_message_id, thread_id,
                                    notice=notice)
         logger.info("Telegram accepted outbound message id=%s", self.last_sent_message_id)
+        if thread_id is not None:
+            # Its own posts count as activity too: a bot never receives them, and a topic only
+            # it has posted in for the last hour is not a finished one (/cleanup).
+            self.topics.touch(destination, thread_id)
         return self.last_sent_message_id if return_message_id else payload
 
     async def _send_with_retry(self, payload: str, reply_to_message_id: Optional[int],

@@ -116,10 +116,24 @@ class OneCommandTests(CleanupCase):
         self.assertEqual(host.deleted_topics, [])
         self.assertIn("active 30m ago", reply)
 
-    def test_a_topic_never_active_is_finished(self):
+    def test_a_topic_with_no_recorded_activity_is_kept(self):
+        """Review: a topic this bot opened minutes ago had no activity and was deleted."""
         host = FakeHost([topic(31, activity=None)])
-        self.ask(self.cleanup(host))
-        self.assertEqual(host.deleted_topics, [31])
+        reply = self.ask(self.cleanup(host))
+        self.assertEqual(host.deleted_topics, [])
+        self.assertIn("no activity recorded", reply)
+
+    def test_work_that_starts_during_the_run_keeps_its_topic(self):
+        host = FakeHost([topic(60, "A"), topic(61, "B")])
+        real_delete = host.cleanup_delete_topic
+
+        async def delete(chat_id, thread_id):
+            host.topics = [topic(61, "B", open_reason="a turn is running")]
+            return await real_delete(chat_id, thread_id)
+        host.cleanup_delete_topic = delete
+        reply = self.ask(self.cleanup(host))
+        self.assertEqual(host.deleted_topics, [60])
+        self.assertIn("B (61) (a turn is running)", reply)
 
     def test_nothing_to_delete_is_said_plainly(self):
         reply = self.ask(self.cleanup(FakeHost([])))
@@ -323,6 +337,41 @@ class ChannelCase(unittest.TestCase):
         reply = self.admin_command("/cleanup@HermesBot")
         self.assertIn("deleted 1 topic(s): DeepSeek: 37 fixed (42)", reply)
         self.assertEqual(self.channel.bot.topics, [(GROUP, 42)])
+
+    def test_the_real_open_work_checks(self):
+        """Review: the running-turn check read a lock table that does not exist."""
+        self.prompt()
+        import asyncio as aio
+
+        class Turn:
+            def done(self):
+                return False
+        self.channel._turn_keys[Turn()] = (GROUP, 42)
+        self.assertEqual(self.channel._open_work_in(GROUP, 42, {}), "a turn is running")
+        self.channel._turn_keys.clear()
+        self.assertIsNone(self.channel._open_work_in(GROUP, 42, {}))
+        store = type("S", (), {"ready": True, "read": lambda self, key: {"links": [
+            {"id": "L1", "role": "work", "status": "open", "phase": "review", "title": "#37"},
+            {"id": "L2", "role": "work", "status": "abandoned", "phase": "development"}]}})()
+        self.channel.state_link.store = store
+        self.assertEqual(self.channel._open_work_in(GROUP, 42, {}), "open work item L1 #37")
+        self.channel.state_link.store = None
+        self.channel.state_link.routing_mode = "registry"
+        self.assertIn("not readable", self.channel._open_work_in(GROUP, 42, {}))
+        del aio
+
+    def test_a_partly_unreadable_owed_table_keeps_everything(self):
+        rows = []
+        self.channel.owed_store = lambda: type("S", (), {"load": lambda self: rows,
+                                                         "unreadable": ["x.json"]})()
+        self.assertIn("*", self.channel._open_owed_topics())
+
+    def test_a_bare_cleanup_naming_a_peer_is_left_to_that_peer(self):
+        self.prompt()
+        self.channel._answers_for_swarm = lambda: True
+        self.channel.topics.touch(GROUP, 42, when=1000.0 - 2 * HOUR)
+        self.admin_command("/cleanup @CodexBot")
+        self.assertEqual(self.channel.bot.topics, [])
 
     def test_a_topic_with_an_open_owed_row_is_kept(self):
         self.prompt()
