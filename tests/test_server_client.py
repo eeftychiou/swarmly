@@ -5,6 +5,7 @@ Integration tests for Fast-Plane WebSocket Gateway Server, Authentication, and C
 import asyncio
 import json
 import os
+import socket
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -89,8 +90,10 @@ class TestServerClientIntegration(unittest.IsolatedAsyncioTestCase):
 
         self.bus = DurableBus(root_dir=self.root_path, config_path=self.config_path)
 
-        # Port for test server
-        self.port = 18765
+        # A free port per test: one fixed port collided when two workers ran this class.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
         self.server = A2AGatewayServer(host="127.0.0.1", port=self.port, bus=self.bus)
         self.server_task = asyncio.create_task(self.server.start())
         await asyncio.sleep(0.05)  # Allow server to bind

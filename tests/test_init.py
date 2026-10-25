@@ -221,6 +221,10 @@ class TestStateRootForAnInstalledWheel(unittest.TestCase):
         from unittest import mock
         from swarmly.telegram import poll
         cfg = SimpleNamespace(bus=SimpleNamespace(repo=None), fallback=None)
+        no_override = mock.patch.dict(os.environ)       # the suite's own root, set aside
+        no_override.start()
+        self.addCleanup(no_override.stop)
+        os.environ.pop("SWARMLY_STATE_ROOT", None)
         self.assertEqual(poll.transport_state_root(cfg), ROOT)          # a checkout
         with TemporaryDirectory() as tmp:
             fake = Path(tmp, "site-packages", "swarmly", "telegram", "poll.py")
@@ -228,6 +232,15 @@ class TestStateRootForAnInstalledWheel(unittest.TestCase):
                 self.assertEqual(poll.transport_state_root(cfg), Path.home() / ".a2a")
         cfg.bus.repo = "/srv/bus"
         self.assertEqual(poll.transport_state_root(cfg), Path("/srv/bus"))
+
+    def test_the_suite_keeps_no_bus_state_out_of_the_checkout(self):
+        """Parallel workers share the checkout: a no-bus test writing there races the others."""
+        from types import SimpleNamespace
+        from swarmly.telegram import poll
+        cfg = SimpleNamespace(bus=SimpleNamespace(repo=None), fallback=None)
+        root = poll.transport_state_root(cfg)
+        self.assertNotEqual(root.resolve(), ROOT)
+        self.assertEqual(root, Path(os.environ["SWARMLY_STATE_ROOT"]))
 
 
 class TestConfigFlagPlacement(unittest.TestCase):
@@ -251,8 +264,10 @@ class TestGitbusRootMatchesThePoller(unittest.TestCase):
                                                       "admin_user_id": 1},
                                             "adapter": {"type": "echo", "cwd": tmp}})
             channel = AgentChannel(config)
+            self.assertEqual(channel._gitbus_root(), poll.transport_state_root(config))
             fake = Path(tmp, "site-packages", "swarmly", "telegram", "poll.py")
-            with mock.patch.object(poll, "__file__", str(fake)):
+            with mock.patch.object(poll, "__file__", str(fake)), mock.patch.dict(os.environ):
+                os.environ.pop("SWARMLY_STATE_ROOT", None)  # the suite's own root, set aside
                 self.assertEqual(channel._gitbus_root(), Path.home() / ".a2a")
 
 

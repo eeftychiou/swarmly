@@ -264,8 +264,11 @@ trusting the writer.
 **Why this is wrong:**
 
 - Discovery hooks differ by invocation. Measured in this repo, at a known head,
-  against the command CI actually runs (`python -m unittest discover tests -v`,
-  from `.github/workflows/tests.yml:26`):
+  against the command CI ran at the time (`python -m unittest discover tests -v`).
+  CI has run `python -m pytest -n auto ... tests` since #320, which flips the
+  outcomes below: `tests/conftest.py` now fires in CI and the `load_tests` hooks
+  do not, so the per-test isolation lives in `tests/conftest.py`. The lesson is
+  unchanged: check the hook against the command in `.github/workflows/tests.yml`.
   - a **per-module** `load_tests` in the test file itself — **fires**;
   - a **package-level** `tests/__init__.py:load_tests` — **does not fire**
     (instrumented with a marker; the marker never printed);
