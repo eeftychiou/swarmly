@@ -3525,19 +3525,29 @@ class AgentChannel:
         return ("Swarm usage today (UTC), from each bot's own ledger and heartbeat; a number a "
                 "CLI does not report is left out:\n" + "\n".join(lines))
 
-    def _memory_note(self) -> str:
-        """This bot's own lessons, and — every ``limits.memory_every_turns`` turns — the one
-        instruction to update them (#226).
+    def _memory_note(self, event: Optional[ChannelEvent] = None) -> str:
+        """This bot's own lessons, what became of its last memory block, and — every
+        ``limits.memory_every_turns`` turns, or right after a refusal — the one instruction to
+        update them (#226, #301).
 
         The lessons ride in the *message*, not the system prompt: the system prompt is cached
         and fixed, and this file changes when the bot writes it. The counter is kept beside
-        the file, so a restart does not restart the count.
+        the file, so a restart does not restart the count. The outcome and a re-ask stay
+        until a turn has run (``Lessons.turn_ran``), so a turn that never reached the model
+        does not spend them.
         """
         try:
             block = self.lessons.block()
-            told = self.lessons.told()
+            told = self.lessons.note()
             told = f"After your last reply: {told}" if told else ""
+            reask = self.lessons.again
             due = self.lessons.note_turn()
+            if event is not None:
+                # Spent once this turn has run (turn_ran); a block this turn writes answers
+                # the re-ask, so its refusal is not re-asked (review of #307).
+                event.__dict__["memory_seq"] = self.lessons.seq
+                event.__dict__["memory_reask"] = reask
+                event.__dict__["memory_due"] = due
             instruction = self.lessons_update_instruction() if due else ""
             parts = [part for part in (block, told, instruction) if part]
             return "\n\n[" + "\n".join(parts) + "]" if parts else ""
@@ -5691,7 +5701,8 @@ class AgentChannel:
                         len(memory.encode("utf-8")))
         if reason:
             notes.append(f"Memory: {reason}")
-        self.lessons.tell("\n".join(notes), refused=not saved)
+        self.lessons.tell("\n".join(notes), refused=not saved,
+                          reasked=bool(event.__dict__.get("memory_reask")))
         return body
 
     def _round_summary(self, event: Optional[ChannelEvent]) -> str:
@@ -7786,7 +7797,7 @@ class AgentChannel:
         text += self._drift_note(event)
         text += self.state_link.registry_note(event.chat_id, event.thread_id)
         text += self._swarm_usage_note()
-        text += self._memory_note()
+        text += self._memory_note(event)
         if not event.self_task and asks_for_topic(event.text or ""):
             text += f"\n\n{TOPIC_ASKED_NOTE}"
         incoming = IncomingMessage(
@@ -8674,6 +8685,11 @@ class AgentChannel:
                 self._run_own_task(CONTINUE_NOTE, event.chat_id, event.thread_id,
                                    self.topics.name(event.chat_id, event.thread_id))
             return None
+
+        # The model answered, or took the prompt into its running task (queued): the memory
+        # outcome and any update ask in this turn's prompt are spent.
+        self.lessons.turn_ran(event.__dict__.get("memory_seq"),
+                              due=bool(event.__dict__.get("memory_due")))
 
         if reply.meta.get("queued"):
             if ticket:
