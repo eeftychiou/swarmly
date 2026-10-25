@@ -1,7 +1,8 @@
-"""Tests for ``/cleanup`` (issue #63): the dry run, the deleting forms, the confirmation.
+"""Tests for ``/cleanup`` (issue #63; simplified 25 Oct): one command deletes every finished
+topic, at once.
 
 No network and no aiogram: the Telegram calls are faked, both at the ``Cleanup`` seam
-(a host with the five methods it needs) and at the channel's aiogram seam (a fake bot), so
+(a host with the methods it needs) and at the channel's aiogram seam (a fake bot), so
 the tests pin what the command decides and what it asks Telegram to do -- never a live group.
 
 Run: python -m unittest tests.test_cleanup -v
@@ -9,9 +10,7 @@ Run: python -m unittest tests.test_cleanup -v
 
 from __future__ import annotations
 
-import asyncio
 import json
-import re
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -19,7 +18,7 @@ from tempfile import TemporaryDirectory
 from swarmly.telegram.adapters.base import load_state
 from tests.aio import run
 from swarmly.telegram.channel import AgentChannel, ChannelEvent
-from swarmly.telegram.cleanup import (CONFIRM_SECONDS, LEDGER_TTL_SECONDS, Cleanup,
+from swarmly.telegram.cleanup import (FINISHED_IDLE_SECONDS, LEDGER_TTL_SECONDS, Cleanup,
                                       GeneralLedger, TopicInfo)
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.topics import TopicMap
@@ -37,11 +36,12 @@ class FakeHost:
     """The channel side of /cleanup, recorded instead of called."""
 
     def __init__(self, topics=(), chat_id=GROUP, delete_ok=True,
-                 message_batches=None) -> None:
+                 message_batches=None, protected=()) -> None:
         self.topics = list(topics)
         self.chat_id = chat_id
         self.delete_ok = delete_ok
         self.message_batches = message_batches      # None: every id goes; else per-batch count
+        self.protected = set(protected)
         self.deleted_topics = []
         self.deleted_messages = []
         self.forgotten = []
@@ -51,6 +51,9 @@ class FakeHost:
 
     def cleanup_topics(self):
         return list(self.topics)
+
+    def cleanup_protected_topics(self):
+        return set(self.protected)
 
     async def cleanup_delete_topic(self, chat_id, thread_id):
         self.deleted_topics.append(int(thread_id))
@@ -66,10 +69,9 @@ class FakeHost:
         self.forgotten.append(int(thread_id))
 
 
-def topic(thread_id, name="work", activity=NOW - 30 * HOUR, refs=(), states=None):
+def topic(thread_id, name="work", activity=NOW - 30 * HOUR, open_reason=None):
     return TopicInfo(thread_id=thread_id, chat_id=GROUP, title=name,
-                     last_activity=activity, refs=tuple(refs),
-                     states=dict(states or {}))
+                     last_activity=activity, open_reason=open_reason)
 
 
 class CleanupCase(unittest.TestCase):
@@ -79,223 +81,116 @@ class CleanupCase(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.ledger_path = self.root / "state" / "general-hermes.json"
         self.ledger = GeneralLedger(self.ledger_path)
-        self.codes = ["c0ffee", "c0ffe1", "c0ffe2", "c0ffe3"]
         self.now = NOW
 
     def cleanup(self, host, **kwargs) -> Cleanup:
-        kwargs.setdefault("handle", "@HermesBot")
-        kwargs.setdefault("idle_hours", 24.0)
-        return Cleanup(host, self.ledger, clock=lambda: self.now,
-                       code=lambda: self.codes.pop(0), **kwargs)
+        kwargs.setdefault("handle", "Hermes")
+        return Cleanup(host, self.ledger, clock=lambda: self.now, **kwargs)
 
     def ask(self, cleanup, *words, is_admin=True):
         return run(cleanup.handle_args(list(words), is_admin=is_admin, chat_id=GROUP))
 
-    def code_in(self, text: str) -> str:
-        match = re.search(r"confirm ([0-9a-f]+)", text)
-        self.assertIsNotNone(match, text)
-        return match.group(1)
 
+class OneCommandTests(CleanupCase):
+    def test_cleanup_deletes_every_finished_topic_at_once(self):
+        host = FakeHost([topic(10, "Round 3"), topic(11, "Round 5.5"),
+                         topic(12, "Live work", open_reason="open work item L1 #268")])
+        reply = self.ask(self.cleanup(host))
+        self.assertEqual(host.deleted_topics, [10, 11])
+        self.assertEqual(host.forgotten, [10, 11])
+        self.assertIn("deleted 2 topic(s): Round 3 (10), Round 5.5 (11)", reply)
+        self.assertIn("Live work (12) (open work item L1 #268)", reply)
 
-class DryRunTests(CleanupCase):
-    def test_the_dry_run_lists_topics_with_their_state_and_deletes_nothing(self):
-        host = FakeHost([
-            topic(42, "Claudebot: 37 fixed", refs=["#37"], states={"#37": "merged"}),
-            topic(43, "DeepSeek: notices", activity=NOW - 2 * HOUR, refs=["#64"],
-                  states={"#64": "open"}),
-            topic(44, "side quest", activity=None),
-        ])
-        text = self.ask(self.cleanup(host))
-        self.assertIn("dry run: nothing is deleted", text)
-        self.assertIn("Topics (3)", text)
-        self.assertIn("42 · Claudebot: 37 fixed · idle 30h · #37 merged", text)
-        self.assertIn("43 · DeepSeek: notices · idle 2h · #64 open", text)
-        self.assertIn("44 · side quest", text)
-        self.assertIn("no linked item", text)
-        self.assertIn("topics done -- 1 topic(s)", text)      # only #42 is done and idle
+    def test_protected_and_kept_topics_stay(self):
+        host = FakeHost([topic(3418, "Swarm pulse"), topic(13481, "Swarm test"), topic(20)],
+                        protected={3418})
+        reply = self.ask(self.cleanup(host, keep=[13481]))
+        self.assertEqual(host.deleted_topics, [20])
+        self.assertIn("Swarm pulse (3418) (protected)", reply)
+        self.assertIn("Swarm test (13481) (protected)", reply)
+
+    def test_a_topic_active_in_the_last_hour_is_not_finished(self):
+        recent = NOW - FINISHED_IDLE_SECONDS / 2
+        host = FakeHost([topic(30, "Just opened", activity=recent)])
+        reply = self.ask(self.cleanup(host))
         self.assertEqual(host.deleted_topics, [])
-        self.assertEqual(host.deleted_messages, [])
+        self.assertIn("active 30m ago", reply)
 
-    def test_the_dry_run_reports_the_general_messages_it_could_delete(self):
-        self.ledger.note(GROUP, [10, 11, 12], now=NOW - HOUR)
-        self.ledger.note(GROUP, [1, 2], now=NOW - LEDGER_TTL_SECONDS - HOUR)   # too old
-        text = self.ask(self.cleanup(FakeHost()))
-        self.assertIn("3 message(s) this bot can still delete", text)
-        self.assertIn("2 recorded longer than 48h ago it can no longer delete", text)
-        self.assertIn("general -- the 3 message(s)", text)
-
-    def test_a_ref_github_could_not_check_is_unknown_not_done(self):
-        host = FakeHost([topic(42, "#37 work", refs=["#37"], states={"#37": None})])
-        text = self.ask(self.cleanup(host))
-        self.assertIn("#37 unknown", text)
-        self.assertIn("topics done -- 0 topic(s)", text)
-
-    def test_a_topic_linking_a_done_and_an_open_item_is_not_done(self):
-        """#63 re-review: reading ``states`` instead of ``refs`` marked a topic done when only
-        some of the items it names were closed -- and deleted work still in flight."""
-        host = FakeHost([topic(42, "#37, #64", refs=["#37", "#64"],
-                               states={"#37": "merged", "#64": "open"})])
-        text = self.ask(self.cleanup(host))
-        self.assertIn("topics done -- 0 topic(s)", text)
-
-    def test_a_ref_missing_from_states_is_not_done(self):
-        host = FakeHost([topic(42, "#37, #64", refs=["#37", "#64"], states={"#37": "closed"})])
-        self.assertIn("topics done -- 0 topic(s)", self.ask(self.cleanup(host)))
-
-    def test_a_topic_with_no_recorded_activity_is_still_offered_once_its_item_is_done(self):
-        host = FakeHost([topic(42, "#37 work", activity=None, refs=["#37"],
-                               states={"#37": "closed"})])
-        text = self.ask(self.cleanup(host))
-        self.assertIn("idle 24h", text)
-        self.assertIn("topics done -- 1 topic(s)", text)
-
-
-class OffTheLoopTests(CleanupCase):
-    """Live: the topic states are GitHub lookups, and a dry run held the bot for 52 s."""
-
-    def test_the_topics_are_gathered_in_a_worker_thread(self):
-        import threading
-        host = FakeHost([topic(5)])
-        threads = []
-        original = host.cleanup_topics
-
-        def gathered():
-            threads.append(threading.current_thread() is threading.main_thread())
-            return original()
-
-        host.cleanup_topics = gathered
-        cleanup = self.cleanup(host)
-        for words in ((), ("topics", "done"), ("topics", "all"), ("topic", "5")):
-            self.ask(cleanup, *words)
-        self.assertTrue(threads)
-        self.assertNotIn(True, threads)
-
-
-class RefusalTests(CleanupCase):
-    def test_a_non_admin_gets_a_refusal_and_nothing_else(self):
-        host = FakeHost([topic(42, "#37", refs=["#37"], states={"#37": "merged"})])
-        cleanup = self.cleanup(host)
-        for words in ((), ("topics", "done"), ("topics", "all"), ("topic", "42"),
-                      ("general",), ("confirm", "c0ffee")):
-            text = self.ask(cleanup, *words, is_admin=False)
-            self.assertIn("only the admin runs /cleanup", text)
+    def test_a_topic_with_no_recorded_activity_is_kept(self):
+        """Review: a topic this bot opened minutes ago had no activity and was deleted."""
+        host = FakeHost([topic(31, activity=None)])
+        reply = self.ask(self.cleanup(host))
         self.assertEqual(host.deleted_topics, [])
-        self.assertEqual(host.deleted_messages, [])
+        self.assertIn("no activity recorded", reply)
 
-    def test_an_unknown_form_gets_a_usage_line(self):
-        text = self.ask(self.cleanup(FakeHost()), "everything")
-        self.assertIn("takes one of", text)
+    def test_work_that_starts_during_the_run_keeps_its_topic(self):
+        host = FakeHost([topic(60, "A"), topic(61, "B")])
+        real_delete = host.cleanup_delete_topic
 
-
-class DeletingFormTests(CleanupCase):
-    def test_topics_done_asks_first_and_deletes_only_on_confirm(self):
-        host = FakeHost([
-            topic(42, "#37 done", refs=["#37"], states={"#37": "merged"}),
-            topic(43, "#64 open", refs=["#64"], states={"#64": "open"}),
-            topic(44, "#65 closed but fresh", activity=NOW - HOUR, refs=["#65"],
-                  states={"#65": "closed"}),
-            topic(45, "no item"),
-        ])
-        cleanup = self.cleanup(host)
-        ask = self.ask(cleanup, "topics", "done")
-        self.assertIn("will delete 1 topic(s)", ask)
-        self.assertIn("cannot be undone", ask)
-        self.assertEqual(host.deleted_topics, [])            # asking deletes nothing
-        code = self.code_in(ask)
-
-        done = self.ask(cleanup, "confirm", code)
-        self.assertEqual(host.deleted_topics, [42])
-        self.assertEqual(host.forgotten, [42])
-        self.assertIn("deleted 1 topic(s): #42", done)
-
-    def test_one_code_stands_for_one_deletion_once(self):
-        host = FakeHost([topic(42, "#37", refs=["#37"], states={"#37": "merged"})])
-        cleanup = self.cleanup(host)
-        code = self.code_in(self.ask(cleanup, "topics", "done"))
-        self.ask(cleanup, "confirm", code)
-        again = self.ask(cleanup, "confirm", code)
-        self.assertIn("no cleanup is waiting on that code", again)
-        self.assertEqual(host.deleted_topics, [42])
-
-    def test_a_code_expires(self):
-        host = FakeHost([topic(42, "#37", refs=["#37"], states={"#37": "merged"})])
-        cleanup = self.cleanup(host)
-        code = self.code_in(self.ask(cleanup, "topics", "done"))
-        self.now += CONFIRM_SECONDS + 1
-        text = self.ask(cleanup, "confirm", code)
-        self.assertIn("expired", text)
-        self.assertEqual(host.deleted_topics, [])
-
-    def test_a_wrong_code_does_nothing(self):
-        host = FakeHost([topic(42, "#37", refs=["#37"], states={"#37": "merged"})])
-        cleanup = self.cleanup(host)
-        self.ask(cleanup, "topics", "done")
-        text = self.ask(cleanup, "confirm", "beef")
-        self.assertIn("no cleanup is waiting on that code", text)
-        self.assertEqual(host.deleted_topics, [])
-
-    def test_topics_all_spares_the_kept_topics(self):
-        host = FakeHost([topic(42, "a"), topic(43, "b"), topic(44, "c")])
-        cleanup = self.cleanup(host, keep=[43])
-        ask = self.ask(cleanup, "topics", "all")
-        self.assertIn("will delete 2 topic(s)", ask)
-        self.ask(cleanup, "confirm", self.code_in(ask))
-        self.assertEqual(sorted(host.deleted_topics), [42, 44])
-
-    def test_topics_all_and_done_spare_the_pulse_topic(self):
-        """Live, 23 Oct: nothing kept "📡 Swarm pulse", so ``topics all`` would have deleted the
-        topic the heartbeat posts to. The host names it; no config is needed."""
-        host = FakeHost([topic(42, "a", refs=("#1",), states={"#1": "closed"}),
-                         topic(3418, "📡 Swarm pulse", refs=("#1",), states={"#1": "closed"})])
-        host.cleanup_protected_topics = lambda: {3418}
-        cleanup = self.cleanup(host)
-        self.assertNotIn("3418", self.ask(cleanup, "topics", "done").split("delete")[-1])
-        ask = self.ask(cleanup, "topics", "all")
-        self.assertIn("will delete 1 topic(s)", ask)
-        self.ask(cleanup, "confirm", self.code_in(ask))
-        self.assertEqual(host.deleted_topics, [42])
-
-    def test_topic_deletes_one_named_topic(self):
-        host = FakeHost([topic(42, "a"), topic(43, "b")])
-        cleanup = self.cleanup(host)
-        ask = self.ask(cleanup, "topic", "43")
-        self.assertIn("will delete 1 topic(s)", ask)
-        self.ask(cleanup, "confirm", self.code_in(ask))
-        self.assertEqual(host.deleted_topics, [43])
-
-    def test_a_failed_delete_is_reported_and_not_forgotten(self):
-        host = FakeHost([topic(42, "a")], delete_ok=False)
-        cleanup = self.cleanup(host)
-        ask = self.ask(cleanup, "topic", "42")
-        text = self.ask(cleanup, "confirm", self.code_in(ask))
-        self.assertIn("could not be deleted", text)
-        self.assertEqual(host.forgotten, [])       # a topic still there is still remembered
-
-    def test_general_deletes_the_ledger_oldest_first_and_forgets_what_went(self):
-        self.ledger.note(GROUP, [30, 10, 20], now=NOW - HOUR)
-        host = FakeHost()
-        cleanup = self.cleanup(host)
-        ask = self.ask(cleanup, "general")
-        self.assertIn("will delete 3 message(s)", ask)
-        text = self.ask(cleanup, "confirm", self.code_in(ask))
-        self.assertEqual(host.deleted_messages, [[10, 20, 30]])     # oldest first
-        self.assertIn("deleted 3 General message(s)", text)
-        self.assertEqual(self.ledger.recent(GROUP, self.now), [])
-
-    def test_general_stops_when_telegram_refuses_the_rest(self):
-        self.ledger.note(GROUP, [1, 2, 3], now=NOW - HOUR)
-        host = FakeHost(message_batches=[2])
-        cleanup = self.cleanup(host)
-        ask = self.ask(cleanup, "general")
-        text = self.ask(cleanup, "confirm", self.code_in(ask))
-        self.assertIn("deleted 2 General message(s)", text)
-        self.assertEqual(self.ledger.recent(GROUP, self.now), [3])
+        async def delete(chat_id, thread_id):
+            host.topics = [topic(61, "B", open_reason="a turn is running")]
+            return await real_delete(chat_id, thread_id)
+        host.cleanup_delete_topic = delete
+        reply = self.ask(self.cleanup(host))
+        self.assertEqual(host.deleted_topics, [60])
+        self.assertIn("B (61) (a turn is running)", reply)
 
     def test_nothing_to_delete_is_said_plainly(self):
-        self.assertEqual(self.ask(self.cleanup(FakeHost()), "topics", "done"),
-                         "@HermesBot: no topic has a closed or merged item and has been idle "
-                         "24h. Nothing to delete.")
-        self.assertIn("no General message", self.ask(self.cleanup(FakeHost()), "general"))
+        reply = self.ask(self.cleanup(FakeHost([])))
+        self.assertIn("deleted 0 topic(s).", reply)
+
+    def test_a_failed_delete_is_reported_and_not_forgotten(self):
+        host = FakeHost([topic(40, "Stuck")], delete_ok=False)
+        reply = self.ask(self.cleanup(host))
+        self.assertEqual(host.forgotten, [])
+        self.assertIn("Could not delete", reply)
+
+    def test_the_reply_never_starts_with_the_bots_own_handle(self):
+        reply = self.ask(self.cleanup(FakeHost([]), handle="@Claude_obot"))
+        self.assertNotIn("@Claude_obot", reply)
+
+
+class OtherFormTests(CleanupCase):
+    def test_preview_deletes_nothing(self):
+        host = FakeHost([topic(10, "Round 3"), topic(12, open_reason="a turn is running")])
+        reply = self.ask(self.cleanup(host), "preview")
+        self.assertEqual(host.deleted_topics, [])
+        self.assertIn("would delete 1 topic(s): Round 3 (10)", reply)
+        self.assertIn("a turn is running", reply)
+
+    def test_topic_deletes_one_named_topic_now(self):
+        host = FakeHost([topic(50, "One", open_reason="open: x")])
+        self.assertIn("deleted 1 topic(s): One (50)", self.ask(self.cleanup(host), "topic", "50"))
+        self.assertEqual(host.deleted_topics, [50])
+
+    def test_topic_refuses_a_protected_one(self):
+        host = FakeHost([topic(3418)], protected={3418})
+        self.assertIn("protected", self.ask(self.cleanup(host), "topic", "3418"))
+        self.assertEqual(host.deleted_topics, [])
+
+    def test_general_deletes_the_ledger_oldest_first_and_forgets_what_went(self):
+        self.ledger.note(GROUP, [5, 6, 7], now=NOW - HOUR)
+        host = FakeHost()
+        reply = self.ask(self.cleanup(host), "general")
+        self.assertEqual(host.deleted_messages, [[5, 6, 7]])
+        self.assertIn("deleted 3 General message(s)", reply)
+        self.assertEqual(self.ledger.recent(GROUP, NOW), [])
+
+    def test_general_stops_when_telegram_refuses_the_rest(self):
+        from swarmly.telegram.cleanup import DELETE_BATCH
+        self.ledger.note(GROUP, list(range(1, DELETE_BATCH + 11)), now=NOW - HOUR)
+        host = FakeHost(message_batches=[40])
+        self.ask(self.cleanup(host), "general")
+        self.assertEqual(len(host.deleted_messages), 1)
+
+    def test_a_non_admin_gets_a_refusal_and_nothing_else(self):
+        host = FakeHost([topic(10)])
+        reply = self.ask(self.cleanup(host), is_admin=False)
+        self.assertIn("only the admin runs /cleanup", reply)
+        self.assertEqual(host.deleted_topics, [])
+
+    def test_an_unknown_form_gets_a_usage_line(self):
+        self.assertIn("/cleanup preview", self.ask(self.cleanup(FakeHost()), "everything"))
 
 
 class LedgerTests(unittest.TestCase):
@@ -436,11 +331,64 @@ class ChannelCase(unittest.TestCase):
                              message_id=message_id)
         return run(self.channel.handle_event(event))
 
-    def test_the_dry_run_is_answered_by_the_transport_without_a_turn(self):
+    def test_cleanup_deletes_a_finished_topic_without_a_turn(self):
         self.prompt()
+        self.channel.topics.touch(GROUP, 42, when=1000.0 - 2 * HOUR)
         reply = self.admin_command("/cleanup@HermesBot")
-        self.assertIn("dry run: nothing is deleted", reply)
-        self.assertIn("42 · DeepSeek: 37 fixed", reply)
+        self.assertIn("deleted 1 topic(s): DeepSeek: 37 fixed (42)", reply)
+        self.assertEqual(self.channel.bot.topics, [(GROUP, 42)])
+
+    def test_the_real_open_work_checks(self):
+        """Review: the running-turn check read a lock table that does not exist."""
+        self.prompt()
+        import asyncio as aio
+
+        class Turn:
+            def done(self):
+                return False
+        self.channel._turn_keys[Turn()] = (GROUP, 42)
+        self.assertEqual(self.channel._open_work_in(GROUP, 42, {}), "a turn is running")
+        self.channel._turn_keys.clear()
+        self.assertIsNone(self.channel._open_work_in(GROUP, 42, {}))
+        store = type("S", (), {"ready": True, "read": lambda self, key: {"links": [
+            {"id": "L1", "role": "work", "status": "open", "phase": "review", "title": "#37"},
+            {"id": "L2", "role": "work", "status": "abandoned", "phase": "development"}]}})()
+        self.channel.state_link.store = store
+        self.assertEqual(self.channel._open_work_in(GROUP, 42, {}), "open work item L1 #37")
+        self.channel.state_link.store = None
+        self.channel.state_link.routing_mode = "registry"
+        self.assertIn("not readable", self.channel._open_work_in(GROUP, 42, {}))
+        del aio
+
+    def test_a_partly_unreadable_owed_table_keeps_everything(self):
+        rows = []
+        self.channel.owed_store = lambda: type("S", (), {"load": lambda self: rows,
+                                                         "unreadable": ["x.json"]})()
+        self.assertIn("*", self.channel._open_owed_topics())
+
+    def test_a_bare_cleanup_naming_a_peer_is_left_to_that_peer(self):
+        self.prompt()
+        self.channel._answers_for_swarm = lambda: True
+        self.channel.topics.touch(GROUP, 42, when=1000.0 - 2 * HOUR)
+        self.admin_command("/cleanup @CodexBot")
+        self.assertEqual(self.channel.bot.topics, [])
+
+    def test_a_topic_with_an_open_owed_row_is_kept(self):
+        self.prompt()
+        self.channel.topics.touch(GROUP, 42, when=1000.0 - 2 * HOUR)
+        from swarmly.telegram.owed import Row
+        rows = [Row(kind="handoff", item="#37", debtor="Codex", owes="a reply", topic="tg-42")]
+        self.channel.owed_store = lambda: type("S", (), {"load": lambda self: rows})()
+        reply = self.admin_command("/cleanup@HermesBot")
+        self.assertIn("deleted 0 topic(s).", reply)
+        self.assertIn("open: Codex owes handoff on #37", reply)
+        self.assertEqual(self.channel.bot.topics, [])
+
+    def test_the_button_only_previews(self):
+        self.prompt()
+        self.channel.topics.touch(GROUP, 42, when=1000.0 - 2 * HOUR)
+        reply = run(self.channel._run_control("swarm.cleanup", ""))
+        self.assertIn("would delete 1 topic(s)", str(reply))
         self.assertEqual(self.channel.bot.topics, [])
 
     def test_anyone_but_the_admin_gets_the_refusal(self):
@@ -464,8 +412,9 @@ class ChannelCase(unittest.TestCase):
         self.channel.bot = FakeBot()
         self.prompt()
         self.assertEqual(self.channel.cleanup.keep, {42})
-        ask = self.admin_command("/cleanup@HermesBot topics all")
-        self.assertIn("no topic to delete", ask)        # 42 is the only one, and it is kept
+        self.channel.topics.touch(GROUP, 42, when=1000.0 - 2 * HOUR)
+        ask = self.admin_command("/cleanup@HermesBot")
+        self.assertIn("DeepSeek: 37 fixed (42) (protected)", ask)   # the only one, kept
 
     def make_channel_from(self, config) -> AgentChannel:
         return AgentChannel(config, adapter=EchoAdapter("Hermes"), sender=self.sender,
@@ -476,20 +425,15 @@ class ChannelCase(unittest.TestCase):
         deleted" and kept listing it."""
         self.prompt()
         self.channel.bot.gone = True
-        ask = self.admin_command("/cleanup@HermesBot topic 42")
-        code = re.search(r"confirm ([0-9a-f]+)", ask).group(1)
-        done = self.admin_command(f"/cleanup@HermesBot confirm {code}", message_id=502)
-        self.assertIn("deleted 1 topic(s): #42", done)
-        self.assertNotIn("could not be deleted", done)
+        done = self.admin_command("/cleanup@HermesBot topic 42")
+        self.assertIn("deleted 1 topic(s): DeepSeek: 37 fixed (42)", done)
+        self.assertNotIn("Could not delete", done)
         self.assertIsNone(self.channel.topics.name(GROUP, 42))
 
     def test_confirming_deletes_the_topic_and_announces_topic_gone(self):
         self.prompt()
-        ask = self.admin_command("/cleanup@HermesBot topic 42")
-        self.assertIn("will delete 1 topic(s)", ask)
-        code = re.search(r"confirm ([0-9a-f]+)", ask).group(1)
-        done = self.admin_command(f"/cleanup@HermesBot confirm {code}", message_id=502)
-        self.assertIn("deleted 1 topic(s): #42", done)
+        done = self.admin_command("/cleanup@HermesBot topic 42")
+        self.assertIn("deleted 1 topic(s): DeepSeek: 37 fixed (42)", done)
         self.assertEqual(self.channel.bot.topics, [(GROUP, 42)])
         # the state is gone, and the peers are told on the machine plane
         self.assertIsNone(self.channel.topics.name(GROUP, 42))
@@ -504,9 +448,7 @@ class ChannelCase(unittest.TestCase):
 
     def test_general_deletes_only_what_the_ledger_recorded(self):
         self.channel.ledger.note(GROUP, [11, 12])
-        ask = self.admin_command("/cleanup@HermesBot general")
-        code = re.search(r"confirm ([0-9a-f]+)", ask).group(1)
-        self.admin_command(f"/cleanup@HermesBot confirm {code}", message_id=503)
+        self.admin_command("/cleanup@HermesBot general")
         sent = self.channel.bot.messages
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], GROUP)
@@ -530,10 +472,8 @@ class ChannelCase(unittest.TestCase):
     def test_a_refused_delete_keeps_the_state(self):
         self.prompt()
         self.channel.bot.fail = True
-        ask = self.admin_command("/cleanup@HermesBot topic 42")
-        code = re.search(r"confirm ([0-9a-f]+)", ask).group(1)
-        text = self.admin_command(f"/cleanup@HermesBot confirm {code}", message_id=505)
-        self.assertIn("could not be deleted", text)
+        text = self.admin_command("/cleanup@HermesBot topic 42")
+        self.assertIn("Could not delete", text)
         self.assertIsNotNone(self.channel.topics.name(GROUP, 42))
         self.assertIn("tg-42", self.channel._models)
         self.assertEqual([t for t in self.sender.sent if "intent=TOPIC_GONE" in t], [])
