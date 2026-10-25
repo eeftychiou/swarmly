@@ -8810,7 +8810,10 @@ class AgentChannel:
                 # test, each with a fresh context.
                 return await self._open_topic(event, title_from(event.text or ""), body,
                                               moved=True)
-        elsewhere = self._topic_elsewhere(event, body)
+        # With registry routing a reply is posted in its turn's topic, always: where a post goes
+        # is the transport's decision in code, never one the reply's words steer (admin, 25 Oct:
+        # a reply that named an item was moved into Swarm pulse).
+        elsewhere = None if self._transport_only_on() else self._topic_elsewhere(event, body)
         if elsewhere is not None:
             return await self._post_in_known_topic(event, body, elsewhere)
         origin = self._topic_origins.get((event.chat_id, event.thread_id))
