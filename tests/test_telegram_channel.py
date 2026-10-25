@@ -2376,37 +2376,6 @@ class TestInstalledRevision(unittest.TestCase):
             self.assertEqual(channel_mod._local_revision(), f"v{__version__}")
 
 
-class TestCleanupLookups(unittest.TestCase):
-    """/cleanup asks GitHub once per number, side by side, and reuses a recent answer."""
-
-    def test_one_lookup_per_number_in_parallel_and_cached(self):
-        import threading
-        import time as time_mod
-        channel = make_channel(make_config(github={"poll_minutes": 0}))
-        channel._cleanup_repo = lambda *_args: "o/r"
-        calls = []
-        lock = threading.Lock()
-
-        class Client:
-            def ref_state(self, repo, number):
-                with lock:
-                    calls.append(number)
-                time_mod.sleep(0.2)
-                return "closed" if number % 2 else "merged"
-
-        channel._gh_client = Client()
-        refs = [f"#{n}" for n in range(1, 13)]
-        started = time_mod.monotonic()
-        states = channel._ref_states(refs, GROUP, 7)
-        took = time_mod.monotonic() - started
-        self.assertEqual(sorted(calls), list(range(1, 13)))       # one call each, no fallback
-        self.assertLess(took, 1.5)                                 # not 12 x 0.2 s in a row
-        self.assertEqual(states["#1"], "closed")
-        self.assertEqual(states["#2"], "merged")
-        channel._ref_states(refs, GROUP, 7)
-        self.assertEqual(len(calls), 12)                           # the second ask is cached
-
-
 class TestTheCommandMenu(unittest.TestCase):
     """Live: only the bot whose token once ran another tool autocompleted, with that tool's
     commands. Every transport now registers Swarmly's own menu on start."""

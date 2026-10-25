@@ -615,6 +615,7 @@ class AgentChannel:
         self._split_pending: Dict[Tuple[Any, ...], _PendingSplit] = {}
         self._split_tasks: Set[asyncio.Task] = set()
         self._gone_topics: set = set()             # topics a reply in flight found closed
+        self._dead_topics: set = set()             # topics a dropped post found gone (kept)
         # Whether a post to a closed or deleted topic goes to General with a note (a reply
         # must land somewhere); ``swarmly-telegram send --topic`` turns it off so a wrong
         # topic id fails instead of posting in General.
@@ -784,9 +785,7 @@ class AgentChannel:
         # command deletes topics and messages only after one explicit confirmation.
         self.ledger = GeneralLedger(_state_file(config, "general"))
         self.cleanup = Cleanup(
-            self, self.ledger,
-            handle=f"@{config.identity.name.lstrip('@')}",
-            idle_hours=float(getattr(config.limits, "cleanup_idle_hours", 24.0)),
+            self, self.ledger, handle=config.identity.alias,
             keep=getattr(config.limits, "cleanup_keep", ()) or ())
         self._gh_client: Any = None
         self._github_task: Optional[asyncio.Task] = None
@@ -1846,11 +1845,17 @@ class AgentChannel:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
                 return None
         elif not (self.mentions_me(event.text or "") or event.replies_to_bot
-                  or self._direct_chat(event)):
+                  or self._direct_chat(event) or self._answers_for_swarm()):
             return None
         return await self.cleanup.handle_args(
             command_args(event.text or ""),
             is_admin=self.config.is_admin(event.author_id), chat_id=event.chat_id)
+
+    def _answers_for_swarm(self) -> bool:
+        """A bare swarm-wide command (``/cleanup``) is answered by one bot: the store's
+        lease holder -- the coordinator."""
+        store = self.state_link.store
+        return bool(store is not None and store.ready and store.holds_lease())
 
     async def _transport_command(self, event: ChannelEvent) -> Optional[str]:
         """A command answered by the transport: /cleanup first (it awaits), then the rest."""
@@ -2036,89 +2041,61 @@ class AgentChannel:
         return int(home) if home is not None else None
 
     def cleanup_topics(self) -> List[TopicInfo]:
-        """Every topic this transport knows in the home group, with what /cleanup decided from.
+        """Every topic this transport knows in the home group, with what /cleanup decides by.
 
         Telegram cannot list a group's topics, so these are the ones the transports recorded
-        (``topics-<alias>.json``): names, when each was last active, and the issue or PR its
-        name or its messages point at.
+        (``topics-<alias>.json``): names, when each was last active, and -- on the loop, from
+        the topic registry and the owed table -- whether it still has open work.
         """
         home = self.cleanup_home_chat()
+        owed = self._open_owed_topics()
         topics: List[TopicInfo] = []
         for chat_id, thread_id, name in self.topics.entries():
-            if home is not None and int(chat_id) != int(home):
+            if thread_id is None or (home is not None and int(chat_id) != int(home)):
                 continue
             if name == PULSE_TOPIC_NAME:
                 continue                           # the swarm's heartbeat, never cleaned up
-            refs = list(dict.fromkeys(
-                list(issue_refs(name or "")) + self._refs_of_topic(chat_id, thread_id)))
             topics.append(TopicInfo(
                 chat_id=int(chat_id), thread_id=int(thread_id), title=name,
                 last_activity=self.topics.last_seen(chat_id, thread_id),
-                refs=tuple(refs), states=self._ref_states(refs, chat_id, thread_id)))
+                open_reason=self._open_work_in(int(chat_id), int(thread_id), owed)))
         return topics
 
-    def _refs_of_topic(self, chat_id: int, thread_id: int) -> List[str]:
-        """The issues and PRs this transport learned the topic is about."""
-        return [ref for ref, topic in self._ref_topics.items()
-                if topic == (int(chat_id), int(thread_id))]
+    def _open_owed_topics(self) -> Dict[str, str]:
+        """Topic token (``tg-<id>``) -> one open owed row in it, as a short line."""
+        out: Dict[str, str] = {}
+        try:
+            rows = self.owed_store().load()
+        except Exception:                                  # noqa: BLE001 - keep, do not guess
+            logger.warning("cleanup: the owed table could not be read", exc_info=True)
+            return {"*": "the owed table could not be read"}
+        for row in rows:
+            if row.is_open and row.topic and row.topic not in out:
+                out[row.topic] = f"{row.debtor} owes {row.kind} on {row.subject}"
+        return out
 
-    def _cleanup_repo(self, chat_id: int, thread_id: Optional[int]) -> Optional[str]:
-        """The repo whose issues decide a topic's state: its project's, else the first."""
-        project = self.router.project_for(chat_id, thread_id)
-        if project is not None and project.repo:
-            return project.repo
-        for settings in self.config.projects.values():
-            if settings.repo:
-                return settings.repo
+    def _open_work_in(self, chat_id: int, thread_id: int, owed: Dict[str, str]) -> Optional[str]:
+        """Why a topic is not finished, or None: a turn running in it, an open owed row, or
+        an open work item in the topic registry."""
+        lock = self._topic_locks.get((chat_id, thread_id)) if hasattr(self, "_topic_locks") \
+            else None
+        if lock is not None and lock.locked():
+            return "a turn is running"
+        if "*" in owed:
+            return owed["*"]
+        token = self._topic_token(chat_id, thread_id)
+        if token and token in owed:
+            return "open: " + owed[token]
+        store = self.state_link.store
+        if store is not None and store.ready:
+            from swarmly.state import keys as K
+            record = store.read(K.topic(thread_id))
+            for link in (record.get("links") if isinstance(record, dict) else None) or []:
+                if not isinstance(link, dict) or link.get("role") != "work":
+                    continue
+                if link.get("status") != "closed" and link.get("phase") != "done":
+                    return f"open work item {link.get('id', '?')} {link.get('title') or ''}".strip()
         return None
-
-    def _github_client(self) -> Any:
-        if self._gh_client is None:
-            from swarmly.github.client import GitHubClient
-            self._gh_client = GitHubClient(
-                token_env=(self.config.github.token_env if self.config.github
-                           else "GH_TOKEN"),
-                alias=self.config.identity.alias,
-                redact=Redactor.from_config(self.config).text)
-        return self._gh_client
-
-    def _ref_states(self, refs: List[str], chat_id: int,
-                    thread_id: Optional[int]) -> Dict[str, Optional[str]]:
-        """Each ref's state (``open``/``closed``/``merged``), or None when gh cannot say.
-
-        A topic is only ever called *done* when every item it links is known to be closed or
-        merged, so an unreachable GitHub keeps its topics: a deletion cannot be undone, and a
-        failure to check is not a reason to delete.
-        """
-        if not refs:
-            return {}
-        repo = self._cleanup_repo(chat_id, thread_id)
-        if not repo or self.config.github is None:
-            return {ref: None for ref in refs}
-        client = self._github_client()
-        numbers: Dict[str, int] = {}
-        for ref in refs:
-            try:
-                numbers[ref] = int(str(ref).lstrip("#"))
-            except (TypeError, ValueError):
-                continue
-        cache = self.__dict__.setdefault("_ref_state_cache", {})
-        now = time.time()
-
-        def lookup(number: int) -> Optional[str]:
-            key = (repo, number)
-            hit = cache.get(key)
-            if hit is not None and now - hit[0] < _REF_STATE_CACHE_SECONDS:
-                return hit[1]
-            state = _ref_state(client.ref_state(repo, number))   # one call, issue or PR
-            if state is not None:
-                cache[key] = (now, state)
-            return state
-
-        # A topic links a dozen items: ask about them side by side, not one after another.
-        with ThreadPoolExecutor(max_workers=_REF_LOOKUP_WORKERS) as pool:
-            found = dict(zip(numbers, pool.map(lookup, numbers.values())))
-        return found
 
     async def cleanup_delete_topic(self, chat_id: int, thread_id: int) -> bool:
         """Delete one forum topic with all its messages (any age: that is deleteForumTopic)."""
@@ -2307,6 +2284,7 @@ class AgentChannel:
         self._topics_reported.discard(key)
         self._report_asked.discard(key)
         self._gone_topics.discard(key)
+        self._dead_topics.discard(key)
         if context:
             for adapter in [self.adapter, *self._project_adapters.values()]:
                 forget = getattr(adapter, "forget_session", None)
@@ -4558,10 +4536,9 @@ class AgentChannel:
         if action == "swarm.sync":
             return await self._sync_now()
         if action == "swarm.cleanup":
-            # The dry run *is* the control: it deletes nothing, and the words it answers with
-            # name the command that would (with its own confirmation code).
+            # A preview: a button press never deletes; /cleanup does, in one go.
             return await self.cleanup.handle_args(
-                [], is_admin=True,
+                ["preview"], is_admin=True,
                 chat_id=self.config.identity.home_channel_id)
         if action == "swarm.pause_all":
             # Hold this bot, and broadcast the hold: every peer applies the same note, so one
@@ -7088,6 +7065,8 @@ class AgentChannel:
         A message accepted for a turn is kept in the inbox until this returns, so a restart
         that cuts a turn (or a queued message, or a reply not yet posted) runs it again.
         """
+        # A message in a topic shows it is there again (a closed topic can be reopened).
+        self._dead_topics.discard((event.chat_id, event.thread_id))
         key = (event.chat_id, event.message_id)
         tracked = event.message_id is not None and not event.self_task
         if tracked:
@@ -9070,8 +9049,14 @@ class AgentChannel:
             # A topic already about the same issue or PR takes the work (round 2 export:
             # "PR #37 re-review" was opened while a topic about #37 existed).
             known = self._topic_for_refs(f"{title}\n{brief}")
-            if known is not None:
-                return await self._continue_in_topic(event, brief, known)
+            if known is not None and known not in self._dead_topics:
+                sent = await self._continue_in_topic(event, brief, known)
+                if known not in self._dead_topics:
+                    return sent
+                # That topic turned out to be gone (deleted since): the work gets a topic of
+                # its own instead of being lost (live, 25 Oct: a round's assignment went to
+                # General for a just-deleted topic).
+                logger.info("topic %s is gone; opening a new topic for the work", known[1])
         now = self._clock()
         self._topics_opened = [t for t in self._topics_opened if now - t < 3600]
         reason = ""
@@ -9221,6 +9206,8 @@ class AgentChannel:
         here = (int(event.chat_id), event.thread_id) == (chat_id, thread_id)
         logger.info("not opening a topic: topic %s is already about the same item", thread_id)
         sent = await self.send(brief, chat_id=chat_id, thread_id=thread_id)
+        if (chat_id, thread_id) in self._dead_topics:
+            return sent                         # the caller opens a new topic instead
         self._log_topic(chat_id, thread_id, self.config.identity.alias, brief,
                         self.last_first_message_id)
         self._mirror_handoffs(brief, chat_id, thread_id, self.last_first_message_id,
@@ -10202,6 +10189,7 @@ class AgentChannel:
                         # reply in a just-deleted topic drew a peer's General cooldown notice).
                         logger.info("topic %s is gone; the rest of this post is dropped, "
                                     "not moved to General", thread_id)
+                        self._dead_topics.add(topic)
                         result = None
                         break
                     if not self.reroute_gone_topics:
