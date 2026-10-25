@@ -50,3 +50,15 @@ class TelegramBusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalHelpersTests(unittest.TestCase):
+    def test_the_round_store_still_builds_on_the_telegram_bus(self):
+        """Live, 25 Oct: the owed sweep raised 'unknown bus transport telegram'."""
+        import tempfile
+        from swarmly.telegram.channel import AgentChannel
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = AgentConfig.from_dict(dict(BASE, bus={"transport": "telegram"},
+                                             state={"backend": "telegram", "dir": tmp}))
+            channel = AgentChannel(cfg)
+            self.assertIsNotNone(channel.round_store())
