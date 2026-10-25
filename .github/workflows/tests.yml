@@ -42,8 +42,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[test]"
+      # One pytest worker per core (pytest-xdist): the suite is ~3,300 independent tests, and
+      # one at a time it was most of every job's wall time (6 minutes on Windows).
       - name: Run the suite with coverage
-        run: python -m coverage run -m unittest discover tests -v
+        run: python -m pytest -n auto --cov --cov-report= tests
       - name: Coverage report
         run: python -m coverage report --skip-covered --sort=cover
       # Issue #7 / brainstorm 2.4-2.5. A host that runs an agent hands the suite its role
@@ -67,7 +69,7 @@ jobs:
             GIT_AUTHOR_NAME=Guard GIT_AUTHOR_EMAIL=guard@a2a.local \
             GIT_COMMITTER_NAME=Guard GIT_COMMITTER_EMAIL=guard@a2a.local \
             SWARMLY_ROLE=developer \
-            python -m unittest discover tests
+            python -m pytest -n auto -q tests
 
   lint:
     runs-on: ubuntu-latest
