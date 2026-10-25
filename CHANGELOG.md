@@ -182,9 +182,11 @@ All notable changes to this project are documented here. The format follows
   state section behind `/state` (backend, mode, routing and whether the store is readable). A
   source nobody collected is `null`, never an empty list; one collected but not ready says so in
   words. `/memory` is served at `GET /memory.json` and only to a verified admin `initData`, the
-  loopback included, returning the bot's words and their size and never the file's home; the
-  page's Memory section says the login is needed when it is opened without one. New sections:
-  Settings, Drift, State, Memory, each linked from the header navigation.
+  loopback included — checked before the page admits whether it has a memory at all — returning
+  the bot's words and their size and never the file's home; a bot without a memory file answers
+  `ready: false`, the page's Memory section says the login is needed when it is opened without
+  one, and it is fetched once rather than on every poll. New sections: Settings, Drift, State,
+  Memory, each linked from the header navigation.
 
 - The dashboard's **look and layout** (`#343`, control centre 2/4): a header with the swarm's
   health (round, coordinator, lease, bots by state, today's spend), section navigation over

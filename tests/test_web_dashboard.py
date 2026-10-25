@@ -1139,20 +1139,32 @@ class TestTheReadCommandViews(unittest.TestCase):
         row.evidence = r"C:\Users\eftyc\swarm notes, chat -1001234567890123"
         return row
 
-    def test_drift_publishes_kinds_and_weights_never_evidence(self):
+    def test_drift_publishes_kinds_and_weights_never_evidence_or_session_keys(self):
         view = webui.drift_view(alias="DeepSeek",
                                 decided={"score": 3, "hard": 1, "remind": True,
                                          "reset": False, "resets_today": 0},
-                                sessions={"tg-19286": (3, 1)},
                                 live=[self.rule("deploy_instruction", 2, NOW - 60)],
                                 now=NOW)
         self.assertEqual((view["score"], view["hard"]), (3, 1))
-        self.assertEqual(view["sessions"], {"tg-19286": {"score": 3, "hard": 1}})
         self.assertEqual(view["recent"][0]["kind"], "deploy_instruction")
         self.assertEqual(view["recent"][0]["age"], 60.0)
         payload = json.dumps(view)
         self.assertNotIn("evidence", payload)
         self.assertNotIn("Users", payload)
+        # The ledger's own per-session keys are chat:thread, so they are not published at all.
+        self.assertNotIn("sessions", view)
+
+    def test_a_real_ledger_key_never_reaches_the_page(self):
+        """Review #349: the fixture fed a pre-redacted key, so this leak could not be seen."""
+        from tests.test_telegram_channel import GROUP, make_channel, make_config
+        channel = make_channel(make_config())
+        channel.record_violation("duplicate_reply", "a repeat", chat_id=GROUP, thread_id=19286)
+        payload = json.dumps(channel.web_state())
+        self.assertNotIn(str(GROUP), payload)
+        self.assertNotIn("19286", payload)
+        # ... while the ledger itself still holds that key, so a view that passed it on would
+        # have been caught here.
+        self.assertTrue(any(str(GROUP) in key for key in channel.drift.sessions()))
 
     def test_state_says_which_backend_and_whether_it_is_ready(self):
         view = webui.state_view(backend="telegram", mode="live", enabled=True, ready=True,
@@ -1175,9 +1187,13 @@ class TestTheReadCommandViews(unittest.TestCase):
         self.assertEqual(view["topics"][0]["effort"], "high")
 
     def test_a_source_nobody_collected_is_null_and_never_an_empty_view(self):
-        rendered = self.state(drift=None, store=None)
+        rendered = self.state(drift=None, store=None, registry=None)
         self.assertIsNone(rendered["drift"])
         self.assertIsNone(rendered["store"])
+        # The registry was not read, so there is no answer about topic overrides either --
+        # an empty list would read as "no overrides" (review, #349).
+        self.assertIsNone(rendered["settings"]["topics"])
+        self.assertTrue(rendered["settings"]["bots"])
         # ... while a source that *is* collected but not ready says so in words.
         self.assertEqual(self.state(drift={"ready": False, "text": webui.NOT_READY})
                          ["drift"]["ready"], False)
@@ -1188,7 +1204,7 @@ class TestTheReadCommandViews(unittest.TestCase):
             self.assertNotIn(secret, payload)
 
     def test_memory_is_words_and_a_size_never_a_path(self):
-        view = webui.memory_view(text="# lessons\n- be brief", alias="DeepSeek")
+        view = webui.memory_view(text="# lessons\n- be brief")
         self.assertTrue(view["ready"])
         self.assertEqual(view["bytes"], len("# lessons\n- be brief".encode("utf-8")))
         self.assertNotIn("memory-", json.dumps(view))
@@ -1247,6 +1263,18 @@ class TestTheMemoryEndpoint(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_a_stranger_cannot_tell_a_wired_page_from_an_unwired_one(self):
+        """Review #349: the login is checked before "is anything wired", so both are 403."""
+        wired = self.server()
+        unwired = webui.DashboardServer(lambda: {"bots": []}, port=0, bot_token=TOKEN,
+                                       admin_id=ADMIN_ID)
+        try:
+            self.assertEqual(self.get(wired.start())[0], 403)
+            self.assertEqual(self.get(unwired.start())[0], 403)
+        finally:
+            wired.stop()
+            unwired.stop()
+
     def test_a_page_with_no_memory_wired_has_no_path(self):
         server = webui.DashboardServer(lambda: {"bots": []}, port=0, bot_token=TOKEN,
                                        admin_id=ADMIN_ID)
@@ -1277,8 +1305,14 @@ class TestTheReadViewsOnThePage(unittest.TestCase):
         page = self.page()
         for marker in ("settings are not being read on this bot",
                        "the state store is not read here",
-                       "the drift ledger is not read here"):
+                       "the drift ledger is not read here",
+                       "the registry is not read here, so no topic override is known"):
             self.assertIn(marker, page, marker)
+
+    def test_the_memory_is_not_refetched_on_every_poll(self):
+        page = self.page()
+        self.assertNotIn("setInterval(memory, EVERY)", page)
+        self.assertIn('location.hash === "#memory"', page)
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

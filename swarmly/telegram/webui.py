@@ -265,20 +265,17 @@ def roster_view(*, cards: Sequence[Mapping[str, Any]] = (),
 
 
 def drift_view(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
-               sessions: Optional[Mapping[str, Any]] = None,
                live: Sequence[Any] = (), now: float = 0.0,
                limit: int = 10) -> Dict[str, Any]:
     """``/drift``: the score, where it stands, and the latest violations behind it.
 
-    Only the kind, its weight and its age are published: the ledger's ``evidence`` is the
-    bot's own words about what it did and can name a topic, a path or an id, so it stays home.
+    Only the kind, its weight and its age are published. Two things the ledger holds stay home:
+    its ``evidence`` (the bot's own words, which can name a topic, a path or an id) and its
+    **per-session keys**, which are literally ``<chat id>:<thread id>`` -- the page draws no
+    per-session row, so publishing them was only ever a leak (review, #349). The score and the
+    hard count are the session's own, so nothing useful is lost.
     """
     moment = float(now)
-    scores: Dict[str, Any] = {}
-    for place, value in dict(sessions or {}).items():
-        pair = value if isinstance(value, (list, tuple)) else (value, 0)
-        scores[str(place)] = {"score": int(_num(pair[0])),
-                              "hard": int(_num(pair[1] if len(pair) > 1 else 0))}
     rows = []
     for row in list(live)[-int(limit):]:
         at = _num(getattr(row, "at", 0.0))
@@ -294,7 +291,6 @@ def drift_view(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
         "remind": bool(decided.get("remind")),
         "reset": bool(decided.get("reset")),
         "resets_today": int(_num(decided.get("resets_today"))),
-        "sessions": scores,
         "recent": rows,
     }
 
@@ -319,7 +315,7 @@ def state_view(*, backend: str = "", mode: str = "", enabled: Any = None,
 
 
 def settings_view(*, cards: Sequence[Mapping[str, Any]] = (),
-                  topics: Sequence[Mapping[str, Any]] = ()) -> Dict[str, Any]:
+                  topics: Optional[Sequence[Mapping[str, Any]]] = ()) -> Dict[str, Any]:
     """``/model``, ``/reasoning`` and ``/role``: what each bot runs, and what a topic changes.
 
     A bot's row is the setting it reports in its own pulse; a topic's row is its binding, which
@@ -330,8 +326,8 @@ def settings_view(*, cards: Sequence[Mapping[str, Any]] = (),
              "model": card.get("model"),
              "effort": card.get("effort")}
             for card in cards]
-    overrides = []
-    for topic in topics:
+    overrides: List[Dict[str, Any]] = []
+    for topic in topics or ():
         for binding in topic.get("bindings") or ():
             overrides.append({
                 "topic": topic.get("topic"),
@@ -340,10 +336,12 @@ def settings_view(*, cards: Sequence[Mapping[str, Any]] = (),
                 "model": binding.get("model"),
                 "effort": binding.get("effort"),
             })
-    return {"ready": True, "bots": bots, "topics": overrides}
+    return {"ready": True, "bots": bots,
+            # ``None``: the registry was not read, so there is no answer about overrides.
+            "topics": (None if topics is None else overrides)}
 
 
-def memory_view(*, text: Optional[str] = None, alias: str = "") -> Dict[str, Any]:
+def memory_view(*, text: Optional[str] = None) -> Dict[str, Any]:
     """``/memory``: this bot's own lessons, for the admin's eyes only.
 
     It reaches the wire through its own path, behind the same verified login as a write
@@ -351,8 +349,7 @@ def memory_view(*, text: Optional[str] = None, alias: str = "") -> Dict[str, Any
     is never published -- only whether there is anything to read.
     """
     body = str(text or "")
-    return {"ready": text is not None, "alias": str(alias or "") or None,
-            "bytes": len(body.encode("utf-8")), "text": body}
+    return {"ready": text is not None, "bytes": len(body.encode("utf-8")), "text": body}
 
 
 # ------------------------------------------------------------------------------------
@@ -629,9 +626,12 @@ def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
         "roster": roster_view(cards=cards, peers=peers or (), coordinator=holder),
         "drift": (None if drift is None else dict(drift)),
         "store": (None if store is None else dict(store)),
-        "settings": (None if registry is None and not cards else
+        # A registry nobody collected is ``None`` here too: an empty ``topics`` would read as
+        # "no topic overrides" instead of "not read" (review, #349).
+        "settings": (None if not cards else
                      settings_view(cards=cards,
-                                   topics=(registry or {}).get("topics") or ())),
+                                   topics=(None if registry is None
+                                           else (registry.get("topics") or ())))),
     }
 
 
@@ -1145,6 +1145,8 @@ function settings(state) {
     line.append(el("span", "sub", "effort " + (bot.effort || "?")));
     box.append(line);
   });
+  if (view.topics === null || view.topics === undefined)
+    box.append(el("p", "note", "the registry is not read here, so no topic override is known"));
   (view.topics || []).forEach((row) => {
     const line = el("div", "line");
     line.append(el("span", "ref", row.topic || "?"));
@@ -1324,8 +1326,12 @@ async function tick() {
 document.getElementById("every").textContent = String(EVERY / 1000);
 tick();
 setInterval(tick, EVERY);
+// The memory is read once, and again only when its section is opened: it never changes on a
+// 3 s beat, and a large memory.md must not be fetched forty times a heartbeat (review, #349).
 memory();
-setInterval(memory, EVERY);
+window.addEventListener("hashchange", () => {
+  if (location.hash === "#memory") memory();
+});
 </script>
 </body>
 </html>
@@ -1562,16 +1568,17 @@ class DashboardServer:
                     return
                 if path == MEMORY_PATH:
                     # Always behind the login, loopback included (#344): a bot's own notes are
-                    # its private working memory, and the path only answers when the transport
-                    # wired one at all.
-                    if server.memory is None:
-                        self._not_found()
-                        return
+                    # its private working memory. The login is checked **first**, so a stranger
+                    # cannot tell a page with a memory hook from one without by 404 vs 403
+                    # (review, #349) -- and only then does "is anything wired" get answered.
                     if not self._admin_ok():
                         self._send(403, json.dumps(
                             {"ready": False, "refused": "auth",
                              "text": "the admin's login is needed to read this"}).encode("utf-8"),
                             "application/json")
+                        return
+                    if server.memory is None:
+                        self._not_found()
                         return
                     try:
                         text = server.memory()
@@ -1579,7 +1586,7 @@ class DashboardServer:
                         self._send(503, b'{"ready":false,"text":"unavailable"}',
                                    "application/json")
                         return
-                    body = json.dumps(memory_view(text=text, alias=server.title),
+                    body = json.dumps(memory_view(text=text),
                                       sort_keys=True, default=str)
                     self._send(200, body.encode("utf-8"), "application/json")
                     return

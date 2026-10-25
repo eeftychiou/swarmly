@@ -3885,9 +3885,10 @@ class AgentChannel:
         try:
             self.drift.fold_inbox()
             decision = self.drift.decide()
+            # The ledger's per-session keys are ``<chat>:<thread>``; they stay home (the page
+            # draws no per-session row), so only the decision and the live rows go on (#349).
             return webui.drift_view(alias=self.config.identity.alias, decided=decision.__dict__,
-                                    sessions=self.drift.sessions(), live=self.drift.live(),
-                                    now=moment)
+                                    live=self.drift.live(), now=moment)
         except Exception:                          # noqa: BLE001 - a page without drift
             logger.warning("web dashboard: the drift ledger is not readable", exc_info=True)
             return {"ready": False, "text": webui.NOT_READY}
