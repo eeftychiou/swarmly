@@ -26,3 +26,9 @@ import tempfile
 
 _redaction_dir = tempfile.mkdtemp(prefix="swarmly-redaction-")
 os.environ["SWARMLY_REDACTION_SECRET_FILE"] = os.path.join(_redaction_dir, "redaction.secret")
+
+# A config with no bus repo keeps its transport state under the checkout's .agents/state.
+# Under `pytest -n auto` every worker would share those files (boots, admitted, inbox,
+# owed rows) and race on them: a restart test read back another worker's write (#320
+# review). Each test process gets a state root of its own, unconditionally like the above.
+os.environ["SWARMLY_STATE_ROOT"] = tempfile.mkdtemp(prefix="swarmly-state-")

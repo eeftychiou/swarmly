@@ -162,7 +162,13 @@ class TestTransportStateRoot(unittest.TestCase):
             "adapter": {"type": "echo"},
             "limits": {"min_seconds_between_messages": 0},
         })
-        self.assertEqual(transport_state_root(config).resolve(), REPO_ROOT)
+        with patch.dict(os.environ):
+            os.environ.pop("SWARMLY_STATE_ROOT", None)  # the suite's own root, set aside
+            self.assertEqual(transport_state_root(config).resolve(), REPO_ROOT)
+            os.environ["SWARMLY_STATE_ROOT"] = str(Path("/srv/state"))
+            self.assertEqual(transport_state_root(config), Path("/srv/state"))
+            config.bus.repo = "/srv/bus"                # a bus repo still wins
+            self.assertEqual(transport_state_root(config), Path("/srv/bus"))
 
 
 # --------------------------------------------------------------------------------------

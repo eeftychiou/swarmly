@@ -1608,8 +1608,12 @@ class TestOnlineNoticeRevision(unittest.TestCase):
 
     def test_status_reports_the_revision_the_process_runs(self):
         """Issue #32: /status names the running revision, not just a task line."""
+        from swarmly.telegram import channel as channel_mod
         channel = make_channel()
-        status = channel._command_reply("status")
+        # As in the busy-drop bound: a `git rev-parse` past its timeout on a loaded runner
+        # would read as drift. The drift itself is pinned by the next test.
+        with patch.object(channel_mod, "_local_revision", return_value=channel._running_revision):
+            status = channel._command_reply("status")
         self.assertIn(f"rev={channel._running_revision}", status)
         self.assertNotIn("drift=restart-needed", status)      # checkout has not moved
 
