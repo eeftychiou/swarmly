@@ -256,14 +256,19 @@ def transport_state_root(cfg: Any) -> Path:
     """Root of the checkout whose ``.agents/state`` holds the transport's lock.
 
     ``bus.repo`` (or its legacy ``fallback.gitbus_root`` alias) wins -- the same
-    resolution the poller and the heartbeat use. The default is the checkout the
-    transport runs from (``~/.a2a`` for an installed wheel), never the process CWD, so a ``run`` started from a scheduler
-    directory and one started from a shell still meet on the same lock.
+    resolution the poller and the heartbeat use. Next comes ``SWARMLY_STATE_ROOT`` when it
+    is set: the test suite gives each of its processes one, so parallel workers never share
+    a state file in the checkout. The default is the checkout the transport runs from
+    (``~/.a2a`` for an installed wheel), never the process CWD, so a ``run`` started from a
+    scheduler directory and one started from a shell still meet on the same lock.
     """
     candidate = getattr(getattr(cfg, "bus", None), "repo", None) \
         or getattr(getattr(cfg, "fallback", None), "gitbus_root", None)
     if candidate:
         return Path(candidate).expanduser()
+    override = os.environ.get("SWARMLY_STATE_ROOT", "").strip()
+    if override:
+        return Path(override).expanduser()
     checkout = Path(__file__).resolve().parents[2]
     if (checkout / "pyproject.toml").is_file():
         return checkout

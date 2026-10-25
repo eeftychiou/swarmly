@@ -332,7 +332,7 @@ Planned:
 
 ```bash
 pip install -e ".[test]"
-python -m unittest discover tests
+python -m pytest -n auto tests      # or: python -m unittest discover tests
 ```
 
 ## How this was built
