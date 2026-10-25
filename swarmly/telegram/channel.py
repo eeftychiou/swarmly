@@ -8899,9 +8899,20 @@ class AgentChannel:
         now = time.time()
         for ref in issue_refs(text):
             if ref in self._ref_topics \
-                    and now - self._ref_seen.get(ref, now) < REF_TOPIC_SECONDS:
+                    and now - self._ref_seen.get(ref, now) < REF_TOPIC_SECONDS \
+                    and self._work_topic(self._ref_topics[ref]):
                 return self._ref_topics[ref]
         return None
+
+    def _work_topic(self, place: Optional[Tuple[int, int]]) -> bool:
+        """A topic work may be moved into: not Swarm pulse (live, 25 Oct: refs learned from
+        bots' chatter there moved a reply into it), not one found gone."""
+        if place is None:
+            return False
+        pulse = self._pulse_topic()
+        if pulse is not None and int(place[1]) == int(pulse):
+            return False
+        return tuple(place) not in self._dead_topics
 
     def topic_for_text(self, text: str) -> Optional[Tuple[int, int]]:
         """The topic already about an issue or PR *text* names, if any (poll.py: a bus reply
@@ -8909,7 +8920,7 @@ class AgentChannel:
         explicit links decide first; today's ref-learning is only the fallback."""
         if self.state_link.links_mode == "registry":
             found = self.state_link.topic_for_refs(issue_refs(text or ""))
-            if found is not None:
+            if found is not None and self._work_topic(found):
                 return found
         return self._topic_for_refs(text)
 
@@ -9121,6 +9132,13 @@ class AgentChannel:
             self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", home, thread_id, name)
         return sent
 
+    def _transport_only_on(self) -> bool:
+        """General and Swarm pulse are transport-only -- no model turn there, nothing from token
+        space posted there -- with ``limits.general_turns: never``, and always with registry
+        routing (admin, 25 Oct: "a block on posting token space posts in General, pulse")."""
+        return (getattr(self.config.limits, "general_turns", "allow") == "never"
+                or getattr(self.state_link, "routing_mode", "legacy") == "registry")
+
     def _transport_only_place(self, event: ChannelEvent) -> Optional[str]:
         """"General" or "Swarm pulse" when ``event`` is in one of them, else None."""
         home = self.config.identity.home_channel_id
@@ -9137,7 +9155,7 @@ class AgentChannel:
         opens a topic for it whichever bot it names (the named bot is addressed again in the
         topic, by the request quoted there); every other bot leaves it to the coordinator.
         None: not such a message, the normal path goes on."""
-        if getattr(self.config.limits, "general_turns", "allow") != "never":
+        if not self._transport_only_on():
             return None
         if event.self_task or event.author_is_bot or \
                 self._transport_only_place(event) != "General":
@@ -9158,7 +9176,7 @@ class AgentChannel:
         one place a message on its way to a turn passes, own briefs and transport turns
         included (the #257 class of bug: a turn that fell back to General).
         """
-        if getattr(self.config.limits, "general_turns", "allow") != "never":
+        if not self._transport_only_on():
             return None
         where = self._transport_only_place(event)
         if where is None:

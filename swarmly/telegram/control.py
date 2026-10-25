@@ -102,7 +102,7 @@ CONTROLS: Tuple[Control, ...] = (
     Control("swarm.failback", "Fail back", confirm=True),
     Control("swarm.role", "Reassign role", confirm=True),
     Control("swarm.cleanup", "Cleanup", report=True,
-            note="a preview: /cleanup deletes"),
+            note="a preview: nothing is deleted"),
     Control("swarm.sync", "Sync"),
     Control("item.nudge", "Nudge", note="costs the owner a turn"),
 )

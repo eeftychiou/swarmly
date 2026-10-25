@@ -331,7 +331,8 @@ class Cleanup:
 
     def preview(self, topics: Sequence[TopicInfo]) -> str:
         finished, kept = self.plan(topics)
-        lines = [f"🧹 {self._me()}: /cleanup would delete {len(finished)} topic(s)"
+        lines = [f"🧹 {self._me()} (a preview: nothing is deleted): /cleanup would delete "
+                 f"{len(finished)} topic(s)"
                  + (": " + ", ".join(self._name(t) for t in finished) if finished else ".")]
         if kept:
             lines.append("Kept: " + "; ".join(f"{self._name(t)} ({why})" for t, why in kept))
