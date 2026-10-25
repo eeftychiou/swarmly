@@ -154,7 +154,8 @@ def _existing_homes(cli: str) -> List[Path]:
     found = []
     for config in sorted(root.glob("*/config.yaml")) if root.is_dir() else []:
         text = config.read_text(encoding="utf-8", errors="replace")
-        if re.search(rf"(?m)^  type: {re.escape(adapter)}\s*$", text):
+        # The adapter or its session-keeping variant (claude_thread for --cli claude).
+        if re.search(rf"(?m)^  type: {re.escape(adapter)}(?:_thread)?\s*$", text):
             found.append(config.parent)
     return found
 
@@ -232,10 +233,14 @@ def prepare(args: argparse.Namespace) -> Tuple[Path, str]:
         # A restart: change only what the flags say, keep every edit the maintainer made.
         from swarmly.telegram.init import _set_key
         text = config_path.read_text(encoding="utf-8")
+        kept = re.search(r"(?m)^  type: (\S+)\s*$", text)
+        family = kept is not None and kept.group(1) == f"{CLI_ADAPTERS[args.cli]}_thread"
         updates = [("agent", "alias", args.alias), ("agent", "home_channel_id",
                     group if args.home_channel else None),
                    ("agent", "admin_user_id", args.admin_userid),
-                   ("adapter", "type", CLI_ADAPTERS[args.cli]),
+                   # A restart keeps the maintainer's session-keeping variant (claude_thread):
+                   # rewriting it to the plain adapter undid the switch on every start.
+                   ("adapter", "type", None if family else CLI_ADAPTERS[args.cli]),
                    ("adapter", "cwd", args.workdir and workdir),
                    ("adapter", "permissions", args.permissions), ("adapter", "model", args.model)]
         for section, key, value in updates:
