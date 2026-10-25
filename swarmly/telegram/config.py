@@ -214,7 +214,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "web": ("enabled", "port", "public_host", "init_max_age"),
     "swarm": ("succession",),
     # topic registry, phase 1: the shared state store, in shadow unless the operator says
-    "state": ("backend", "mode", "heartbeat_minutes", "lease", "links", "routing"),
+    "state": ("backend", "mode", "heartbeat_minutes", "lease", "links", "routing", "owed"),
 }
 
 
@@ -1014,6 +1014,10 @@ class StateSettings:
     #: ``registry`` -- the topic registry does: the coordinator takes the topic's messages,
     #: linked agents when named or handed work, an unlinked mention is refused.
     routing: str = "legacy"
+    #: Phase 3: ``shadow`` -- the owed table is on gitbus, each bot mirrors its rows into the
+    #: store; ``store`` -- the store holds it: each bot publishes its own rows every heartbeat
+    #: and reads the others' from there, and nothing goes to gitbus.
+    owed: str = "shadow"
 
 
 @dataclass
@@ -1440,8 +1444,13 @@ class AgentConfig:
                 raise ConfigError(f"state.routing must be legacy or registry (got {routing!r})")
             if routing == "registry" and backend != "telegram":
                 raise ConfigError("state.routing: registry needs state.backend: telegram")
+            owed = str(state_raw.get("owed") or "shadow").strip().lower()
+            if owed not in ("shadow", "store"):
+                raise ConfigError(f"state.owed must be shadow or store (got {owed!r})")
+            if owed == "store" and backend != "telegram":
+                raise ConfigError("state.owed: store needs state.backend: telegram")
             state = StateSettings(backend=backend, mode=mode, heartbeat_minutes=minutes,
-                                  lease=lease, links=links, routing=routing)
+                                  lease=lease, links=links, routing=routing, owed=owed)
         elif state_raw is not None:
             raise ConfigError("'state' must be a mapping")
 

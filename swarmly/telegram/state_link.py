@@ -139,6 +139,9 @@ class StateLink:
         #: Phase 6: "registry" lets the topic registry decide who takes a topic's messages.
         routing = str(getattr(settings, "routing", "legacy") or "legacy").lower()
         self.routing_mode = routing if self.backend == "telegram" else "legacy"
+        #: Phase 3: "store" makes the store the owed table (no gitbus documents).
+        owed = str(getattr(settings, "owed", "shadow") or "shadow").lower()
+        self.owed_mode = owed if self.backend == "telegram" else "off"
         self._last_github = float("-inf")
         #: When each work link (by its URL) was last asked about: the check's cap goes to the
         #: links asked about longest ago, so no link waits behind 30 that never close (review).
@@ -274,18 +277,18 @@ class StateLink:
                         done.append("stats")
                 except Exception as exc:               # noqa: BLE001 - shadow: never fatal
                     logger.warning("state: stats sync failed: %s", exc, exc_info=True)
-                try:
-                    if await self.sync_owed(store, moment):
-                        done.append("owed")
-                except Exception as exc:               # noqa: BLE001 - shadow: never fatal
-                    logger.warning("state: owed sync failed: %s", exc, exc_info=True)
-                    done.append("owed failed")
+                if self.owed_mode != "store":
+                    await self._owed_beat(store, moment, done)
                 rev = str(getattr(self.channel, "_running_revision", "") or "")
                 await store.write(K.probe(store.alias, "beat"),
                                   {"at": round(moment), "rev": rev[:12],
                                    "pos": store.log.last_pos, "hash": store.state_hash()})
                 self._last_beat = moment
                 done.append("beat")
+            if self.owed_mode == "store":
+                # The table itself: published every heartbeat, as gitbus pushed each row at
+                # once -- a debt must not wait out the state cadence to be seen.
+                await self._owed_beat(store, moment, done)
             self.error = ""
         except Exception as exc:                       # noqa: BLE001 - shadow: never fatal
             self.error = f"{type(exc).__name__}: {exc}"[:200]
@@ -798,24 +801,129 @@ class StateLink:
             return False
         return bool((await store.write(key, value)).applied)
 
-    # -- the owed table (phase 3, part 2: shadow) --------------------------------------------
-    #: Closed rows stay in the store this long, so a reader sees how a debt ended.
+    # -- the owed table (phase 3: shadow, then the store) -------------------------------------
+    #: Closed rows stay in the store this long, so a reader sees how a debt ended -- and longer
+    #: while any bot's key still holds the same row open (closed beats open only while the
+    #: closed copy is there to be read; review).
     OWED_KEEP_CLOSED_SECONDS = 24 * 3600.0
 
-    def _own_owed_rows(self, now: float) -> list:
-        """This bot's own rows (the ones it wrote): open ones, and closed ones of the last day.
-        Each bot writes only its own rows, so its store key has one writer, as on gitbus."""
+    def _own_owed_rows(self, now: float, published: Optional[list] = None,
+                       open_elsewhere: Optional[set] = None) -> list:
+        """The rows this bot publishes under ``agent/<alias>/owed``.
+
+        Shadow: the rows it wrote, as it reads them today (a mirror for /state to compare).
+        Store: every row it *holds* -- its state directory, whoever wrote the row, so a close
+        or a stall it records on a peer's row reaches everyone -- folded with what it published
+        before, so a lost state directory never empties the table (review). Closed rows go
+        after a day, unless another key still holds them open."""
+        from swarmly.telegram.owed import Row, fold
         store = self.channel.owed_store()
-        me = K.norm(self.channel.config.identity.alias)
-        rows = [row for row in store.load() if K.norm(row.writer) == me
-                and (row.is_open or now - float(row.updated_at) <= self.OWED_KEEP_CLOSED_SECONDS)]
+        if self.owed_mode != "store":
+            me = K.norm(self.channel.config.identity.alias)
+            rows = [row for row in store.load() if K.norm(row.writer) == me and (
+                row.is_open or now - float(row.updated_at) <= self.OWED_KEEP_CLOSED_SECONDS)]
+        else:
+            before = []
+            for data in published or []:
+                try:
+                    before.append(Row.from_dict(data))
+                except Exception:                      # noqa: BLE001 - one bad row
+                    logger.warning("state: an owed row this bot published is unreadable")
+            held = store.held()
+            ids = {row.id for row in held}
+            # The directory is the truth for the ids it holds (a re-opened id replaces its
+            # closed copy); what was published before only fills in ids it lost (review).
+            rows = [row for row in fold(held + [r for r in before if r.id not in ids])
+                    if row.is_open
+                    or now - float(row.updated_at) <= self.OWED_KEEP_CLOSED_SECONDS
+                    or row.id in (open_elsewhere or set())]
         return sorted((row.to_dict() for row in rows), key=lambda row: str(row.get("kind", ""))
-                      + str(row.get("item", "")) + str(row.get("debtor", "")))
+                      + str(row.get("item", "")) + str(row.get("debtor", ""))
+                      + str(row.get("head", "")) + str(row.get("key_extra", "")))
+
+    async def _owed_beat(self, store: Any, moment: float, done: list) -> None:
+        try:
+            if await self.sync_owed(store, moment):
+                done.append("owed")
+        except Exception as exc:                       # noqa: BLE001 - never fatal
+            logger.warning("state: owed sync failed: %s", exc, exc_info=True)
+            done.append("owed failed")
+
+    @staticmethod
+    def _owed_dicts(store: Any) -> Dict[str, list]:
+        """key -> its rows as plain dicts, for every ``agent/<a>/owed`` key. On the loop. A
+        value of the wrong shape is skipped, so one bad key never hides the table (review)."""
+        out: Dict[str, list] = {}
+        for key in list(store.keys("agent/")):
+            if not key.endswith("/owed"):
+                continue
+            value = store.read(key)
+            rows = value.get("rows") if isinstance(value, dict) else None
+            if not isinstance(rows, list):
+                if value is not None:
+                    logger.warning("state: %s is not an owed table; skipping it", key)
+                continue
+            out[key] = [dict(data) for data in rows if isinstance(data, dict)]
+        return out
+
+    @staticmethod
+    def _rows_of(tables: Dict[str, list], keep: Any) -> list:
+        """Fresh Row objects for the tables ``keep(key)`` selects (a reader may change them)."""
+        from swarmly.telegram.owed import Row
+        rows = []
+        for key, items in tables.items():
+            if not keep(key):
+                continue
+            for data in items:
+                try:
+                    rows.append(Row.from_dict(data))
+                except Exception:                      # noqa: BLE001 - one bad row
+                    logger.warning("state: an owed row in %s is unreadable", key)
+        return rows
+
+    def _owed_tables(self) -> Dict[str, list]:
+        """The store's owed tables: read fresh on the event loop; a reader on a worker thread
+        (``asyncio.to_thread``) gets the copy the last read on the loop took, since the store's
+        log is only ever changed there (review: iterating it from a thread raced its updates).
+        Raises when the store is not ready, so the reader reports "cannot read" instead of
+        "nothing is owed"."""
+        store = self.store
+        if store is None or not store.ready:
+            raise RuntimeError("the state store is not ready")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            snapshot = getattr(self, "_owed_snapshot", None)
+            if snapshot is None:
+                raise RuntimeError("the store's owed rows are not read yet") from None
+            return snapshot
+        self._owed_snapshot = self._owed_dicts(store)
+        return self._owed_snapshot
+
+    def shared_owed_rows(self) -> list:
+        """The other bots' rows, as the store holds them (``state.owed: store``)."""
+        mine = K.agent(self.channel.config.identity.alias, "owed")
+        return self._rows_of(self._owed_tables(), lambda key: key != mine)
+
+    def published_owed_rows(self) -> list:
+        """The rows this bot itself published (read for ids its directory lost)."""
+        mine = K.agent(self.channel.config.identity.alias, "owed")
+        return self._rows_of(self._owed_tables(), lambda key: key == mine)
 
     async def sync_owed(self, store: Any, now: float) -> bool:
         """Write ``agent/<alias>/owed`` when this bot's rows changed. True if written."""
-        rows = await asyncio.to_thread(self._own_owed_rows, now)
         key = K.agent(store.alias, "owed")
+        own = store.read(key)
+        # A malformed own key is replaced, never a reason to stop publishing (#298 review).
+        published = [r for r in (own.get("rows") if isinstance(own, dict) else None) or []
+                     if isinstance(r, dict)]
+        open_elsewhere: set = set()
+        if self.owed_mode == "store":
+            self._owed_snapshot = self._owed_dicts(store)
+            open_elsewhere = {row.id for row in self._rows_of(self._owed_snapshot,
+                                                              lambda other: other != key)
+                              if row.is_open}
+        rows = await asyncio.to_thread(self._own_owed_rows, now, published, open_elsewhere)
         value = {"rows": rows}
         if store.read(key) == value or (not rows and store.read(key) is None):
             return False
@@ -840,6 +948,12 @@ class StateLink:
 
     def _owed_compare(self) -> str:
         """Shadow: the open rows the store holds, against the ones this bot reads today."""
+        if self.owed_mode == "store":
+            try:
+                rows = [row for row in self.channel.owed_store().load() if row.is_open]
+            except Exception:                          # noqa: BLE001 - a summary only
+                return ""
+            return f"owed: the store holds the table ({len(rows)} open row(s))"
         try:
             mine = {row.id for row in self.channel.owed_store().load() if row.is_open}
         except Exception:                              # noqa: BLE001 - a comparison only

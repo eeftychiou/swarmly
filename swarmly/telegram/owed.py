@@ -50,7 +50,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from swarmly.transports.base import OWED_RELPATH, is_bus_document
 
@@ -316,7 +316,9 @@ class Row:
             state=str(data.get("state") or OPEN),
             closed_by=str(data.get("closed_by") or ""),
             writer=str(data.get("writer") or ""),
-            created_at=data.get("created_at") or 0.0,
+            # A stored row without its creation time is old, never "now": the fold lets a row
+            # created after a close beat that close, so a missing stamp must not read as new.
+            created_at=data.get("created_at") or data.get("updated_at") or 1.0,
             updated_at=data.get("updated_at") or 0.0, version=VERSION)
 
 
@@ -590,10 +592,13 @@ def fold(rows: Iterable[Row]) -> List[Row]:
     """One row per id across writers (#162 review).
 
     Two observers of the same debt write the same id in their own directories. The reader's
-    rule: **closed beats open** -- a debt answered is answered, whoever noticed first -- and
-    among two rows of the same state the newest ``updated_at`` wins, then the one that has an
-    ``observed`` value, then the highest writer name (so the fold is deterministic rather than
-    dependent on the order the files were read).
+    rule: **closed beats open** -- a debt answered is answered, whoever noticed first -- unless
+    the open row was *created* after that close: then it is the same debt owed again (a second
+    hand-off in one topic), not a stale copy. A sweep refreshing a stale open copy moves its
+    ``updated_at``, never its ``created_at``, so that cannot resurrect a settled debt (#298
+    review). Among two rows of the same state the newest ``updated_at`` wins, then the one that
+    has an ``observed`` value, then the highest writer name (so the fold is deterministic
+    rather than dependent on the order the files were read).
     """
     best: Dict[str, Row] = {}
     for row in rows:
@@ -601,8 +606,9 @@ def fold(rows: Iterable[Row]) -> List[Row]:
         if seen is None:
             best[row.id] = row
             continue
-        if seen.is_open and not row.is_open:
-            best[row.id] = row
+        if seen.is_open != row.is_open:
+            opened, closed = (seen, row) if seen.is_open else (row, seen)
+            best[row.id] = opened if opened.created_at > closed.updated_at else closed
             continue
         if seen.is_open == row.is_open:
             if (row.updated_at, bool(row.observed), str(row.writer).lower()) >                     (seen.updated_at, bool(seen.observed), str(seen.writer).lower()):
@@ -622,7 +628,9 @@ class OwedStore:
     """
 
     def __init__(self, alias: str, *, state_dir: Optional[Path] = None, transport: Any = None,
-                 root: Optional[Path] = None, clock: Any = time.time):
+                 root: Optional[Path] = None, clock: Any = time.time,
+                 shared: Optional[Callable[[], List["Row"]]] = None,
+                 published: Optional[Callable[[], List["Row"]]] = None):
         self.alias = _alias(alias)
         if not self.alias:
             raise OwedError("an owed store needs the alias of the bot that holds it")
@@ -630,6 +638,13 @@ class OwedStore:
         self.transport = transport
         self.root = Path(root) if root is not None else self.state_dir
         self.clock = clock
+        #: The other bots' rows, when the table lives on the state store (``state.owed:
+        #: store``): read with this bot's own copy, in place of the bus documents.
+        self.shared = shared
+        #: What this bot published to the store itself: read only for the ids its state
+        #: directory no longer holds (a lost directory), never over the ones it does -- the
+        #: directory is the truth for its rows, and a re-opened id must not stay closed.
+        self.published = published
         self._unreadable: List[str] = []
 
     @property
@@ -762,19 +777,40 @@ class OwedStore:
         bus held rows (#173 review, QA), so the two are folded here and every reader -- /owed,
         settlement, the nudge -- sees the same table.
         """
-        directory = self.directory
         self._unreadable = []
+        rows: List[Row] = self.held(self._unreadable)
+        on_store = self.shared is not None
+        if self.root is not None:
+            # On the store, this bot's own bus documents are history: its state directory holds
+            # those rows, and a document closed before the switch would hide a re-opened id for
+            # good (review). The other writers' documents still count.
+            rows.extend(self._read_documents(self.root, self._unreadable,
+                                             skip=self.safe_alias if on_store else None))
+        if on_store:
+            held = {row.id for row in rows}
+            try:
+                rows.extend(self.shared())
+                if self.published is not None:
+                    rows.extend(row for row in self.published() if row.id not in held)
+            except Exception:                        # noqa: BLE001 - never "nothing is owed"
+                self._unreadable.append("state store")
+                logger.warning("owed: the store's rows could not be read", exc_info=True)
+        return fold(rows)
+
+    def held(self, unreadable: Optional[List[str]] = None) -> List[Row]:
+        """The rows in this bot's own state directory, unfolded: the ones it holds, whoever
+        wrote them (a close or a stall it recorded on a peer's row is here too)."""
+        directory = self.directory
         rows: List[Row] = []
         if directory is not None and directory.is_dir():
             for path in sorted(directory.glob("*.json")):
                 try:
                     rows.append(Row.from_dict(json.loads(path.read_text(encoding="utf-8"))))
                 except Exception:                    # noqa: BLE001 - one bad file, one row lost
-                    self._unreadable.append(path.name)
+                    if unreadable is not None:
+                        unreadable.append(path.name)
                     logger.warning("owed: unreadable row %s; skipping it", path.name)
-        if self.root is not None:
-            rows.extend(self._read_documents(self.root, self._unreadable))
-        return fold(rows)
+        return rows
 
     @property
     def unreadable(self) -> List[str]:
@@ -810,7 +846,8 @@ class OwedStore:
         return list(rows)
 
     @staticmethod
-    def _read_documents(root: Path, unreadable: Optional[List[str]] = None) -> List[Row]:
+    def _read_documents(root: Path, unreadable: Optional[List[str]] = None,
+                        skip: Optional[str] = None) -> List[Row]:
         """Every row document under *root*'s `.agents/owed/`, as read (not yet folded).
 
         A document that cannot be read is reported to *unreadable* as well as logged: a table
@@ -822,6 +859,8 @@ class OwedStore:
             return []
         rows: List[Row] = []
         for path in sorted(base.glob("*/*.json")):
+            if skip is not None and path.parent.name == skip:
+                continue
             try:
                 rows.append(Row.from_dict(json.loads(path.read_text(encoding="utf-8"))))
             except Exception:                        # noqa: BLE001 - one bad document, one row

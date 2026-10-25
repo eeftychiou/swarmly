@@ -1320,6 +1320,11 @@ class AgentChannel:
         self._drop_notices[key] = now
         store = self.state_link.store
         holder = store.holder() if store is not None and store.ready else None
+        if holder:                                     # its own spelling, not the key's
+            from swarmly.state import keys as K
+            profile = store.read(K.agent(holder, "profile"))
+            holder = str((profile.get("alias") if isinstance(profile, dict) else None)
+                         or holder)
         coordinator = holder or "the coordinator"
         handle = self.config.identity.name.lstrip("@")
         await self.send(
@@ -5740,6 +5745,19 @@ class AgentChannel:
         from swarmly.telegram.owed import OwedStore
         from swarmly.telegram.wake import wake_dir_for
         root = self._gitbus_root()
+        if getattr(self.state_link, "owed_mode", "") == "store":
+            # Phase 3 (state.owed: store): this bot's own copy, and every bot's rows from the
+            # state store; nothing is pushed to gitbus. The bus documents already in the
+            # checkout are still read, never written: rows and closures from before the switch
+            # must not reopen or vanish (review). Switch every bot at once: a bot still on
+            # shadow reads gitbus only and would not see what the others now publish.
+            # No checkout: root=None, which OwedStore reads as its state directory, where no
+            # bus document is ever written -- so no document is read either.
+            has_checkout = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+            return OwedStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
+                             transport=None, root=root if has_checkout else None,
+                             clock=time.time, shared=self.state_link.shared_owed_rows,
+                             published=self.state_link.published_owed_rows)
         has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
         return OwedStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
                          transport=self.bus_transport(root) if has_bus else None, root=root,
@@ -10178,6 +10196,14 @@ class AgentChannel:
                         silent=silent, notice=notice,
                     )
                 except TopicGone:
+                    if self._drop_gone_topic_posts():
+                        # Topic registry: a reply belongs to its topic, never to General --
+                        # moved there it addressed peers in the wrong place (live, 25 Oct: a
+                        # reply in a just-deleted topic drew a peer's General cooldown notice).
+                        logger.info("topic %s is gone; the rest of this post is dropped, "
+                                    "not moved to General", thread_id)
+                        result = None
+                        break
                     if not self.reroute_gone_topics:
                         raise
                     # The topic went away mid-reply: the rest goes to General, from this part
@@ -10309,10 +10335,19 @@ class AgentChannel:
             self._forget_topic_refs(destination, thread_id)
             if int(destination) == int(self.config.identity.home_channel_id or 0):
                 self.state_link.topic_gone(thread_id, deleted=_is_topic_deleted(gone.__cause__))
-            if self._turn_slots is not None or not self.reroute_gone_topics:
+            if (self._turn_slots is not None or not self.reroute_gone_topics
+                    or self._drop_gone_topic_posts()):
                 raise
         return await self._post_in_general(payload, entities, plain, destination, thread_id,
                                            silent)
+
+    def _drop_gone_topic_posts(self) -> bool:
+        """With registry routing or ``limits.general_turns: never`` a post for a topic that
+        has gone is dropped, not moved to General (docs/design/topic-registry.md §3)."""
+        if not self.reroute_gone_topics:
+            return False                       # the caller wants the refusal raised
+        never = str(getattr(self.config.limits, "general_turns", "allow") or "allow") == "never"
+        return never or getattr(self.state_link, "routing_mode", "legacy") == "registry"
 
     async def _post_in_general(self, payload: str, entities: Optional[List[Dict[str, Any]]],
                                plain: bool, destination: int, thread_id: int,
