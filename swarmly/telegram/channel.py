@@ -418,6 +418,8 @@ class ChannelEvent:
     attachments: List[Dict[str, Any]] = field(default_factory=list)   # files, photos, voice
     handoff: bool = False                  # set by routing: an expected hand-off, no cooldown
     cooldown_left: float = 0.0             # set by routing: a message to this bot the cooldown dropped
+    unlinked: bool = False                 # set by routing: named here, but not linked to the topic
+    replies_to_peer: Optional[str] = None  # the handle of another bot this message replies to
     self_task: bool = False                # a brief this agent gave itself (topic or membership)
     reassembled: bool = False              # #29: the split parts of one reply, joined already
 
@@ -1228,6 +1230,14 @@ class AgentChannel:
                 self._expect_handoff(event, first)
                 return False, f"{first} is named first (limits.multi_mention: first)"
 
+        # Topic registry, phase 6 (state.routing: registry): in a work topic with a record, the
+        # registry decides -- the coordinator takes the topic's messages, linked agents when
+        # named or handed work. Commands keep their own rules.
+        if command is None:
+            routed = self._registry_route(event, text)
+            if routed is not None:
+                return routed
+
         # If this agent is mentioned, ALWAYS DELIVER to current conversation!
         if self.mentions_me(text):
             return True, "mentioned"
@@ -1239,6 +1249,83 @@ class AgentChannel:
             return True, "non-bot author and respond_without_mention is on"
 
         return False, "not addressed to this agent"
+
+    def _registry_route(self, event: ChannelEvent, text: str) -> Optional[tuple[bool, str]]:
+        """The registry's routing decision (docs/design/topic-registry.md §2), or None when
+        the mention rules decide (flag off, store not ready, no coordinator, no record)."""
+        from swarmly.state import keys as K
+        from swarmly.telegram.routing import Message, decide
+        facts = self.state_link.route_facts(event.chat_id, event.thread_id)
+        if facts is None:
+            return None
+        author = (self.config.peer_alias_for(event.author_username, event.author_id)
+                  if event.author_is_bot else None)
+        named = self._peer_handles_named(text)
+        if event.replies_to_peer and event.replies_to_peer not in named:
+            named.append(event.replies_to_peer)       # a reply to another bot addresses it
+        message = Message(
+            author=K.norm(author) if author else None,
+            author_is_bot=event.author_is_bot,
+            author_is_admin=bool(self.config.is_admin(event.author_id)),
+            names_me=self.mentions_me(text),
+            replies_to_me=event.replies_to_bot,
+            handed_to_me=event.handoff or self._assigned_to_me(text),
+            named=tuple(named),
+            names_me_explicitly=self._first_mention_at(
+                text or "", self.config.identity.name.lstrip("@"),
+                self.config.identity.alias.strip()) is not None,
+            author_handle=(event.author_username or "").lstrip("@").lower() or None)
+        route = decide(facts, message)
+        event.unlinked = route.refuse_unlinked
+        return route.respond, route.reason
+
+    def _peer_handles_named(self, text: str) -> List[str]:
+        """The peer *bots* *text* names (by @username, @alias or a leading "Alias:"), as
+        their Telegram handles (lower case; the normalised alias for a peer configured by id).
+        People among the peers (the owner) are never agents to route to or link (review)."""
+        from swarmly.state import keys as K
+        people = set(self.config.owner_peers())
+        named: List[str] = []
+        for alias, target in (self.config.peers or {}).items():
+            if alias in people:
+                continue
+            bare = str(target or "").strip().lstrip("@")
+            if self._first_mention_at(text or "", "" if bare.isdigit() else bare,
+                                      str(alias)) is None:
+                continue
+            handle = K.norm(alias) if (not bare or bare.isdigit()) else bare.lower()
+            if handle not in named:
+                named.append(handle)
+        return named
+
+    def _assigned_to_me(self, text: str) -> bool:
+        """An ``ASSIGN:`` line in *text* hands this bot work."""
+        from swarmly.state import keys as K
+        from swarmly.state.links import AssignLine, parse_lines
+        me = K.norm(self.config.identity.alias)
+        return any(isinstance(line, AssignLine) and K.norm(line.agent.lstrip("@")) == me
+                   for line in parse_lines(text or ""))
+
+    async def _unlinked_notice(self, event: ChannelEvent) -> None:
+        """Say once per window that this bot was named in a topic it is not linked to, so the
+        sender sees why no turn came (phase 6). Peers' transports drop "⚠️" notices."""
+        key = (event.chat_id, event.thread_id, "unlinked", event.author_id,
+               (event.author_username or "").lower())
+        now = self._clock()
+        last = self._drop_notices.get(key)
+        if last is not None and now - last < DROP_NOTICE_SECONDS:
+            return
+        self._drop_notices[key] = now
+        store = self.state_link.store
+        holder = store.holder() if store is not None and store.ready else None
+        coordinator = holder or "the coordinator"
+        handle = self.config.identity.name.lstrip("@")
+        await self.send(
+            f"⚠️ {self.config.identity.alias} took no turn: it isn't linked to this topic. "
+            f"{coordinator} links agents here by naming them (or the admin with /link "
+            f"@{handle}).",
+            reply_to_message_id=event.message_id, chat_id=event.chat_id,
+            thread_id=event.thread_id, silent=True, notice=True)
 
     def register_author(self, event: ChannelEvent) -> None:
         """No-op: loop guard removed per user contract."""
@@ -7439,6 +7526,15 @@ class AgentChannel:
         if person is not None:
             return person or None
 
+        # Phase 6: the admin naming peers in a topic links them (the store lease holder
+        # records it; a no-op elsewhere and with routing: legacy).
+        if (not event.author_is_bot and event.thread_id is not None and event.text
+                and parse_command(event.text) is None
+                and self.config.is_admin(event.author_id)):
+            self.state_link.note_admin_mentions(event.chat_id, event.thread_id,
+                                                self._peer_handles_named(event.text),
+                                                event.author_id)
+
         decision, reason = self.should_respond(event)
         logger.info("routing decision: respond=%s (reason: %s)", decision, reason)
         if decision and event.message_id is not None:
@@ -7453,6 +7549,8 @@ class AgentChannel:
             self.stats.ignored += 1
             if event.cooldown_left > 0:
                 await self._cooldown_notice(event)     # a notice, not a turn: still None
+            elif event.unlinked:
+                await self._unlinked_notice(event)     # phase 6: named, but not linked here
             else:
                 # #27: a peer bot that named this bot and got no turn hears which handle was
                 # dropped and why, so a lost hand-off never reads as one that was taken.
@@ -8239,7 +8337,8 @@ class AgentChannel:
                     self.topics.context(event.chat_id, event.thread_id), event.thread_id)
                 if reply.ok and reply.text:
                     # Phase 5: the coordinator's LINK/ASSIGN/PHASE lines (holder only).
-                    self.state_link.note_reply(event.chat_id, event.thread_id, reply.text)
+                    self.state_link.note_reply(event.chat_id, event.thread_id, reply.text,
+                                               self._peer_handles_named(reply.text))
             if reply is None:
                 logger.info("turn end: message %s, no reply (%.1fs)", event.message_id,
                             time.monotonic() - started)
@@ -10494,6 +10593,10 @@ class AgentChannel:
             reply_to is not None and self.bot is not None and not topic_root
             and getattr(getattr(reply_to, "from_user", None), "id", None) == getattr(self.bot, "id", None)
         )
+        replied = getattr(reply_to, "from_user", None) if reply_to is not None else None
+        replies_to_peer = (str(getattr(replied, "username", "") or "").lower() or None) if (
+            replied is not None and not topic_root and getattr(replied, "is_bot", False)
+            and not replies_to_bot) else None
         return ChannelEvent(
             text=getattr(message, "text", None) or getattr(message, "caption", None) or "",
             chat_id=int(getattr(getattr(message, "chat", None), "id", 0)),
@@ -10502,6 +10605,7 @@ class AgentChannel:
             author_is_bot=bool(getattr(author, "is_bot", False)),
             message_id=getattr(message, "message_id", None),
             replies_to_bot=replies_to_bot,
+            replies_to_peer=replies_to_peer,
             raw=message,
             thread_id=(getattr(message, "message_thread_id", None)
                        if getattr(message, "is_topic_message", False) else None),

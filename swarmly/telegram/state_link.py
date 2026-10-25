@@ -136,6 +136,9 @@ class StateLink:
         #: Phase 5: "registry" lets GitHub notices follow the topics' explicit links.
         self.links_mode = str(getattr(settings, "links", "legacy") or "legacy").lower() \
             if self.backend == "telegram" else "legacy"
+        #: Phase 6: "registry" lets the topic registry decide who takes a topic's messages.
+        routing = str(getattr(settings, "routing", "legacy") or "legacy").lower()
+        self.routing_mode = routing if self.backend == "telegram" else "legacy"
         self._last_github = float("-inf")
         #: When each work link (by its URL) was last asked about: the check's cap goes to the
         #: links asked about longest ago, so no link waits behind 30 that never close (review).
@@ -297,18 +300,78 @@ class StateLink:
                                                 or 0),
                            repo=self.registry._repo(), clock=self.clock)
 
-    def note_reply(self, chat_id: int, thread_id: Optional[int], text: str) -> None:
+    def note_reply(self, chat_id: int, thread_id: Optional[int], text: str,
+                   named: Optional[list] = None) -> None:
         """The coordinator's reply in a topic: record its LINK/ASSIGN/PHASE lines (the lease
-        holder only -- it alone writes topic records)."""
+        holder only -- it alone writes topic records). With ``routing: registry`` the peers it
+        names (``named``: their Telegram handles) are linked too: the coordinator's mention is
+        how an agent joins a topic."""
         from swarmly.state.links import parse_lines
+        lines = parse_lines(text) if text else []
+        handles = list(named or []) if self.routing_mode == "registry" else []
+        self._record_in_topic(chat_id, thread_id, lines, handles,
+                              K.norm(self.channel.config.identity.alias))
+
+    def note_admin_mentions(self, chat_id: int, thread_id: Optional[int],
+                            named: list, author_id: Optional[int]) -> None:
+        """The admin named peers (their handles) in a topic: with ``routing: registry`` the
+        holder links them (the admin's mention links an agent, as the coordinator's does)."""
+        if self.routing_mode != "registry" or not named:
+            return
+        by = f"admin:{author_id}" if author_id is not None else "admin"
+        self._record_in_topic(chat_id, thread_id, [], list(named), by)
+
+    @staticmethod
+    def _bare(handle: Any) -> str:
+        return str(handle or "").strip().lstrip("@").lower()
+
+    def agent_for_handle(self, handle: str) -> Optional[str]:
+        """The alias an agent publishes in its profile, found by its Telegram handle; else
+        this bot's peers alias for it. Each bot names its peers its own way, so a link is
+        keyed by the agent's own alias (the profile's), never a peer's spelling (review)."""
+        bare = self._bare(handle)
         store = self.store
-        if store is None or not store.ready or thread_id is None or not text:
+        if store is not None and bare:
+            for key in store.keys("agent/"):
+                if key.endswith("/profile"):
+                    profile = store.read(key) or {}
+                    if self._bare(profile.get("handle")) == bare and profile.get("alias"):
+                        return str(profile["alias"])
+        return self.channel.config.peer_alias_for(bare) if bare else None
+
+    def _handles_of(self, alias: str) -> Set[str]:
+        """The names an agent goes by, for comparing: its alias and its handle."""
+        out = {K.norm(alias)}
+        store = self.store
+        profile = (store.read(K.agent(alias, "profile")) if store is not None else None) or {}
+        if profile.get("handle"):
+            out.add(self._bare(profile.get("handle")))
+        return out
+
+    def _record_in_topic(self, chat_id: int, thread_id: Optional[int], lines: list,
+                         handles: list, by: str) -> None:
+        store = self.store
+        if store is None or not store.ready or thread_id is None or not (lines or handles):
             return
         if int(chat_id) != int(self.channel.config.identity.home_channel_id or 0):
             return
-        lines = parse_lines(text)
-        if not lines or not store.holds_lease():
+        if not store.holds_lease():
             return
+        agents: List[str] = []
+        if handles:
+            data = store.read(K.topic(thread_id))
+            if not data and not lines:
+                return                 # a mention alone never opens a record (review)
+            have: Set[str] = set()
+            for alias in (data or {}).get("agents") or {}:
+                have |= self._handles_of(alias)
+            for handle in handles:
+                alias = self.agent_for_handle(handle)
+                if alias and K.norm(alias) not in have and self._bare(handle) not in have \
+                        and alias not in agents:
+                    agents.append(alias)
+            if not agents and not lines:
+                return                                 # all linked already: no write
         name = self.channel.topics.name(chat_id, thread_id) or ""
 
         async def record() -> None:
@@ -317,7 +380,8 @@ class StateLink:
                     ops = self._ops()
                     await store.refresh()
                     topic = ops.topic(thread_id, name)
-                    done = ops.apply(topic, lines, K.norm(self.channel.config.identity.alias))
+                    done = ops.apply(topic, lines, by)
+                    done += [ops.link_agent(topic, alias, by) for alias in agents]
                     saved = await ops.save(thread_id, topic)
                 if saved:
                     logger.info("registry: topic %s: %s", thread_id, "; ".join(done))
@@ -327,6 +391,53 @@ class StateLink:
         self._tasks = getattr(self, "_tasks", set())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def route_facts(self, chat_id: int, thread_id: Optional[int]) -> Optional[Any]:
+        """The registry's facts for routing a message in this topic, or None when routing
+        stays with the mention rules: the flag is off, the store is not ready, there is no
+        coordinator (lease lapsed), the topic has no open record, or it is Swarm pulse.
+
+        Agents are named by alias *and* handle in ``linked``, so a peer's own spelling of an
+        alias never decides a match (review)."""
+        from swarmly.telegram.routing import Facts
+        store = self.store
+        if self.routing_mode != "registry" or store is None or not store.ready:
+            return None
+        if thread_id is None or int(chat_id) != int(
+                self.channel.config.identity.home_channel_id or 0):
+            return None
+        pulse = getattr(self.channel, "_pulse_topic", None)
+        if callable(pulse) and pulse() == thread_id:
+            return None                        # transport-only: nothing there is routed
+        holder = store.holder()
+        data = store.read(K.topic(thread_id))
+        if not holder or not data or data.get("status") == "closed":
+            return None
+        unlinked = self._unlinked_since_last_turn(data)
+        linked: Set[str] = set()
+        for alias in data.get("agents") or {}:
+            linked |= self._handles_of(alias)
+        # Until phase 9, an agent that has already worked here counts as linked (topics opened
+        # before the flag have only their coordinator in ``agents``) -- unless /unlink took it
+        # off since.
+        for key in store.keys(f"topic/{int(thread_id)}/agent/"):
+            alias = key.rsplit("/", 1)[1]
+            if int((store.read(key) or {}).get("turns") or 0) > 0 and alias not in unlinked:
+                linked |= self._handles_of(alias)
+        holder_handle = self._bare((store.read(K.agent(holder, "profile")) or {}).get("handle"))
+        identity = self.channel.config.identity
+        return Facts(me=K.norm(identity.alias), coordinator=K.norm(holder),
+                     linked=frozenset(linked), coordinator_handle=holder_handle or None,
+                     me_handle=self._bare(identity.name) or None)
+
+    @staticmethod
+    def _unlinked_since_last_turn(data: dict) -> Set[str]:
+        """Agents whose latest role change in the topic's history is an /unlink."""
+        latest: Dict[str, Any] = {}
+        for change in data.get("history") or []:
+            if change.get("field") == "role" and change.get("agent"):
+                latest[K.norm(change["agent"])] = change.get("to")
+        return {alias for alias, to in latest.items() if to == "unlinked"}
 
     #: How often the lease holder asks GitHub where its linked items stand.
     GITHUB_EVERY_SECONDS = 900.0
