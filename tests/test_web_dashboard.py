@@ -564,9 +564,9 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
         self.assertFalse(off.web_state()["registry"]["topics"][0]["links"][0]["stalled"])
 
 
+
 ADMIN_ID = 424242
 TOKEN = "123456:TEST-TOKEN"
-
 
 def init_data(*, token: str = TOKEN, admin: int = ADMIN_ID, auth_date: float = NOW,
               hash_override: str = "", **extra: Any) -> str:
@@ -876,6 +876,208 @@ class TestTheLookAndLayout(unittest.TestCase):
         page = self.page()
         self.assertIn('? "?" : String(value)', page)          # num()
         self.assertIn('? "?" : "$" + Number(value).toFixed(2)', page)   # money()
+class TestTheWritePath(unittest.TestCase):
+    """#342: ``POST /api/action`` -- one write, behind the admin's Mini App login."""
+
+    def server(self, action: Any = None, **fields: Any) -> Any:
+        self.asked: list = []
+
+        def handler(payload: Any) -> Any:
+            self.asked.append(dict(payload))
+            return {"ok": True, "verdict": "run", "text": "Pause done.", "action": "bot.pause"}
+
+        base: Dict[str, Any] = dict(provider=lambda: {"bots": []}, port=0, bot_token=TOKEN,
+                                    admin_id=ADMIN_ID, action=action or handler)
+        base.update(fields)
+        return webui.DashboardServer(**base)
+
+    def post(self, url: str, body: Any = None, *, init: str = "", origin: str = "",
+             method: str = "POST", path: str = "") -> Any:
+        data = body if isinstance(body, bytes) else json.dumps(body or {"action": "bot.pause"})
+        if not isinstance(data, bytes):
+            data = data.encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if init:
+            headers[webui.INIT_HEADER] = init
+        if origin:
+            headers["Origin"] = origin
+        request = urllib.request.Request(url.rstrip("/") + (path or webui.ACTION_PATH),
+                                         data=data, headers=headers,
+                                         method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
+    def test_a_write_without_init_data_is_refused_even_on_the_loopback(self):
+        server = self.server()
+        try:
+            url = server.start()
+            status, answer = self.post(url)
+            self.assertEqual(status, 403)
+            self.assertEqual(answer["refused"], "auth")
+            self.assertFalse(answer["ok"])
+            self.assertEqual(self.asked, [])                  # nothing ran
+            # ... and the page itself still reads as before, with no initData (#258).
+            with urllib.request.urlopen(url.rstrip("/") + webui.STATE_PATH, timeout=5) as got:
+                self.assertEqual(got.status, 200)
+        finally:
+            server.stop()
+
+    def test_a_forged_or_expired_login_is_refused(self):
+        server = self.server()
+        try:
+            url = server.start()
+            forged = init_data(hash_override="0" * 64)
+            self.assertEqual(self.post(url, init=forged)[0], 403)
+            stale = init_data(auth_date=NOW - webui.INIT_MAX_AGE - 60)
+            self.assertEqual(self.post(url, init=stale)[0], 403)
+            self.assertEqual(self.asked, [])
+        finally:
+            server.stop()
+
+    def test_a_login_that_is_not_the_admins_is_refused(self):
+        server = self.server()
+        try:
+            url = server.start()
+            status, answer = self.post(url, init=init_data(admin=ADMIN_ID + 1))
+            self.assertEqual(status, 403)
+            self.assertEqual(answer["refused"], "auth")
+            self.assertEqual(self.asked, [])
+        finally:
+            server.stop()
+
+    def test_a_verified_admin_write_runs_once_with_the_policys_own_words(self):
+        server = self.server()
+        try:
+            url = server.start()
+            status, answer = self.post(url, {"action": "bot.pause"},
+                                       init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 200)
+            self.assertEqual(answer["ok"], True)
+            self.assertEqual(answer["text"], "Pause done.")
+            self.assertEqual(answer["verdict"], "run")
+            self.assertEqual(len(self.asked), 1)              # one POST, one run
+        finally:
+            server.stop()
+
+    def test_a_confirm_answer_carries_its_code_and_runs_on_the_second_post(self):
+        ran: list = []
+
+        def handler(payload: Any) -> Any:
+            if not payload.get("code"):
+                return {"ok": False, "verdict": "confirm", "confirm": "a1b2",
+                        "action": "bot.restart", "text": "Tap again to confirm Restart."}
+            ran.append(payload["code"])
+            return {"ok": True, "verdict": "run", "text": "Restart done."}
+
+        server = self.server(action=handler)
+        try:
+            url = server.start()
+            login = init_data(auth_date=time.time())
+            status, asked = self.post(url, {"action": "bot.restart"}, init=login)
+            self.assertEqual((status, asked["ok"]), (200, False))
+            self.assertEqual(asked["confirm"], "a1b2")
+            self.assertEqual(ran, [])                         # the first tap changes nothing
+            status, done = self.post(url, {"action": "bot.restart", "code": asked["confirm"]},
+                                     init=login)
+            self.assertEqual(status, 200)
+            self.assertEqual(done["ok"], True)
+            self.assertEqual(ran, ["a1b2"])
+        finally:
+            server.stop()
+
+    def test_only_the_named_fields_of_an_answer_reach_the_wire(self):
+        def handler(payload: Any) -> Any:
+            return {"ok": True, "verdict": "run", "text": "Pause done.",
+                    "chat_id": -1001234567890123, "thread_id": 19286,
+                    "token": TOKEN, "path": r"C:\Users\eftyc\secret", "extra": "dropped"}
+
+        server = self.server(action=handler)
+        try:
+            url = server.start()
+            status, answer = self.post(url, init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 200)
+            self.assertEqual(sorted(answer), ["ok", "text", "verdict"])
+            payload = json.dumps(answer)
+            for secret in ("1001234567890123", "19286", TOKEN, "Users", "eftyc", "dropped"):
+                self.assertNotIn(secret, payload)
+        finally:
+            server.stop()
+
+    def test_a_cross_site_origin_is_refused_before_anything_runs(self):
+        server = self.server()
+        try:
+            url = server.start()
+            status, answer = self.post(url, init=init_data(auth_date=time.time()),
+                                       origin="https://evil.example.com")
+            self.assertEqual(status, 403)
+            self.assertEqual(answer["refused"], "origin")
+            self.assertEqual(self.asked, [])
+        finally:
+            server.stop()
+
+    def test_another_path_is_still_read_only(self):
+        server = self.server()
+        try:
+            url = server.start()
+            status, _answer = self.post(url, b"{}", path=webui.STATE_PATH,
+                                        init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 405)
+            self.assertEqual(self.asked, [])
+        finally:
+            server.stop()
+
+    def test_a_server_with_no_action_wired_refuses_the_write_path(self):
+        server = webui.DashboardServer(lambda: {"bots": []}, port=0, bot_token=TOKEN,
+                                       admin_id=ADMIN_ID)          # no action: read-only
+        self.assertIsNone(server.action)
+        try:
+            url = server.start()
+            status, answer = self.post(url, init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 405)
+            self.assertIn("error", answer)
+        finally:
+            server.stop()
+
+    def test_a_page_with_no_init_data_window_refuses_every_write(self):
+        server = self.server(init_max_age=0)                        # fails closed (#347)
+        try:
+            url = server.start()
+            status, answer = self.post(url, init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 403)
+            self.assertEqual(answer["refused"], "auth")
+            self.assertEqual(self.asked, [])
+        finally:
+            server.stop()
+
+    def test_a_body_that_is_not_json_or_is_too_big_is_a_400(self):
+        server = self.server()
+        try:
+            url = server.start()
+            login = init_data(auth_date=time.time())
+            self.assertEqual(self.post(url, b"not json", init=login)[0], 400)
+            self.assertEqual(self.post(url, b'["no"]', init=login)[0], 400)
+            big = b'{"action": "' + b"a" * (webui.MAX_BODY_BYTES + 1) + b'"}'
+            self.assertEqual(self.post(url, big, init=login)[0], 400)
+            self.assertEqual(self.asked, [])
+        finally:
+            server.stop()
+
+    def test_a_handler_that_raises_is_a_503_not_a_traceback(self):
+        def broken(payload: Any) -> Any:
+            raise RuntimeError("the control blew up")
+
+        server = self.server(action=broken)
+        try:
+            url = server.start()
+            status, answer = self.post(url, init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 503)
+            self.assertFalse(answer["ok"])
+            self.assertNotIn("blew up", json.dumps(answer))
+        finally:
+            server.stop()
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -36,13 +36,14 @@ import secrets
 import socket
 import subprocess
 import types
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import time
 import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Set,
+                    Tuple, Union)
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -3929,7 +3930,8 @@ class AgentChannel:
             public_host=str(getattr(web, "public_host", "") or ""),
             bot_token=str(getattr(self.config.identity, "bot_token", "") or ""),
             admin_id=getattr(self.config.identity, "admin_user_id", 0),
-            init_max_age=float(getattr(web, "init_max_age", 300.0) or 0.0))
+            init_max_age=float(getattr(web, "init_max_age", 300.0) or 0.0),
+            action=self.web_action)
         try:
             url = server.start()
         except OSError as exc:
@@ -4173,6 +4175,10 @@ class AgentChannel:
     #: twice and name the wrong thing once.
     CONTROL_BROADCASTS = ("swarm.pause_all", "swarm.lease", "swarm.failback")
 
+    #: How long a dashboard write may wait for the event loop before the page is told no
+    #: (#342). A control that answers slower than this is one the page must not hang on.
+    ACTION_TIMEOUT = 30.0
+
     def _control_event(self, command: str, argument: str = "") -> ChannelEvent:
         """A synthetic event for a report control: the admin, typing a bare command.
 
@@ -4305,7 +4311,7 @@ class AgentChannel:
             logger.warning("control centre: could not post the confirm button", exc_info=True)
 
     async def _apply_pick(self, action: str, value: str, target: str = "",
-                          presser: str = "") -> str:
+                          presser: str = "", via: str = "") -> str:
         """Set what a picker chose -- through the same function the typed command runs.
 
         ``/model <name>`` and ``/reasoning <level>`` are the transport's own answers, so a
@@ -4317,7 +4323,8 @@ class AgentChannel:
         if action == "bot.effort":
             return self._reasoning_command(self._control_event("reasoning", value))
         if action == "swarm.lease":
-            return await self.hand_over_lease(value, presser=presser)
+            # A hand-over posts its own CONTROL note, so the marker has to reach it (#347).
+            return await self.hand_over_lease(value, presser=presser, via=via)
         if action == "swarm.role":
             who = str(target or "").strip()
             if not who:
@@ -4379,13 +4386,37 @@ class AgentChannel:
         self._control_policy = policy
         return policy
 
-    async def handle_control_press(self, press: Any) -> str:
+    @staticmethod
+    def _with_via(line: str, via: str) -> str:
+        """A CONTROL line with the marker of *how* it was pressed (``via=dashboard``).
+
+        One place decides it, so a page's press is recognisable wherever its record is written
+        -- the local line and a swarm-wide ``target=*`` one alike (review, #347). The Telegram
+        path passes no *via*, and its lines stay exactly as they were.
+        """
+        return f"{line} via={via}" if via else line
+
+    async def handle_control_press(self, press: Any, *, via: str = "",
+                                   observed: Optional[Dict[str, Any]] = None) -> str:
         """One button press: decide, act, log, answer. Never raises.
 
         Answering is what the presser sees in the chat; the log line rides the channel NOTE
         path (and so the bus, when ``bus.repo`` is set), so a control leaves a record of who
-        stopped what.
+        stopped what. *via* names another way of pressing -- ``dashboard`` for the page (#342)
+        -- and is written into that line.
+
+        *observed*, when given, is filled with the outcome that **actually happened**: the
+        verdict, the confirm code only when it is real, and why a press was refused. A caller
+        reads it after this returns, and nothing is shared between presses -- so two at once
+        cannot swap answers, and a press refused for a stale lease reports ``refused`` instead
+        of the decision it began with (review, #347).
         """
+        def record(verdict: str, *, action: str = "", target: str = "", code: str = "",
+                   reason: str = "") -> None:
+            if observed is not None:
+                observed.update({"verdict": verdict, "action": action, "target": target,
+                                 "code": code, "reason": reason})
+
         try:
             decision = self.control_policy().decide(press, actor=str(press.user_id))
             if decision.verdict == press_mod.REFUSED:
@@ -4394,6 +4425,8 @@ class AgentChannel:
                 # anybody pressing a keyboard that is not ours) has no business learning it
                 # (#157). The policy already refuses a non-admin before it looks the action up,
                 # so this only moves the answer in front of the lease read.
+                record(press_mod.REFUSED, action=decision.action, target=decision.target,
+                       reason=decision.reason)
                 self._control_answer = decision.text
                 return decision.text
             stale = self._control_elsewhere()
@@ -4403,32 +4436,118 @@ class AgentChannel:
                 # answer "done" from a bot that no longer coordinates (review, #133).
                 if decision.code:
                     # The policy minted a second-tap code before this refusal: no button will
-                    # carry it, so drop it rather than leave a dead code pending (#159).
+                    # carry it, so drop it rather than leave a dead code pending (#159). The
+                    # caller is told nothing ran, so it can never hand that code back.
                     self.control_policy().drop(decision.code)
+                record(press_mod.REFUSED, action=decision.action, target=decision.target,
+                       reason=press_mod.NOT_COORDINATOR)
                 answer = f"{stale} coordinates now: press the dashboard in its message."
                 self._control_answer = answer
                 return answer
             if decision.verdict == press_mod.RUN:
                 answer = await self._run_control(decision.action, decision.target,
                                                  presser=str(press.user_id),
-                                                 value=decision.value)
+                                                 value=decision.value, via=via)
                 if answer:
                     decision.text = answer
+                record(press_mod.RUN, action=decision.action, target=decision.target)
             if decision.verdict == press_mod.CONFIRM:
+                # Recorded before the button is offered: the code is real either way, and a
+                # failure to post the button must not turn a usable code into "refused".
+                record(press_mod.CONFIRM, action=decision.action, target=decision.target,
+                       code=decision.code)
                 # The policy minted a code; without a button for it the second tap is not
                 # deliverable, and nothing that stops or changes can be carried out (#153).
                 await self._offer_confirm(decision)
+            # A swarm-wide control posts its own ``target=*`` note (which already names the
+            # pressing bot), so a second, local note would double every press on the bus. That
+            # note carries *via* itself (``_run_control``), so a page's press is marked on it
+            # and gets no second line (review, #347).
             if decision.log and decision.action not in self.CONTROL_BROADCASTS:
-                # A swarm-wide control posts its own ``target=*`` note (which already names
-                # the pressing bot); a second, local note would double every press on the bus.
-                await self._post_control_note(decision.log)
+                await self._post_control_note(self._with_via(decision.log, via))
             self._control_answer = decision.text
             return decision.text
         except ControlRefused as exc:
+            record(press_mod.REFUSED, reason=press_mod.ACTION_REFUSED)
             return str(exc)
         except Exception:                      # noqa: BLE001 - a press must not break the bot
+            if observed is not None and not observed.get("verdict"):
+                observed.update({"verdict": press_mod.REFUSED, "reason": press_mod.FAILED})
             logger.warning("control centre: the press failed", exc_info=True)
             return "the press failed; the log has the reason"
+
+    # -- the dashboard's write path (control centre 1/4, #342) ---------------------------
+    def web_action(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+        """One write from the page, carried out on the transport's own loop (#342).
+
+        The HTTP server runs in a thread of its own and every control is a coroutine on the
+        event loop, so the request is handed over and its answer waited for -- with a bound,
+        because a page that never hears back is worse than one told "no".
+        """
+        loop = self.__dict__.get("_loop")
+        if loop is None or loop.is_closed():
+            return {"ok": False, "refused": "not_running",
+                    "text": "the transport is not running its controls"}
+        try:
+            future = asyncio.run_coroutine_threadsafe(self.dashboard_action(request), loop)
+            return dict(future.result(self.ACTION_TIMEOUT) or {})
+        except FuturesTimeout:
+            # The coroutine cannot be cancelled from here, so it may still finish and log its
+            # audit line. The answer says so rather than claiming nothing happened (#347).
+            logger.warning("web dashboard: a control did not answer in %gs",
+                           self.ACTION_TIMEOUT)
+            return {"ok": False, "refused": "timeout",
+                    "text": ("the control did not answer in time; it may still have run, "
+                             "the log will say")}
+        except Exception:                          # noqa: BLE001 - a page, not a traceback
+            logger.warning("web dashboard: the dashboard action failed", exc_info=True)
+            return {"ok": False, "refused": "failed",
+                    "text": "the action failed; the log has the reason"}
+
+    async def dashboard_action(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+        """Carry out one action asked for by the page (#342).
+
+        It becomes the same press a Telegram button delivers -- ``ctl:<action>[:<target>]``,
+        or ``ctl:confirm:<code>`` for the second tap -- so there is one policy (admin-only,
+        a second tap for anything that stops, one log line) and one set of actions. The answer
+        says whether it ran, gives the policy's own words, and hands back the code a second
+        POST needs when the control asks again.
+        """
+        action = str(request.get("action") or "").strip()
+        target = str(request.get("target") or "").strip()
+        value = str(request.get("value") or "").strip()
+        code = str(request.get("code") or "").strip()
+        if not action and not code:
+            return {"ok": False, "refused": press_mod.UNKNOWN,
+                    "text": "a write needs an action or a confirm code"}
+        if action and (":" in action or any(ch.isspace() for ch in action)):
+            return {"ok": False, "refused": press_mod.UNKNOWN, "action": action,
+                    "text": "there is no control by that name"}
+        if ":" in target or any(ch.isspace() for ch in target):
+            return {"ok": False, "refused": press_mod.TARGET, "action": action,
+                    "text": "that target is not one this page can name"}
+        if any(ch.isspace() for ch in code):
+            return {"ok": False, "refused": press_mod.EXPIRED, "action": action,
+                    "text": "that confirmation expired or was already used"}
+        data = (press_mod.confirm_data(code) if code
+                else press_mod.callback_data(action, target, value))
+        press = press_mod.Press(user_id=int(self.config.identity.admin_user_id or 0),
+                                data=data, at=time.time())
+        # The admin's identity is not taken from the request: the page has already checked the
+        # Mini App's signed login against admin_user_id, and the policy checks it again below.
+        # What the page is told is what actually happened, from this press's own record -- never
+        # a channel-wide slot two presses could share (review, #347).
+        observed: Dict[str, Any] = {}
+        text = await self.handle_control_press(press, via="dashboard", observed=observed)
+        verdict = str(observed.get("verdict") or press_mod.REFUSED)
+        answer: Dict[str, Any] = {"ok": verdict == press_mod.RUN, "verdict": verdict,
+                                  "action": action or str(observed.get("action") or ""),
+                                  "target": target, "text": text}
+        if verdict == press_mod.CONFIRM:
+            answer["confirm"] = str(observed.get("code") or "")
+        if verdict == press_mod.REFUSED:
+            answer["refused"] = str(observed.get("reason") or press_mod.REFUSED)
+        return answer
 
     async def _handle_control_text(self, event: ChannelEvent) -> Optional[str]:
         """A control typed into the chat: the press handler, fed by text instead of a callback.
@@ -4489,7 +4608,8 @@ class AgentChannel:
                    for alias in (getattr(self.config, "peer_roles", None) or {})}
         return wanted in roster
 
-    async def hand_over_lease(self, to: str, *, presser: str = "") -> str:
+    async def hand_over_lease(self, to: str, *, presser: str = "",
+                              via: str = "") -> str:
         """Give the coordinator lease to *to*: this holder steps down, the target claims.
 
         Two writes, by two bots, which is the whole point: a claim is signed by whoever writes
@@ -4522,8 +4642,8 @@ class AgentChannel:
         # that bot any more. Ordering cannot go wrong the other way round -- the target claims
         # term N+1, which outranks the term being given up -- so a note that arrives early is
         # harmless, and a note that never arrives leaves the lease exactly where it was.
-        await self._post_control_note(press_mod.PressPolicy.log_line(
-            "swarm.lease", who, presser or "0", time.time(), done=True, value="take"))
+        await self._post_control_note(self._with_via(press_mod.PressPolicy.log_line(
+            "swarm.lease", who, presser or "0", time.time(), done=True, value="take"), via))
         try:
             async with self._lease_lock():
                 # The term read above, not the current one: the successor may already have
@@ -4540,7 +4660,7 @@ class AgentChannel:
         return (f"lease: handed to {who} -- it claims term {term + 1} and takes the dashboard "
                 f"when the note reaches it")
 
-    async def fail_back_lease(self, *, presser: str = "") -> str:
+    async def fail_back_lease(self, *, presser: str = "", via: str = "") -> str:
         """Give the lease back to the coordinator the admin named (#154).
 
         Two shapes, because the admin's intent is one: a bot that holds the role hands it to
@@ -4553,15 +4673,17 @@ class AgentChannel:
                                  "peer's role), so there is nobody to fail back to")
         me = str(self.config.identity.alias)
         if named.lower() != me.lower():
-            return await self.hand_over_lease(named, presser=presser)
+            # This branch *is* a hand-over, so the marker follows it too (#347 review).
+            return await self.hand_over_lease(named, presser=presser, via=via)
         if await asyncio.to_thread(self.lease_fence):
             raise ControlRefused(f"fail back: {me} already holds the lease")
-        term = await self._take_handed_lease(presser=presser)
+        term = await self._take_handed_lease(presser=presser, via=via)
         if term is None:
             raise ControlRefused(f"fail back: {me} could not claim the next term; see the log")
         return f"lease: {me} took term {term} back as the named coordinator"
 
-    async def _take_handed_lease(self, *, presser: str = "") -> Optional[int]:
+    async def _take_handed_lease(self, *, presser: str = "",
+                                 via: str = "") -> Optional[int]:
         """The other half of a hand-over: claim the next term, then take the dashboard.
 
         The claim is ``promoted``: the old holder has yielded, and the admin's press is the
@@ -4593,8 +4715,8 @@ class AgentChannel:
         term = int(getattr(row, "term", 0) or 0)
         logger.warning("lease: %s took term %d on the admin's hand-over from %s",
                        me, term, getattr(state, "holder", "") or "nobody")
-        await self._post_control_note(press_mod.PressPolicy.log_line(
-            "swarm.lease", me, presser or "0", time.time(), done=True, value="taken"))
+        await self._post_control_note(self._with_via(press_mod.PressPolicy.log_line(
+            "swarm.lease", me, presser or "0", time.time(), done=True, value="taken"), via))
         try:
             await self.send(
                 f"\U0001f504 coordinator lease: {me} is acting coordinator at term {term} "
@@ -4644,16 +4766,16 @@ class AgentChannel:
             line), silent=True, notice=True, allow_when_frozen=True)
 
     async def _run_control(self, action: str, target: str, *, presser: str = "",
-                           value: str = "") -> Optional[str]:
+                           value: str = "", via: str = "") -> Optional[str]:
         """Carry out one wired control, here and -- for a swarm-wide one -- everywhere else.
 
         Returns the words to answer the presser with when the control is one that *reports*
         (None otherwise, and the policy's own line is the answer).
         """
         if value:
-            return await self._apply_pick(action, value, target, presser=presser)
+            return await self._apply_pick(action, value, target, presser=presser, via=via)
         if action == "swarm.failback":
-            return await self.fail_back_lease(presser=presser)
+            return await self.fail_back_lease(presser=presser, via=via)
         if action == "swarm.role" and target:
             # Step two of the role pick: the bot is chosen, now ask which role.
             return await self._offer_picker(action, target)
@@ -4673,7 +4795,8 @@ class AgentChannel:
             # Hold this bot, and broadcast the hold: every peer applies the same note, so one
             # press stops the swarm instead of only the bot that owns the message.
             self._pause_self(None, quiet=True)
-            await self._post_control_note(press_mod.every_bot(action, presser or "0"))
+            await self._post_control_note(self._with_via(
+                press_mod.every_bot(action, presser or "0"), via))
             return
         if action == "item.nudge":
             await self._nudge_item(target)

@@ -1229,19 +1229,34 @@ and time left, and the round in flight with its checklist progress; the open deb
 under the cards. A bot that stopped beating is `down` whatever it last said of itself, and a
 number the runtime never reported is `null` in the JSON and `?` on the page — never a zero.
 
-Three rules bound it. **Read-only:** `GET`/`HEAD` on those two paths and nothing else — a write
-is a `405`, an unknown path a `404`, and the admin's buttons stay in Telegram. **Loopback
-only:** it binds `127.0.0.1`, so nothing off the host reaches it; slice 2 — the same page as a
-Telegram Mini App, over HTTPS with `initData` checked — is the admin's decision, not a
-config flag. **No identifiers, no external references:** every field is picked by name, so a
-record carrying a chat id, a token or a path shows none of them, and the page loads nothing
-from anywhere (no CDN, no font host), so it works on a LAN with no route out. It follows the
-system's light or dark preference and is built phone-width first, ready to be the Mini App's
-page unchanged. As a Mini App it also takes the chat's own theme: `tgWebAppColorScheme` becomes
-the page's `data-theme`, which selects a **whole palette** (every colour token, not a hint), so
+Three rules bound it. **Read-only, but for one path:** `GET`/`HEAD` serve the page and its
+state, and the only write is `POST /api/action` (#342, below) — every other method is a `405`,
+an unknown path a `404`, and the admin's buttons stay in Telegram. **Loopback only:** it binds
+`127.0.0.1`, so nothing off the host reaches it; slice 2 — the same page as a Telegram Mini
+App, over HTTPS with `initData` checked — is the admin's decision, not a config flag.
+**No identifiers, no external references:** every field is picked by name, so a record carrying
+a chat id, a token or a path shows none of them, and the page loads nothing from anywhere (no
+CDN, no font host), so it works on a LAN with no route out. It follows the system's light or
+dark preference and is built phone-width first, ready to be the Mini App's page
+unchanged. As a Mini App it also takes the chat's own theme: `tgWebAppColorScheme`
+becomes the page's `data-theme`, which selects a **whole palette** (every colour token, not a hint), so
 no status colour is left over from the other scheme, and the chat's `tgWebAppThemeParams`
 colours go on top of it as overrides. A chat that sends colours but no scheme gets its palette
 from the luminance of `bg_color`.
+
+**One write path: `POST /api/action` (#342).** The control centre's first slice. A body is
+`{action, target?, value?, code?}` and it is carried out by *the same dispatch the dashboard
+buttons use* — `control.CONTROLS` through `control_press` — so there is one table of actions,
+one admin check and one second tap for anything that stops something. The answer is the
+policy's own words plus `ok`, `verdict`, and — when the control asks again — the single-use
+`confirm` code a second POST sends back. Every write needs a valid admin `initData`, the
+loopback included: a local request without one is a `403` and the plain page stays read-only. A
+cross-site `Origin` is refused, a body over 8 KiB or not a JSON object is a `400`, and every
+executed action leaves one line in the control topic (`via=dashboard`) naming who did what — on
+a swarm-wide control that line is its own `target=*` note, marked the same way. No field of the
+answer is an id or a path, and the answer reports what *actually* happened: a press refused
+because another bot coordinates now says `refused: not_coordinator` with no confirm code
+instead of claiming it ran, and two presses at once never swap their answers.
 
 The page follows the lease like the pin: the first heartbeat that finds this bot coordinating
 starts the server, and the first that finds another bot coordinating stops it — so a failover

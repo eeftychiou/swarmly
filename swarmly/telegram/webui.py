@@ -16,10 +16,12 @@ a LAN with no route out, and nothing in it can call home.
 **Unknown stays unknown.** A number the runtime never reported is ``null`` in the JSON and
 ``?`` on the page; it is never summed as a zero. A total says how many rows reported one.
 
-**Read-only, and only while this bot holds the lease.** The server answers ``GET``/``HEAD``
-for two paths and refuses everything else: the admin buttons stay in Telegram. It binds
-``127.0.0.1``, so nothing off the host can reach it; slice 2 (a Telegram Mini App over HTTPS)
-is where an address becomes a decision, and that decision is the admin's.
+**One write, and only while this bot holds the lease.** The server answers ``GET``/``HEAD``
+for the page and its state, and one ``POST`` -- ``/api/action``, the control centre's write
+path (#342) -- which is refused unless it carries a verified admin Mini App ``initData``, the
+loopback included. Everything else is a ``404`` or a ``405``. It binds ``127.0.0.1``, so
+nothing off the host can reach it; slice 2 (a Telegram Mini App over HTTPS) is where an
+address becomes a decision, and that decision is the admin's.
 
 The page carries the swarm (one card per bot), the lease and the round, the open debts, and
 -- since #332 -- the topic registry: one card per open work topic, read from the same
@@ -40,7 +42,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlsplit
 
 from swarmly.state import keys as K
 from swarmly.state.records import Profile, RecordError, Topic, as_dict
@@ -56,6 +58,15 @@ BADGES: Dict[str, str] = {
 #: The two paths the server knows. Anything else is a 404, and no other method is allowed.
 PAGE_PATH = "/"
 STATE_PATH = "/state.json"
+
+#: The one path that *writes* (#342): ``POST`` with ``{action, target?, value?, code?}``, sent
+#: through the same dispatch the Telegram buttons use. Every write needs a verified admin
+#: ``initData``, the loopback included: the plain local page stays read-only.
+ACTION_PATH = "/api/action"
+
+#: The most a write's body may carry: an action, a target, a value and a confirm code. A body
+#: larger than this is refused unread, so a page cannot be made to buffer something huge.
+MAX_BODY_BYTES = 8192
 
 #: Where the server binds. Loopback only: the page is reached through a tunnel, not a bind
 #: (#240 slice 2). The bind stays local so nothing on the network can talk to it directly.
@@ -1030,28 +1041,57 @@ setInterval(tick, EVERY);
 # ------------------------------------------------------------------------------------
 
 
+def action_answer(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """A write's answer, read by name: what ran, how it went, the words, the confirm code.
+
+    Nothing else reaches the wire. The *text* is the policy's own answer -- the same words the
+    Telegram button gives -- so a page shows exactly what a presser would have read, and no
+    field here is ever an id or a path.
+    """
+    ok = bool(raw.get("ok"))
+    out: Dict[str, Any] = {
+        "ok": ok,
+        "verdict": str(raw.get("verdict") or ("ok" if ok else "refused"))[:24],
+        "text": str(raw.get("text") or "")[:2000],
+    }
+    for name in ("refused", "action", "target", "confirm"):
+        value = str(raw.get(name) or "").strip()
+        if value:
+            out[name] = value[:64]
+    return out
+
+
 class DashboardServer:
     """A read-only HTTP server for the page, on the loopback, for as long as it is started.
 
     ``provider`` is called once per request and returns the JSON-able state; anything it
     raises is a 503 with a JSON body, never a traceback on the wire. The server owns one
     daemon thread, so a stuck request cannot hold the transport's shutdown.
+
+    ``action`` is the one write path (#342). It is a plain callable -- the transport hands the
+    request to its own dispatch -- so this module stays free of asyncio, and a server without
+    one is read-only exactly as before.
     """
 
     def __init__(self, provider: Callable[[], Mapping[str, Any]], *, port: int = 0,
                  host: str = HOST, title: str = "Swarm", every: float = 3.0,
                  public_host: str = "", bot_token: str = "", admin_id: Any = 0,
-                 init_max_age: float = INIT_MAX_AGE) -> None:
+                 init_max_age: float = INIT_MAX_AGE,
+                 action: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None
+                 ) -> None:
         self.provider = provider
         self.host = host
         self.requested_port = int(port)
         self.title = title
         self.every = every
+        #: The write path (#342): ``{action, target, value, code}`` in, ``{ok, text, …}`` out.
+        #: ``None`` means no controls are wired, and a POST stays a 405.
+        self.action = action
         #: The name the page is reached under behind a tunnel (#240 slice 2). Empty means the
         #: server only answers for the loopback, and every request is local.
         self.public_host = str(public_host or "").strip().lower()
         #: The Mini App's ``initData`` is checked against these. Empty token or admin means
-        #: "no public host", which never asks for one.
+        #: "no public host", which never asks for one -- and, since #342, no write either.
         self.bot_token = str(bot_token or "")
         self.admin_id = admin_id
         self.init_max_age = float(init_max_age)
@@ -1223,9 +1263,89 @@ class DashboardServer:
             def do_HEAD(self) -> None:                      # noqa: N802
                 self.do_GET()
 
+            # -- the write path (#342) ---------------------------------------------------
+            def _origin_ok(self) -> bool:
+                """Whether a write comes from this page and nowhere else.
+
+                A browser sends ``Origin`` on every cross-site ``POST``; a name that is not one
+                this server answers for is another site's form or fetch, and it is refused
+                before anything else happens. A request with no ``Origin`` (a script, a test)
+                still faces the ``initData`` check below, which is the real door.
+                """
+                given = str(self.headers.get("Origin", "") or "").strip().lower()
+                if not given:
+                    return True
+                name = urlsplit(given).netloc.lower()
+                bare = name.rsplit(":", 1)[0] if name.count(":") == 1 else name
+                return name in server.hosts or bare in server.hosts
+
+            def _write(self, code: int, payload: Mapping[str, Any]) -> None:
+                self._send(code, json.dumps(action_answer(payload), sort_keys=True)
+                           .encode("utf-8"), "application/json")
+
+            def do_POST(self) -> None:                      # noqa: N802
+                path = self.path.partition("?")[0]
+                if not self._host_ok():
+                    self._not_found()
+                    return
+                if path != ACTION_PATH:
+                    self._read_only()                       # every other path stays read-only
+                    return
+                if server.action is None:
+                    self._read_only()                       # no controls wired: still a 405
+                    return
+                if not self._origin_ok():
+                    self._write(403, {"ok": False, "refused": "origin",
+                                      "text": "that origin may not write here"})
+                    return
+                # Every write needs a verified admin Mini App login -- the loopback included
+                # (#342). The plain local page stays read-only, and a write is never weaker
+                # than the state read the same page already has to pass.
+                if server.init_max_age <= 0:
+                    # A write fails closed: the age check is what makes a captured payload
+                    # useless, and config refuses a window of 0 anyway (review, #347).
+                    logger.info("web dashboard: refused a write (no init_max_age window)")
+                    self._write(403, {"ok": False, "refused": "auth",
+                                      "text": "this page has no initData window to check"})
+                    return
+                ok, why = verify_init_data(str(self.headers.get(INIT_HEADER, "") or ""),
+                                          bot_token=server.bot_token,
+                                          admin_id=server.admin_id,
+                                          now=time.time(), max_age=server.init_max_age)
+                if not ok:
+                    logger.info("web dashboard: refused a write (%s)", why)
+                    self._write(403, {"ok": False, "refused": "auth", "text": why})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    length = -1
+                if length < 0 or length > MAX_BODY_BYTES:
+                    self._write(400, {"ok": False, "refused": "body",
+                                      "text": "a write is a small JSON object"})
+                    return
+                try:
+                    asked = json.loads(self.rfile.read(length) or b"{}")
+                except ValueError:
+                    self._write(400, {"ok": False, "refused": "body",
+                                      "text": "the body is not JSON"})
+                    return
+                if not isinstance(asked, dict):
+                    self._write(400, {"ok": False, "refused": "body",
+                                      "text": "the body is not a JSON object"})
+                    return
+                try:
+                    answer = server.action(asked)
+                except Exception:                       # noqa: BLE001 - never on the wire
+                    logger.warning("web dashboard: the action failed", exc_info=True)
+                    self._write(503, {"ok": False, "refused": "failed",
+                                      "text": "the action failed; the log has the reason"})
+                    return
+                self._write(200, dict(answer or {}))
+
             def _read_only(self) -> None:
                 self._send(405, b'{"error":"read-only"}', "application/json")
 
-            do_POST = do_PUT = do_PATCH = do_DELETE = _read_only      # noqa: N815
+            do_PUT = do_PATCH = do_DELETE = _read_only      # noqa: N815
 
         return Handler

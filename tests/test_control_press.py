@@ -10,7 +10,9 @@ stopped what and when.
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
+from typing import Any
 from unittest import mock
 
 from swarmly.telegram import channel as channel_mod
@@ -983,6 +985,21 @@ class TestTheLeaseControls(unittest.TestCase):
         self.assertIn("value=take", notes[0])
         self.assertIn("by=%d" % self.ADMIN, notes[0])
 
+    def test_a_picked_hand_over_from_the_page_carries_the_marker(self):
+        """Review #347: a picker value reaches _apply_pick, so *via* has to follow it."""
+        channel = self.channel()
+        asked = asyncio.run(channel.dashboard_action(
+            {"action": "swarm.lease", "value": "Codex"}))
+        self.assertEqual(asked["verdict"], cp.CONFIRM)
+        done = asyncio.run(channel.dashboard_action(
+            {"action": "swarm.lease", "value": "Codex", "code": asked["confirm"]}))
+        self.assertTrue(done["ok"])
+        self.assertEqual(len(channel.store.yielded), 1)        # the hand-over really ran
+        notes = self.notes(channel)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("value=take", notes[0])
+        self.assertIn("via=dashboard", notes[0])
+
     def test_a_bot_that_does_not_hold_the_lease_cannot_hand_it_on(self):
         # Still the coordinator as far as the press gate is concerned, but its lease lapsed:
         # the fence is what says so, and that is the rule a hand-over must obey.
@@ -1034,6 +1051,20 @@ class TestTheLeaseControls(unittest.TestCase):
         notes = self.notes(channel)
         self.assertEqual(len(notes), 1)
         self.assertIn("target=Codex", notes[0])
+
+    def test_a_fail_back_from_the_page_marks_its_hand_over_note(self):
+        """Twin of the picker test: fail_back's hand-over branch must carry the marker (#347)."""
+        channel = self.channel(named="Codex")
+        asked = asyncio.run(channel.dashboard_action({"action": "swarm.failback"}))
+        self.assertEqual(asked["verdict"], cp.CONFIRM)
+        done = asyncio.run(channel.dashboard_action(
+            {"action": "swarm.failback", "code": asked["confirm"]}))
+        self.assertTrue(done["ok"])
+        self.assertEqual(len(channel.store.yielded), 1)        # the hand-over really ran
+        notes = self.notes(channel)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("target=Codex", notes[0])
+        self.assertIn("via=dashboard", notes[0])
 
     def test_fail_back_with_no_named_coordinator_says_so(self):
         channel = self.channel(named="")
@@ -1226,6 +1257,159 @@ class TestTheSwarmControls(unittest.TestCase):
         channel = self.channel()
         self.assertIn("swarm.sync", channel.control_actions())
         self.assertIn("swarm.cleanup", channel.control_actions())
+
+
+class TestTheDashboardWritePath(unittest.TestCase):
+    """#342: the page's write path runs the same press, with its code and its audit line."""
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        return channel
+
+    def ask(self, channel, **request):
+        return run(channel.dashboard_action(request))
+
+    def test_a_plain_action_runs_once_and_answers_with_the_policys_words(self):
+        channel = self.channel()
+        answer = self.ask(channel, action="bot.pause")
+        self.assertTrue(answer["ok"])
+        self.assertEqual(answer["verdict"], cp.RUN)
+        self.assertTrue(channel._frozen)                      # it actually ran
+        self.assertIn("Pause done", answer["text"])
+        self.assertNotIn("confirm", answer)
+
+    def test_a_control_that_stops_something_needs_its_code(self):
+        channel = self.channel()
+        asked = self.ask(channel, action="bot.restart")
+        self.assertEqual((asked["ok"], asked["verdict"]), (False, cp.CONFIRM))
+        self.assertFalse(channel.restart_requested)           # the first post changes nothing
+        code = asked["confirm"]
+        self.assertTrue(code, "a confirm answer must carry the code the second post sends")
+        done = self.ask(channel, action="bot.restart", code=code)
+        self.assertTrue(done["ok"])
+        self.assertTrue(channel.restart_requested)
+
+    def test_a_code_is_single_use(self):
+        channel = self.channel()
+        code = self.ask(channel, action="bot.restart")["confirm"]
+        self.ask(channel, action="bot.restart", code=code)
+        again = self.ask(channel, action="bot.restart", code=code)
+        self.assertEqual(again["verdict"], cp.REFUSED)
+        self.assertEqual(again["refused"], cp.EXPIRED)
+
+    def test_an_action_with_no_controls_entry_is_refused(self):
+        channel = self.channel()
+        answer = self.ask(channel, action="bot.selfdestruct")
+        self.assertEqual(answer["verdict"], cp.REFUSED)
+        self.assertEqual(answer["refused"], cp.UNKNOWN)
+        self.assertNotIn("selfdestruct", channel.control_actions())
+
+    def test_a_malformed_request_is_refused_without_running_anything(self):
+        channel = self.channel()
+        self.assertEqual(self.ask(channel)["refused"], cp.UNKNOWN)          # nothing asked
+        self.assertEqual(self.ask(channel, action="bot:pause")["refused"], cp.UNKNOWN)
+        self.assertEqual(self.ask(channel, action="bot.pause",
+                                  target="a:b")["refused"], cp.TARGET)
+        self.assertFalse(channel._frozen)
+
+    def test_one_audit_line_per_executed_action_says_via_dashboard(self):
+        channel = self.channel()
+        self.ask(channel, action="bot.pause")
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL bot.pause" in entry["text"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("via=dashboard", notes[0])
+        self.assertIn("by=%d" % ADMIN_ID, notes[0])
+        self.assertIn("target=", notes[0])
+
+    def test_a_refused_or_confirming_write_leaves_no_audit_line(self):
+        channel = self.channel()
+        self.ask(channel, action="bot.restart")               # only a code is minted
+        self.ask(channel, action="bot.selfdestruct")
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL bot.restart" in entry["text"]
+                 or "CONTROL bot.selfdestruct" in entry["text"]]
+        self.assertEqual(notes, [])
+
+    def test_two_presses_at_once_do_not_swap_their_answers(self):
+        """Review #347: the answer must be this press's outcome, not a shared slot's."""
+        channel = self.channel()
+        slow = channel._offer_confirm
+
+        async def slow_offer(decision: Any) -> None:
+            await asyncio.sleep(0.05)                    # the send yields, as in production
+            await slow(decision)
+
+        channel._offer_confirm = slow_offer
+
+        async def both() -> Any:
+            return await asyncio.gather(
+                channel.dashboard_action({"action": "bot.restart"}),
+                channel.dashboard_action({"action": "bot.pause"}))
+
+        restart, pause = asyncio.run(both())
+        self.assertEqual(restart["verdict"], cp.CONFIRM)
+        self.assertTrue(restart["confirm"], "the restart lost its confirm code")
+        self.assertFalse(restart["ok"])
+        self.assertFalse(channel.restart_requested)
+        self.assertEqual(pause["verdict"], cp.RUN)
+        self.assertTrue(pause["ok"])
+        self.assertNotIn("confirm", pause)
+        self.assertTrue(channel._frozen)
+
+    def test_a_stale_coordinator_is_told_that_nothing_ran(self):
+        """Review #347: a press refused for a stale lease answered ok:true and a dead code."""
+        channel = self.channel()
+        channel.current_coordinator = lambda now=None: "Claudebot"
+        answer = self.ask(channel, action="bot.pause")
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["verdict"], cp.REFUSED)
+        self.assertEqual(answer["refused"], cp.NOT_COORDINATOR)
+        self.assertFalse(channel._frozen)
+        asked = self.ask(channel, action="bot.restart")
+        self.assertFalse(asked["ok"])
+        self.assertNotIn("confirm", asked)               # never offer a code that was dropped
+        self.assertEqual(asked["refused"], cp.NOT_COORDINATOR)
+        self.assertEqual(channel.control_policy().pending(), [])
+
+    def test_a_swarm_wide_control_carries_the_marker_on_its_own_note(self):
+        """Review #347: the three broadcast controls post one note -- it must say via."""
+        channel = self.channel()
+        code = self.ask(channel, action="swarm.pause_all")["confirm"]
+        done = self.ask(channel, action="swarm.pause_all", code=code)
+        self.assertTrue(done["ok"])
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL swarm.pause_all" in entry["text"]]
+        self.assertEqual(len(notes), 1, notes)            # one line, not a duplicate
+        self.assertIn("target=*", notes[0])
+        self.assertIn("via=dashboard", notes[0])
+        self.assertIn("by=%d" % ADMIN_ID, notes[0])
+
+    def test_the_answer_carries_no_identifier(self):
+        from tests.test_telegram_channel import GROUP
+        channel = self.channel()
+        payload = json.dumps(self.ask(channel, action="bot.pause"))
+        for secret in (str(GROUP), str(ADMIN_ID), "TEST"):
+            self.assertNotIn(secret, payload)
+
+    def test_a_transport_that_is_not_running_answers_instead_of_hanging(self):
+        channel = self.channel()
+        self.assertIn("not running", channel.web_action({"action": "bot.pause"})["text"])
+
+    def test_the_server_is_wired_to_the_write_path(self):
+        channel = make_channel(make_config(web={"enabled": True, "port": 0},
+                                           control={"chat_id": -1001234567890,
+                                                    "topic_id": 307}))
+        channel.is_coordinator = lambda now=None: True
+        channel._sync_web_dashboard()
+        try:
+            wired = channel._web_server.action
+            self.assertIsNotNone(wired)
+            self.assertIs(wired.__self__, channel)             # this transport's own dispatch
+        finally:
+            channel.is_coordinator = lambda now=None: False
+            channel._sync_web_dashboard()
 
 
 def round_state(items):
