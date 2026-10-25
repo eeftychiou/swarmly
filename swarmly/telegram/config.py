@@ -924,8 +924,9 @@ class BusSettings:
     enabled: bool = True
     #: Settle window before the delivery-verify probe (issue #80); 0 disables it.
     verify_settle_seconds: float = DEFAULT_VERIFY_SETTLE_SECONDS
-    #: Where envelope files live: ``git`` (default), ``folder`` or ``gdrive``
-    #: (see :mod:`swarmly.transports`). ``repo`` stays the home of local state either way.
+    #: Where envelope files live: ``git`` (default), ``folder`` or ``gdrive`` (see
+    #: :mod:`swarmly.transports`), or ``telegram``: no files, the Telegram state store is the
+    #: bus (needs ``state.backend: telegram``). Local state lives in ``state.dir``.
     transport: str = "git"
     folder: Optional[str] = None         # transport: folder -- the synced/shared bus folder
     gdrive: Dict[str, Any] = field(default_factory=dict)  # transport: gdrive -- folder_id, credentials
@@ -1261,6 +1262,12 @@ class AgentConfig:
             bus_enabled_raw = (poll_minutes != 0)
 
         transport_kind = str(bus_raw.get("transport") or "git").strip().lower()
+        if transport_kind == "telegram":
+            # The swarm's bus is the Telegram store: no checkout, no polling, no mirror files.
+            # Said in one setting, not by leaving the section out (admin, 25 Oct).
+            repo = None
+            poll_minutes = 0
+            bus_enabled_raw = False
         folder_raw = bus_raw.get("folder")
         bus_folder = (os.path.expandvars(os.path.expanduser(str(folder_raw).strip()))
                       if folder_raw not in (None, "") else None)
@@ -1300,8 +1307,8 @@ class AgentConfig:
             swarm_agent=bus_swarm_agent,
             allow_unsigned=allow_unsigned,
             senders=bus_senders,
-            mirror_handoffs=_parse_bool("bus.mirror_handoffs",
-                                        bus_raw.get("mirror_handoffs", True)),
+            mirror_handoffs=(transport_kind != "telegram" and _parse_bool(
+                "bus.mirror_handoffs", bus_raw.get("mirror_handoffs", True))),
         )
         fallback = FallbackSettings(
             gitbus_poll_minutes=int(poll_minutes),
@@ -1460,6 +1467,9 @@ class AgentConfig:
                                   dir=state_dir)
         elif state_raw is not None:
             raise ConfigError("'state' must be a mapping")
+        if bus.transport == "telegram" and (state is None or state.backend != "telegram"):
+            raise ConfigError("bus.transport: telegram needs state.backend: telegram "
+                              "(the Telegram state store is the bus)")
 
         # Issue #240: the local read-only web page. No section, no server: nothing opens a
         # port unless the operator asked for one (and only the lease holder serves it).
