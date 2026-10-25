@@ -1245,6 +1245,20 @@ moves the page with the role instead of leaving a stale one answering on an old 
 server is one daemon thread; `stop()` closes the port, so a restart never leaves two answers
 on one port.
 
+**The Topics panel (#332).** Under the debts the page shows the topic registry: one card per
+**open** topic, most recently active first — its name, each of its links with the ref, status,
+phase and assignees, and each of its bindings with the agent, its role, the turns since its
+session was last rotated and its drift score. A work item whose phase has not moved for
+`limits.stall_minutes` (thirty by default, the stall ladder's own threshold) is flagged
+**stalled**, and a binding at its `max_turns`/`max_age_hours` limit or over the drift reset
+line carries a **rotation due** badge. The records are the store's `topic/<id>` and
+`agent/<alias>/profile` — the same ones `/topics` reads — so a refresh still costs no model
+turn and no gitbus read. Only public refs are published: a `local` link's ref is a filesystem
+path and a `topic` link's is `T-<thread>-<n>` — a thread id — so for those just the title goes
+on the page, and only the drift score this bot can see (its own ledger) is shown, a peer's
+being an unknown `?`. On a bot whose store is not ready the panel says **registry not ready**
+— never an empty list, which would claim there are no topics.
+
 **The same page as a Telegram Mini App (#240, slice 2).** Name the host the page is reached
 under and the page becomes a Mini App: the pinned card grows an **Open dashboard** button, and
 `/state.json` answers only the admin.
