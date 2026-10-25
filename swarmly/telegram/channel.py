@@ -2728,9 +2728,11 @@ class AgentChannel:
                     "rulebook again and follow it.]",
                     reminder,
                     self.state_link.registry_facts(chat_id, thread_id)) if part)
-                template = IncomingMessage(text="", author_alias=self.config.identity.alias,
-                                           context_id=context_id,
-                                           mentions=dict(self.config.peers))
+                template = IncomingMessage(
+                    text="", author_alias=self.config.identity.alias, context_id=context_id,
+                    mentions=dict(self.config.peers),
+                    maintainer_username=getattr(self.config.identity, "maintainer_username",
+                                                None))
                 rotated = bool(await rotate(context_id, template, prefix))
             else:
                 adapter.forget_session(context_id)

@@ -677,7 +677,7 @@ class StateLink:
 
     async def sync_stats(self, store: Any) -> bool:
         """Write ``agent/<alias>/stats`` when it changed. True if written."""
-        value = await asyncio.to_thread(self.agent_stats)
+        value = self.agent_stats()             # on the loop: the ledger has one writer
         if not value:
             return False
         key = K.agent(store.alias, "stats")

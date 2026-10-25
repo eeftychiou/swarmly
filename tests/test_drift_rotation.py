@@ -77,13 +77,35 @@ class ClaudeTurnLimitTests(unittest.TestCase):
         claude = ClaudeThreadAdapter("Claude", settings, runner=runner)
         message = topic_message()
         first = claude.topic_session(message.context_id)
-        asyncio.run(claude.respond(message))
-        reply = asyncio.run(claude.respond(message))
-        self.assertTrue(reply.meta.get("rotated"))
+
+        async def go():
+            await claude.respond(message)
+            reply = await claude.respond(message)
+            self.assertTrue(reply.meta.get("rotated"))
+            await claude.respond(message)       # queued behind the rotation: the new session
+            return reply
+        asyncio.run(go())
         self.assertIn(HANDOVER_PROMPT[:40], runner.calls[2][-1])
         self.assertNotEqual(claude.topic_session(message.context_id), first)
-        asyncio.run(claude.respond(message))
-        self.assertIn("ship #12", runner.calls[3][-1])
+        third = runner.calls[3]
+        self.assertEqual(third[third.index("--session-id") + 1],
+                         claude.topic_session(message.context_id))
+        self.assertIn("ship #12", third[-1])
+
+
+class TopicLessViolationTests(unittest.TestCase):
+    def test_a_guard_violation_with_no_topic_ages_out(self):
+        """Review: with no window, one guard row reminded every topic for ever."""
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = dr.DriftLedger(Path(tmp) / "drift.json", clock=clock)
+            ledger.record("merge_gate_refused")                 # the guard: no topic
+            self.assertTrue(ledger.decide("-100:7").remind)
+            clock.now += dr.WINDOW_SECONDS + 1
+            self.assertFalse(ledger.decide("-100:7").remind)
+            ledger.record("duplicate_reply", topic="-100:7")
+            clock.now += 30 * 86400
+            self.assertEqual(ledger.decide("-100:7").score, 1)   # a topic's row stays
 
 
 class RotatingAdapter(Recording):

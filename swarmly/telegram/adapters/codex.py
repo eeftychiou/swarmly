@@ -249,6 +249,8 @@ class CodexAdapter(SubprocessAdapter):
     async def rotate(self, context_id: str, message: IncomingMessage, prefix: str = "") -> bool:
         """Retire the topic's session now (a drift reset): it writes its handover, and the
         next turn starts a new session from ``prefix`` and that handover."""
+        if not self._sessions_supported():
+            return False                                   # no session to hand over from
         lock = self._turns.setdefault(context_id, asyncio.Lock())
         async with lock:
             thread = self.thread_for(context_id)

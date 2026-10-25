@@ -46,10 +46,10 @@ RULES: Dict[str, Tuple[int, str]] = {
 REMIND_AT = 3
 #: A score at or over this (or two hard violations) retires the topic's session.
 RESET_AT = 6
-#: Kept for callers that read it; the score no longer ages out on a clock. A violation counts
-#: against the **session** it happened in (its topic's) until that session is reset: a session
-#: that runs for days and breaks a rule twice a day must still reach the line (admin, 24 Oct,
-#: docs/design/topic-registry.md "Agent stats and drift").
+#: A violation counts against the **session** it happened in (its topic's) until that session
+#: is reset -- no clock: a session that runs for days and breaks a rule twice a day must still
+#: reach the line (admin, 24 Oct, docs/design/topic-registry.md "Agent stats and drift"). Only
+#: a violation with no topic (the role guard's) ages out, after this long.
 WINDOW_SECONDS = 6 * 3600.0
 #: The ledger keeps this many rows.
 KEEP = 300
@@ -179,12 +179,17 @@ class DriftLedger:
         """The violations that count against a session: those of ``topic`` (and those with no
         topic, which count against every session) since that topic's last reset. With no
         topic: every violation whose own session has not been reset since."""
+        now = float(self.clock())
         if topic is not None:
             out: List[Violation] = []
             for row in self.rows:
                 if row.reset and row.topic in (topic, ""):
                     out = []
-                elif not row.reset and row.topic in (topic, ""):
+                elif not row.reset and row.topic == topic:
+                    out.append(row)
+                elif not row.reset and not row.topic and now - row.at <= WINDOW_SECONDS:
+                    # A violation with no topic (the role guard's) counts against every
+                    # session, but only for the window: no session's reset would clear it.
                     out.append(row)
             return out
         kept: List[Violation] = []
@@ -192,8 +197,9 @@ class DriftLedger:
             if row.reset:
                 continue
             later = self.rows[index + 1:]
-            if not any(r.reset and (r.topic == row.topic or r.topic == "" or not row.topic)
-                       for r in later):
+            if not row.topic and now - row.at > WINDOW_SECONDS:
+                continue
+            if not any(r.reset and (r.topic == row.topic or r.topic == "") for r in later):
                 kept.append(row)
         return kept
 
@@ -221,10 +227,15 @@ class DriftLedger:
     def summary(self, alias: str) -> str:
         d = self.decide()
         live = self.live()
-        head = (f"{alias}: drift score {d.score} (remind at {REMIND_AT}, reset at {RESET_AT}), "
-                f"{d.hard} hard, {d.resets_today} reset(s) in 24h")
+        sessions = self.sessions()
+        worst = max((score for score, _hard in sessions.values()), default=0)
+        head = (f"{alias}: drift score {d.score} across live violations (remind at "
+                f"{REMIND_AT}, reset at {RESET_AT}, per session); by session: "
+                + (", ".join(f"{t} {s}" + (f" ({h} hard)" if h else "")
+                             for t, (s, h) in sessions.items()) or "none")
+                + f"; highest {worst}; {d.resets_today} reset(s) in 24h")
         if not live:
-            return head + ". No violations in the window."
+            return head + ". No live violations."
         rows = [f"· {time.strftime('%H:%M', time.localtime(r.at))} {r.kind} "
                 f"(+{r.severity}) {r.evidence}" for r in live[-10:]]
         return head + "\n" + "\n".join(rows)

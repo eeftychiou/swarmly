@@ -375,24 +375,34 @@ class ClaudeThreadAdapter(ClaudeAdapter):
         """Retire the topic's session now (a drift reset): it writes its handover, and the
         next turn creates a new session (the next generation) from ``prefix`` and it."""
         from swarmly.telegram.adapters.handover import HANDOVER_PROMPT
-        session = self.topic_session(context_id)
         text: Optional[str] = None
-        if session in self._known or session in self._rules_held:
-            lock = self._turns.setdefault(session, asyncio.Lock())
-            async with lock:
-                self._session.set(session)
-                self._create.set(False)
-                try:
-                    reply = await ClaudeAdapter.respond(self, dataclasses.replace(
-                        message, text=HANDOVER_PROMPT, fresh_text=None,
-                        context_id=context_id))
-                    text = reply.text if reply is not None and reply.ok else None
-                except Exception:                          # noqa: BLE001 - fall back
-                    logging.getLogger(__name__).warning(
-                        "%s: the handover turn failed", self.alias, exc_info=True)
-        self._handovers.save(context_id, text, prefix)
-        self.forget_session(context_id)                    # the next generation
-        return True
+        # One lock per topic for turns and rotations alike, and the session read *inside* it:
+        # a turn queued behind a rotation must run in the new session, not the retired one
+        # (review: it resumed the old one and used up the lead).
+        async with self._turns.setdefault(self._lock_key(context_id), asyncio.Lock()):
+            session = self.topic_session(context_id)
+            if session not in self._known and session not in self._rules_held:
+                if self._handovers.pending(context_id):
+                    return False                   # already rotated, its lead still pending
+                self._handovers.save(context_id, None, prefix)
+                self.forget_session(context_id)
+                return True
+            self._session.set(session)
+            self._create.set(False)
+            try:
+                reply = await ClaudeAdapter.respond(self, dataclasses.replace(
+                    message, text=HANDOVER_PROMPT, fresh_text=None, context_id=context_id))
+                text = reply.text if reply is not None and reply.ok else None
+            except Exception:                              # noqa: BLE001 - fall back
+                logging.getLogger(__name__).warning(
+                    "%s: the handover turn failed", self.alias, exc_info=True)
+            self._handovers.save(context_id, text, prefix)
+            self.forget_session(context_id)                # the next generation
+            return True
+
+    @staticmethod
+    def _lock_key(context_id: Optional[str]) -> str:
+        return f"topic:{context_id}" if context_id else "general"
 
     def _can_create(self, session_id: Optional[str] = None) -> bool:
         try:
@@ -419,10 +429,16 @@ class ClaudeThreadAdapter(ClaudeAdapter):
         return True
 
     async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
-        session = self.session_for(message)
-        lock = self._turns.setdefault(session, asyncio.Lock())
+        key = self._lock_key(getattr(message, "context_id", None))
+        rotating = getattr(self, "_rotating", {}).get(key)
+        if rotating is not None and not rotating.done():
+            # A rotation started by the previous turn goes first: this turn belongs to the
+            # new session and starts from the handover.
+            await asyncio.shield(rotating)
+        lock = self._turns.setdefault(key, asyncio.Lock())
         rotate_now = False
         async with lock:
+            session = self.session_for(message)            # read under the lock (rotation)
             self._session.set(session)
             # A topic's session is usually new: create it first rather than fail a resume.
             # One that exists already (after a restart) refuses, and is then resumed.
@@ -483,6 +499,10 @@ class ClaudeThreadAdapter(ClaudeAdapter):
                 limit = self.settings.session_turn_limit
                 rotate_now = bool(limit) and turns >= int(limit)
         if rotate_now and reply is not None:
-            await self.rotate(context_id, message)
+            # In the background: the reply that reached the limit is posted now, and the next
+            # turn in the topic waits on the lock until the handover is written.
+            task = asyncio.get_running_loop().create_task(self.rotate(context_id, message))
+            self._rotating = getattr(self, "_rotating", {})
+            self._rotating[key] = task
             reply.meta["rotated"] = True
         return reply
