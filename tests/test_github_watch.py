@@ -172,6 +172,9 @@ class TestGitHubWatch(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first_call_kwargs.get("chat_id"), -1001234567890)
             self.assertEqual(first_call_kwargs.get("thread_id"), 12)
             self.assertNotIn("message_thread_id", first_call_kwargs)
+            # A model's answer is token space: the send check refuses it in General or the
+            # Swarm pulse (#313).
+            self.assertIs(first_call_kwargs.get("token"), True)
 
             # Verify state was saved to disk
             state_reloaded = NotificationState.load(state_file)

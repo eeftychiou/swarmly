@@ -10799,6 +10799,14 @@ class AgentChannel:
             # follows the message it replies to, as before.
             where = ({"thread_id": row["thread_id"], "token": True}
                      if row.get("thread_id") is not None else {})
+            barred = self.token_barred(row["chat_id"], row["thread_id"]) if where else None
+            if barred is not None:
+                # `send` would refuse it before any attempt, and again on every retry: the
+                # ticket stops here, and its overdue alert says the answer was not posted.
+                logger.warning("%s is transport-only: reply ticket %s is not posted there",
+                               barred, row['id'][:8])
+                self.replies.unposted(row['id'], f"answer not posted: {barred} is transport-only")
+                return
             try:
                 telegram_message_id = await self.send(
                     row['text'], reply_to_message_id=row['message_id'], chat_id=row['chat_id'],

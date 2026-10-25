@@ -231,11 +231,14 @@ final answer alone does **not** send anything to Telegram.
 
 The bridge sends submitted replies with the sender's exact username and a reply-to ID,
 and records Telegram's returned message ID. `reply-status ID` distinguishes `queued`,
-`ready`, `sent`, `skipped`, `overdue`, `queue_failed`, and `delivery_unknown`.
+`ready`, `sent`, `skipped`, `overdue`, `queue_failed`, `delivery_unknown`, and `unposted`.
 Duplicate Telegram updates and duplicate reply submissions do not cause another send.
 Unanswered tickets raise a visible alert after `adapter.reply_timeout_seconds` (default
 600). A late reply can resolve an overdue ticket. A failed/interrupted send is retained
 as `delivery_unknown`, not blindly retried: inspect Telegram before manually recovering.
+An answer asked for in a transport-only topic, such as the Swarm pulse under
+`limits.general_turns: never`, is never posted there: its ticket becomes `unposted` and raises
+the same alert.
 An uncertain queue receipt is alerted separately with its persisted failure detail, so that
 receipt alert cannot consume the later task-deadline alert; completed legacy reservations are
 migrated without generating a false warning.

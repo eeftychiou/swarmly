@@ -585,7 +585,7 @@ class GitHubWatcher:
         else:
             reply = await adapter.respond(incoming)
         if reply and reply.text:
-            await self.channel.send(reply.text, chat_id=chat_id, thread_id=thread_id)
+            await self.channel.send(reply.text, chat_id=chat_id, thread_id=thread_id, token=True)
         return reply
 
     async def _standalone_reply(self, project: Optional[ProjectSettings],
