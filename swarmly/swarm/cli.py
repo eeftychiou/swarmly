@@ -475,6 +475,8 @@ def _join_command(raw: List[str]) -> bool:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    from ..winconsole import hide_child_consoles
+    hide_child_consoles()             # pythonw on Windows: no console window per child process
     raw = list(sys.argv[1:] if argv is None else argv)
     if _join_command(raw):
         # `swarmly --cli <runtime> ...`: start an agent that joins the swarm (docs/JOIN.md).

@@ -951,6 +951,8 @@ def _init(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[list] = None) -> int:
+    from swarmly.winconsole import hide_child_consoles
+    hide_child_consoles()             # pythonw on Windows: no console window per child process
     args = build_parser().parse_args(argv)
     if args.command == "init":
         return _init(args)
