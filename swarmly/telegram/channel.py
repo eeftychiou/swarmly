@@ -4904,6 +4904,11 @@ class AgentChannel:
         Returns the words to answer the presser with when the control is one that *reports*
         (None otherwise, and the policy's own line is the answer).
         """
+        # Before anything opens: a control that is this bot's own (its model, its effort, its
+        # CLI, its memory) is refused here when the press names a peer -- a picker offered for
+        # a peer's card would set *this* bot, and answering it later would let a press get one
+        # tap too far (review, #345).
+        self._refuse_peer_self_only(action, target)
         if action == "swarm.hold":
             return self._hold_control("hold")
         if action == "swarm.release":
@@ -4923,7 +4928,6 @@ class AgentChannel:
             return await self._offer_picker(action, target)
         if control_mod.is_picker(action):
             return await self._offer_picker(action)
-        self._refuse_peer_self_only(action, target)
         report = self.control_report(action)
         if report is not None:
             return report
@@ -5040,17 +5044,12 @@ class AgentChannel:
         return ""
 
     def _memory_control(self, target: str) -> str:
-        """``/memory clear`` as a press: this bot's own file, and never a peer's (#345).
+        """``/memory clear`` as a press: this bot's own file (#345).
 
-        A memory is the bot's own; a page from another bot's card cannot empty it, because the
-        press would land *here* while the card named *there* -- so it is refused in words
-        rather than clearing the wrong bot's notes.
+        A press for another bot never reaches this: ``bot.memory`` is in ``control.SELF_ONLY``,
+        and ``_run_control`` refuses a peer's target before anything runs -- one refusal, in
+        one place, so the words are the same however the press arrived.
         """
-        who = str(target or "").strip().lstrip("@")
-        mine = str(self.config.identity.alias).strip().lower()
-        if who and who.lower() not in ("", "self", mine):
-            raise ControlRefused(f"memory is {self.config.identity.alias}'s own file: its page "
-                                 f"clears it, not a card from here")
         return self._memory_command(self._control_event("memory", "clear"))
 
     async def refresh_control_center(self, *, now: Optional[float] = None) -> Optional[Any]:

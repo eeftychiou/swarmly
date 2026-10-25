@@ -1528,7 +1528,8 @@ class TestTheControlsThatChangeTheSwarm(unittest.TestCase):
         channel.lessons = mock.Mock()
         done = self.confirm(channel, action="bot.memory", target="Codex")
         self.assertFalse(done["ok"])
-        self.assertIn("own file", done["text"])
+        self.assertEqual(done["refused"], cp.ACTION_REFUSED)
+        self.assertIn("own", done["text"])               # the one SELF_ONLY refusal
         self.assertFalse(channel.lessons.clear.called)
 
 
@@ -1589,6 +1590,23 @@ class TestABotsOwnRuntimeIsItsOwn(unittest.TestCase):
                  if "CONTROL bot.effort" in entry["text"]]
         self.assertEqual(len(notes), 1, notes)
         self.assertIn("value=high", notes[0])
+
+    def test_a_bare_press_for_a_peer_is_refused_before_any_picker_opens(self):
+        """Review #345: the picker used to open first, so the refusal came one tap too late."""
+        channel = self.channel()
+        for action in ("bot.model", "bot.effort"):
+            answer = self.ask(channel, action=action, target="Codex")
+            self.assertEqual(answer["verdict"], cp.REFUSED, action)
+            self.assertEqual(answer["refused"], cp.ACTION_REFUSED, action)
+            self.assertNotIn("confirm", answer)              # not even a code was minted
+        self.assertEqual(channel._test_sender.sent, [])       # and no picker was posted
+        self.assertEqual(channel.control_policy().pending(), [])
+
+    def test_a_report_is_refused_from_a_peer_card_too(self):
+        channel = self.channel()
+        answer = self.ask(channel, action="bot.cli", target="Codex")
+        self.assertEqual(answer["refused"], cp.ACTION_REFUSED)
+        self.assertIn("own", answer["text"])
 
     def test_the_page_draws_them_on_this_bots_card_only(self):
         channel = self.channel()
