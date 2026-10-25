@@ -96,6 +96,30 @@ class StateLinkTests(unittest.TestCase):
         self.assertIn("unreachable", claude.describe())
 
 
+class StatsTests(unittest.TestCase):
+    def test_drift_stats_are_written_to_the_bots_own_key(self):
+        import tempfile as tf
+        from swarmly.telegram import drift as dr
+        clock = Clock()
+        group = FakeGroup(clock)
+        claude = link_for(group, "Claudebot", clock)
+        with tf.TemporaryDirectory() as tmp:
+            claude.channel.drift = dr.DriftLedger(Path(tmp) / "drift.json", clock=clock)
+            claude.channel.drift.record("duplicate_reply", "again", "-100:7")
+
+            async def go():
+                await claude.store.start()
+                first = await claude.sync_stats(claude.store)
+                again = await claude.sync_stats(claude.store)
+                return first, again
+            first, again = asyncio.run(go())
+        self.assertTrue(first)
+        self.assertFalse(again, "unchanged")
+        stats = claude.store.read("agent/claudebot/stats")
+        self.assertEqual(stats["sessions"], {"-100:7": [1, 0]})
+        self.assertEqual(stats["violations"][0]["kind"], "duplicate_reply")
+
+
 class OwedShadowTests(unittest.TestCase):
     def test_each_bot_writes_its_own_rows_and_the_store_folds_them(self):
         from swarmly.telegram.owed import Row
