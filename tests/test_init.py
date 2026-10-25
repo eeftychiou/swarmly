@@ -323,6 +323,8 @@ class TestStateRootWithoutABus(unittest.TestCase):
             cfg = self.cfg(tmp, state_dir=str(Path(tmp) / "here"))
             self.assertEqual(poll.transport_state_root(cfg), Path(tmp) / "here")
             os.environ["SWARMLY_STATE_ROOT"] = str(Path(tmp) / "env")
+            self.assertEqual(poll.transport_state_root(cfg), Path(tmp) / "here")   # said outright
+            cfg.state.dir = None
             self.assertEqual(poll.transport_state_root(cfg), Path(tmp) / "env")
 
     def test_state_dir_is_read_from_config(self):

@@ -15,7 +15,9 @@ from swarmly.transports.base import BusTransport, TransportError, is_envelope_na
 from swarmly.transports.folder import FolderTransport
 from swarmly.transports.git import BusPushError, GitTransport
 
-TRANSPORT_KINDS = ("git", "folder", "gdrive")
+#: ``telegram``: no envelope files at all -- the Telegram state store is the bus
+#: (docs/design/topic-registry.md); nothing is polled and no transport object is built.
+TRANSPORT_KINDS = ("git", "folder", "gdrive", "telegram")
 
 __all__ = [
     "BusPushError",

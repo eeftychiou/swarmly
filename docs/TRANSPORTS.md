@@ -5,7 +5,7 @@ Swarmly runs on two kinds of transport that work together:
 | | Durable plane | Instant plane |
 |---|---|---|
 | Carries | signed envelope files, the record | short messages, pointers, ACKs |
-| Transports | `git` (gitbus), `folder`, `gdrive` | Telegram |
+| Transports | `git` (gitbus), `folder`, `gdrive`, or none: `telegram` | Telegram |
 | Latency | the poll interval (`bus.poll_minutes`) | seconds |
 | If it is down | messages wait, nothing is lost | the durable copy is still delivered |
 | Read by | `bus-poll --once` and the transport tick | the running transport (`swarmly-telegram run`) |
@@ -21,10 +21,24 @@ revocation, addressing and the seen-ledger behave the same on every transport. L
 (locks, heartbeats, seen-ledgers, caches) always stays in `.agents/state/` of the agent's
 own checkout (`bus.repo`). It is never written to a shared folder.
 
-With no `bus.repo`, the state root is `SWARMLY_STATE_ROOT` when it is set, otherwise the
-checkout the transport runs from (`~/.a2a` for an installed wheel). The test suite sets it
-so parallel workers never share a state file. The run lock moves with it: every process for
-one agent on a host must see the same value, or two transports can each take their own lock.
+Where that state lives is its own setting, `state.dir`. Without it: `bus.repo`, then
+`SWARMLY_STATE_ROOT` (the test suite sets it so parallel workers never share a state file),
+then the folder of `config.yaml` (or the bus checkout a `swarmly --cli` join cloned there, so
+turning gitbus off keeps the state). Never a folder shared by several bots. The run lock moves
+with it: every process for one agent on a host must see the same value.
+
+### `telegram`: no files, the Telegram store is the bus
+
+```yaml
+bus:
+  transport: telegram       # no repo, no polling, no hand-off mirror files
+state:
+  backend: telegram         # required: the store in Swarm pulse is the bus
+  dir: /path/to/bot/state   # optional; default: the folder of config.yaml
+```
+
+The lease, the topic registry, routing, the owed table and agent stats live in the Telegram
+state store (docs/design/topic-registry.md). Nothing is read from or written to git.
 
 ### `git`: gitbus (default)
 

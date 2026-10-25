@@ -266,6 +266,9 @@ def transport_state_root(cfg: Any) -> Path:
     last resort is the checkout the transport runs from (``~/.a2a`` for an installed wheel),
     never the process CWD.
     """
+    explicit = getattr(getattr(cfg, "state", None), "dir", None)
+    if explicit:                                   # said outright: it wins
+        return Path(str(explicit)).expanduser()
     candidate = getattr(getattr(cfg, "bus", None), "repo", None) \
         or getattr(getattr(cfg, "fallback", None), "gitbus_root", None)
     if candidate:
@@ -273,9 +276,6 @@ def transport_state_root(cfg: Any) -> Path:
     override = os.environ.get("SWARMLY_STATE_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
-    explicit = getattr(getattr(cfg, "state", None), "dir", None)
-    if explicit:
-        return Path(str(explicit)).expanduser()
     source = getattr(cfg, "source_path", None)
     if source:
         home = Path(source).expanduser().resolve().parent

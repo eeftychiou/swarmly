@@ -257,12 +257,14 @@ class Membership:
 
     def joined(self) -> bool:
         """Whether this agent is past the handshake: it has a role and a bus to work on."""
+        if self.cfg.bus.transport == "telegram":
+            return bool(self.state.role)          # the Telegram store is the bus: nothing to set up
         return bool(self.state.role and self.bus_location() and self.bus_ready())
 
     def bus_ready(self) -> bool:
         """Whether this agent works on the bus: the launcher made its checkout, or the
         config names one (an agent set up by hand)."""
-        if self.state.bus_ready:
+        if self.state.bus_ready or self.cfg.bus.transport == "telegram":
             return True
         bus = self.cfg.bus
         return not self.dynamic and bool(bus.repo or (bus.transport == "folder" and bus.folder))
