@@ -5253,8 +5253,12 @@ class AgentChannel:
         cache = self.__dict__.setdefault("_bus_transports", {})
         if key not in cache:
             bus = self.config.bus
+            # With the Telegram store as the bus there is no envelope transport: the local
+            # helpers that still read files (the round store) get the plain local checkout,
+            # exactly as with no bus section at all (live, 25 Oct: the sweep raised).
+            kind = None if bus.transport == "telegram" else bus.transport
             cache[key] = build_transport(
-                bus.transport, repo=Path(root), ref=self.config.fallback.gitbus_ref,
+                kind, repo=Path(root), ref=self.config.fallback.gitbus_ref,
                 folder=bus.folder, gdrive=bus.gdrive,
                 state_dir=Path(root) / ".agents" / "state",
                 identity=tuple(self.config.identity.git_identity))
