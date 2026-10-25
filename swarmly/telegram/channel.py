@@ -7457,6 +7457,15 @@ class AgentChannel:
             self.topics.touch(event.chat_id, event.thread_id)
             if in_home_channel:
                 self.state_link.topic_seen(event.thread_id)  # open again, if it was closed
+        # Nothing to answer: no text and nothing attached is a service message (a topic opened
+        # or renamed, a pin). It has taught the name above and is never a turn. Live, 25 Oct:
+        # with registry routing the coordinator takes every person's message in a work topic,
+        # and it answered "your message reached me with no text".
+        if not (event.text or "").strip() and not event.attachments and not event.self_task:
+            self.stats.ignored += 1
+            logger.info("message %s in topic %s has no text and nothing attached; no turn",
+                        event.message_id, event.thread_id)
+            return None
         self._note_general_message(event.chat_id, event.message_id, event.thread_id)
         self.record_topic_turn(event.chat_id, event.thread_id, event.text or "")
         self._note_progress(event)
