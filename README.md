@@ -312,6 +312,7 @@ asyncio.run(main())
 | Durable transports (git, folder, Google Drive) and Telegram | [docs/TRANSPORTS.md](https://github.com/eeftychiou/swarmly/blob/main/docs/TRANSPORTS.md) |
 | Using Swarmly in another project | [docs/ADOPT.md](https://github.com/eeftychiou/swarmly/blob/main/docs/ADOPT.md) |
 | Telegram channel, adapters, rules | [docs/telegram-channel.md](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram-channel.md) |
+| Chat commands (one page) | [docs/telegram/COMMANDS.md](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/COMMANDS.md) |
 | Channel protocol v1.1 | [docs/telegram/PROTOCOL.md](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/PROTOCOL.md) |
 | Safe upgrade and rollback | [docs/telegram/UPGRADE.md](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/UPGRADE.md) |
 | Every document, by audience | [docs/README.md](https://github.com/eeftychiou/swarmly/blob/main/docs/README.md) |
