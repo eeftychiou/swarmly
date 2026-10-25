@@ -3546,11 +3546,12 @@ class AgentChannel:
         """
         try:
             block = self.lessons.block()
-            if not self.lessons.note_turn():
-                return f"\n\n[{block}]" if block else ""
-            instruction = self.lessons_update_instruction()
-            parts = [part for part in (block, instruction) if part]
-            return "\n\n[" + "\n".join(parts) + "]"
+            told = self.lessons.told()
+            told = f"After your last reply: {told}" if told else ""
+            due = self.lessons.note_turn()
+            instruction = self.lessons_update_instruction() if due else ""
+            parts = [part for part in (block, told, instruction) if part]
+            return "\n\n[" + "\n".join(parts) + "]" if parts else ""
         except Exception:                              # noqa: BLE001 - a turn without the note
             logger.debug("no memory note this turn", exc_info=True)
             return ""
@@ -5682,26 +5683,28 @@ class AgentChannel:
         """Take a ``MEMORY:`` block out of a reply and save it as this bot's lessons (#226).
 
         The block is removed in every case — a memory block is never posted, and one that is
-        over the cap must not appear in the channel as prose either. A refusal (too large, or
-        empty) keeps the old memory and says why *in the reply*, because a bot that believes
-        its lessons were saved stops carrying them.
+        over the cap must not appear in the channel as prose either. What became of it (saved,
+        or refused and why) is told to the bot in its next turn's prompt, never posted: a bot
+        that believes its lessons were saved stops carrying them, but the outcome is the bot's
+        feedback, not the people's (admin, 25 Oct). A refusal asks for the update again then.
         """
         from swarmly.telegram.lessons import extract_block
         body, memory, reason = extract_block(text or "")
         if memory is None and reason is None:
             return text
         notes: List[str] = []
+        saved = False
         if memory is not None:
             saved, said = self.lessons.save(memory)
-            # Not "MEMORY: ..." -- that is the marker `extract_block` opens on, and a reply
-            # that is nothing but notes would be read as a second block (review of #231).
+            # Not "MEMORY: ..." -- that is the marker `extract_block` opens on, and a note fed
+            # back into a turn must not read as a block to copy (review of #231).
             notes.append(("Memory updated: " if saved else "Memory refused: ") + said)
             logger.info("memory %s this turn (%d bytes)", "updated" if saved else "refused",
                         len(memory.encode("utf-8")))
         if reason:
             notes.append(f"Memory: {reason}")
-        joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
-        return joined
+        self.lessons.tell("\n".join(notes), refused=not saved)
+        return body
 
     def _round_summary(self, event: Optional[ChannelEvent]) -> str:
         """``/round[@bot] [issue]``: what the round waits on, and how old the state is."""
