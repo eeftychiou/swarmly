@@ -1320,6 +1320,9 @@ class AgentChannel:
         self._drop_notices[key] = now
         store = self.state_link.store
         holder = store.holder() if store is not None and store.ready else None
+        if holder:                                     # its own spelling, not the key's
+            from swarmly.state import keys as K
+            holder = str((store.read(K.agent(holder, "profile")) or {}).get("alias") or holder)
         coordinator = holder or "the coordinator"
         handle = self.config.identity.name.lstrip("@")
         await self.send(
@@ -5740,6 +5743,17 @@ class AgentChannel:
         from swarmly.telegram.owed import OwedStore
         from swarmly.telegram.wake import wake_dir_for
         root = self._gitbus_root()
+        if getattr(self.state_link, "owed_mode", "") == "store":
+            # Phase 3 (state.owed: store): this bot's own copy, and every bot's rows from the
+            # state store; nothing is pushed to gitbus. The bus documents already in the
+            # checkout are still read, never written: rows and closures from before the switch
+            # must not reopen or vanish (review). Switch every bot at once: a bot still on
+            # shadow reads gitbus only and would not see what the others now publish.
+            has_checkout = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+            return OwedStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
+                             transport=None, root=root if has_checkout else None,
+                             clock=time.time, shared=self.state_link.shared_owed_rows,
+                             published=self.state_link.published_owed_rows)
         has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
         return OwedStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
                          transport=self.bus_transport(root) if has_bus else None, root=root,
