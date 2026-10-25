@@ -316,7 +316,9 @@ class Row:
             state=str(data.get("state") or OPEN),
             closed_by=str(data.get("closed_by") or ""),
             writer=str(data.get("writer") or ""),
-            created_at=data.get("created_at") or 0.0,
+            # A stored row without its creation time is old, never "now": the fold lets a row
+            # created after a close beat that close, so a missing stamp must not read as new.
+            created_at=data.get("created_at") or data.get("updated_at") or 1.0,
             updated_at=data.get("updated_at") or 0.0, version=VERSION)
 
 
@@ -590,10 +592,13 @@ def fold(rows: Iterable[Row]) -> List[Row]:
     """One row per id across writers (#162 review).
 
     Two observers of the same debt write the same id in their own directories. The reader's
-    rule: **closed beats open** -- a debt answered is answered, whoever noticed first -- and
-    among two rows of the same state the newest ``updated_at`` wins, then the one that has an
-    ``observed`` value, then the highest writer name (so the fold is deterministic rather than
-    dependent on the order the files were read).
+    rule: **closed beats open** -- a debt answered is answered, whoever noticed first -- unless
+    the open row was *created* after that close: then it is the same debt owed again (a second
+    hand-off in one topic), not a stale copy. A sweep refreshing a stale open copy moves its
+    ``updated_at``, never its ``created_at``, so that cannot resurrect a settled debt (#298
+    review). Among two rows of the same state the newest ``updated_at`` wins, then the one that
+    has an ``observed`` value, then the highest writer name (so the fold is deterministic
+    rather than dependent on the order the files were read).
     """
     best: Dict[str, Row] = {}
     for row in rows:
@@ -601,8 +606,9 @@ def fold(rows: Iterable[Row]) -> List[Row]:
         if seen is None:
             best[row.id] = row
             continue
-        if seen.is_open and not row.is_open:
-            best[row.id] = row
+        if seen.is_open != row.is_open:
+            opened, closed = (seen, row) if seen.is_open else (row, seen)
+            best[row.id] = opened if opened.created_at > closed.updated_at else closed
             continue
         if seen.is_open == row.is_open:
             if (row.updated_at, bool(row.observed), str(row.writer).lower()) >                     (seen.updated_at, bool(seen.observed), str(seen.writer).lower()):

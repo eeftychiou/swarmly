@@ -913,7 +913,10 @@ class StateLink:
     async def sync_owed(self, store: Any, now: float) -> bool:
         """Write ``agent/<alias>/owed`` when this bot's rows changed. True if written."""
         key = K.agent(store.alias, "owed")
-        published = list((store.read(key) or {}).get("rows") or [])
+        own = store.read(key)
+        # A malformed own key is replaced, never a reason to stop publishing (#298 review).
+        published = [r for r in (own.get("rows") if isinstance(own, dict) else None) or []
+                     if isinstance(r, dict)]
         open_elsewhere: set = set()
         if self.owed_mode == "store":
             self._owed_snapshot = self._owed_dicts(store)

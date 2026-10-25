@@ -14,7 +14,7 @@ from tests.test_telegram_channel import make_channel, make_config
 
 def row(item, debtor, writer, state="open"):
     out = Row(kind="handoff", item=item, debtor=debtor, owes="a review", writer=writer,
-              key_extra="tg-7")
+              key_extra="tg-7", created_at=1000.0)       # old: before any test clock
     out.state = state
     return out
 
@@ -35,6 +35,34 @@ class SharedRowsTests(unittest.TestCase):
             self.assertIn("cannot read", store.summary())
 
 
+class FoldTests(unittest.TestCase):
+    """#298 review: a debt owed again after its close must not hide behind that close."""
+
+    def rows(self):
+        closed = row("#12", "deepseek", "deepseek", state="closed")
+        closed.created_at, closed.updated_at = 100.0, 200.0
+        return closed
+
+    def test_an_open_row_created_after_the_close_wins(self):
+        again = row("#12", "deepseek", "claudebot")
+        again.created_at = again.updated_at = 300.0
+        from swarmly.telegram.owed import fold
+        self.assertEqual([r.state for r in fold([self.rows(), again])], ["open"])
+        self.assertEqual([r.state for r in fold([again, self.rows()])], ["open"])
+
+    def test_a_stale_open_copy_still_loses_even_refreshed(self):
+        stale = row("#12", "deepseek", "claudebot")
+        stale.created_at, stale.updated_at = 50.0, 900.0          # a sweep touched it later
+        from swarmly.telegram.owed import fold
+        self.assertEqual([r.state for r in fold([stale, self.rows()])], ["closed"])
+
+    def test_a_stored_row_without_a_creation_time_is_old(self):
+        data = row("#12", "deepseek", "claudebot").to_dict()
+        data.pop("created_at")
+        data["updated_at"] = 150.0
+        self.assertEqual(Row.from_dict(data).created_at, 150.0)
+
+
 class StoreModeLinkTests(unittest.TestCase):
     def links(self):
         clock = Clock()
@@ -50,6 +78,7 @@ class StoreModeLinkTests(unittest.TestCase):
         state = Path(tmp) / name
         link.channel.owed_store = lambda: OwedStore(link.store.alias, state_dir=state,
                                                     root=Path(tmp) / f"bus-{name}",
+                                                    clock=link.clock,
                                                     shared=link.shared_owed_rows,
                                                     published=link.published_owed_rows)
         return link.channel.owed_store
@@ -81,6 +110,51 @@ class StoreModeLinkTests(unittest.TestCase):
                 return here, there
             here, there = asyncio.run(go())
         self.assertEqual((here, there), (["open"], ["open"]))
+
+    def test_a_re_opened_id_wins_over_a_peers_old_close(self):
+        """#298 review repro: the coordinator closes, the asker hands off again."""
+        clock, claude, deepseek = self.links()
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_store = self.holding(claude, tmp, "c")
+            deepseek_store = self.holding(deepseek, tmp, "d")
+
+            async def go():
+                await claude.store.start()
+                await deepseek.store.start()
+                first = row("#12", "deepseek", "claudebot")
+                first.created_at = first.updated_at = clock()
+                claude_store().save(first)
+                await claude.sync_owed(claude.store, clock())
+                await deepseek.store.refresh()
+                clock.t += 60
+                deepseek_store().save(row("#12", "deepseek", "claudebot", state="closed"))
+                await deepseek.sync_owed(deepseek.store, clock())
+                await claude.store.refresh()
+                clock.t += 60
+                again = row("#12", "deepseek", "claudebot")
+                again.created_at = again.updated_at = clock()
+                claude_store().save(again)
+                await claude.sync_owed(claude.store, clock())
+                await deepseek.store.refresh()
+                mine = [r.state for r in claude_store().load() if r.item == "#12"]
+                theirs = [r.state for r in deepseek_store().load() if r.item == "#12"]
+                return mine, theirs
+            mine, theirs = asyncio.run(go())
+        self.assertEqual((mine, theirs), (["open"], ["open"]))
+
+    def test_a_malformed_own_key_is_replaced(self):
+        clock, claude, _ = self.links()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.holding(claude, tmp, "c")
+
+            async def go():
+                await claude.store.start()
+                await claude.store.write("agent/claudebot/owed", ["not", "a", "table"])
+                store().save(row("#12", "deepseek", "claudebot"))
+                self.assertTrue(await claude.sync_owed(claude.store, clock()))
+                return claude.store.read("agent/claudebot/owed")
+            value = asyncio.run(go())
+        self.assertEqual([r["item"] for r in value["rows"]], ["#12"])
 
     def test_one_malformed_key_does_not_hide_the_table(self):
         clock, claude, deepseek = self.links()

@@ -82,3 +82,23 @@ class TestOneStillPausedNoticePerTopic(unittest.TestCase):
 
     def test_the_default_cap_allows_a_round_of_four_bots(self):
         self.assertEqual(make_config().limits.max_peer_turns_per_topic, 8)
+
+
+class TestARegistryReplyIsNeverMovedToGeneral(unittest.TestCase):
+    """Live, 25 Oct: a reply in a just-deleted topic went to General, named a peer there and
+    drew its General cooldown notice. With registry routing a reply stays in its topic."""
+
+    def test_the_post_is_dropped(self):
+        channel = make_channel()
+        channel._sender = None
+        channel.bot = DeadTopicBot()
+        channel.state_link.routing_mode = "registry"
+        run(channel.send("@reasonix_dd_bot thanks", thread_id=307))
+        self.assertEqual(channel.bot.accepted, [])
+
+    def test_general_turns_never_drops_it_too(self):
+        channel = make_channel(make_config(limits={"general_turns": "never"}))
+        channel._sender = None
+        channel.bot = DeadTopicBot()
+        run(channel.send("the answer", thread_id=307))
+        self.assertEqual(channel.bot.accepted, [])
