@@ -824,21 +824,46 @@ class Membership:
             self._onboard()           # else on the start that has the bus checkout
 
     # -- admin commands -------------------------------------------------------------------
+    async def _answer(self, event: "ChannelEvent", text: str) -> None:
+        """One line back to whoever sent the command, where they sent it."""
+        await self.ch.send(text, reply_to_message_id=event.message_id, chat_id=event.chat_id,
+                           thread_id=event.thread_id, allow_when_frozen=True,
+                           address_peers=False)
+
     async def handle_command(self, event: "ChannelEvent") -> bool:
-        """``/bus``, ``/role`` and ``/swarm`` from the admin; True when consumed."""
+        """``/bus`` and ``/role`` from the admin, and ``/swarm`` from anyone; True when consumed.
+
+        Every bot applies a ``/role``, ``/role@bot <role>`` included (that bot is the one it
+        names), so they all agree. A refusal or a malformed one is answered by the bot named,
+        or by the coordinator for a bare one: one line, not one per bot."""
         parsed = parse_command(event.text or "")
         if parsed is None or parsed[0] not in ("bus", "role", "swarm") or event.author_is_bot:
             return False
         command, target = parsed
-        if target and target.lstrip("@").lower() != self._me():
+        mine = bool(target) and str(target).lstrip("@").lower() == self._me()
+        if target and not mine and command != "role":
             return True
         if command == "role" and not command_args(event.text or ""):
             return False                              # plain /role: the diagnostic answer
+        speaks = mine if target else self.is_coordinator()
+        args = (event.text or "").split()[1:]
+        if command == "swarm":
+            # Anyone may ask (it changes nothing). With no coordinator every agent answers, but
+            # not a newcomer still joining: it knows nothing yet (live test: a starting agent
+            # answered a /swarm from its backlog with "bus: unknown, coordinator: none" while
+            # the coordinator was up).
+            joining = self.dynamic and not self.joined()
+            if self.is_coordinator() or target or (not self.state.coordinator and not joining):
+                # It lists every bot by name: an answer, never a call to each of them.
+                await self.ch.send(await self.status_text(),
+                                   reply_to_message_id=event.message_id, address_peers=False)
+            return True
         if not self.cfg.is_admin(event.author_id):
             logger.warning("/%s from @%s ignored: only the admin changes the swarm", command,
                            event.author_username)
+            if speaks:
+                await self._answer(event, f"⛔ only the admin can use /{command}")
             return True
-        args = (event.text or "").split()[1:]
         if command == "bus":
             if args:
                 if not self.dynamic:
@@ -850,27 +875,27 @@ class Membership:
                     self.state.bus_ready = False          # a new bus: set it up again
                 await self.adopt_bus(args[0])
             return True
-        if command == "swarm":
-            # With no coordinator every agent answers, but not a newcomer still joining: it
-            # knows nothing yet (live test: a starting agent answered a /swarm from its
-            # backlog with "bus: unknown, coordinator: none" while the coordinator was up).
-            joining = self.dynamic and not self.joined()
-            if self.is_coordinator() or target or (not self.state.coordinator and not joining):
-                # It lists every bot by name: an answer, never a call to each of them.
-                await self.ch.send(await self.status_text(),
-                                   reply_to_message_id=event.message_id, address_peers=False)
-            return True
         handles = [a.lstrip("@") for a in args if a.startswith("@")]
+        if not handles and target:
+            handles = [str(target).lstrip("@")]           # /role@bot <role>
         roles = [a for a in args if not a.startswith("@")]
         if len(handles) != 1 or len(roles) != 1 or not _ROLE_NAME(roles[0].lower()):
+            if speaks:
+                await self._answer(event, "/role takes one bot and one role: "
+                                          "/role @bot <role>, or /role@bot <role>")
             return True
         role = roles[0].lower()
         if role not in self._role_names():
             logger.warning("/role: unknown role %r", role)
+            if speaks:
+                await self._answer(event, f"/role: there is no role {role}; the roles are "
+                                          f"{', '.join(self._role_names()) or 'none'}")
             return True
         mine = handles[0].lower() == self._me()
         alias = self.alias if mine else self.cfg.peer_alias_for(handles[0])
         if alias is None:
+            if speaks:
+                await self._answer(event, f"/role: @{handles[0]} is not a bot of this swarm")
             return True
         if role == "coordinator":
             self._demote_coordinators(but=alias)

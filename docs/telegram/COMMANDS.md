@@ -11,6 +11,7 @@ of its messages, or with `@bot` in it. Most commands need that: a bare `/status`
 `/release`, `/topic` and `/swarm` the coordinator answers. The topic-registry commands
 (`/link`, `/unlink`, `/phase`) are written by the bot holding the state store's lease.
 "Admin" means only `agent.admin_user_id` may use it; anyone in the swarm may use the rest.
+Anyone else who names a bot gets a one-line "⛔ only the admin" refusal from it.
 
 **The `/` menu adds the bot.** In a group with several bots, Telegram sends a command picked
 from the menu as `/cmd@thatbot`. That is right for the commands below that name a bot, but
@@ -52,7 +53,7 @@ all) taking turns; **hold** keeps everyone answering but starting nothing new.
 |---|---|
 | `/model@bot` (admin to set) | Show the model this bot runs in this topic; `/model@bot <name>` switches it from the next turn (`default` goes back). |
 | `/reasoning@bot` (admin to set) | The same for reasoning effort (`low` … `max`, `default`). `/effort@bot` is the same command. |
-| `/role@bot` | Show a bot's role and the team's. The admin sets one with `/role @bot <role>`: the bot's handle goes after the command, not on it. `/role @bot coordinator` names a new coordinator, and the old one becomes a developer. |
+| `/role@bot` | Show a bot's role and the team's. The admin sets one with `/role@bot <role>` (or `/role @bot <role>`); every bot applies it. `/role @bot coordinator` names a new coordinator, and the old one becomes a developer. |
 
 ## Topics and work items (the topic registry)
 

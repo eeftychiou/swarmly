@@ -1313,6 +1313,11 @@ class AgentChannel:
         if not self.config.is_admin(event.author_id):
             logger.warning("/%s from @%s ignored: only the admin changes the swarm",
                            command, event.author_username)
+            if target or self.is_coordinator():
+                # The bot named, or the coordinator for a bare one: one line, not one per bot.
+                await self.send(f"⛔ only the admin can use /{command}",
+                                reply_to_message_id=event.message_id, chat_id=event.chat_id,
+                                thread_id=event.thread_id, allow_when_frozen=True)
             return True
         if command == "sync":
             await self._sync_now(chat_id=event.chat_id, thread_id=event.thread_id)
@@ -8088,7 +8093,8 @@ class AgentChannel:
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
                 return None
-        elif not (self.mentions_me(event.text or "") or event.replies_to_bot):
+        elif not (self.mentions_me(event.text or "") or event.replies_to_bot
+                  or self._direct_chat(event)):
             return None
         return command
 
