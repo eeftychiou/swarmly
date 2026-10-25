@@ -5,7 +5,6 @@ Integration tests for Fast-Plane WebSocket Gateway Server, Authentication, and C
 import asyncio
 import json
 import os
-import socket
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -90,13 +89,15 @@ class TestServerClientIntegration(unittest.IsolatedAsyncioTestCase):
 
         self.bus = DurableBus(root_dir=self.root_path, config_path=self.config_path)
 
-        # A free port per test: one fixed port collided when two workers ran this class.
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.port = probe.getsockname()[1]
-        self.server = A2AGatewayServer(host="127.0.0.1", port=self.port, bus=self.bus)
+        # Port 0 and read back what was bound: one fixed port collided when two workers ran
+        # this class (as in test_gateway_hardening).
+        self.server = A2AGatewayServer(host="127.0.0.1", port=0, bus=self.bus)
         self.server_task = asyncio.create_task(self.server.start())
-        await asyncio.sleep(0.05)  # Allow server to bind
+        for _ in range(100):
+            if self.server.server and self.server.server.sockets:
+                break
+            await asyncio.sleep(0.01)
+        self.port = self.server.server.sockets[0].getsockname()[1]
 
     async def asyncTearDown(self):
         await self.server.stop()
