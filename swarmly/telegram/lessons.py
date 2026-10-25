@@ -18,8 +18,12 @@ Where it lives:
   ``WAIT`` line or a ``ROUND_STATE`` block, it is never posted — and saved.
 * **The cap** is ``limits.memory_max_bytes`` (2048 by default), counted in UTF-8 bytes. A
   block past it is **refused**: the old memory stays, and the bot is told the size and asked
-  to compress next time. It is never truncated silently, because a half-cut lesson reads as a
-  whole one.
+  to compress. It is never truncated silently, because a half-cut lesson reads as a whole one.
+* **The outcome** (saved, refused and why) is told to the bot in its *next* turn's prompt,
+  never posted: it is the bot's feedback, not the people's (admin, 25 Oct: "Memory refused"
+  lines in a work topic). A refusal asks for the update again on that next turn, once; a
+  second refusal in a row waits for the normal count, so a bot that cannot compress is not
+  asked on every turn.
 
 Lessons, not logs: one line each, what happened and what to do next time.
 """
@@ -158,8 +162,14 @@ class Lessons:
         self.counter_path = turns_path(config)
         self.memory = self._load()
         state = load_state(self.counter_path, "memory turn counter") if self.counter_path else {}
-        self.since_asked = int(state.get("since_asked", 0) or 0) if isinstance(state, dict) else 0
-        self.turns = int(state.get("turns", 0) or 0) if isinstance(state, dict) else 0
+        state = state if isinstance(state, dict) else {}
+        self.since_asked = int(state.get("since_asked", 0) or 0)
+        self.turns = int(state.get("turns", 0) or 0)
+        #: What became of the last memory block, for the next turn's prompt; "" once told.
+        self.said = str(state.get("said") or "")
+        #: Ask for the update again on the next turn (one refusal in a row, not more).
+        self.again = bool(state.get("again"))
+        self.refusals = int(state.get("refusals", 0) or 0)
 
     # -- the file ----------------------------------------------------------------------
     def _load(self) -> str:
@@ -189,8 +199,8 @@ class Lessons:
         if size > self.max_bytes:
             return False, (
                 f"your memory is unchanged: that block is {size} bytes and the cap is "
-                f"{self.max_bytes}. Compress it next time — keep the lessons that still hold "
-                f"and drop the rest.")
+                f"{self.max_bytes}. Compress it on your next update — keep the lessons that "
+                f"still hold and drop the rest.")
         if self.path is None:
             self.memory = memory                     # no state folder: kept for this run
             return True, "memory updated for this run only (no state folder to keep it in)"
@@ -212,16 +222,41 @@ class Lessons:
                 return f"memory not cleared: {exc}"
         return "memory cleared: the file is empty now"
 
+    # -- what became of a block -----------------------------------------------------------
+    def tell(self, note: str, *, refused: bool) -> None:
+        """Keep the outcome of a memory block for the bot's next turn, where it is told.
+
+        A refusal asks for the update again on that turn, but only the first in a row: a bot
+        whose re-asked block is refused too goes back to the normal count.
+        """
+        self.said = (note or "").strip()
+        if refused:
+            self.refusals += 1
+            self.again = self.refusals <= 1
+        else:
+            self.refusals = 0
+            self.again = False
+        self._save_counter()
+
+    def told(self) -> str:
+        """The outcome kept by :meth:`tell`, once: "" afterwards."""
+        said, self.said = self.said, ""
+        if said:
+            self._save_counter()
+        return said
+
     # -- the turn counter ---------------------------------------------------------------
     def note_turn(self) -> bool:
-        """Count this turn; True when an update is due, which is at most once every N."""
+        """Count this turn; True when an update is due: every N turns, or right after a
+        refused block (once)."""
         self.turns += 1
         self.since_asked += 1
-        due = self.since_asked >= self.every_turns
+        due = self.again or self.since_asked >= self.every_turns
         if due:
             # Reset on the *ask*, not on the write: a bot that ignores the instruction must
             # not be asked on every turn from then on.
             self.since_asked = 0
+            self.again = False
         self._save_counter()
         return due
 
@@ -229,7 +264,8 @@ class Lessons:
         if self.counter_path is None:
             return
         save_state(self.counter_path,
-                   {"turns": self.turns, "since_asked": self.since_asked},
+                   {"turns": self.turns, "since_asked": self.since_asked, "said": self.said,
+                    "again": self.again, "refusals": self.refusals},
                    "memory turn counter")
 
 

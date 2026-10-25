@@ -185,17 +185,59 @@ class TestTheTurnPrompt(unittest.TestCase):
             self.assertIn("Your lessons so far", reply)
             self.assertIn(LESSON, reply)
 
-    def test_an_oversize_block_is_refused_in_the_reply_and_nothing_is_posted(self):
+    def oversize(self, channel, head="PR #229 is up."):
+        return channel.apply_memory_block(
+            f"{head}\n\nMEMORY:\n" + "\n".join([LESSON] * 4) + f"\n{END_MARKER}",
+            event("@HermesBot: ship it"))
+
+    def test_an_oversize_block_is_refused_and_nothing_of_it_is_posted(self):
+        """Admin, 25 Oct: "Memory refused" lines in a work topic were the bot's feedback in
+        the people's chat. The reply keeps only its point; the refusal waits for the bot."""
         with TemporaryDirectory() as tmp:
             channel = self.channel(tmp, memory_max_bytes=100)
             channel.lessons.save(LESSON)
-            body = channel.apply_memory_block(
-                f"PR #229 is up.\n\nMEMORY:\n" + "\n".join([LESSON] * 4) + f"\n{END_MARKER}",
-                event("@HermesBot: ship it"))
-            self.assertIn("PR #229 is up.", body)
-            self.assertIn("Memory refused", body)
-            self.assertNotIn(LESSON, body)
+            body = self.oversize(channel)
+            self.assertEqual(body, "PR #229 is up.")
             self.assertEqual(channel.lessons.text(), LESSON)   # the old memory stands
+
+    def test_the_refusal_is_told_on_the_next_turn_with_the_update_asked_again(self):
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, memory_max_bytes=100, memory_every_turns=99)
+            channel.lessons.save(LESSON)
+            self.oversize(channel)
+            note = channel._memory_note()
+            self.assertIn("After your last reply: Memory refused", note)
+            self.assertIn("the cap is 100", note)
+            self.assertIn("Update your memory now", note)     # compress it on this turn
+            later = channel._memory_note()
+            self.assertNotIn("Memory refused", later)          # told once
+            self.assertNotIn("Update your memory now", later)  # and asked once
+
+    def test_a_second_refusal_in_a_row_waits_for_the_count(self):
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, memory_max_bytes=100, memory_every_turns=99)
+            channel.lessons.save(LESSON)
+            self.oversize(channel)
+            self.assertIn("Update your memory now", channel._memory_note())
+            self.oversize(channel)                             # the re-asked block, too big
+            note = channel._memory_note()
+            self.assertIn("Memory refused", note)
+            self.assertNotIn("Update your memory now", note)
+
+    def test_the_refusal_survives_a_restart(self):
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, memory_max_bytes=100, memory_every_turns=99)
+            channel.lessons.save(LESSON)
+            self.oversize(channel)
+            restarted = self.channel(tmp, memory_max_bytes=100, memory_every_turns=99)
+            note = restarted._memory_note()
+            self.assertIn("Memory refused", note)
+            self.assertIn("Update your memory now", note)
+
+    def test_a_reply_that_is_only_a_refused_block_posts_nothing(self):
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, memory_max_bytes=100)
+            self.assertEqual(self.oversize(channel, head=""), "")
 
     def test_a_memory_block_does_not_eat_the_lines_that_follow_it(self):
         """#226 review: with no END MEMORY the block runs to the end of the reply.
@@ -227,10 +269,11 @@ class TestTheTurnPrompt(unittest.TestCase):
             channel = self.channel(tmp)
             body = channel.apply_memory_block(
                 f"Review is in.\n\nMEMORY:\n{LESSON}\n{END_MARKER}", event("hi"))
-            self.assertEqual(body.splitlines()[0], "Review is in.")
-            self.assertNotIn(LESSON, body)
-            self.assertIn("Memory updated", body)
+            self.assertEqual(body, "Review is in.")
             self.assertEqual(channel.lessons.text(), LESSON)
+            note = channel._memory_note()
+            self.assertIn("After your last reply: Memory updated", note)
+            self.assertNotIn("Update your memory now", note)  # a saved block is not re-asked
 
 
 class TestTheMemoryCommand(unittest.TestCase):

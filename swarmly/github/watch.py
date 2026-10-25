@@ -1258,6 +1258,9 @@ class GitHubWatcher:
 
     #: A PR's body must name the issue it closes.
     _CLOSES = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)")
+    #: ...or the larger issue it is one step of: a phase PR must not close the whole roadmap
+    #: issue (live, 25 Oct: #298, "Part of #260", was flagged). One issue may have several.
+    _PART_OF = re.compile(r"(?i)\bpart\s+of\s+#\d+")
     #: Test removal and skipping a PR adds (unified diff lines).
     _TEST_REMOVED = re.compile(r"^-\s*(?:async\s+)?def\s+test_", re.M)
     _TEST_ADDED = re.compile(r"^\+\s*(?:async\s+)?def\s+test_", re.M)
@@ -1266,9 +1269,10 @@ class GitHubWatcher:
     async def _check_new_prs(self, project: Any, router: Optional[ProjectRouter],
                              outcome: GitHubPollOutcome) -> None:
         """The rulebook's PR rules, checked once per PR head on the lease holder's poll
-        (admin, 24 Oct): the PR names the issue it closes, one open PR per issue, and no test
-        is deleted or skipped without a word. A finding is a PR comment and a line in the PR's
-        topic, so it reaches the author's and the coordinator's token space."""
+        (admin, 24 Oct): the PR names the issue it closes (or is part of), one open PR per
+        issue, and no test is deleted or skipped without a word. A finding is a PR comment and
+        a line in the PR's topic, so it reaches the author's and the coordinator's token
+        space."""
         lister = getattr(self.client, "open_prs", None)
         repo = str(getattr(project, "repo", "") or "")
         if not callable(lister) or not repo:
@@ -1292,8 +1296,9 @@ class GitHubWatcher:
             changed = True
             findings: List[str] = []
             refs = sorted(set(self._CLOSES.findall(str(pr.get("body") or ""))), key=int)
-            if not refs:
-                findings.append("it names no issue it closes (`Closes #N` in the body)")
+            if not refs and not self._PART_OF.search(str(pr.get("body") or "")):
+                findings.append("it names no issue it closes (`Closes #N` in the body, or "
+                                "`Part of #N` for one step of a larger issue)")
             for ref in refs:
                 others = [n for n in closes.get(ref, []) if n != number]
                 if others:
