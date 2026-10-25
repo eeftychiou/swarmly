@@ -779,6 +779,7 @@ class OwedStore:
         """
         self._unreadable = []
         rows: List[Row] = self.held(self._unreadable)
+        in_directory = {row.id for row in rows}
         on_store = self.shared is not None
         if self.root is not None:
             # On the store, this bot's state directory is the truth for the ids it holds: its own
@@ -786,20 +787,23 @@ class OwedStore:
             # hide a re-opened id for good -- #298 review). For every other id the document still
             # counts: some closures exist only there (live, 25 Oct: skipping them all brought
             # back debts settled the day before).
-            own = (self.safe_alias, {row.id for row in rows}) if on_store else None
+            own = (self.safe_alias, in_directory) if on_store else None
             rows.extend(self._read_documents(self.root, self._unreadable, skip=own))
         if on_store:
-            held = {row.id for row in rows}
             try:
                 rows.extend(self.shared())
                 if self.published is not None:
-                    rows.extend(row for row in self.published() if row.id not in held)
-            except RuntimeError as exc:              # not ready yet (a start): no traceback
+                    # What this bot published fills the ids its directory lost, and is folded
+                    # with any old bus document for them: a re-open published after the
+                    # switch was created after that close and wins (#328 review). Filtering by
+                    # the ids the documents added would drop it for a closed copy.
+                    rows.extend(row for row in self.published() if row.id not in in_directory)
+            except Exception as exc:                 # noqa: BLE001 - never "nothing is owed"
                 self._unreadable.append("state store")
-                logger.info("owed: the store's rows cannot be read yet: %s", exc)
-            except Exception:                        # noqa: BLE001 - never "nothing is owed"
-                self._unreadable.append("state store")
-                logger.warning("owed: the store's rows could not be read", exc_info=True)
+                if type(exc) is RuntimeError:        # not ready yet (a start): no traceback
+                    logger.info("owed: the store's rows cannot be read yet: %s", exc)
+                else:                                # a subclass (RecursionError, ...) is a bug
+                    logger.warning("owed: the store's rows could not be read", exc_info=True)
         return fold(rows)
 
     def held(self, unreadable: Optional[List[str]] = None) -> List[Row]:
