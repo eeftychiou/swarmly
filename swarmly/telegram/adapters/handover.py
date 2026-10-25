@@ -53,6 +53,8 @@ NO_HANDOVER_LEAD = (
 
 #: A handover reply shorter than this is not a handover.
 MIN_HANDOVER_CHARS = 80
+#: An index entry holding the whole lead (handover with its prefix), not a file path.
+RAW = "raw:"
 
 
 class Handovers:
@@ -92,10 +94,22 @@ class Handovers:
     def pending(self, context_id: str) -> bool:
         return context_id in self._pending
 
-    def save(self, context_id: str, text: Optional[str]) -> Optional[Path]:
+    def save(self, context_id: str, text: Optional[str], prefix: str = "") -> Optional[Path]:
         """Keep the handover for the topic's next session; ``None`` or a stub records that
-        the old session wrote none."""
+        the old session wrote none. ``prefix`` goes ahead of it in the new session's first
+        prompt (a drift reset: the broken rules and the registry's facts, which win over
+        anything the handover claims)."""
         text = (text or "").strip()
+        if prefix:
+            usable = len(text) >= MIN_HANDOVER_CHARS
+            body = prefix.rstrip() + "\n\n" + (TAKEOVER_LEAD + text + TAKEOVER_END if usable
+                                                else NO_HANDOVER_LEAD)
+            path = self._write(context_id, text) if usable else None
+            self._pending[context_id] = RAW + body
+            self._save_index()
+            logger.info("%s: handover for %s saved with its lead%s", self.alias, context_id,
+                        f" ({path})" if path else " (no usable handover)")
+            return path
         if len(text) < MIN_HANDOVER_CHARS:
             self._pending[context_id] = ""
             self._save_index()
@@ -120,11 +134,27 @@ class Handovers:
                     f" to {path}" if path else "")
         return path
 
+    def _write(self, context_id: str, text: str) -> Optional[Path]:
+        if self.folder is None:
+            return None
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        safe = re.sub(r"[^\w.-]", "_", f"{context_id}-{self.alias.lower()}")
+        path = self.folder / f"{safe}-{stamp}.md"
+        try:
+            self.folder.mkdir(parents=True, exist_ok=True)
+            path.write_text(text + "\n", encoding="utf-8")
+        except OSError:
+            logger.warning("%s: could not write the handover file", self.alias, exc_info=True)
+            return None
+        return path
+
     def lead(self, context_id: str) -> str:
         """What goes ahead of the new session's first prompt ("" when nothing is pending)."""
         if context_id not in self._pending:
             return ""
         held = self._pending[context_id]
+        if held.startswith(RAW):
+            return held[len(RAW):] + "\n\n"
         if not held:
             return NO_HANDOVER_LEAD
         text = held

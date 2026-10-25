@@ -2677,13 +2677,14 @@ class AgentChannel:
                 out[alias] = (role, ranked[0])
         return out
 
-    def _drift_note(self) -> str:
-        """The broken rules, quoted back while this bot's drift score is over the line."""
+    def _drift_note(self, event: Optional[ChannelEvent] = None) -> str:
+        """The broken rules, quoted back while this topic's session is over the line."""
+        topic = f"{event.chat_id}:{event.thread_id}" if event is not None else None
         try:
             self.drift.fold_inbox()
-            if not self.drift.decide().remind:
+            if not self.drift.decide(topic).remind:
                 return ""
-            text = self.drift.reminder()
+            text = self.drift.reminder(topic)
         except Exception:                                  # noqa: BLE001 - a note, not a turn
             logger.debug("drift: no reminder this turn", exc_info=True)
             return ""
@@ -2711,23 +2712,52 @@ class AgentChannel:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        # The broken rules, quoted before the mark clears them: the new session starts with
+        # them (docs/design/topic-registry.md, "Drift reset = handover rotation").
+        reminder = self.drift.reminder(f"{chat_id}:{thread_id}")
         # Marked now, not when the task runs: two violations in one reply must reset once.
         self.drift.mark_reset(f"{chat_id}:{thread_id}")
-        task = loop.create_task(self._drift_reset(chat_id, thread_id, decision))
+        task = loop.create_task(self._drift_reset(chat_id, thread_id, decision, reminder))
         self._self_tasks.add(task)
 
-    async def _drift_reset(self, chat_id: int, thread_id: Optional[int], decision: Any) -> None:
-        """Retire this topic's session after repeated violations: the next turn starts a new
-        one, which reads the rulebook again (a fresh-session runtime gets it every turn)."""
+    async def _drift_reset(self, chat_id: int, thread_id: Optional[int], decision: Any,
+                           reminder: str = "") -> None:
+        """Retire this topic's session after repeated violations, as a handover rotation: the
+        old session writes its handover, and the new one starts from the rulebook (its rules,
+        read fresh), the rules it broke, the registry's facts about the topic, then the
+        handover (docs/design/topic-registry.md, "Drift reset = handover rotation")."""
         context_id = self.topics.context(chat_id, thread_id)
+        adapter = self._adapter_for(chat_id, thread_id)
+        rotate = getattr(adapter, "rotate", None)
+        rotated = False
         try:
-            self._adapter_for(chat_id, thread_id).forget_session(context_id)
+            if context_id and callable(rotate):
+                prefix = "\n\n".join(part for part in (
+                    "[A drift reset retired your previous session for this topic. Read your "
+                    "rulebook again and follow it.]",
+                    reminder,
+                    self.state_link.registry_facts(chat_id, thread_id)) if part)
+                template = IncomingMessage(
+                    text="", author_alias=self.config.identity.alias, context_id=context_id,
+                    mentions=dict(self.config.peers),
+                    maintainer_username=getattr(self.config.identity, "maintainer_username",
+                                                None))
+                rotated = bool(await rotate(context_id, template, prefix))
+            else:
+                adapter.forget_session(context_id)
         except Exception:                                  # noqa: BLE001 - the notice still goes
             logger.warning("drift: could not retire the session for %s", context_id,
                            exc_info=True)
+            try:
+                adapter.forget_session(context_id)
+            except Exception:                              # noqa: BLE001
+                pass
         alias = self.config.identity.alias
+        how = ("its old session wrote a handover, and the new one starts from the rulebook, "
+               "the broken rules and that handover" if rotated else
+               "it re-reads the rulebook from a fresh session next turn")
         await self.send(f"♻️ {alias}: context reset after {decision.score} points of rule "
-                        "violations; it re-reads the rulebook from a fresh session next turn.",
+                        f"violations; {how}.",
                         chat_id=chat_id, thread_id=thread_id, silent=True, notice=True)
         if decision.resets_today + 1 >= 3:
             home = self.config.identity.home_channel_id
@@ -7604,7 +7634,7 @@ class AgentChannel:
             text += self._waiting_note(event.text)
         text += self._frozen_peers_note()
         text += self._hold_note()
-        text += self._drift_note()
+        text += self._drift_note(event)
         text += self.state_link.registry_note(event.chat_id, event.thread_id)
         text += self._swarm_usage_note()
         text += self._memory_note()
