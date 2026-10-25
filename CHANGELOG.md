@@ -173,6 +173,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A **Topics panel** on the local dashboard (`#332`): one card per open work topic from the
+  state store's registry — most recently active first, with the topic's name, each link's ref,
+  status, phase and assignees, and each binding's agent, role, turns since its session was
+  last rotated and drift score. A work item whose phase has not moved for
+  `limits.stall_minutes` reads **stalled**, using the stall ladder's own threshold; a binding
+  at its profile's `max_turns`/`max_age_hours` or over the drift reset line carries a
+  **rotation due** badge. The records are the ones `/topics` reads (`topic/<id>`,
+  `agent/<alias>/profile`), so a refresh costs no model turn and no gitbus read, and a
+  `PHASE:` change shows on the next poll. Only public refs reach the wire — a `local` link's
+  ref is a path, so only its title is published — and only this bot's own drift score is
+  known, a peer's staying `null`. A store that is not ready says **registry not ready**
+  rather than drawing an empty panel.
+
 - The dashboard page as a **Telegram Mini App** (`#240`, slice 2): set `web.public_host` to the
   name a tunnel gives the host and the pinned card grows an **Open dashboard** button
   (`web_app`), whose URL is `https://<public_host>/` — `web.port` is the loopback port the

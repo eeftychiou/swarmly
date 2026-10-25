@@ -18,11 +18,83 @@ import urllib.request
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
+from swarmly.state import keys as K
+from swarmly.state.records import (AgentInTopic, Assignment, Binding, Link, Profile, Topic)
 from swarmly.telegram import webui
+from swarmly.telegram.config import ChannelLimits
 from swarmly.telegram.rounds import RoundState
 from swarmly.telegram.snapshot import BUSY, DOWN, FROZEN, IDLE, PAUSED, STUCK, Snapshot
 
 NOW = 1_700_000_000.0
+
+#: The fixed registry records the panel is built from (two topics, one stalled, one due).
+CHAT = -1001234567890123
+THREAD = 19286
+OTHER = 4242
+SECRET_PATH = r"C:\Users\eftyc\swarm\notes.md"
+
+
+def iso(at: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+
+class FakeStore:
+    """A stand-in for the shared state store: just ``ready``, ``keys`` and ``read``."""
+
+    def __init__(self, data: Dict[str, Any], *, ready: bool = True) -> None:
+        self.data = dict(data)
+        self.ready = ready
+
+    def keys(self, prefix: str = "") -> list:
+        return sorted(key for key in self.data if key.startswith(prefix))
+
+    def read(self, key: str) -> Optional[Dict[str, Any]]:
+        return self.data.get(key)
+
+
+def records(*, phase_at: float = NOW - 3600, last_activity: Optional[str] = None,
+            max_turns: int = 50) -> Dict[str, Any]:
+    """Two open topics: a stalled work item, a reference, a local path, a due binding."""
+    def work(link_id: str, ref: str, kind: str, phase: str, at: float) -> Link:        return Link(id=link_id, provider="github", kind=kind, ref=ref, role="work", title=ref,
+                    added_by="Claudebot", added_at=iso(NOW - 7200), status="open", phase=phase,
+                    phase_at=iso(at), assignees=[
+                        Assignment(agent="DeepSeek", role="developer", assigned_by="Claudebot",
+                                   assigned_at=iso(NOW - 7200))])
+
+    dashboard = Topic(
+        topic_id=THREAD, chat_id=CHAT, title="Dashboard", status="open", opened_by="Claudebot",
+        opened_at=iso(NOW - 86400), last_activity=(iso(NOW - 60) if last_activity is None
+                                                   else last_activity),
+        links=[work("L1", "#332", "issue", "review", phase_at),
+               Link(id="L2", provider="github", kind="issue",
+                    ref="https://github.com/eeftychiou/swarmly/issues/240", role="reference",
+                    title="#240", added_by="Claudebot", added_at=iso(NOW - 7200)),
+               Link(id="L3", provider="local", kind="file", ref=SECRET_PATH, role="reference",
+                    title="UX notes", added_by="admin", added_at=iso(NOW - 7200))],
+        agents={"Claudebot": Binding(role="coordinator", runtime="claude", model="opus",
+                                     effort="high", linked_by="transport",
+                                     linked_at=iso(NOW - 7200)),
+                "DeepSeek": Binding(role="developer", runtime="reasonix", model="deepseek",
+                                    effort="low", linked_by="Claudebot",
+                                    linked_at=iso(NOW - 7200))})
+    registry = Topic(
+        topic_id=OTHER, chat_id=CHAT, title="Registry", status="open", opened_by="Claudebot",
+        opened_at=iso(NOW - 86400), last_activity=iso(NOW - 7200),
+        links=[work("L1", "#335", "pr", "development", NOW - 60)])
+    closed = Topic(topic_id=999, chat_id=CHAT, title="Closed work", status="closed",
+                   opened_by="Claudebot", opened_at=iso(NOW - 86400),
+                   last_activity=iso(NOW - 60))
+    session = AgentInTopic(session_id="20261025-deepseek", started_at=iso(NOW - 3600),
+                           turns=7, rotations=1)
+    profile = Profile(alias="DeepSeek", handle="@DeepSeek_dd_bot", runtime="reasonix",
+                      default_model="deepseek", max_turns=max_turns)
+    return {
+        K.topic(THREAD): dashboard.to_dict(),
+        K.topic(OTHER): registry.to_dict(),
+        K.topic(999): closed.to_dict(),
+        K.topic_agent(THREAD, "DeepSeek"): session.to_dict(),
+        K.agent("DeepSeek", "profile"): profile.to_dict(),
+    }
 
 
 def snap(alias: str, state: str = IDLE, **fields: Any) -> Snapshot:
@@ -288,6 +360,102 @@ class TestTheServer(unittest.TestCase):
             server.stop()
 
 
+class TestTheTopicsPanel(unittest.TestCase):
+    """#332: one card per open topic, read from the store's registry and nothing else."""
+
+    def store(self, *, ready: bool = True) -> Any:
+        return FakeStore(records(), ready=ready)
+
+    def panel(self, **fields: Any) -> Dict[str, Any]:
+        base: Dict[str, Any] = dict(now=NOW, store=self.store(),
+                                    drift={(THREAD, "deepseek"): {"score": 6, "hard": 1}})
+        base.update(fields)
+        return webui.registry_panel(**base)
+
+    def test_one_card_per_open_topic_with_its_links_status_phase_and_assignees(self):
+        cards = self.panel()["topics"]
+        self.assertEqual([card["topic"] for card in cards], ["Dashboard", "Registry"])
+        dashboard = cards[0]
+        self.assertEqual([link["id"] for link in dashboard["links"]], ["L1", "L2", "L3"])
+        work = dashboard["links"][0]
+        self.assertEqual((work["ref"], work["status"], work["phase"]),
+                         ("#332", "open", "review"))
+        self.assertEqual(work["assignees"], [{"agent": "DeepSeek", "as": "developer"}])
+        self.assertEqual(cards[1]["links"][0]["phase"], "development")
+
+    def test_most_recently_active_topic_comes_first(self):
+        topics = self.panel()["topics"]
+        self.assertLess(topics[0]["updated"], topics[1]["updated"])
+        self.assertEqual(topics[0]["updated"], 60.0)
+        # A topic that never said when it was active goes last, and is not made a zero.
+        records_quiet = records(last_activity="")
+        cards = webui.registry_panel(now=NOW, store=FakeStore(records_quiet))["topics"]
+        self.assertEqual(cards[-1]["topic"], "Dashboard")
+        self.assertIsNone(cards[-1]["updated"])
+
+    def test_an_item_with_no_phase_change_past_the_nudge_threshold_is_stalled(self):
+        self.assertEqual(webui.STALL_SECONDS, ChannelLimits().stall_minutes * 60.0)
+        cards = self.panel()["topics"]
+        self.assertTrue(cards[0]["links"][0]["stalled"])       # review, an hour ago
+        self.assertFalse(cards[1]["links"][0]["stalled"])      # development, a minute ago
+        self.assertTrue(cards[0]["stalled"])
+        self.assertFalse(cards[1]["stalled"])
+        self.assertFalse(cards[0]["links"][1].get("stalled"))   # a reference has no phase
+
+    def test_a_phase_change_clears_the_stall(self):
+        fresh = records(phase_at=NOW - 60)
+        cards = webui.registry_panel(now=NOW, store=FakeStore(fresh))["topics"]
+        self.assertFalse(cards[0]["links"][0]["stalled"])
+
+    def test_the_ladder_turned_off_flags_nothing_from_age(self):
+        cards = webui.registry_panel(now=NOW, store=FakeStore(records()),
+                                     stall_seconds=float("inf"))["topics"]
+        self.assertFalse(cards[0]["links"][0]["stalled"])
+
+    def test_a_binding_due_for_rotation_says_why(self):
+        bindings = {b["agent"]: b for b in self.panel()["topics"][0]["bindings"]}
+        self.assertEqual(bindings["DeepSeek"]["turns"], 7)
+        self.assertEqual(bindings["DeepSeek"]["rotations"], 1)
+        self.assertEqual(bindings["DeepSeek"]["drift"], 6)
+        self.assertEqual(bindings["DeepSeek"]["rotation_due"], "drift")
+        # No session record yet: unknown, never a zero, and never a made-up rotation.
+        self.assertIsNone(bindings["Claudebot"]["turns"])
+        self.assertIsNone(bindings["Claudebot"]["drift"])
+        self.assertIsNone(bindings["Claudebot"]["rotation_due"])
+
+    def test_a_profiles_turn_limit_also_makes_a_rotation_due(self):
+        asked = records(max_turns=5)
+        cards = webui.registry_panel(now=NOW, store=FakeStore(asked))["topics"]
+        binding = [b for b in cards[0]["bindings"] if b["agent"] == "DeepSeek"][0]
+        self.assertEqual(binding["rotation_due"], "turns")
+
+    def test_a_store_that_is_not_ready_says_not_ready_and_not_an_empty_panel(self):
+        self.assertEqual(self.panel(store=self.store(ready=False)),
+                         {"ready": False, "topics": []})
+        self.assertEqual(self.panel(store=None), {"ready": False, "topics": []})
+
+    def test_only_aliases_names_and_refs_reach_the_wire(self):
+        payload = json.dumps(self.panel(), sort_keys=True)
+        for secret in (str(CHAT), str(THREAD), str(OTHER), "Users", "notes.md", "C:\\\\"):
+            self.assertNotIn(secret, payload)
+        for kept in ("Dashboard", "Registry", "#332", "#335", "DeepSeek", "UX notes"):
+            self.assertIn(kept, payload)
+
+    def test_the_state_carries_the_panel(self):
+        rendered = webui.watch_state(now=NOW, registry=self.panel())
+        self.assertTrue(rendered["registry"]["ready"])
+        self.assertEqual(len(rendered["registry"]["topics"]), 2)
+        self.assertIsNone(webui.watch_state(now=NOW)["registry"])
+
+    def test_the_page_shows_the_panel_and_says_so_when_it_is_not_ready(self):
+        page = webui.page_html(title="Swarm")
+        for marker in ('id="topics"', "topicCard(", "registry not ready", "no open topics yet",
+                       "rotation due"):
+            self.assertIn(marker, page)
+        rendered = webui.watch_state(now=NOW, registry={"ready": False, "topics": []})
+        self.assertFalse(rendered["registry"]["ready"])
+
+
 class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
     """#240: the page belongs to the lease holder, like the pin -- and closes with the lease."""
 
@@ -328,6 +496,24 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
         from tests.test_telegram_channel import GROUP
         self.assertNotIn(str(GROUP), rendered)
         self.assertNotIn("TEST", rendered)                 # the bot token never reaches a page
+
+    def test_the_topics_panel_says_not_ready_without_a_store_then_follows_a_phase_change(self):
+        from tests.test_telegram_channel import GROUP
+        channel = self.channel()
+        self.assertFalse(channel.web_state()["registry"]["ready"])
+        channel.state_link.store = FakeStore(records())
+        panel = channel.web_state()["registry"]
+        self.assertTrue(panel["ready"])
+        self.assertEqual(panel["topics"][0]["links"][0]["phase"], "review")
+        moved = Topic.from_dict(records()[K.topic(THREAD)])
+        moved.links[0].phase = "qa"
+        channel.state_link.store.data[K.topic(THREAD)] = moved.to_dict()
+        # One refresh later the page has it: the panel is read per request, never cached.
+        panel = channel.web_state()["registry"]
+        self.assertEqual(panel["topics"][0]["links"][0]["phase"], "qa")
+        self.assertNotIn(str(GROUP), json.dumps(panel))
+        # The threshold is the stall ladder's own, and 0 (the ladder off) flags nothing.
+        self.assertEqual(channel.registry_stall_seconds(), 30 * 60.0)
 
 
 ADMIN_ID = 424242

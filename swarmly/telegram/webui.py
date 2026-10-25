@@ -21,12 +21,17 @@ for two paths and refuses everything else: the admin buttons stay in Telegram. I
 ``127.0.0.1``, so nothing off the host can reach it; slice 2 (a Telegram Mini App over HTTPS)
 is where an address becomes a decision, and that decision is the admin's.
 
+The page carries the swarm (one card per bot), the lease and the round, the open debts, and
+-- since #332 -- the topic registry: one card per open work topic, read from the same
+``topic/<id>`` records ``/topics`` reads, so a ``PHASE:`` change shows on the next poll.
+
 The page itself is one string with its styles and script inline -- self-contained, phone-width
 first, light and dark by ``prefers-color-scheme`` -- ready to be the Mini App's page unchanged.
 """
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import hmac
 import json
@@ -37,6 +42,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import parse_qsl
 
+from swarmly.state import keys as K
+from swarmly.state.records import Profile, RecordError, Topic
+from swarmly.telegram.drift import RESET_AT as DRIFT_RESET_AT
 from swarmly.telegram.snapshot import (BUSY, DOWN, FROZEN, IDLE, PAUSED, STUCK, Snapshot)
 
 #: One word per state, and the colour class the page paints it with (#241's vocabulary).
@@ -189,11 +197,243 @@ def owed_rows(rows: Sequence[Any] = (), *, now: float) -> List[Dict[str, Any]]:
     return out
 
 
+# ------------------------------------------------------------------------------------
+# The registry's topics (#332)
+# ------------------------------------------------------------------------------------
+
+#: A work item whose phase has not moved for this long reads as stalled. It is the transport's
+#: own nudge threshold (``limits.stall_minutes``, thirty minutes by default), so the page and
+#: the stall ladder never disagree about when a thing has gone quiet.
+STALL_SECONDS = 30 * 60.0
+
+#: The providers whose ``ref`` is safe to publish: a URL, a short ``#12``, a task id. A
+#: ``local`` ref is a filesystem path, so only that link's title goes on the wire.
+PUBLIC_PROVIDERS = ("github", "gitlab", "gdrive", "cloud", "topic")
+
+#: The phases in which a work item is finished, so no phase change is ever due.
+DONE_PHASES = ("done",)
+
+
+def _as_dict(raw: Any) -> Dict[str, Any]:
+    """A record or a plain dict, as a plain dict: the panel is built from either."""
+    to_dict = getattr(raw, "to_dict", None)
+    if callable(to_dict):
+        return dict(to_dict())
+    return dict(raw) if isinstance(raw, Mapping) else {}
+
+
+def _iso_seconds(text: Any) -> Optional[float]:
+    """An ISO-8601 UTC stamp as epoch seconds, or ``None`` when it is not one."""
+    token = str(text or "").strip()
+    if not token:
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(token, "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _since(stamp: Any, moment: float) -> Optional[float]:
+    at = _iso_seconds(stamp)
+    return None if at is None else max(0.0, moment - at)
+
+
+def link_cards(links: Sequence[Any] = (), *, now: float,
+               stall_seconds: float = STALL_SECONDS) -> List[Dict[str, Any]]:
+    """One topic's links, read by name: the ref, its status, its phase, who is on it.
+
+    A work item is **stalled** when its phase has not changed for *stall_seconds* and it is
+    neither closed nor done -- the same threshold the transport's nudge ladder uses. A link
+    with no ``phase_at`` is not stalled: an unknown age is not a stale one.
+    """
+    moment = float(now)
+    out: List[Dict[str, Any]] = []
+    for raw in links:
+        data = _as_dict(raw)
+        provider = str(data.get("provider") or "").strip().lower()
+        ref = str(data.get("ref") or "").strip()
+        name = str(data.get("title") or "").strip()
+        card: Dict[str, Any] = {
+            "id": str(data.get("id") or "").strip() or None,
+            "role": str(data.get("role") or "").strip() or None,
+            "kind": str(data.get("kind") or "").strip() or None,
+            # A local link's ref is a path: it stays out of the JSON, and the title speaks.
+            "ref": (ref or None) if provider in PUBLIC_PROVIDERS else None,
+            "name": name or None,
+        }
+        if card["role"] == "work":
+            phase = str(data.get("phase") or "").strip() or None
+            status = str(data.get("status") or "").strip() or None
+            age = _since(data.get("phase_at"), moment)
+            card.update({
+                "status": status,
+                "phase": phase,
+                "phase_age": age,
+                "stalled": bool(status != "closed" and phase not in DONE_PHASES
+                                and age is not None and age >= float(stall_seconds)),
+                "assignees": [{
+                    "agent": str(_as_dict(a).get("agent") or "").strip() or None,
+                    "as": str(_as_dict(a).get("as") or _as_dict(a).get("role")
+                              or "").strip() or None,
+                } for a in data.get("assignees") or ()],
+            })
+        out.append(card)
+    return out
+
+
+def _rotation_due(session: Mapping[str, Any], profile: Mapping[str, Any],
+                  drift: Optional[Mapping[str, Any]], age: Optional[float]) -> Optional[str]:
+    """Why this session should be handed over, or ``None``: the design's three reasons.
+
+    Drift first, because it is the reason that must not wait; then the profile's own limits
+    (``max_turns``, ``max_age_hours``). A limit the profile does not set never trips.
+    """
+    if drift is not None:
+        score = int(_num(drift.get("score")))
+        hard = int(_num(drift.get("hard")))
+        if score >= DRIFT_RESET_AT or hard >= 2:
+            return "drift"
+    turns = session.get("turns")
+    limit = profile.get("max_turns")
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 \
+            and isinstance(turns, int) and turns >= limit:
+        return "turns"
+    limit_age = profile.get("max_age_hours")
+    if isinstance(limit_age, (int, float)) and not isinstance(limit_age, bool) \
+            and float(limit_age) > 0 and age is not None \
+            and age >= float(limit_age) * 3600.0:
+        return "age"
+    return None
+
+
+def binding_cards(agents: Mapping[str, Any] = (), *, thread: Any,
+                  sessions: Optional[Mapping[Any, Mapping[str, Any]]] = None,
+                  profiles: Optional[Mapping[str, Mapping[str, Any]]] = None,
+                  drift: Optional[Mapping[Any, Mapping[str, Any]]] = None,
+                  now: float) -> List[Dict[str, Any]]:
+    """A topic's bindings: the agent, its role, and its session's state.
+
+    The session is written by that agent's own transport, so one may be missing; then the
+    turn count is ``null`` (unknown) rather than a zero nobody reported. Nothing here is
+    looked up live: availability stays on the bot cards, which read the pulse.
+    """
+    moment = float(now)
+    sessions = sessions or {}
+    profiles = profiles or {}
+    drift = drift or {}
+    out: List[Dict[str, Any]] = []
+    for alias in sorted(agents or ()):
+        binding = dict(agents[alias] or {})
+        key = K.norm(alias)
+        session = dict(sessions.get((thread, key)) or {})
+        known = bool(session)
+        started = _iso_seconds(session.get("started_at"))
+        age = None if started is None else max(0.0, moment - started)
+        profile = dict(profiles.get(key) or {})
+        score = drift.get((thread, key))
+        turns = session.get("turns")
+        out.append({
+            "agent": str(alias),
+            "role": str(binding.get("role") or "").strip() or None,
+            "runtime": str(binding.get("runtime") or "").strip() or None,
+            "model": str(binding.get("model") or "").strip() or None,
+            "effort": str(binding.get("effort") or "").strip() or None,
+            # Turns since the session started -- which is since its last rotation.
+            "turns": (int(_num(turns)) if known else None),
+            "rotations": (int(_num(session.get("rotations"))) if known else None),
+            "session_age": age,
+            "handover": (bool(session.get("handover")) if known else None),
+            "drift": (None if score is None else int(_num(score.get("score")))),
+            "hard": (None if score is None else int(_num(score.get("hard")))),
+            "rotation_due": (_rotation_due(session, profile, score, age) if known else None),
+        })
+    return out
+
+
+def topic_cards(*, now: float, topics: Sequence[Any] = (),
+                sessions: Optional[Mapping[Any, Mapping[str, Any]]] = None,
+                profiles: Optional[Mapping[str, Mapping[str, Any]]] = None,
+                drift: Optional[Mapping[Any, Mapping[str, Any]]] = None,
+                stall_seconds: float = STALL_SECONDS) -> List[Dict[str, Any]]:
+    """One card per **open** topic, most recently active first.
+
+    The topic's own identity (its thread id, its chat id) is used to reach its session
+    records and goes no further: what reaches the wire is the topic's name, its links' refs
+    and the agents' aliases.
+    """
+    moment = float(now)
+    cards: List[Dict[str, Any]] = []
+    for raw in topics:
+        data = _as_dict(raw)
+        if str(data.get("status") or "open").strip().lower() != "open":
+            continue                                    # closed topics carry no live work
+        thread = data.get("topic_id")
+        links = link_cards(data.get("links") or (), now=moment, stall_seconds=stall_seconds)
+        bindings = binding_cards(data.get("agents") or {}, thread=thread, sessions=sessions,
+                                 profiles=profiles, drift=drift, now=moment)
+        cards.append({
+            "topic": str(data.get("title") or "").strip() or None,
+            "status": "open",
+            "updated": _since(data.get("last_activity"), moment),
+            "stalled": any(link.get("stalled") for link in links),
+            "links": links,
+            "bindings": bindings,
+        })
+    # Most recently active first; a topic that never said goes last, and never becomes a zero.
+    cards.sort(key=lambda card: card["updated"] if card["updated"] is not None
+               else float("inf"))
+    return cards
+
+
+def registry_panel(*, now: float, store: Any = None,
+                   drift: Optional[Mapping[Any, Mapping[str, Any]]] = None,
+                   stall_seconds: float = STALL_SECONDS) -> Dict[str, Any]:
+    """The Topics panel from the store's registry -- the same records ``/topics`` reads.
+
+    A store that is not started, or not yet ``ready``, is reported as such: an empty panel
+    would say "no topics" about a registry nobody has read, which is the one thing a status
+    page must never do. Nothing here costs a model turn, and no gitbus is read.
+    """
+    if store is None or not getattr(store, "ready", False):
+        return {"ready": False, "topics": []}
+    topics: List[Dict[str, Any]] = []
+    sessions: Dict[Any, Dict[str, Any]] = {}
+    for key in store.keys("topic/"):
+        place = K.topic_of(key)
+        if place is None:
+            continue
+        thread, alias = place
+        data = store.read(key) or {}
+        if alias is not None:
+            sessions[(thread, K.norm(alias))] = data
+            continue
+        try:
+            topics.append(Topic.from_dict(data).to_dict())
+        except RecordError:
+            # A record this bot cannot read is left out and logged: a page that raises is
+            # worse than one that is thin.
+            logger.warning("web dashboard: topic/%s is unreadable; leaving it off the page",
+                           thread)
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for key in store.keys("agent/"):
+        parts = key.split("/")
+        if len(parts) == 3 and parts[2] == "profile":
+            try:
+                profiles[K.norm(parts[1])] = Profile.from_dict(store.read(key) or {}).to_dict()
+            except RecordError:
+                logger.warning("web dashboard: %s is unreadable; no limits from it", key)
+    return {"ready": True,
+            "topics": topic_cards(now=now, topics=topics, sessions=sessions,
+                                  profiles=profiles, drift=drift,
+                                  stall_seconds=stall_seconds)}
+
+
 def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
                 usage: Optional[Mapping[str, Mapping[str, Any]]] = None,
                 roles: Optional[Mapping[str, str]] = None, coordinator: str = "",
                 lease: Optional[Any] = None, round_state: Optional[Any] = None,
-                owed: Sequence[Any] = ()) -> Dict[str, Any]:
+                owed: Sequence[Any] = (), registry: Optional[Mapping[str, Any]] = None
+                ) -> Dict[str, Any]:
     """The JSON the page polls: the same records the pinned card is built from, in full.
 
     The card drops detail to fit 4,096 characters; a page has room, so nothing is cut here --
@@ -226,6 +466,11 @@ def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
         "bots": cards,
         "total": swarm_total(cards),
         "owed": owed_rows(owed, now=moment),
+        # A caller that did not collect the registry says so with ``None``: the page hides the
+        # panel rather than claiming a registry nobody read.
+        "registry": (None if registry is None else
+                     {"ready": bool(registry.get("ready")),
+                      "topics": list(registry.get("topics") or ())}),
     }
 
 
@@ -373,10 +618,17 @@ h1 { font-size: 17px; margin: 0 0 2px; }
 .card .doing { margin-top: 4px; font-size: 14px; }
 .card .meta { margin-top: 4px; color: var(--dim); font-size: 13px;
   display: flex; flex-wrap: wrap; gap: 2px 12px; }
-.owed h2, .strip h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em;
-  color: var(--dim); margin: 0 0 6px; }
+.owed h2, .strip h2, .topics h2 { font-size: 13px; text-transform: uppercase;
+  letter-spacing: .04em; color: var(--dim); margin: 0 0 6px; }
 .owed .line { font-size: 13px; padding: 3px 0; border-top: 1px solid var(--line); }
 .owed .line:first-of-type { border-top: 0; }
+.topics .card .line { font-size: 13px; padding: 3px 0; border-top: 1px solid var(--line);
+  display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; }
+.topics .card .line:first-of-type { border-top: 0; }
+.topics .ref { font-weight: 600; }
+.topics .binding { color: var(--dim); font-size: 13px; padding: 2px 0;
+  display: flex; flex-wrap: wrap; gap: 2px 10px; }
+.badge.due { color: var(--stuck); }
 footer { color: var(--dim); font-size: 12px; text-align: center; padding: 6px 0 2px; }
 @media (min-width: 720px) { body { padding: 20px; } .grid { column-gap: 10px; } }
 </style>
@@ -389,6 +641,7 @@ footer { color: var(--dim); font-size: 12px; text-align: center; padding: 6px 0 
 <section class="strip" id="strip"><div class="row" id="strip-row"></div></section>
 <main id="bots"></main>
 <section class="owed" id="owed" hidden><h2>Owed</h2><div id="owed-rows"></div></section>
+<section class="topics" id="topics" hidden><h2>Topics</h2><div id="topic-cards"></div></section>
 <footer>read-only &middot; refreshes every <span id="every"></span>s</footer>
 <script>
 const STATE = "__STATE_PATH__";
@@ -445,6 +698,41 @@ function card(bot) {
   return box;
 }
 
+function topicCard(topic) {
+  const box = el("article", "card");
+  const top = el("div", "top");
+  top.append(el("span", "alias", topic.topic || "?"));
+  top.append(el("span", "badge " + (topic.stalled ? "stuck" : "idle"),
+    topic.stalled ? "stalled" : "open"));
+  if (topic.updated !== null && topic.updated !== undefined)
+    top.append(el("span", "sub", "active " + ago(topic.updated) + " ago"));
+  box.append(top);
+  (topic.links || []).forEach((link) => {
+    const line = el("div", "line");
+    line.append(el("span", "ref", link.ref || link.name || link.id || "?"));
+    if (link.ref && link.name) line.append(el("span", "sub", link.name));
+    if (link.phase) line.append(el("span", "badge " + (link.stalled ? "stuck" : "idle"),
+      link.phase));
+    if (link.stalled) line.append(el("span", "sub",
+      "no phase change for " + ago(link.phase_age)));
+    const who = (link.assignees || []).filter((a) => a.agent)
+      .map((a) => a.agent + (a.as ? " " + a.as : ""));
+    if (who.length) line.append(el("span", "sub", who.join(", ")));
+    box.append(line);
+  });
+  (topic.bindings || []).forEach((binding) => {
+    const line = el("div", "binding");
+    line.append(el("span", "", binding.agent + (binding.role ? " " + binding.role : "")));
+    line.append(el("span", "", "turns " + num(binding.turns)));
+    if (binding.drift !== null && binding.drift !== undefined)
+      line.append(el("span", "", "drift " + binding.drift));
+    if (binding.rotation_due)
+      line.append(el("span", "badge due", "rotation due: " + binding.rotation_due));
+    box.append(line);
+  });
+  return box;
+}
+
 function render(state) {
   document.getElementById("stamp").textContent =
     "refreshed " + state.refreshed +
@@ -486,6 +774,22 @@ function render(state) {
     });
   } else {
     owed.hidden = true;
+  }
+
+  const topics = document.getElementById("topics");
+  const cards = document.getElementById("topic-cards");
+  cards.replaceChildren();
+  if (state.registry) {
+    topics.hidden = false;
+    if (!state.registry.ready) {
+      cards.append(el("div", "line", "registry not ready"));
+    } else if (!(state.registry.topics || []).length) {
+      cards.append(el("div", "line", "no open topics yet"));
+    } else {
+      state.registry.topics.forEach((topic) => cards.append(topicCard(topic)));
+    }
+  } else {
+    topics.hidden = true;
   }
 }
 

@@ -3840,11 +3840,56 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - a page without debts
             logger.warning("web dashboard: the owed table is not readable", exc_info=True)
             owed = []
+        try:
+            registry = webui.registry_panel(now=moment, store=self.registry_store(),
+                                            drift=self.registry_drift(),
+                                            stall_seconds=self.registry_stall_seconds())
+        except Exception:                          # noqa: BLE001 - a page without topics
+            logger.warning("web dashboard: the registry is not readable", exc_info=True)
+            registry = {"ready": False, "topics": []}
         return webui.watch_state(
             now=moment, snapshots=self.control_snapshots(moment),
             usage=self.control_usage(), roles=self.control_roles(),
             coordinator=str(self.current_coordinator(now=moment) or ""), lease=lease,
-            round_state=self.control_round(), owed=owed)
+            round_state=self.control_round(), owed=owed, registry=registry)
+
+    def registry_store(self) -> Any:
+        """The shared state store the topic registry lives in, or ``None`` (#332).
+
+        ``None`` is a real answer: a bot with no ``state.backend`` has no registry to show,
+        and the panel says so instead of drawing an empty list.
+        """
+        return getattr(self.state_link, "store", None)
+
+    def registry_stall_seconds(self) -> float:
+        """The panel's stall threshold: the stall ladder's own (``limits.stall_minutes``).
+
+        With the ladder turned off (``0``) nothing is flagged from age -- the operator has said
+        the swarm does not nudge on a clock, and the page must not invent one.
+        """
+        limits = getattr(self.config, "limits", None)
+        minutes = float(getattr(limits, "stall_minutes", 0) or 0)
+        return minutes * 60.0 if minutes > 0 else float("inf")
+
+    def registry_drift(self) -> Dict[Any, Dict[str, int]]:
+        """This bot's own drift ledger, per topic and binding (#332, #247).
+
+        A bot can see only its own ledger today, so only its own bindings get a score; every
+        peer's stays ``null`` on the page -- an unknown score is not a clean one.
+        """
+        scores: Dict[Any, Dict[str, int]] = {}
+        from swarmly.state import keys as K
+        try:
+            alias = str(self.config.identity.alias or "")
+            home = int(self.config.identity.home_channel_id or 0)
+            for place, (score, hard) in self.drift.sessions().items():
+                chat, _, thread = str(place).partition(":")
+                if not thread.isdigit() or int(chat or 0) != home:
+                    continue
+                scores[(int(thread), K.norm(alias))] = {"score": int(score), "hard": int(hard)}
+        except Exception:                          # noqa: BLE001 - a page without drift
+            logger.warning("web dashboard: the drift ledger is not readable", exc_info=True)
+        return scores
 
     def _sync_web_dashboard(self, *, now: Optional[float] = None) -> str:
         """Serve the page while this bot holds the lease; stop when it does not (#240).
