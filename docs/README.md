@@ -26,6 +26,7 @@ Start with the [README](../README.md), then [Getting started](GETTING-STARTED.md
 
 | Document | What it covers |
 |---|---|
+| [telegram/COMMANDS.md](telegram/COMMANDS.md) | every chat command on one page: stop, pause/resume, hold/release, status, usage, topics, links |
 | [telegram/PROTOCOL.md](telegram/PROTOCOL.md) | the Telegram channel protocol (v1.1): addressing, envelope, ACKs, escalation, liveness |
 | [SWARM.md](SWARM.md) | the `a2a/2` swarm kernel (preview): lanes, the `swarmly` CLI and MCP server, the safety guard |
 | [SWARM-PROTOCOL.md](SWARM-PROTOCOL.md) | the `a2a/2` intents and rules, generated from `swarmly/swarm/protocol.yaml` |
