@@ -131,6 +131,12 @@ class TestTheBlockInTheReply(unittest.TestCase):
         self.assertEqual(block, LESSON)
         self.assertIn("more than one", reason or "")
 
+    def test_an_empty_first_block_does_not_hide_the_lessons_after_it(self):
+        body, block, reason = extract_block(
+            f"PR is up.\n\nMEMORY:\n\n{END_MARKER}\nMEMORY:\n{LESSON}\n{END_MARKER}")
+        self.assertEqual((body, block), ("PR is up.", LESSON))
+        self.assertIn("more than one", reason or "")
+
     def test_a_reply_without_a_block_is_untouched(self):
         text = "PR is up. Nothing learned this time."
         self.assertEqual(extract_block(text), (text, None, None))
@@ -193,10 +199,10 @@ class TestTheTurnPrompt(unittest.TestCase):
             self.assertIn("Your lessons so far", reply)
             self.assertIn(LESSON, reply)
 
-    def oversize(self, channel, head="PR #229 is up."):
+    def oversize(self, channel, head="PR #229 is up.", ev=None):
         return channel.apply_memory_block(
             f"{head}\n\nMEMORY:\n" + "\n".join([LESSON] * 4) + f"\n{END_MARKER}",
-            event("@HermesBot: ship it"))
+            ev if ev is not None else event("@HermesBot: ship it"))
 
     def test_an_oversize_block_is_refused_and_nothing_of_it_is_posted(self):
         """Admin, 25 Oct: "Memory refused" lines in a work topic were the bot's feedback in
@@ -227,9 +233,39 @@ class TestTheTurnPrompt(unittest.TestCase):
             channel = self.channel(tmp, memory_max_bytes=100, memory_every_turns=99)
             channel.lessons.save(LESSON)
             self.oversize(channel)
-            self.assertIn("Update your memory now", channel._memory_note())
-            channel.lessons.turn_ran()
-            self.oversize(channel)                             # the re-asked block, too big
+            asked = event("@HermesBot: next")
+            self.assertIn("Update your memory now", channel._memory_note(asked))
+            channel.lessons.turn_ran(asked.__dict__["memory_seq"])
+            self.oversize(channel, ev=asked)                   # the re-asked block, too big
+            note = channel._memory_note()
+            self.assertIn("Memory refused", note)
+            self.assertNotIn("Update your memory now", note)
+
+    def test_a_refused_re_ask_is_not_re_asked_when_two_prompts_carried_it(self):
+        """Review of #307: queued turns, or two topics, both carry the re-ask. The one that
+        runs first writes no block; the second one's refused block must not be re-asked."""
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, memory_max_bytes=100, memory_every_turns=99)
+            self.oversize(channel)
+            first, second = event("@HermesBot: one"), event("@HermesBot: two")
+            self.assertIn("Update your memory now", channel._memory_note(first))
+            self.assertIn("Update your memory now", channel._memory_note(second))
+            channel.lessons.turn_ran(first.__dict__["memory_seq"])     # no block in it
+            channel.lessons.turn_ran(second.__dict__["memory_seq"])
+            self.oversize(channel, ev=second)
+            self.assertNotIn("Update your memory now", channel._memory_note())
+
+    def test_a_parallel_save_does_not_make_a_refused_re_ask_re_asked(self):
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, memory_max_bytes=100, memory_every_turns=99)
+            self.oversize(channel)
+            one, two = event("@HermesBot: a", thread_id=7), event("@HermesBot: b", thread_id=8)
+            channel._memory_note(one)
+            channel._memory_note(two)
+            channel.lessons.turn_ran(one.__dict__["memory_seq"])
+            channel.apply_memory_block(f"ok\n\nMEMORY:\n{LESSON}\n{END_MARKER}", one)  # saved
+            channel.lessons.turn_ran(two.__dict__["memory_seq"])       # stale: a no-op
+            self.oversize(channel, ev=two)
             note = channel._memory_note()
             self.assertIn("Memory refused", note)
             self.assertNotIn("Update your memory now", note)

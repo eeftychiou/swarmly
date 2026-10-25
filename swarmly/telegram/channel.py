@@ -3536,7 +3536,7 @@ class AgentChannel:
         return ("Swarm usage today (UTC), from each bot's own ledger and heartbeat; a number a "
                 "CLI does not report is left out:\n" + "\n".join(lines))
 
-    def _memory_note(self) -> str:
+    def _memory_note(self, event: Optional[ChannelEvent] = None) -> str:
         """This bot's own lessons, what became of its last memory block, and — every
         ``limits.memory_every_turns`` turns, or right after a refusal — the one instruction to
         update them (#226, #301).
@@ -3551,7 +3551,13 @@ class AgentChannel:
             block = self.lessons.block()
             told = self.lessons.note()
             told = f"After your last reply: {told}" if told else ""
+            reask = self.lessons.again
             due = self.lessons.note_turn()
+            if event is not None:
+                # Spent once this turn has run (turn_ran); a block this turn writes answers
+                # the re-ask, so its refusal is not re-asked (review of #307).
+                event.__dict__["memory_seq"] = self.lessons.seq
+                event.__dict__["memory_reask"] = reask
             instruction = self.lessons_update_instruction() if due else ""
             parts = [part for part in (block, told, instruction) if part]
             return "\n\n[" + "\n".join(parts) + "]" if parts else ""
@@ -5706,7 +5712,8 @@ class AgentChannel:
                         len(memory.encode("utf-8")))
         if reason:
             notes.append(f"Memory: {reason}")
-        self.lessons.tell("\n".join(notes), refused=not saved)
+        self.lessons.tell("\n".join(notes), refused=not saved,
+                          reasked=bool(event.__dict__.get("memory_reask")))
         return body
 
     def _round_summary(self, event: Optional[ChannelEvent]) -> str:
@@ -7799,8 +7806,7 @@ class AgentChannel:
         text += self._drift_note(event)
         text += self.state_link.registry_note(event.chat_id, event.thread_id)
         text += self._swarm_usage_note()
-        text += self._memory_note()
-        event.__dict__["memory_seq"] = self.lessons.seq    # spent once the turn has run
+        text += self._memory_note(event)
         if not event.self_task and asks_for_topic(event.text or ""):
             text += f"\n\n{TOPIC_ASKED_NOTE}"
         incoming = IncomingMessage(

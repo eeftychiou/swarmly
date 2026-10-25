@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from swarmly.telegram.adapters.base import load_state, save_state
 
@@ -96,43 +96,36 @@ def turns_path(config: Any) -> Optional[Path]:
 def extract_block(text: str) -> Tuple[str, Optional[str], Optional[str]]:
     """Split a reply into ``(body, block, reason)``.
 
-    The block is removed from the reply in **every** case — a memory block is never posted,
-    including one that is malformed or too large — so the caller never has to choose between
-    posting the notes and losing the reply. ``block`` is None when the reply carried none.
+    Every block is removed from the reply in **every** case — a memory block is never posted,
+    including one that is malformed, too large or a second one — so the caller never has to
+    choose between posting the notes and losing the reply. ``block`` is the first block with
+    lessons in it, None when the reply carried none.
     """
     text = text or ""
-    opened = _OPEN.search(text)
-    if opened is None:
+    if _OPEN.search(text) is None:
         return text, None, None
-    closing = _CLOSE.search(text, opened.end())
-    if closing is None:
-        block = text[opened.end():]
-        after = ""
-        reason = None
-    else:
-        block = text[opened.end():closing.start()]
-        after = text[closing.end():]
-        reason = None
-    body = (text[:opened.start()].rstrip() + "\n" + after.lstrip("\n")) if text[:opened.start()].strip() \
-        else after.lstrip("\n")
-    if _OPEN.search(body):                            # a second block: take the first only
-        reason = "more than one memory block; the first one is used"
-        body = _strip_blocks(body)                    # and post none of them
-    block = block.strip("\n")
-    if not block.strip():
-        return body.strip(), None, "the memory block was empty"
-    return body.strip(), block, reason
-
-
-def _strip_blocks(text: str) -> str:
-    """*text* without any memory block: each runs to its END MEMORY, or to the end."""
+    kept: List[str] = []
+    blocks: List[str] = []
+    pos = 0
     while True:
-        opened = _OPEN.search(text)
+        opened = _OPEN.search(text, pos)
         if opened is None:
-            return text.strip()
+            kept.append(text[pos:])
+            break
+        kept.append(text[pos:opened.start()])
         closing = _CLOSE.search(text, opened.end())
-        after = text[closing.end():] if closing is not None else ""
-        text = text[:opened.start()].rstrip() + "\n" + after.lstrip("\n")
+        if closing is None:                           # no END MEMORY: it runs to the end
+            blocks.append(text[opened.end():])
+            break
+        blocks.append(text[opened.end():closing.start()])
+        pos = closing.end()
+    body = "\n".join(part.strip("\n") for part in kept if part.strip()).strip()
+    found = [block.strip("\n") for block in blocks if block.strip()]
+    reason = ("more than one memory block; the first with lessons in it is used"
+              if len(blocks) > 1 else None)
+    if not found:
+        return body, None, "the memory block was empty"
+    return body, found[0], reason
 
 
 def size_of(text: str) -> int:
@@ -182,8 +175,6 @@ class Lessons:
         self.said = str(state.get("said") or "")
         #: Ask for the update again on the next turn that runs (after a refusal).
         self.again = bool(state.get("again"))
-        #: The last turn that ran carried that re-ask: its refused block is not re-asked.
-        self.reasked = bool(state.get("reasked"))
         #: Bumped by :meth:`tell`: a turn built before a newer outcome must not spend it.
         self.seq = 0
 
@@ -239,15 +230,15 @@ class Lessons:
         return "memory cleared: the file is empty now"
 
     # -- what became of a block -----------------------------------------------------------
-    def tell(self, note: str, *, refused: bool) -> None:
+    def tell(self, note: str, *, refused: bool, reasked: bool = False) -> None:
         """Keep the outcome of a memory block for the bot's next turn, where it is told.
 
-        A refusal asks for the update again on that turn, unless the refused block was itself
-        the answer to a re-ask: that bot goes back to the normal count.
+        A refusal asks for the update again on that turn, unless the refused block answered a
+        prompt that already carried the re-ask (*reasked*, known per turn): that bot goes back
+        to the normal count.
         """
         self.said = (note or "").strip()
-        self.again = refused and not self.reasked
-        self.reasked = False
+        self.again = refused and not reasked
         self.seq += 1
         self._save_counter()
 
@@ -261,10 +252,9 @@ class Lessons:
         parallel turn's block, told since) stays for the next turn."""
         if seq is not None and seq != self.seq:
             return
-        if not (self.said or self.again or self.reasked):
+        if not (self.said or self.again):
             return
         self.said = ""
-        self.reasked = self.again
         self.again = False
         self._save_counter()
 
@@ -287,7 +277,7 @@ class Lessons:
             return
         save_state(self.counter_path,
                    {"turns": self.turns, "since_asked": self.since_asked, "said": self.said,
-                    "again": self.again, "reasked": self.reasked},
+                    "again": self.again},
                    "memory turn counter")
 
 
