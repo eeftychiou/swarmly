@@ -109,6 +109,16 @@ class TopicMemory:
             self._topics.pop(next(iter(self._topics)))
         self._schedule_save()
 
+    def topic_of(self, chat_id: int, message_id: int) -> Optional[Key]:
+        """The discussion a message seen here was posted in, if it is still remembered."""
+        for key, topic in self._topics.items():
+            if key[0] != int(chat_id):
+                continue
+            entries = list(topic["log"]) + list(topic["progress"]) + [topic["opening"]]
+            if any(entry is not None and entry[0] == message_id for entry in entries):
+                return key
+        return None
+
     def _schedule_save(self) -> None:
         """Save soon, once for a burst of messages; at once when no event loop runs."""
         try:

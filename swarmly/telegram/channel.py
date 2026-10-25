@@ -1965,12 +1965,13 @@ class AgentChannel:
                     break
                 partial = self._native_partial(plan, runner)
                 if partial:
-                    await self._edit_native(event.chat_id, message_id, partial)
+                    await self._edit_native(event.chat_id, message_id, partial,
+                                            event.thread_id)
         finally:
             self._native_runners.pop(key, None)
         outcome = task.result()
         await self._edit_native(event.chat_id, message_id,
-                                self._native_output(plan, outcome, runner))
+                                self._native_output(plan, outcome, runner), event.thread_id)
         return message_id
 
     def _native_partial(self, plan: Any, runner: Any) -> str:
@@ -1989,7 +1990,8 @@ class AgentChannel:
         head = outcome.line(plan, runner.timeout)
         return f"{head}\n\n{outcome.text}".strip() if outcome.text else head
 
-    async def _edit_native(self, chat_id: int, message_id: Any, text: str) -> None:
+    async def _edit_native(self, chat_id: int, message_id: Any, text: str,
+                           thread_id: Optional[int] = None) -> None:
         """Stream into the one message: edit it, or post a new one where editing is impossible."""
         body = Redactor.from_config(self.config).text(text)
         edit = getattr(self.bot, "edit_message_text", None)
@@ -1998,10 +2000,14 @@ class AgentChannel:
                 await edit(text=body, chat_id=int(chat_id), message_id=int(message_id),
                            parse_mode=None, disable_web_page_preview=True)
                 return
-            except Exception:                              # noqa: BLE001 - fall back to a post
+            except Exception as exc:                       # noqa: BLE001 - fall back to a post
+                if "message is not modified" in str(exc).lower():
+                    return                     # the screen did not change since the last edit
                 logger.warning("native: could not edit the output message; posting it",
                                exc_info=True)
-        await self.send(body, chat_id=chat_id, allow_when_frozen=True)
+        # In the run's own topic (it went to General before: a /cli run in a topic whose
+        # edit failed finished in General).
+        await self.send(body, chat_id=chat_id, thread_id=thread_id, allow_when_frozen=True)
 
     def _stop_native(self, chat_id: int, thread_id: Optional[int], *,
                      everything: bool) -> int:
@@ -7804,7 +7810,7 @@ class AgentChannel:
             ticket, created = self.replies.register(
                 chat_id=event.chat_id, message_id=event.message_id,
                 recipient=author_username or peer_username, text=event.text,
-                timeout=self.config.adapter.reply_timeout_seconds,
+                timeout=self.config.adapter.reply_timeout_seconds, thread_id=event.thread_id,
                 # Issue #31 review: the ticket is judged by the budget this turn was given,
                 # so a reply that follows the rules is not refused at submit time.
                 reply_chars=((project_settings.reply_chars if project_settings is not None
@@ -8833,6 +8839,13 @@ class AgentChannel:
         suffix = f"\n\n({elapsed:.0f}s)" if elapsed >= 60 else ""
         reply_to_message_id = event.message_id if event.replies_to_bot else None
         shown = strip_report_marker(body) if report is not None else body
+        barred = self.token_barred(event.chat_id, event.thread_id)
+        if barred is not None:
+            # Not posted, so not remembered or mirrored either (the gate keeps turns out of
+            # here; this is the backstop when something gets past it).
+            logger.warning("%s is transport-only: a reply there is not posted: %r", barred,
+                           shown[:120])
+            return None
         sent = await self.send(f"{shown}{suffix}", reply_to_message_id=reply_to_message_id,
                                chat_id=event.chat_id, thread_id=event.thread_id, token=True)
         self._log_topic(event.chat_id, event.thread_id, self.config.identity.alias, shown,
@@ -8847,7 +8860,7 @@ class AgentChannel:
                 # the topic, and General gets the transport's own line pointing at it.
                 name = self.topics.name(event.chat_id, event.thread_id) or "the topic"
                 await self.send(f"↩ «{name}» reported back: {link}".rstrip(": "),
-                                chat_id=origin[0], thread_id=origin[1], silent=True)
+                                chat_id=origin[0], thread_id=origin[1])
             else:
                 # A summary for people: its @mentions would start turns for every bot it names.
                 await self.send(f"{defuse_mentions(report)}\n\n↩ from {link}".rstrip(),
@@ -8979,10 +8992,32 @@ class AgentChannel:
         bots' chatter there moved a reply into it), not one found gone."""
         if place is None:
             return False
-        pulse = self._pulse_topic()
-        if pulse is not None and int(place[1]) == int(pulse):
+        if self._is_pulse(place[0], place[1]):
             return False
         return tuple(place) not in self._dead_topics
+
+    def _is_pulse(self, chat_id: int, thread_id: Optional[int]) -> bool:
+        """Swarm pulse: the pulse's own topic, or any topic with its name (two opened at once
+        before every bot picked the same one)."""
+        if thread_id is None:
+            return False
+        pulse = self._pulse_topic()
+        return (pulse is not None and int(thread_id) == int(pulse)) \
+            or self.topics.name(int(chat_id), int(thread_id)) == PULSE_TOPIC_NAME
+
+    def topic_of_message(self, message_id: Any) -> Optional[Tuple[int, int]]:
+        """The home group's work topic a message this bot saw was posted in (poll.py: a bus
+        answer to a mirrored hand-off goes where the hand-off was), else None."""
+        home = self.config.identity.home_channel_id
+        try:
+            found = self._topic_memory.topic_of(int(home), int(message_id)) \
+                if home is not None else None
+        except (TypeError, ValueError):
+            return None
+        if found is None or found[1] is None:
+            return None
+        place = (int(found[0]), int(found[1]))
+        return place if self._work_topic(place) else None
 
     def topic_for_text(self, text: str) -> Optional[Tuple[int, int]]:
         """The topic already about an issue or PR *text* names, if any (the GitHub watch: a
@@ -9029,14 +9064,17 @@ class AgentChannel:
             return "⛔ only the admin can move items between topics" \
                 if speaks and not event.author_is_bot else ""
         refs = issue_refs(" ".join(command_args(event.text or "")))
-        if event.thread_id is None or not refs:
-            return ("📌 /topic works inside a topic, with the items that live there: "
+        if event.thread_id is None or not refs \
+                or not self._work_topic((int(event.chat_id), int(event.thread_id))):
+            return ("📌 /topic works inside a work topic, with the items that live there: "
                     "/topic #164 #165") if speaks else ""
         self._learn_topic_refs(event.chat_id, event.thread_id, " ".join(refs), pin=True)
         # With registry routing the topics' explicit links decide first: the lease holder
         # records the admin's link here, and it outranks every other topic's (review, #279).
         self.state_link.note_pin(event.chat_id, event.thread_id, refs, event.author_id)
-        return (f"📌 {', '.join(refs)} live in this topic now: replies about them are "
+        # Transport-only: a reply stays in its turn's topic, so only notices follow the pin.
+        what = "notices" if self._transport_only_on() else "replies"
+        return (f"📌 {', '.join(refs)} live in this topic now: {what} about them are "
                 "posted here.") if speaks else ""
 
     def _pin_linked_item(self, event: ChannelEvent) -> List[str]:
@@ -9070,11 +9108,6 @@ class AgentChannel:
         if not getattr(self.config.limits, "work_in_topics", False) or home is None \
                 or event.thread_id is None or int(event.chat_id) != int(home) \
                 or is_command_reply(body) or parse_report_back(body) is not None:
-            return None
-        if self._transport_only_on():
-            # Where a post goes is the transport's decision, never the words of the reply
-            # (admin, 25 Oct, after a reply was moved into Swarm pulse by the items it named):
-            # a reply is posted in the topic of its turn (design §6, phase 4).
             return None
         if not event.author_is_bot:
             # A person's question is answered where it was asked (live, 23 Oct: the admin asked
@@ -9240,8 +9273,7 @@ class AgentChannel:
             return None                                    # a DM, or another group
         if thread_id is None:
             return "General"
-        pulse = self._pulse_topic()
-        return "Swarm pulse" if pulse is not None and int(thread_id) == int(pulse) else None
+        return "Swarm pulse" if self._is_pulse(int(home), thread_id) else None
 
     def token_barred(self, chat_id: Optional[int], thread_id: Optional[int]) -> Optional[str]:
         """"General" or "Swarm pulse" when text from token space -- a model's reply, a peer's
@@ -10763,11 +10795,15 @@ class AgentChannel:
             if self._frozen:
                 self.replies.release_claim(row['id'])
                 return
+            # The topic the question was asked in; an older ticket has none, and its answer
+            # follows the message it replies to, as before.
+            where = ({"thread_id": row["thread_id"], "token": True}
+                     if row.get("thread_id") is not None else {})
             try:
                 telegram_message_id = await self.send(
                     row['text'], reply_to_message_id=row['message_id'], chat_id=row['chat_id'],
                     on_attempt=lambda: self.replies.attempting(row['id']),
-                    return_message_id=True,
+                    return_message_id=True, **where,
                 )
                 if telegram_message_id is _SEND_SUPPRESSED:
                     self.replies.release_claim(row['id'])
