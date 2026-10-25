@@ -1155,7 +1155,7 @@ def _took(took: Callable[..., Any], ref: dict, sender: str) -> bool:
 
 async def _echo_reply(channel: Any, sender: str, reply: Any,
                       outcome: PollOutcome, thread_id: Optional[int] = None,
-                      about: str = "") -> None:
+                      about: str = "", message_id: Any = None) -> None:
     """Best-effort Telegram echo of an adapter reply (transport up only).
 
     Never retried and never queued for reconnect (issue #59): a failure just
@@ -1165,6 +1165,13 @@ async def _echo_reply(channel: Any, sender: str, reply: Any,
         return
     echo_text = f"[gitbus \u2190 {sender}] {reply.text}"
     chat_id: Optional[int] = None
+    of_message = getattr(channel, "topic_of_message", None)
+    if thread_id is None and message_id is not None and callable(of_message):
+        # A mirror names its Telegram message, not its topic (issue #22): the topic this bot
+        # saw that message in is where the hand-off came from, so the answer goes there.
+        found = of_message(message_id)
+        if isinstance(found, tuple) and len(found) == 2:
+            chat_id, thread_id = found
     find = getattr(channel, "topic_for_text", None)
     only = getattr(channel, "_transport_only_on", None)
     if callable(only) and only() is True:
@@ -1183,10 +1190,11 @@ async def _echo_reply(channel: Any, sender: str, reply: Any,
     barred = getattr(channel, "token_barred", None)
     place = barred(chat_id, thread_id) if callable(barred) else None
     if isinstance(place, str):
-        # No topic of its own (a mirror names a topic token, not a thread): not shown in
-        # Telegram. No bot takes a turn there anyway, so nothing that reached one is lost.
-        logger.info("poll: %s is transport-only, so %s's answer is not echoed there: %r",
-                    place, sender, reply.text[:200])
+        # No topic of its own (bus mail that came from no topic, or a hand-off this bot never
+        # saw in Telegram): not shown there. No bot takes a turn in General anyway.
+        outcome.replies_unposted += 1
+        logger.warning("poll: %s is transport-only, so %s's answer has no topic to be shown "
+                       "in and is not posted: %r", place, sender, reply.text[:200])
         return
     if getattr(channel, "_sender", None) is None:
         if getattr(channel, "bot", None) is not None:
@@ -1675,7 +1683,9 @@ async def bus_poll_once(channel: Any, *,
             if not is_frozen_now:
                 await _echo_reply(channel, sender, reply, outcome,
                                   thread_id=tg_ref.get("thread") if isinstance(tg_ref, dict)
-                                  else None, about=text)
+                                  else None, about=text,
+                                  message_id=tg_ref.get("message_id")
+                                  if isinstance(tg_ref, dict) else None)
 
         # After the loop, refresh the freeze flag in case RESUME arrived.
         is_frozen_now = bool(getattr(channel, "_frozen", False))

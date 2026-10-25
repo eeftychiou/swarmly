@@ -1170,6 +1170,9 @@ class Membership:
         if home is not None:
             from swarmly.telegram.channel import ChannelEvent
             self.ch._expect_handoff(ChannelEvent(text="", chat_id=int(home)), alias)
+        barred = getattr(self.ch, "token_barred", None)
+        if callable(barred) and isinstance(barred(None, None), str):
+            reason = ""            # the coordinator's own words: not in a transport-only General
         await self.ch.send(format_message(
             Envelope(type=MessageType.HELLO, to=alias, intent="ROLE", ref=role),
             f"🎭 @{handle.lstrip('@')} you are the swarm's {role}." + (f" {reason}" if reason
