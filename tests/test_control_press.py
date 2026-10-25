@@ -1532,6 +1532,75 @@ class TestTheControlsThatChangeTheSwarm(unittest.TestCase):
         self.assertFalse(channel.lessons.clear.called)
 
 
+class TestABotsOwnRuntimeIsItsOwn(unittest.TestCase):
+    """Review #345: a pick pressed for a peer changed *this* bot, and the note named the peer.
+
+    The pick is applied by the bot the press lands on and a report describes the bot that
+    answers, so a press aimed at another bot is refused -- in words, before anything changes --
+    and the page draws these controls on this bot's own card only.
+    """
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        return channel
+
+    def ask(self, channel, **request):
+        return run(channel.dashboard_action(request))
+
+    def test_an_effort_pressed_for_a_peer_is_refused_and_changes_nothing(self):
+        channel = self.channel()
+        asked = self.ask(channel, action="bot.effort", target="Codex", value="high")
+        self.assertEqual(asked["verdict"], cp.CONFIRM)          # a value always asks twice
+        answer = self.ask(channel, code=asked["confirm"])
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["refused"], cp.ACTION_REFUSED)
+        self.assertIn("own", answer["text"])
+        self.assertEqual(channel._efforts, {})                  # this bot's effort is untouched
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL bot.effort" in entry["text"]]
+        self.assertEqual(notes, [])                             # and nothing claims it did
+
+    def test_a_model_pressed_for_a_peer_is_refused_too(self):
+        channel = self.channel()
+        asked = self.ask(channel, action="bot.model", target="Codex", value="some-model")
+        answer = self.ask(channel, code=asked["confirm"])
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["refused"], cp.ACTION_REFUSED)
+        self.assertEqual(channel._models, {})
+
+    def test_a_report_pressed_for_a_peer_answers_this_bot_and_says_so(self):
+        channel = self.channel()
+        answer = self.ask(channel, action="bot.cli", target="Codex")
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["refused"], cp.ACTION_REFUSED)
+        self.assertIn("own", answer["text"])
+
+    def test_the_same_press_for_this_bot_still_runs(self):
+        channel = self.channel()
+        asked = self.ask(channel, action="bot.effort", target="Hermes", value="high")
+        answer = self.ask(channel, code=asked["confirm"])
+        # It ran: the reasoning command's own words come back (the echo adapter has no effort
+        # setting, so those words are the refusal *about the setting*, not about the target).
+        self.assertTrue(answer["ok"], answer)
+        self.assertIn("Hermes", answer["text"])
+        self.assertNotIn("would change the bot that answers", answer["text"])
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL bot.effort" in entry["text"]]
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("value=high", notes[0])
+
+    def test_the_page_draws_them_on_this_bots_card_only(self):
+        channel = self.channel()
+        view = channel.web_controls()
+        self.assertEqual(view["self"], "Hermes")
+        rows = {row["action"]: row for row in view["controls"]}
+        for action in ("bot.model", "bot.effort", "bot.cli", "bot.memory"):
+            self.assertTrue(rows[action]["self_only"], action)
+        for action in ("bot.pause", "bot.resume", "bot.stop_turn", "bot.restart"):
+            self.assertFalse(rows[action]["self_only"], action)
+
+
 class TestEveryConfirmingControlAsksTwice(unittest.TestCase):
     """#345: the second tap is the only way anything that stops or changes something runs."""
 

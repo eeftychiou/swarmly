@@ -366,12 +366,15 @@ def controls_view(controls: Optional[Mapping[str, Any]] = None) -> Optional[Dict
             "note": str(raw.get("note") or ""),
             "typed": str(raw.get("typed") or ""),
             "where": str(raw.get("where") or ""),
+            # A control that reads or sets *this* bot's own runtime: drawn on this bot's card
+            # and nowhere else, because the press lands here (review, #345).
+            "self_only": bool(raw.get("self_only")),
             "choices": _picks(raw.get("choices")),
         }
         if raw.get("then"):
             row["then"] = _picks(raw.get("then"))
         rows.append(row)
-    return {"ready": True, "controls": rows}
+    return {"ready": True, "self": str(controls.get("self") or ""), "controls": rows}
 
 
 def _picks(raw: Any) -> List[Dict[str, str]]:
@@ -1421,7 +1424,11 @@ function controlsFor(state, where, target) {
   const box = el("div", "controls");
   const view = state.controls;
   if (view && view.ready) {
-    (view.controls || []).filter((row) => row.where === where)
+    const mine = !target || target === view.self;
+    (view.controls || [])
+      // Model, effort, CLI and memory are this bot's own: drawn on its card, never on a
+      // peer's, because a pick is applied by the bot the press lands on (review, #345).
+      .filter((row) => row.where === where && (mine || !row.self_only))
       .forEach((row) => box.append(controlNode(row, target)));
   }
   return box;
@@ -1437,7 +1444,8 @@ function controlsPanel(state) {
   // instead of drawing a button that answers 403.
   if (!ADMIN) {
     reason.textContent = "the controls are disabled: this page needs the admin's verified " +
-      "Mini App login and it was opened without one (open the dashboard from Telegram).";
+      "Mini App login and this request did not carry one (open the dashboard from Telegram " +
+      "as the admin).";
   }
   const view = state.controls;
   if (!view || !view.ready) {
@@ -1515,6 +1523,8 @@ async function confirmPress() {
 }
 
 function render(state) {
+  ADMIN = Boolean(state.admin);
+  document.body.dataset.admin = ADMIN ? "1" : "0";
   document.getElementById("stamp").textContent =
     "refreshed " + state.refreshed +
     (state.coordinator ? " · coordinator " + state.coordinator : " · no coordinator");
@@ -1553,12 +1563,12 @@ const INIT = (() => {
   return match ? decodeURIComponent(match[1]) : "";
 })();
 
-// The write path, and whether this page has the admin's verified login to use it. A page
-// opened locally has neither: the controls are drawn disabled, and the server would refuse
-// the POST anyway (the login is checked there, not here).
+// The write path, and whether this page has the admin's verified login to use it. That is
+// the server's answer (`state.admin`), not the mere presence of some initData in the URL: a
+// member's login is a valid one and still not the admin's. A page opened locally has none
+// either way, so its controls are drawn disabled -- and the server refuses the POST anyway.
 const ACTION = "__ACTION_PATH__";
-const ADMIN = Boolean(INIT);
-document.body.dataset.admin = ADMIN ? "1" : "0";
+let ADMIN = false;
 
 // A Mini App also hands its chat's theme in the hash: which scheme it is, and some of its
 // colours. Nothing is loaded to read them.
@@ -1826,19 +1836,21 @@ class DashboardServer:
                     return True
                 return name in server.hosts or given in server.hosts
 
-            def _admin_ok(self) -> bool:
+            def _admin_ok(self, what: str = "a memory read") -> bool:
                 """Whether this request carries a valid admin ``initData``, wherever it came from.
 
                 The state has a loopback exception (#258: the operator on the host is not a
                 stranger); the memory does not (#344) -- so the check is repeated here rather
-                than reusing the one that may have answered "yes" for a local request.
+                than reusing the one that may have answered "yes" for a local request. Since
+                #345 the state read also reports the answer (``admin``), which is what the page
+                draws its controls from: a member's *valid* login is still not the admin's.
                 """
                 raw = str(self.headers.get(INIT_HEADER, "") or "")
                 ok, why = verify_init_data(raw, bot_token=server.bot_token,
                                            admin_id=server.admin_id,
                                            now=time.time(), max_age=server.init_max_age)
                 if not ok:
-                    logger.info("web dashboard: refused a memory read (%s)", why)
+                    logger.info("web dashboard: refused %s (%s)", what, why)
                 return ok
 
             def _init_ok(self, query: str) -> bool:
@@ -1896,7 +1908,12 @@ class DashboardServer:
                         self._send(403, b'{"error":"not the admin"}', "application/json")
                         return
                     try:
-                        payload = server.state()
+                        payload = dict(server.state())
+                        # Whether this very request carries the admin's verified login: the
+                        # page draws its controls enabled from *this*, never from the mere
+                        # presence of some initData in its URL -- a member's login is valid
+                        # and still not the admin's (review, #345).
+                        payload["admin"] = self._admin_ok("a state read")
                     except Exception:                       # noqa: BLE001 - never on the wire
                         self._send(503, b'{"error":"unavailable"}', "application/json")
                         return

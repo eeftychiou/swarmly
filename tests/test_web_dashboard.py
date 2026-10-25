@@ -1360,8 +1360,12 @@ class TestTheControlCentre(unittest.TestCase):
 
     def test_the_page_has_no_control_it_can_press_without_the_admins_login(self):
         page = webui.page_html()
-        # The page's own gate: no login, no enabled button -- and the reason, written down.
-        self.assertIn("const ADMIN = Boolean(INIT);", page)
+        # The page's own gate: no verified admin, no enabled button -- and the reason, written
+        # down. It reads the *server's* answer (`state.admin`), never the presence of some
+        # initData in the URL: a member's login is valid and still not the admin's (#345).
+        self.assertIn("let ADMIN = false;", page)
+        self.assertIn("ADMIN = Boolean(state.admin);", page)
+        self.assertNotIn("Boolean(INIT)", page)
         self.assertIn('document.body.dataset.admin = ADMIN ? "1" : "0";', page)
         self.assertIn("go.disabled = !ADMIN;", page)
         self.assertIn("the controls are disabled", page)
@@ -1377,6 +1381,40 @@ class TestTheControlCentre(unittest.TestCase):
         self.assertIn("controlNode(nudge, item.item)", page)              # on its round item
         self.assertIn('.where === "swarm"', page)                         # the rest in the panel
 
+    def test_the_state_says_whether_this_request_is_the_admin(self):
+        """Review #345: a member's valid initData drew live buttons that answered 403."""
+        server = webui.DashboardServer(lambda: {"bots": []}, port=0, bot_token=TOKEN,
+                                       admin_id=ADMIN_ID)
+        try:
+            url = server.start()
+
+            def read(init: str = "") -> Any:
+                headers = {webui.INIT_HEADER: init} if init else {}
+                request = urllib.request.Request(url.rstrip("/") + webui.STATE_PATH,
+                                                 headers=headers)
+                with urllib.request.urlopen(request, timeout=5) as got:
+                    return json.loads(got.read())
+
+            self.assertFalse(read()["admin"])                       # opened locally: no login
+            self.assertFalse(read(init_data(admin=ADMIN_ID + 1,
+                                            auth_date=time.time()))["admin"])
+            self.assertTrue(read(init_data(auth_date=time.time()))["admin"])
+        finally:
+            server.stop()
+
+    def test_a_bots_own_controls_are_drawn_on_this_bots_card_only(self):
+        view = self.channel().web_state()["controls"]
+        self.assertEqual(view["self"], "Hermes")
+        rows = {row["action"]: row for row in view["controls"]}
+        for action in ("bot.model", "bot.effort", "bot.cli", "bot.memory"):
+            self.assertTrue(rows[action]["self_only"], action)
+        for action in ("bot.pause", "bot.stop_turn", "swarm.hold"):
+            self.assertFalse(rows[action]["self_only"], action)
+        # And the page asks the view which bot it is before drawing one on a card.
+        page = webui.page_html()
+        self.assertIn("const mine = !target || target === view.self;", page)
+        self.assertIn("(mine || !row.self_only)", page)
+
     def test_a_page_that_collected_no_controls_draws_none(self):
         self.assertIsNone(webui.controls_view(None))
         self.assertIsNone(webui.watch_state(now=NOW)["controls"])
@@ -1390,7 +1428,7 @@ class TestTheControlCentre(unittest.TestCase):
              "chat_id": CHAT, "token": "secret", "choices": [["low", "low"], "not a pair"]}]})
         row = view["controls"][0]
         self.assertEqual(sorted(row), ["action", "choices", "confirm", "label", "note",
-                                       "report", "typed", "where"])
+                                       "report", "self_only", "typed", "where"])
         self.assertEqual(row["choices"], [{"label": "low", "value": "low"}])
         for secret in ("secret", str(CHAT)):
             self.assertNotIn(secret, json.dumps(view))

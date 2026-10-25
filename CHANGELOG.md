@@ -187,7 +187,12 @@ All notable changes to this project are documented here. The format follows
   is drawn disabled with the reason shown. `control.MENU_COVERAGE` maps **every** entry of
   `commands.MENU_COMMANDS` to its control(s) or panel, with one written exclusion — `/topic`, which
   needs the topic's thread id and the page publishes none — and the suite fails on a gap, on a row
-  naming a control that does not exist, and on a row for a command the menu dropped.
+  naming a control that does not exist, and on a row for a command the menu dropped. Model, Effort,
+  CLI and Memory are **this bot's own** (`control.SELF_ONLY`): a pick is applied by the bot the press
+  lands on, so they are drawn on the bot's own card only and a press for a peer is refused in words
+  (it used to set this bot's effort and write a note naming the peer). Which page may press is the
+  **server's** answer — `/state.json` carries `admin` for the request's own verified login — so a
+  member's valid `initData` draws the same disabled controls as a page opened without one.
 
 - A **view per read command** on the dashboard (`#344`, control centre 3/4): the roster behind
   `/status` and `/swarm` (role, state, model, effort, rev, and the peers this bot knows), the

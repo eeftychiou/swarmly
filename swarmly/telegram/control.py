@@ -144,6 +144,19 @@ def typed(action: str) -> str:
     return str(found.typed) if found else ""
 
 
+#: The controls that read or change **this bot's own** runtime -- its model, its effort, its
+#: CLI allowlist, its memory file. A press for another bot would either change the wrong bot
+#: (the pick is applied by the bot the press lands on) or answer about the wrong one (a report
+#: describes the bot that answers), so the page draws them on this bot's own card only, and the
+#: transport refuses the press however it arrives (review, #345).
+SELF_ONLY: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.cli", "bot.memory")
+
+
+def self_only(action: str) -> bool:
+    """Whether *action* only makes sense on the bot it lands on, never addressed to a peer."""
+    return str(action) in SELF_ONLY
+
+
 def page_actions() -> Tuple[str, ...]:
     """Every control this module's own table offers on the page, in table order (#345).
 

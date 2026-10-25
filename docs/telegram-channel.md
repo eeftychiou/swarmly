@@ -1283,7 +1283,15 @@ above), so the two can never behave differently.
 Where a control sits is its own prefix: a `bot.` control is drawn **on that bot's card** (Pause,
 Resume, Stop turn, Restart, Model, Effort, CLI, Memory), an `item.` control **on the round item
 it acts on** (Nudge), and a `swarm.` control in the **Controls** panel (Hold, Release, Pause all,
-Hand lease, Fail back, Reassign role, Cleanup, Sync, Admit, Remove). A control that takes a value
+Hand lease, Fail back, Reassign role, Cleanup, Sync, Admit, Remove).
+
+Four of the per-bot controls — Model, Effort, CLI and Memory — are **this bot's own**: a pick is
+applied by the bot the press lands on, and a report describes the bot that answers, so asking for
+a peer's model from its card would change this bot's and then say the peer's name. They are drawn
+on the bot's own card only, and the transport refuses such a press however it arrives — the page,
+or a typed `ctl:bot.effort:Codex:high` — in words: `Effort is Hermes's own: a press for Codex
+would change the bot that answers, not that one`. Pause, Resume, Stop turn and Restart are not in
+that list: those travel as a `CONTROL` note that names the peer, and the peer applies them. A control that takes a value
 carries the one it can be picked from — a model, an effort level, a bot, a role, a round item's
 key — read in code by `control_choices`, so drawing the panel costs no model turn; a control whose
 value cannot be picked, like `/admit`'s `@username`, shows a text box instead.
@@ -1312,7 +1320,10 @@ While the page has no verified admin login — opened locally, or without the Mi
 `initData` — **every control is drawn disabled** and the panel says why, rather than offering a
 button that would answer `403`; the login is checked on the server for every write anyway, so the
 disabled state is a courtesy on top of the real door. The page's own gate (`ADMIN`) never decides
-anything: it only draws.
+anything: it only draws. And it is the **server's** answer, not the presence of a login: `/state.json`
+carries `admin: true` only when *this request* presented the admin's verified `initData`, so a
+member's valid login (a real Telegram user, not the admin) draws the same disabled state as a
+page opened locally — the two look identical because, for the buttons, they are.
 
 The page follows the lease like the pin: the first heartbeat that finds this bot coordinating
 starts the server, and the first that finds another bot coordinating stops it — so a failover

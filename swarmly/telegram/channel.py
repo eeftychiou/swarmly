@@ -3879,6 +3879,7 @@ class AgentChannel:
                     "note": found.note,
                     "typed": control_mod.typed(found.action),
                     "where": found.action.split(".", 1)[0],
+                    "self_only": control_mod.self_only(found.action),
                     "choices": [[str(label), str(value)] for label, value
                                 in self.control_choices(found.action)],
                 }
@@ -3888,7 +3889,7 @@ class AgentChannel:
                     row["then"] = [[str(label), str(value)] for label, value
                                    in self.control_choices(found.action, "a-bot")]
                 rows.append(row)
-            return {"ready": True, "controls": rows}
+            return {"ready": True, "self": str(self.config.identity.alias), "controls": rows}
         except Exception:                      # noqa: BLE001 - a page without controls
             logger.warning("web dashboard: the controls are not readable", exc_info=True)
             return {"ready": False, "controls": [],
@@ -4419,6 +4420,27 @@ class AgentChannel:
         except Exception:                      # noqa: BLE001 - the answer still stands
             logger.warning("control centre: could not post the confirm button", exc_info=True)
 
+    def own_target(self, target: str) -> bool:
+        """Whether a press names this bot (or nobody): the only bot its own picks can change."""
+        who = str(target or "").strip().lstrip("@").lower()
+        return who in ("", "self", str(self.config.identity.alias).strip().lower())
+
+    def _refuse_peer_self_only(self, action: str, target: str) -> None:
+        """Refuse a press on this bot's own runtime when it names another bot (#345 review).
+
+        The pick is applied by the bot the press *lands* on, and a report describes the bot
+        that answers -- so "set Codex's effort", pressed here, used to change this bot's and
+        then write a note naming Codex. The note path is value-blind, so no re-route could put
+        it right: the press is refused, in words, before anything changes.
+        """
+        if not control_mod.self_only(action) or self.own_target(target):
+            return
+        found = control_mod.control(action)
+        label = found.label if found else action
+        raise ControlRefused(
+            f"{label} is {self.config.identity.alias}'s own: a press for {target} would change "
+            f"the bot that answers, not that one")
+
     async def _apply_pick(self, action: str, value: str, target: str = "",
                           presser: str = "", via: str = "") -> str:
         """Set what a picker chose -- through the same function the typed command runs.
@@ -4427,6 +4449,7 @@ class AgentChannel:
         picked value behaves exactly like a typed one: same validation, same limits, same
         words back.
         """
+        self._refuse_peer_self_only(action, target)
         if action == "bot.model":
             return self._model_command(self._control_event("model", value))
         if action == "bot.effort":
@@ -4900,6 +4923,7 @@ class AgentChannel:
             return await self._offer_picker(action, target)
         if control_mod.is_picker(action):
             return await self._offer_picker(action)
+        self._refuse_peer_self_only(action, target)
         report = self.control_report(action)
         if report is not None:
             return report
