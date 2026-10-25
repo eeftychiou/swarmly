@@ -363,8 +363,6 @@ class StateLink:
         agents: List[str] = []
         if handles:
             data = store.read(K.topic(thread_id))
-            if not data and not lines:
-                return                 # a mention alone never opens a record (review)
             have: Set[str] = set()
             for alias in (data or {}).get("agents") or {}:
                 have |= self._handles_of(alias)
@@ -398,7 +396,8 @@ class StateLink:
     def route_facts(self, chat_id: int, thread_id: Optional[int]) -> Optional[Any]:
         """The registry's facts for routing a message in this topic, or None when routing
         stays with the mention rules: the flag is off, the store is not ready, there is no
-        coordinator (lease lapsed), the topic has no open record, or it is Swarm pulse.
+        coordinator (lease lapsed), the topic's record is closed, or it is Swarm pulse. A topic
+        with no record yet routes as a new one: the coordinator is linked.
 
         Agents are named by alias *and* handle in ``linked``, so a peer's own spelling of an
         alias never decides a match (review)."""
@@ -414,8 +413,12 @@ class StateLink:
             return None                        # transport-only: nothing there is routed
         holder = store.holder()
         data = store.read(K.topic(thread_id))
-        if not holder or not data or data.get("status") == "closed":
+        if not holder or (data and data.get("status") == "closed"):
             return None
+        # A topic with no record yet is a new one, and the coordinator's (live, 25 Oct: the
+        # admin's first message in a fresh topic reached nobody). The holder's beat writes
+        # its record; until then only the coordinator is linked.
+        data = data or {"agents": {holder: {}}}
         unlinked = self._unlinked_since_last_turn(data)
         linked: Set[str] = set()
         for alias in data.get("agents") or {}:

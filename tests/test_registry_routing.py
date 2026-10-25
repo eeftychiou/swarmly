@@ -253,11 +253,22 @@ class RecordedLinkTests(unittest.TestCase):
         topic = Topic.from_dict(link.store.read("topic/55"))
         self.assertEqual(topic.agents["Codex"].linked_by, "admin:1")
 
-    def test_a_mention_alone_opens_no_record(self):
+    def test_a_new_topic_routes_to_the_coordinator(self):
+        """Live, 25 Oct: the admin's first message in a fresh topic reached nobody."""
         link = self.link()
-        link.note_admin_mentions(-100, 77, ["codexbot"], 1)
-        self.assertFalse(getattr(link, "_tasks", None))
-        self.assertIsNone(link.route_facts(-100, 77))
+        facts = link.route_facts(-100, 77)
+        self.assertEqual(facts.coordinator, "claudebot")
+        self.assertIn("claudebot", facts.linked)
+        self.assertNotIn("codex", facts.linked)
+
+    def test_the_admins_mention_in_a_new_topic_links_and_opens_its_record(self):
+        link = self.link()
+
+        async def go():
+            link.note_admin_mentions(-100, 77, ["codexbot"], 1)
+            await asyncio.gather(*list(link._tasks))
+        asyncio.run(go())
+        self.assertIn("codex", link.route_facts(-100, 77).linked)
 
     def test_with_routing_legacy_nothing_is_linked_or_routed(self):
         link = LinkFlowTests.link(self)
