@@ -7457,7 +7457,17 @@ class AgentChannel:
             self.topics.touch(event.chat_id, event.thread_id)
             if in_home_channel:
                 self.state_link.topic_seen(event.thread_id)  # open again, if it was closed
+        # Nothing to answer: no text and nothing attached is a service message (a topic opened
+        # or renamed, a pin). It has taught the name above and is never a turn. Live, 25 Oct:
+        # with registry routing the coordinator takes every person's message in a work topic,
+        # and it answered "your message reached me with no text".
+        # A General message id is still recorded first, so /cleanup can delete a sticker or pin.
         self._note_general_message(event.chat_id, event.message_id, event.thread_id)
+        if not (event.text or "").strip() and not event.attachments and not event.self_task:
+            self.stats.ignored += 1
+            logger.info("message %s in topic %s has no text and nothing attached; no turn",
+                        event.message_id, event.thread_id)
+            return None
         self.record_topic_turn(event.chat_id, event.thread_id, event.text or "")
         self._note_progress(event)
         if in_home_channel and event.text and self._anonymous_admin_post(event) \
@@ -11201,7 +11211,8 @@ def attachments_from_aiogram(message: Any) -> List[Dict[str, Any]]:
         found.append({"file_id": best.file_id, "name": "photo.jpg", "mime": "image/jpeg",
                       "size": getattr(best, "file_size", None)})
     for kind, default_name in (("document", "file"), ("voice", "voice.ogg"),
-                               ("audio", "audio"), ("video", "video.mp4")):
+                               ("audio", "audio"), ("video", "video.mp4"),
+                               ("video_note", "video_note.mp4")):   # a round video
         item = getattr(message, kind, None)
         if item is None:
             continue
