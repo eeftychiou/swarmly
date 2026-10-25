@@ -1258,6 +1258,20 @@ answer is an id or a path, and the answer reports what *actually* happened: a pr
 because another bot coordinates now says `refused: not_coordinator` with no confirm code
 instead of claiming it ran, and two presses at once never swap their answers.
 
+**A view per read command (#344).** `/status` and `/swarm` are the roster (each bot's role,
+state, model, effort and rev, plus the peers this bot knows), `/usage all` the usage table,
+`/round` and `/owed` the round board, `/topics` the registry panel, `/model`, `/reasoning` and
+`/role` the settings section (each bot's default, and the binding a topic overrides it with),
+`/drift` the ledger's score plus the kinds and weights of the live violations, and `/state` the
+store's backend, mode and readiness. A source that is not collected is `null` in the JSON and
+never an empty list; a source collected but not ready says so in words.
+
+`/memory` is the exception: a bot's own notes are served at `/memory.json` and **only** to a
+verified admin `initData`, the loopback included, and that path is a `404` when the transport
+keeps no memory. The page's Memory section says "the admin's login is needed" when it is opened
+without the Mini App login, and the file's home never reaches the wire — only its words and
+their size.
+
 The page follows the lease like the pin: the first heartbeat that finds this bot coordinating
 starts the server, and the first that finds another bot coordinating stops it — so a failover
 moves the page with the role instead of leaving a stale one answering on an old host. The
