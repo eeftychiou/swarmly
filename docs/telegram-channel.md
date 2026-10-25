@@ -997,8 +997,8 @@ to N topics run a turn at the same time.
 - `/pause` from the admin holds every bot (`/pause@<bot>` or `/pause @<bot>` holds one): a
   turn already running finishes and posts its answer, then the bot takes no more turns, from
   Telegram or the bus. A paused bot says "paused" with the `FROZEN` line its peers route by;
-  for a bare `/pause` only the coordinator answers, once for the swarm, and the peers learn
-  each other's pause from the pulse. The hold survives restarts. `/resume` (or
+  for a bare `/pause` only the coordinator answers, once for the swarm, and every bot marks
+  its peers paused at once, since each saw the same command. The hold survives restarts. `/resume` (or
   `/resume@<bot>`) lifts it; a bare one clears every freeze each bot knew of, and only the
   coordinator answers. Use it to stop a run at its budget without killing processes.
 - `/hold [reason]` from the admin holds the **whole swarm** (`/hold@<bot>` too: the mention only

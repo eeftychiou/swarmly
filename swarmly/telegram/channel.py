@@ -1448,7 +1448,9 @@ class AgentChannel:
         chat_id = event.chat_id if event is not None else int(self.config.identity.home_channel_id or 0)
         thread_id = event.thread_id if event is not None else None
         project = self.router.project_for(chat_id, thread_id)
-        workdir = str(self.router.workdir_for(project, thread_id)) if project and thread_id is not None else None
+        # create=False: /status must not fetch or add a worktree (only a turn does).
+        workdir = (str(self.router.workdir_for(project, thread_id, create=False))
+                   if project and thread_id is not None else None)
         return where_reply(
             alias=alias,
             chat_id=chat_id,
@@ -1475,8 +1477,16 @@ class AgentChannel:
     def _session_label(self, context_id: Optional[str], event: Optional[ChannelEvent] = None) -> Optional[str]:
         """The adapter session a turn in this discussion resumes, when the adapter keeps one
         per discussion; else the configured conversation."""
-        adapter = (self._adapter_for(event.chat_id, event.thread_id)
-                   if event is not None else self.adapter)
+        adapter: Optional[AgentAdapter] = self.adapter
+        project = (self.router.project_for(event.chat_id, event.thread_id)
+                   if event is not None and event.thread_id is not None else None)
+        if project is not None and event is not None and event.thread_id is not None:
+            # The adapter a turn made for this topic, never a new one: /status is asked by
+            # peers too, and making the adapter adds the topic's worktree.
+            adapter = self._project_adapters.get(
+                str(self.router.workdir_for(project, event.thread_id, create=False)))
+            if adapter is None:
+                return None                            # no turn here yet, so no session
         session_for = getattr(adapter, "session_for", None)
         if callable(session_for):
             try:
@@ -3158,7 +3168,8 @@ class AgentChannel:
         return Pulse(alias=self.config.identity.alias, at=now, rev=self._running_revision,
                      role=self._role_name() if self.config.identity.role else "", term=term,
                      busy_since=now - max(durations) if durations else None,
-                     frozen=bool(self._frozen), status=status, held=held,
+                     # A bot finishing its last turn before a pause takes no new work either.
+                     frozen=bool(self._frozen or self._pause_pending), status=status, held=held,
                      released_at=None if self._hold else (self._hold_released_at or None))
 
     def _pulse_usage(self, now: float, *, advance: bool = True) -> Dict[str, Any]:
@@ -7375,11 +7386,17 @@ class AgentChannel:
 
         # Topic registry, phase 5: /link, /unlink, /phase -- the store lease holder answers.
         parsed_command = parse_command(event.text or "")
-        if parsed_command and parsed_command[0] == "link":
-            self._pin_linked_item(event)
+        pinned = (self._pin_linked_item(event)
+                  if parsed_command and parsed_command[0] == "link" else [])
         registry_reply = (await self.state_link.registry_command(event)
                           if parsed_command and parsed_command[0] in ("link", "unlink", "phase")
                           else None)
+        if registry_reply == "" and pinned and not self.state_link.enabled \
+                and parsed_command and not parsed_command[1] and self._answers_for_swarm():
+            # No store, so no lease holder answers a bare /link; the pin still happened.
+            registry_reply = (f"📌 {', '.join(pinned)} live in this topic now: replies about "
+                              "them are posted here. The state store is off, so the topic "
+                              "registry keeps nothing.")
         if registry_reply == "":
             return None
         if registry_reply is not None:
@@ -7819,9 +7836,11 @@ class AgentChannel:
         now have ended and posted. ``quiet``: the whole swarm pauses, so this bot posts no
         FROZEN line when its turn ends (its pulse tells the peers). Returns what happened:
         "already", "paused" or "pausing"."""
-        if self._frozen:
+        if self._frozen and self._freeze_ref != "quota":
             return "already"
-        if not self._turn_running():
+        if self._frozen or not self._turn_running():
+            # Out of quota counts too: a quota freeze lifts itself when the quota resets, and
+            # the pause must outlast that.
             self._set_frozen(True, "pause")
             return "paused"
         if not self._pause_pending:
@@ -7939,7 +7958,7 @@ class AgentChannel:
             text = ("▶ The swarm is released: work goes on." if was
                     else "▶ The swarm was not on hold.")
         logger.info("%s: /%s from the admin", self.config.identity.alias, command)
-        speaks = mine if target else self.is_coordinator()
+        speaks = mine if target else (self._answers_for_swarm() or self._direct_chat(event))
         return text if speaks else ""
 
     def _handle_pause(self, event: ChannelEvent) -> Optional[str]:
@@ -7959,7 +7978,8 @@ class AgentChannel:
                 return ""
             named = True
         else:
-            named = bool(self._dropped_handles(text))     # @username or @alias, not @all
+            # @username or @alias (not @all), or the admin's private chat with this bot.
+            named = bool(self._dropped_handles(text)) or self._direct_chat(event)
             if not named and self._mentions_other_peer(text):
                 return ""                      # /pause @Codex is for Codex
         if not self.config.is_admin(event.author_id):
@@ -8000,10 +8020,29 @@ class AgentChannel:
             text = "▶ Every bot resumed."
         else:
             self._pause_self((event.chat_id, event.thread_id), quiet=True)
+            # Every peer saw the same command: route around all of them now, without waiting
+            # for their pulses (a bus-plane pulse never updates this table).
+            fresh = [alias for alias in (getattr(self.config, "peers", None) or {})
+                     if alias not in self._peers_frozen]
+            for alias in fresh:
+                self._peers_frozen[alias] = {"ref": "pause", "until": None}
+            if fresh:
+                save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
             text = ("⏸ Pausing every bot: each finishes the turn it is running, then takes no "
                     "more. /resume to continue.")
         logger.info("%s: a bare /%s from the admin", self.config.identity.alias, command)
-        return text if self.is_coordinator() else ""
+        return text if self._answers_for_swarm() else ""
+
+    def _answers_for_swarm(self) -> bool:
+        """Whether this bot answers a bare swarm-wide command: the coordinator, or, while no
+        lease is live, the coordinator the admin named. A paused swarm renews no lease, so
+        after a long /pause the lease has lapsed and the /resume would get no answer."""
+        if self.is_coordinator():
+            return True
+        try:
+            return self.current_coordinator() is None and self.is_named_coordinator()
+        except Exception:                          # noqa: BLE001 - unknown is not the one
+            return False
 
     async def _hold_for_cooldown(self, event: ChannelEvent, key: Any, lock: asyncio.Lock,
                                  stopped: Callable[[], bool]) -> Optional[asyncio.Lock]:
@@ -8819,20 +8858,21 @@ class AgentChannel:
         return (f"📌 {', '.join(refs)} live in this topic now: replies about them are "
                 "posted here.") if speaks else ""
 
-    def _pin_linked_item(self, event: ChannelEvent) -> None:
+    def _pin_linked_item(self, event: ChannelEvent) -> List[str]:
         """The admin's ``/link #N`` (as work) says what ``/topic #N`` says: the item lives in
         this topic, for today's routing too. Every bot applies it to its own topic map, as it
-        does /topic; the registry answer stays the lease holder's."""
+        does /topic; the registry answer stays the lease holder's. Returns the items pinned."""
         args = command_args(event.text or "")
         if event.author_is_bot or not self.config.is_admin(event.author_id) \
                 or event.thread_id is None or not args:
-            return
+            return []
         from swarmly.state.links import LinkLine, parse_lines
         refs = [ref for line in parse_lines("LINK: " + " ".join(args))
                 if isinstance(line, LinkLine) and line.role == "work"
                 for ref in issue_refs(line.ref)]
         if refs:
             self._learn_topic_refs(event.chat_id, event.thread_id, " ".join(refs), pin=True)
+        return refs
 
     def _topic_elsewhere(self, event: ChannelEvent, body: str) -> Optional[Tuple[int, int]]:
         """The topic a reply in another topic belongs in, when it is only about items that

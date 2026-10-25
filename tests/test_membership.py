@@ -1084,9 +1084,11 @@ class TheSwarmCommandsAnswerTests(unittest.TestCase):
 
     @staticmethod
     def say(channel, text, author_id=ADMIN_ID):
+        """What the channel posted for *text*: its last line, or "" if it posted none."""
+        before = len(channel._test_sender.sent)
         run(channel.handle_event(event(text, author_id=author_id, is_bot=False,
                                        username="alice" if author_id == ADMIN_ID else "mallory")))
-        return channel._test_sender.last or ""
+        return channel._test_sender.last if len(channel._test_sender.sent) > before else ""
 
     def test_role_on_the_bot_sets_that_bots_role_on_every_bot(self):
         channel = self.channel()                  # Hermes: /role@codex_x_bot is not for it
@@ -1105,6 +1107,17 @@ class TheSwarmCommandsAnswerTests(unittest.TestCase):
         self.say(channel, "/role@codex_x_bot reviewer")         # Codex is named: it confirms
         self.assertEqual(channel._test_sender.sent, [])
         self.assertEqual(channel.config.peer_roles["Codex"], "reviewer")
+
+    def test_a_new_coordinator_is_announced_once(self):
+        """The promoted bot's own "is coordinator" line is the answer; no second one."""
+        channel = self.channel(role="developer")
+        channel.is_coordinator = lambda **_: False
+        channel._test_sender.sent.clear()
+        self.say(channel, "/role@HermesBot coordinator")
+        run(asyncio.sleep(0))
+        said = [entry["text"] for entry in channel._test_sender.sent
+                if "is coordinator" in entry["text"]]
+        self.assertEqual(len(said), 1, said)
 
     def test_any_member_may_ask_for_the_swarm_and_a_stranger_learns_nothing(self):
         channel = self.channel()

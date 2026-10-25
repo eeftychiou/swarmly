@@ -279,15 +279,67 @@ class TestTypingAndStop(unittest.TestCase):
                 channel.is_coordinator = lambda **_: coordinator
                 back = []
                 channel._peer_back = back.append
-                run(channel.handle_event(human("/pause", message_id=2)))
-                channel._peers_frozen["Codex"] = {"ref": "pause", "until": None}
+                run(channel.handle_event(human("/pause", message_id=2)))   # marks both peers
                 channel.bot.sent.clear()
                 run(channel.handle_event(human("/resume", message_id=3)))
                 self.assertFalse(channel._frozen)
                 self.assertEqual(channel.frozen_peers(), {})
-                self.assertEqual(back, ["Codex"])      # the coordinator still re-balances
+                # The coordinator still re-balances, as when each peer posted RESUMED.
+                self.assertEqual(back, ["Antigravity", "Codex"])
                 texts = [sent["text"].split("</b> ")[-1] for sent in channel.bot.sent]
                 self.assertEqual(texts, ["▶ Every bot resumed."] if coordinator else [])
+
+    def test_a_bare_pause_routes_around_every_peer_at_once(self):
+        """Every peer saw the same /pause: it is marked paused here at once, not a pulse later
+        (a bus-plane pulse never updates the table), and a bot still finishing its last turn
+        tells its pulse it takes no work."""
+        adapter = _GatedAdapter("Hermes")
+        channel = bot_channel(adapter=adapter)
+        channel.is_coordinator = lambda **_: False
+
+        async def during(ch):
+            await ch.handle_event(human("/pause", message_id=2))
+            return ch.own_pulse(1000.0).frozen
+
+        _, pulsed_frozen = self.hold(channel, adapter, during)
+        self.assertTrue(pulsed_frozen)
+        self.assertEqual(sorted(channel.frozen_peers()), ["Antigravity", "Codex"])
+
+    def test_a_bare_pause_holds_a_bot_that_was_out_of_quota(self):
+        """A quota freeze thaws itself when the quota resets; a pause must outlast it."""
+        channel = bot_channel()
+        channel.is_coordinator = lambda **_: False
+        channel._set_frozen(True, "quota", until=1.0)
+        run(channel.handle_event(human("/pause", message_id=2)))
+        self.assertTrue(channel._frozen)
+        self.assertEqual(channel._freeze_ref, "pause")
+        self.assertIsNone(channel._freeze_until)
+
+    def test_a_pause_in_the_admins_private_chat_is_for_this_bot(self):
+        """A private chat holds one bot: a bare /pause there pauses it, with its own line, and
+        speaks for nobody else."""
+        channel = bot_channel()
+        channel.is_coordinator = lambda **_: True
+        run(channel.handle_event(human("/pause", chat_id=ADMIN_ID)))
+        self.assertTrue(channel._frozen)
+        self.assertIn("intent=FROZEN", channel.bot.sent[-1]["text"])
+        self.assertNotIn("every bot", channel.bot.sent[-1]["text"])
+        self.assertEqual(channel.frozen_peers(), {})
+
+    def test_after_a_long_pause_the_named_coordinator_answers(self):
+        """A paused swarm renews no lease, so it lapses; the coordinator the admin named still
+        answers the bare /resume, and nobody else does."""
+        for named in (True, False):
+            with self.subTest(named=named):
+                channel = bot_channel()
+                channel.is_coordinator = lambda **_: False
+                channel.current_coordinator = lambda **_: None       # the lease has lapsed
+                channel.is_named_coordinator = lambda: named
+                run(channel.handle_event(human("/pause", message_id=2)))
+                channel.bot.sent.clear()
+                run(channel.handle_event(human("/resume", message_id=3)))
+                texts = [sent["text"].split("</b> ")[-1] for sent in channel.bot.sent]
+                self.assertEqual(texts, ["▶ Every bot resumed."] if named else [])
 
     def test_a_pause_that_names_a_bot_is_that_bots(self):
         """``/pause @bot`` is ``/pause@bot``: the named bot pauses, the others are left alone."""

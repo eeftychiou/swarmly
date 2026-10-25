@@ -917,7 +917,7 @@ class Membership:
         else:
             self._set_peer_role(alias, role, coordinator=True)
             self._save()
-        if speaks:
+        if speaks and role != "coordinator":       # a new coordinator announces itself
             await self._answer(event, f"✅ {alias} is {role} now.")
         return True
 

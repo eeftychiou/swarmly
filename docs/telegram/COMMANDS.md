@@ -12,12 +12,13 @@ bot named that way, and a bare `/status`, `/ping` or `/stop` in the group gets n
 A bare `/pause`, `/resume`, `/hold`, `/release`, `/topic`, `/admit`, `/remove`, `/sync` or
 `/role @bot <role>` reaches **every** bot, and so does a bare `/bus` (every bot that has no bus
 yet). Each bot applies it. The coordinator answers a bare `/pause`, `/resume`, `/hold`,
-`/release`, `/topic` or role change, once for the swarm. `/sync` has every bot post its peer
-list, `/admit` has every bot welcome the newcomer, and `/remove` gets no answer. `/swarm` is
-answered by the coordinator, or by every bot while no coordinator is recorded. The
-topic-registry commands (`/link`, `/unlink`, `/phase`) are answered by the bot holding the state
-store's lease, which writes them. `/swarm`, `/admit`, `/remove`, `/sync`, `/bus` and setting a
-role work in the home group only.
+`/release`, `/topic` or role change, once for the swarm; after a long pause, when no lease is
+live, the coordinator you named answers `/pause`, `/resume`, `/hold` and `/release`. `/sync` has
+every bot post its peer list, `/admit` has every bot welcome the newcomer, and `/remove` gets no
+answer. `/swarm` is answered by the coordinator, or by every bot while no coordinator is
+recorded. The topic-registry commands (`/link`, `/unlink`, `/phase`) are answered by the bot
+holding the state store's lease, which writes them. `/swarm`, `/admit`, `/remove`, `/sync`,
+`/bus` and setting a role work in the home group only.
 
 "Admin" means only `agent.admin_user_id` may use it. Any other member of the swarm (people in
 `agent.allowed_users`, and peer bots) may use the rest; strangers are ignored unless
@@ -38,7 +39,7 @@ all) taking turns; **hold** keeps everyone answering but starting nothing new.
 | Command | Admin | What it does | Undo |
 |---|---|---|---|
 | `/stop@bot` | yes | Cancels the bot's running turn, ends its CLI process and drops the messages queued behind it: in a topic, that topic's only; in General or with `/stop@bot all`, everything. Messages held past the queue's limit still run afterwards. A paused bot ignores it. | — (one-off) |
-| `/pause` / `/pause@bot` | yes | The bot (bare: every bot) finishes the turn in flight, then takes **no more turns**, from Telegram or the bus. `/pause@bot` (or `/pause @bot`) gets that bot's "paused" line; a bare `/pause` gets one line from the coordinator for the whole swarm. The messages queued behind that turn are dropped, and nothing sent while it is paused is kept for later: a person gets one 🧊 line saying it is paused. A paused coordinator stops renewing its lease, so another bot takes over coordinating. The pause survives a restart once the running turn has ended. | `/resume` / `/resume@bot` |
+| `/pause` / `/pause@bot` | yes | The bot (bare: every bot) finishes the turn in flight, then takes **no more turns**, from Telegram or the bus. `/pause@bot` (or `/pause @bot`) gets that bot's "paused" line; a bare `/pause` gets one line from the coordinator for the whole swarm. The messages queued behind that turn are dropped, and nothing sent while it is paused is kept for later: a person gets one 🧊 line saying it is paused. A bot out of quota is paused too, so it stays paused when its quota comes back. A paused coordinator stops renewing its lease, so another bot takes over coordinating. The pause survives a restart once the running turn has ended. | `/resume` / `/resume@bot` |
 | `/resume` / `/resume@bot` | yes | Lifts a pause. Also ends a quota freeze early (or switch model with `/model@bot`). A bare `/resume` resumes every bot, and the coordinator answers once. | — |
 | `/hold [reason]` | yes | Holds the **whole swarm** (`/hold@bot` only picks who answers). Bots still take turns for what they are asked, GitHub notices included, but every turn is told to start no new work, merge nothing, open no pull request and hand nothing off. The timers that wake bots stop: owed wakes, the stall ladder, hand-off reminders. Survives restarts, and reaches a bot that was down within one pulse. | `/release` |
 | `/release` | yes | Lifts the hold, swarm-wide. The latest of hold/release always wins. | — |
@@ -67,7 +68,7 @@ Any member may use these.
 |---|---|
 | `/model@bot` (admin to set) | Show the model this bot runs in this topic; `/model@bot <name>` switches it from the next turn (`default` goes back). |
 | `/reasoning@bot` (admin to set) | The same for reasoning effort (`low` … `max`, `default`). `/effort@bot` is the same command. |
-| `/role@bot` | Show a bot's role and the team's. The admin sets one with `/role@bot <role>` (or `/role @bot <role>`); every bot applies it, and the bot named (or, for `/role @bot`, the coordinator) confirms it. `/role @bot coordinator` names a new coordinator, and the old one becomes a developer. |
+| `/role@bot` | Show a bot's role and the team's. The admin sets one with `/role@bot <role>` (or `/role @bot <role>`); every bot applies it, and the bot named (or, for `/role @bot`, the coordinator) confirms it. `/role @bot coordinator` names a new coordinator, which announces itself, and the old one becomes a developer. |
 
 ## Topics and work items (the topic registry)
 
