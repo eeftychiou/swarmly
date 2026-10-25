@@ -52,12 +52,23 @@ class DriftLedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.reminder(), "")
         self.assertEqual(self.ledger.decide().resets_today, 1)
 
-    def test_old_violations_age_out_and_the_ledger_survives_a_restart(self):
-        self.ledger.record("addressed_frozen_peer")
-        self.clock.now += dr.WINDOW_SECONDS + 1
+    def test_a_violation_counts_until_its_session_is_reset_and_survives_a_restart(self):
+        """No clock ageing: a session running for days still reaches the line (admin, 24 Oct)."""
+        self.ledger.record("addressed_frozen_peer", topic="-100:7")
+        self.clock.now += 3 * 86400
         again = dr.DriftLedger(self.ledger.path, clock=self.clock)
-        self.assertEqual(len(again.rows), 1)
-        self.assertEqual(again.decide().score, 0)
+        self.assertEqual(again.decide("-100:7").score, 3)
+        self.assertTrue(again.record("merge_gate_refused", topic="-100:7").reset)
+
+    def test_sessions_are_scored_apart(self):
+        self.ledger.record("addressed_frozen_peer", topic="-100:7")
+        self.ledger.record("duplicate_reply", topic="-100:8")
+        self.ledger.mark_reset("-100:7")
+        self.assertEqual(self.ledger.decide("-100:7").score, 0)
+        self.assertEqual(self.ledger.decide("-100:8").score, 1)
+        self.assertEqual(self.ledger.sessions(), {"-100:8": (1, 0)})
+        self.ledger.record("secret_in_push")                 # no topic: every session
+        self.assertEqual(self.ledger.decide("-100:7").score, 3)
 
     def test_another_process_reports_through_the_inbox(self):
         self.clock.now = time.time()                    # the guard stamps real time

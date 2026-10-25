@@ -267,6 +267,11 @@ class StateLink:
                         self._reconcile_logged(store))
                     done.append("github check started")
                 try:
+                    if await self.sync_stats(store):
+                        done.append("stats")
+                except Exception as exc:               # noqa: BLE001 - shadow: never fatal
+                    logger.warning("state: stats sync failed: %s", exc, exc_info=True)
+                try:
                     if await self.sync_owed(store, moment):
                         done.append("owed")
                 except Exception as exc:               # noqa: BLE001 - shadow: never fatal
@@ -463,6 +468,20 @@ class StateLink:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def registry_facts(self, chat_id: int, thread_id: Optional[int]) -> str:
+        """What the registry records for a topic, as a few lines for a new session's first
+        prompt; the facts win over a handover's own claims. "" when nothing is recorded."""
+        store = self.store
+        if store is None or not store.ready or thread_id is None:
+            return ""
+        data = store.read(K.topic(thread_id)) or {}
+        items = [self.registry._link_text(link) for link in data.get("links") or []
+                 if link.get("added_by") != "legacy"]
+        if not items:
+            return ""
+        return ("[Recorded by the transport for this topic -- these facts win over anything a "
+                "handover says: " + "; ".join(items[:12]) + ".]")
+
     def registry_note(self, chat_id: int, thread_id: Optional[int]) -> str:
         """The coordinator's per-turn hint (the store lease holder, in a topic): how to record
         this topic's work, and what is recorded already. Empty for everyone else."""
@@ -640,6 +659,31 @@ class StateLink:
         if await ops.save(event.thread_id, topic):
             return f"Recorded: {said}"
         return "The store did not take the change; try again in a moment."
+
+    # -- agent stats and drift (phase 8) -------------------------------------------------------
+    def agent_stats(self) -> dict:
+        """This bot's drift, as the store keeps it: score per live session, resets in the last
+        day, the latest violations. Its own key, so the coordinator and the dashboard can read
+        every bot's (docs/design/topic-registry.md, "Agent stats and drift")."""
+        ledger = getattr(self.channel, "drift", None)
+        if ledger is None:
+            return {}
+        ledger.fold_inbox()
+        decision = ledger.decide()
+        recent = [{"kind": r.kind, "severity": r.severity, "topic": r.topic,
+                   "at": round(float(r.at))} for r in ledger.rows if not r.reset][-20:]
+        return {"sessions": {t: list(v) for t, v in ledger.sessions().items()},
+                "resets_24h": int(decision.resets_today), "violations": recent}
+
+    async def sync_stats(self, store: Any) -> bool:
+        """Write ``agent/<alias>/stats`` when it changed. True if written."""
+        value = await asyncio.to_thread(self.agent_stats)
+        if not value:
+            return False
+        key = K.agent(store.alias, "stats")
+        if store.read(key) == value or (store.read(key) is None and not value["violations"]):
+            return False
+        return bool((await store.write(key, value)).applied)
 
     # -- the owed table (phase 3, part 2: shadow) --------------------------------------------
     #: Closed rows stay in the store this long, so a reader sees how a debt ended.

@@ -42,6 +42,7 @@ import atexit
 import contextvars
 import dataclasses
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -301,11 +302,15 @@ class ClaudeThreadAdapter(ClaudeAdapter):
         #: re-creating the old id is refused as "in use" and would resume it.
         self._generations: Dict[str, int] = {}
         self._generations_path: Optional[Path] = None
+        from swarmly.telegram.adapters.handover import Handovers
+        self._handovers = Handovers(self.alias)
+        self._session_turns: Dict[str, int] = {}     # session -> turns this process ran in it
 
     def use_state_file(self, path: Optional[Path]) -> None:
         """Keep, per session, the hash of the channel rules it holds in ``path`` (JSON), so a
         restart does not send them inline again to sessions that already have them."""
         self._state_path = path
+        self._handovers.attach(path)
         held = load_state(path, f"{self.alias}: Claude sessions")
         self._rules_held.update({str(k): str(v) for k, v in held.items() if v})
         self._known.update(self._rules_held)    # these exist: resume them, never re-create
@@ -366,6 +371,29 @@ class ClaudeThreadAdapter(ClaudeAdapter):
                    f"{self.alias}: Claude generations")
         return known
 
+    async def rotate(self, context_id: str, message: IncomingMessage, prefix: str = "") -> bool:
+        """Retire the topic's session now (a drift reset): it writes its handover, and the
+        next turn creates a new session (the next generation) from ``prefix`` and it."""
+        from swarmly.telegram.adapters.handover import HANDOVER_PROMPT
+        session = self.topic_session(context_id)
+        text: Optional[str] = None
+        if session in self._known or session in self._rules_held:
+            lock = self._turns.setdefault(session, asyncio.Lock())
+            async with lock:
+                self._session.set(session)
+                self._create.set(False)
+                try:
+                    reply = await ClaudeAdapter.respond(self, dataclasses.replace(
+                        message, text=HANDOVER_PROMPT, fresh_text=None,
+                        context_id=context_id))
+                    text = reply.text if reply is not None and reply.ok else None
+                except Exception:                          # noqa: BLE001 - fall back
+                    logging.getLogger(__name__).warning(
+                        "%s: the handover turn failed", self.alias, exc_info=True)
+        self._handovers.save(context_id, text, prefix)
+        self.forget_session(context_id)                    # the next generation
+        return True
+
     def _can_create(self, session_id: Optional[str] = None) -> bool:
         try:
             uuid.UUID(session_id or self._session.get())
@@ -393,6 +421,7 @@ class ClaudeThreadAdapter(ClaudeAdapter):
     async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
         session = self.session_for(message)
         lock = self._turns.setdefault(session, asyncio.Lock())
+        rotate_now = False
         async with lock:
             self._session.set(session)
             # A topic's session is usually new: create it first rather than fail a resume.
@@ -403,9 +432,14 @@ class ClaudeThreadAdapter(ClaudeAdapter):
                             and self._can_create(session))
             self._create.set(create_first)
             first = message
-            if create_first and message.fresh_text:
-                # A new session needs the task and the progress, not only the last messages.
-                first = dataclasses.replace(message, text=message.fresh_text)
+            context_id = str(getattr(message, "context_id", None) or "")
+            taking_over = create_first and context_id and self._handovers.pending(context_id)
+            if create_first and (message.fresh_text or taking_over):
+                # A new session needs the task and the progress, not only the last messages --
+                # and, after a rotation, the old session's handover ahead of them.
+                lead = self._handovers.lead(context_id) if taking_over else ""
+                first = dataclasses.replace(message, text=lead + (message.fresh_text
+                                                                   or message.text or ""))
             try:
                 reply = await super().respond(first)
             finally:
@@ -429,6 +463,8 @@ class ClaudeThreadAdapter(ClaudeAdapter):
                 finally:
                     self._create.set(False)
             if reply is not None and reply.ok:
+                if taking_over:
+                    self._handovers.done(context_id)
                 self._known.add(session)
                 rules = self.system_rules(message)
                 if rules and self._rules_held.get(session) != rules_digest(rules):
@@ -439,4 +475,14 @@ class ClaudeThreadAdapter(ClaudeAdapter):
                 reply.meta.setdefault("conversation", session)
                 if getattr(message, "context_id", None):
                     reply.meta.setdefault("context_id", message.context_id)
-            return reply
+            if reply is not None and reply.ok and context_id:
+                # adapter.session_turn_limit: past it, the session hands over to a new one
+                # (none by default: Claude Code compacts a long session by itself).
+                turns = self._session_turns.get(session, 0) + 1
+                self._session_turns[session] = turns
+                limit = self.settings.session_turn_limit
+                rotate_now = bool(limit) and turns >= int(limit)
+        if rotate_now and reply is not None:
+            await self.rotate(context_id, message)
+            reply.meta["rotated"] = True
+        return reply

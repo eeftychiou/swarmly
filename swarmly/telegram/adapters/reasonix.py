@@ -175,6 +175,25 @@ class ReasonixAdapter(SubprocessAdapter):
         limit = self._turn_limit()
         return bool(limit and turns >= limit)
 
+    async def rotate(self, context_id: str, message: IncomingMessage, prefix: str = "") -> bool:
+        """Retire the topic's session now (a drift reset): it writes its handover, and the
+        next turn starts a new session from ``prefix`` and that handover."""
+        lock = self._topic_turns.setdefault(context_id, asyncio.Lock())
+        async with lock:
+            session = self.session_for(context_id)
+            text: Optional[str] = None
+            if session:
+                try:
+                    reply = await self._run_in(dataclasses.replace(
+                        message, text=HANDOVER_PROMPT, fresh_text=None,
+                        context_id=context_id), session)
+                    text = reply.text if reply is not None and reply.ok else None
+                except Exception:                          # noqa: BLE001 - fall back
+                    logger.warning("%s: the handover turn failed", self.alias, exc_info=True)
+            self._handovers.save(context_id, text, prefix)
+            self._remember(context_id, None)
+            return True
+
     async def _hand_over(self, message: IncomingMessage, context_id: str) -> None:
         """The retiring session writes its handover; the next turn starts a new session from
         it, ahead of the topic recap."""
