@@ -50,7 +50,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from swarmly.transports.base import OWED_RELPATH, is_bus_document
 
@@ -765,7 +765,7 @@ class OwedStore:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps(sorted(set(relpaths))), encoding="utf-8")
             else:
-                path.unlink()
+                path.unlink(missing_ok=True)     # no marker yet: nothing to clear
         except OSError:                                  # a marker that cannot be written is
             logger.warning("owed: could not update the local-only marker %s", path)
 
@@ -781,17 +781,22 @@ class OwedStore:
         rows: List[Row] = self.held(self._unreadable)
         on_store = self.shared is not None
         if self.root is not None:
-            # On the store, this bot's own bus documents are history: its state directory holds
-            # those rows, and a document closed before the switch would hide a re-opened id for
-            # good (review). The other writers' documents still count.
-            rows.extend(self._read_documents(self.root, self._unreadable,
-                                             skip=self.safe_alias if on_store else None))
+            # On the store, this bot's state directory is the truth for the ids it holds: its own
+            # bus document for such an id is history (a document closed before the switch would
+            # hide a re-opened id for good -- #298 review). For every other id the document still
+            # counts: some closures exist only there (live, 25 Oct: skipping them all brought
+            # back debts settled the day before).
+            own = (self.safe_alias, {row.id for row in rows}) if on_store else None
+            rows.extend(self._read_documents(self.root, self._unreadable, skip=own))
         if on_store:
             held = {row.id for row in rows}
             try:
                 rows.extend(self.shared())
                 if self.published is not None:
                     rows.extend(row for row in self.published() if row.id not in held)
+            except RuntimeError as exc:              # not ready yet (a start): no traceback
+                self._unreadable.append("state store")
+                logger.info("owed: the store's rows cannot be read yet: %s", exc)
             except Exception:                        # noqa: BLE001 - never "nothing is owed"
                 self._unreadable.append("state store")
                 logger.warning("owed: the store's rows could not be read", exc_info=True)
@@ -847,7 +852,7 @@ class OwedStore:
 
     @staticmethod
     def _read_documents(root: Path, unreadable: Optional[List[str]] = None,
-                        skip: Optional[str] = None) -> List[Row]:
+                        skip: Optional[Tuple[str, Set[str]]] = None) -> List[Row]:
         """Every row document under *root*'s `.agents/owed/`, as read (not yet folded).
 
         A document that cannot be read is reported to *unreadable* as well as logged: a table
@@ -859,10 +864,11 @@ class OwedStore:
             return []
         rows: List[Row] = []
         for path in sorted(base.glob("*/*.json")):
-            if skip is not None and path.parent.name == skip:
-                continue
             try:
-                rows.append(Row.from_dict(json.loads(path.read_text(encoding="utf-8"))))
+                row = Row.from_dict(json.loads(path.read_text(encoding="utf-8")))
+                if skip is not None and path.parent.name == skip[0] and row.id in skip[1]:
+                    continue                    # the writer's own state copy holds this id
+                rows.append(row)
             except Exception:                        # noqa: BLE001 - one bad document, one row
                 logger.warning("owed: unreadable row document %s; skipping it", path)
                 if unreadable is not None:
