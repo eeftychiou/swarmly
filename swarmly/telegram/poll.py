@@ -1166,6 +1166,11 @@ async def _echo_reply(channel: Any, sender: str, reply: Any,
     echo_text = f"[gitbus \u2190 {sender}] {reply.text}"
     chat_id: Optional[int] = None
     find = getattr(channel, "topic_for_text", None)
+    only = getattr(channel, "_transport_only_on", None)
+    if callable(only) and only() is True:
+        # General and Swarm pulse are transport-only: the words of the answer do not pick
+        # its topic either (admin, 25 Oct: routing is decided in transport space).
+        find = None
     if thread_id is None and callable(find):
         # The mirror names no topic (no shared secret): the topic already about the same
         # issue or PR, never General (round 2 export: these echoes all landed in General).
@@ -1175,6 +1180,14 @@ async def _echo_reply(channel: Any, sender: str, reply: Any,
             known = None
         if known is not None:
             chat_id, thread_id = known
+    barred = getattr(channel, "token_barred", None)
+    place = barred(chat_id, thread_id) if callable(barred) else None
+    if isinstance(place, str):
+        # No topic of its own (a mirror names a topic token, not a thread): not shown in
+        # Telegram. No bot takes a turn there anyway, so nothing that reached one is lost.
+        logger.info("poll: %s is transport-only, so %s's answer is not echoed there: %r",
+                    place, sender, reply.text[:200])
+        return
     if getattr(channel, "_sender", None) is None:
         if getattr(channel, "bot", None) is not None:
             # The running transport: post like any other reply. (Before, only an injected

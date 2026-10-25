@@ -108,6 +108,16 @@ async def post_and_notify(channel: Any, *, to: str, text: str, intent: str = "ST
                          bus_pointer=bus_pointer(transport, location, filename))
     if not notify:
         return result
+    barred = getattr(channel, "token_barred", None)
+    place = barred(None, None) if callable(barred) else None
+    if isinstance(place, str):
+        # The pointer goes to General, which is transport-only: no bot takes a turn there, so
+        # it would wake nobody and only put an agent's words in front of people. The poller
+        # delivers the durable copy (admin, 25 Oct: no token space posts in General).
+        result.error = f"not pointed at from Telegram: {place} is transport-only"
+        logger.info("relay: %s is transport-only; %s is delivered by the poller", place,
+                    message.message_id)
+        return result
 
     kind = (telegram_type or (MessageType.NOTE if recipient == "*" else MessageType.REQUEST))
     envelope = Envelope(type=kind, to=recipient, intent=intent, bus=result.bus_pointer,

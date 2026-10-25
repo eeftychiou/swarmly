@@ -542,6 +542,15 @@ async def _send_with_retry(channel: AgentChannel, text: str, topic: Optional[int
 
 async def _send(config: AgentConfig, text: str, topic: Optional[int] = None) -> int:
     channel = AgentChannel(config)
+    barred = channel.token_barred(None, topic)
+    if barred is not None:
+        # Whoever runs this -- an agent from its shell, as often as not -- posts its own words:
+        # never in General or Swarm pulse once they are transport-only.
+        print(json.dumps({"state": "refused", "topic": topic,
+                          "reason": f"{barred} is transport-only"}))
+        print(f"not posted: {barred} is transport-only; post in a work topic with --topic",
+              file=sys.stderr)
+        return 1
     from aiogram import Bot
     from aiogram.client.default import DefaultBotProperties
     channel.bot = Bot(token=config.identity.bot_token,
