@@ -119,7 +119,7 @@ pressing the button is quieter.
 | Reassign role | Like `/role @bot <role>`, but it never gives or takes the coordinator role. |
 | Cleanup | `/cleanup preview`: what `/cleanup` would delete; a press deletes nothing. |
 | Sync | The coordinator re-posts its peer list. A bare `/sync` makes every bot do it. |
-| Admit, Remove | `/admit @name` and `/remove @name`: admit adds a bot whose HELLO has already reached this one (the `@username` is typed), remove takes a bot out of the roster after a second tap. |
+| Admit, Remove | `/admit @name` and `/remove @name`: admit adds a bot whose HELLO has already reached this one (the `@username` is typed), remove takes a bot out of the roster. Both ask for a second tap — Admit came back to the table in #345, wired for the first time, and a control that changes the roster is confirmed. |
 | Nudge | On a round item's line, or typed as `ctl:item.nudge:<issue>`: wakes the bot that owes that item, which costs it a turn. |
 
 The live page (#345) draws the same controls from the same table — a `bot.` button on that bot's

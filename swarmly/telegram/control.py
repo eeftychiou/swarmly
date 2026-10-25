@@ -114,7 +114,7 @@ CONTROLS: Tuple[Control, ...] = (
             note="every bot still answers, but starts nothing"),
     Control("swarm.release", "Release", confirm=True,
             note="every bot may start turns again"),
-    Control("swarm.admit", "Admit", typed="a bot's @username",
+    Control("swarm.admit", "Admit", confirm=True, typed="a bot's @username",
             note="adds a bot whose HELLO has already reached this one"),
     Control("swarm.remove", "Remove", confirm=True,
             note="takes the bot out of this roster"),

@@ -334,7 +334,9 @@ class TestTheMessageFits(unittest.TestCase):
 class TestControls(unittest.TestCase):
     def test_anything_that_stops_or_changes_asks_for_a_second_tap(self):
         for action in ("bot.stop_turn", "bot.restart", "swarm.pause_all",
-                       "swarm.lease", "swarm.failback", "swarm.role"):
+                       "swarm.lease", "swarm.failback", "swarm.role",
+                       "bot.memory", "swarm.hold", "swarm.release",
+                       "swarm.admit", "swarm.remove"):
             self.assertTrue(ct.needs_confirm(action), action)
         for action in ("bot.pause", "bot.resume", "bot.model", "swarm.sync"):
             self.assertFalse(ct.needs_confirm(action), action)
@@ -348,11 +350,25 @@ class TestControls(unittest.TestCase):
         self.assertNotIn("swarm.sync", ct.reports())          # a resync does change the swarm
 
     def test_the_retired_buttons_are_gone(self):
-        """WAKE had nothing left to pick (#215), Freeze was Pause behind a second tap, and
-        Admit bot was never wired (the admin, 25 Oct): none of them is in the table."""
-        for action in ("bot.wake", "bot.freeze", "swarm.admit"):
+        """WAKE had nothing left to pick (#215) and Freeze was Pause behind a second tap:
+        neither is in the table.
+
+        Admit left it too, but for a different reason -- it was *never wired* ("the WAKE and
+        Freeze buttons, and the never-wired Admit bot, leave the table", 568f7da, the admin's
+        own round). #345 asked for `/admit` as a page control and wired it (the roster change
+        and the welcome the typed command makes), so it is back, with the second tap every
+        change carries -- see ``test_admit_is_back_because_it_is_wired``.
+        """
+        for action in ("bot.wake", "bot.freeze"):
             self.assertIsNone(ct.control(action), action)
             self.assertNotIn(action, ct.PICKERS)
+
+    def test_admit_is_back_because_it_is_wired(self):
+        found = ct.control("swarm.admit")
+        self.assertIsNotNone(found)
+        self.assertTrue(found.confirm, "adding a bot to the roster asks twice")
+        self.assertEqual(found.typed, "a bot's @username")     # a handle cannot be picked
+        self.assertIn("HELLO", found.note)
 
     def test_the_nudge_says_it_costs_a_turn(self):
         self.assertIn("turn", ct.control("item.nudge").note)
