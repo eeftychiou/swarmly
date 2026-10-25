@@ -2267,6 +2267,34 @@ class AgentChannel:
         except Exception:                                  # noqa: BLE001 - best effort
             logger.exception("could not announce the deletion of topic %s", thread_id)
 
+    def close_owed_for_gone_topic(self, chat_id: int, thread_id: Optional[int],
+                                  context: Optional[str] = None) -> int:
+        """A deleted topic answers its hand-offs: nobody can reply there any more, so its open
+        hand-off rows close (live, 25 Oct: deleting finished topics left orphan debts, and
+        their reminders fired for hours). Returns how many closed."""
+        if thread_id is None:
+            return 0
+        token = context or self._topic_token(chat_id, thread_id)
+        if not token:
+            return 0
+        try:
+            store = self.owed_store()
+            done = []
+            for row in store.load():
+                if row.is_open and row.kind == "handoff" and token in (row.topic, row.key_extra):
+                    row.state = "closed"
+                    row.closed_by = "topic deleted"
+                    done.append(row)
+            if done:
+                store.save_all(done)
+                logger.info("owed: topic %s is gone; closed %d hand-off row(s)", thread_id,
+                            len(done))
+            return len(done)
+        except Exception:                                  # noqa: BLE001 - book-keeping only
+            logger.warning("owed: could not close the hand-offs of gone topic %s", thread_id,
+                           exc_info=True)
+            return 0
+
     def forget_topic_state(self, chat_id: int, thread_id: Optional[int]) -> None:
         """Forget everything this transport kept about a topic that is gone (issue #63).
 
@@ -2280,6 +2308,7 @@ class AgentChannel:
         chat_id, thread_id = int(chat_id), int(thread_id)
         key = (chat_id, thread_id)
         context = self.topics.context(chat_id, thread_id)
+        self.close_owed_for_gone_topic(chat_id, thread_id, context)
         self.topics.forget(chat_id, thread_id)
         self._topic_memory.forget(chat_id, thread_id)
         self._forget_topic_refs(chat_id, thread_id)
@@ -10485,7 +10514,10 @@ class AgentChannel:
             self._gone_topics.add((destination, thread_id))
             self._forget_topic_refs(destination, thread_id)
             if int(destination) == int(self.config.identity.home_channel_id or 0):
-                self.state_link.topic_gone(thread_id, deleted=_is_topic_deleted(gone.__cause__))
+                deleted = _is_topic_deleted(gone.__cause__)
+                self.state_link.topic_gone(thread_id, deleted=deleted)
+                if deleted:
+                    self.close_owed_for_gone_topic(destination, thread_id)
             if (self._turn_slots is not None or not self.reroute_gone_topics
                     or self._drop_gone_topic_posts()):
                 raise
