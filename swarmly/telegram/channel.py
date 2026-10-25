@@ -1313,11 +1313,15 @@ class AgentChannel:
         if not self.config.is_admin(event.author_id):
             logger.warning("/%s from @%s ignored: only the admin changes the swarm",
                            command, event.author_username)
-            if target or self.is_coordinator():
-                # The bot named, or the coordinator for a bare one: one line, not one per bot.
+            member = getattr(self.config.limits, "strangers", "ignore") != "ignore" or \
+                self.config.is_member(event.author_id, event.author_username, False)
+            if target or (member and self.is_coordinator()):
+                # The bot named, or the coordinator for a member's bare one: one line, not one
+                # per bot, and no line a stranger can set off.
                 await self.send(f"⛔ only the admin can use /{command}",
                                 reply_to_message_id=event.message_id, chat_id=event.chat_id,
-                                thread_id=event.thread_id, allow_when_frozen=True)
+                                thread_id=event.thread_id, allow_when_frozen=True,
+                                address_peers=False)
             return True
         if command == "sync":
             await self._sync_now(chat_id=event.chat_id, thread_id=event.thread_id)

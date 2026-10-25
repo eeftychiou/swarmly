@@ -1092,6 +1092,8 @@ class TheSwarmCommandsAnswerTests(unittest.TestCase):
         channel = self.channel()                  # Hermes: /role@codex_x_bot is not for it
         self.say(channel, "/role@codex_x_bot researcher")
         self.assertEqual(channel.config.peer_roles["Codex"], "researcher")
+        self.say(channel, "/role@HermesBot researcher")          # and the bot it names
+        self.assertEqual(channel.membership.state.role, "researcher")
 
     def test_any_member_may_ask_for_the_swarm_and_a_stranger_learns_nothing(self):
         channel = self.channel()
@@ -1099,27 +1101,46 @@ class TheSwarmCommandsAnswerTests(unittest.TestCase):
         channel.config.identity.allowed_users = ["77"]
         self.assertIn("SWARM bus:", self.say(channel, "/swarm", author_id=77))
 
-    def test_someone_elses_role_change_is_refused_out_loud_once(self):
-        channel = self.channel()
+    def test_a_members_role_change_is_refused_out_loud_once(self):
+        channel = self.channel()                  # the coordinator answers a bare one
+        channel.config.identity.allowed_users = ["77"]
         self.assertIn("only the admin can use /role",
                       self.say(channel, "/role @codex_x_bot coordinator", author_id=77))
         self.assertNotEqual(channel.config.peer_roles.get("Codex"), "coordinator")
+        channel._test_sender.sent.clear()
+        self.say(channel, "/role@codex_x_bot coordinator", author_id=77)
+        self.assertEqual(channel._test_sender.sent, [])          # Codex is named: it answers
         quiet = self.channel(role="developer")
+        quiet.config.identity.allowed_users = ["77"]
         quiet.is_coordinator = lambda **_: False
         self.assertNotIn("only the admin",
                          self.say(quiet, "/role @codex_x_bot coordinator", author_id=77))
 
+    def test_a_strangers_bare_command_gets_no_line(self):
+        channel = self.channel()
+        for text in ("/role @codex_x_bot coordinator", "/sync", "/bus x"):
+            self.assertNotIn("only the admin", self.say(channel, text, author_id=77), text)
+
     def test_an_unknown_role_is_answered_with_the_roles_there_are(self):
         channel = self.channel()
         answer = self.say(channel, "/role @codex_x_bot wizard")
-        self.assertIn("there is no role wizard", answer)
+        self.assertIn("There is no role wizard", answer)
         self.assertIn("researcher", answer)
+        self.assertFalse(answer.lstrip().startswith("/"))       # never read as a command
 
     def test_someone_elses_admit_is_refused_out_loud(self):
         channel = self.channel()
         self.assertIn("only the admin can use /admit",
                       self.say(channel, "/admit@HermesBot @stranger_bot", author_id=77))
 
+    def test_a_members_bare_sync_is_refused_by_the_coordinator_only(self):
+        channel = self.channel()
+        channel.config.identity.allowed_users = ["77"]
+        self.assertIn("only the admin can use /sync", self.say(channel, "/sync", author_id=77))
+        quiet = self.channel(role="developer")
+        quiet.config.identity.allowed_users = ["77"]
+        quiet.is_coordinator = lambda **_: False
+        self.assertNotIn("only the admin", self.say(quiet, "/sync", author_id=77))
 
 if __name__ == "__main__":
     unittest.main()

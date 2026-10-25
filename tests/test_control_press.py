@@ -458,7 +458,8 @@ class TestAPeerAppliesWhatItCanAndSaysWhatItCannot(unittest.TestCase):
         note says ``target=self``: from the coordinator's mouth that is the coordinator."""
         channel = self.channel()
         self.assertIn("not mine", apply(channel, self.note("bot.pause", "self")))
-        self.assertIn("not mine", apply(channel, self.note("bot.stop_turn", "")))
+        empty = "CONTROL bot.stop_turn target= by=%d at=2027-01-15T08:00:00Z state=done" % ADMIN_ID
+        self.assertIn("not mine", apply(channel, empty))
         self.assertFalse(channel._frozen)
         self.assertEqual(apply(channel, self.note("bot.pause", "Hermes")), "applied: bot.pause")
         self.assertTrue(channel._frozen)
