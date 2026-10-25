@@ -173,6 +173,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- The dashboard's **look and layout** (`#343`, control centre 2/4): a header with the swarm's
+  health (round, coordinator, lease, bots by state, today's spend), section navigation over
+  **Swarm**, **Round & owed**, **Topics**, **Usage** (a per-bot table plus the swarm total) and
+  **Controls** (a placeholder until slice 4), one card and one badge style throughout, a token
+  design system with a dark palette, phone-width first with two columns from 760px. As a Mini
+  App the chat's theme is taken whole: `tgWebAppColorScheme` selects a complete palette via
+  `data-theme` (so a status badge is never left in the other scheme's colours -- the review
+  measured 1.7-2.2:1 before this, 5.6-8.0:1 after), the chat's own theme params are applied on
+  top, and a chat that sends colours without a scheme gets its palette from `bg_color`'s
+  luminance. No external references, unknown values still `?`.
+
 - A **Topics panel** on the local dashboard (`#332`): one card per open work topic from the
   state store's registry — most recently active first, with the topic's name, each link's ref,
   status, phase and assignees, and each binding's agent, role, turns since its session was
