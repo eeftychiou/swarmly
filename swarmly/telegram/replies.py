@@ -17,7 +17,7 @@ from typing import Any, List, Optional, Union
 
 #: The channel's default reply budget, shared with the turn rules (issue #31). Imported here
 #: rather than duplicated so one number cannot drift from the other.
-from swarmly.telegram.adapters.base import DEFAULT_REPLY_CHARS
+from swarmly.telegram.adapters.base import DEFAULT_REPLY_CHARS, drop_stray_silence
 
 
 def reply_state_path(config) -> Path:
@@ -236,6 +236,10 @@ class ReplyStore:
                 tag = f"@{row['recipient']}" if row['recipient'] else ""
                 if tag and not body.lower().startswith(tag.lower() + ":"):
                     body = f"{tag}: {body}"
+                if not drop_stray_silence(body).strip():
+                    # The transport never posts the sentinel, so this answer would post nothing.
+                    raise ValueError("NO_REPLY is not an answer; use --skip with a reason for a "
+                                     "pure ACK/status")
                 limit = self.budget_for(row)
                 if len(body) >= limit:
                     # The budget is "under N": N itself is already over it, as it always was
@@ -247,6 +251,9 @@ class ReplyStore:
                 if row['text'] == body and (state != 'skipped' or row['detail'] == detail):
                     return dict(row)  # idempotent submission, never a second send
                 raise ValueError("ticket already has a different response")
+            if row['state'] == 'unposted':
+                raise ValueError(f"ticket is unposted ({row['detail']}); the transport will not "
+                                 "post an answer for it")
             if row['state'] not in ('pending', 'queued', 'overdue'):
                 raise ValueError(f"ticket is {row['state']}; inspect delivery before retrying")
             db.execute("UPDATE replies SET state=?, text=?, detail=?, notified=0 WHERE id=?", (state, body, detail, request_id))
@@ -278,10 +285,12 @@ class ReplyStore:
         """The transport refused the answer before sending it (its topic is transport-only).
 
         Nothing was posted, and a retry would be refused the same way, so the ticket stops
-        here. Its overdue alert then tells the admin the answer was not posted.
+        here. Its overdue alert then tells the admin the answer was not posted -- with a fresh
+        alert count: a late answer to a ticket whose overdue alerts were already spent must
+        still say it was not posted.
         """
         with self._db() as db:
-            db.execute("UPDATE replies SET state='unposted', notified=0, detail=? "
+            db.execute("UPDATE replies SET state='unposted', notified=0, alerts=0, detail=? "
                        "WHERE id=? AND state='claimed'", (detail, request_id))
 
     def uncertain(self, request_id):
@@ -343,7 +352,7 @@ class ReplyStore:
         with self._db() as db:
             query = ("UPDATE replies SET state='skipped', detail='closed by originating author', "
                      "notified=1 WHERE id LIKE ? AND state IN ('pending','queued','overdue',"
-                     "'queue_failed','delivery_unknown')")
+                     "'queue_failed','delivery_unknown','unposted')")
             params: List[Any] = [f"{ref}%"]
             if recipient:
                 query += " AND lower(recipient)=lower(?)"

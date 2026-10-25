@@ -49,6 +49,37 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(duplicate['id'], row['id'])
         self.assertEqual(restarted.summary(), {'queued': 1})
 
+    def unposted(self):
+        row = self.ticket()
+        self.store.queued(row['id'])
+        self.store.submit(row['id'], text='Review posted on #17.')
+        self.store.claim_ready()
+        self.store.unposted(row['id'], 'answer not posted: Swarm pulse is transport-only')
+        return row
+
+    def test_an_answer_that_is_only_no_reply_is_refused_at_submission(self):
+        """The transport never posts the sentinel: accepted, it left the ticket `claimed`
+        with nothing to send (#321 review)."""
+        row = self.ticket()
+        self.store.queued(row['id'])
+        for text in ('NO_REPLY', '@example_hermes_bot: NO_REPLY', '**NO_REPLY**'):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, '--skip'):
+                self.store.submit(row['id'], text=text)
+        self.assertEqual(self.store.get(row['id'])['state'], 'queued')
+        self.assertEqual(self.store.submit(row['id'], text='NO_REPLY\nLGTM, merged.')['text'],
+                         '@example_hermes_bot: NO_REPLY\nLGTM, merged.')
+
+    def test_an_unposted_ticket_says_so_when_answered_again(self):
+        row = self.unposted()
+        with self.assertRaisesRegex(ValueError, 'unposted .*transport-only'):
+            self.store.submit(row['id'], text='a second answer')
+
+    def test_the_author_can_close_an_unposted_ticket(self):
+        row = self.unposted()
+        self.assertEqual(self.store.resolve_prefix(row['id'][:8], author='example_hermes_bot'), 1)
+        self.assertEqual(self.store.get(row['id'])['state'], 'skipped')
+        self.assertEqual(self.store.overdue(now=100), [])
+
     def test_reply_submissions_are_addressed_and_idempotent(self):
         row = self.ticket()
         result = self.store.submit(row['id'], text='Review posted on #17.')

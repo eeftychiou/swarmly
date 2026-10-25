@@ -226,7 +226,8 @@ adapter:
 this is acceptance, **not completion**. Original mentions and paragraph boundaries are
 preserved, including messages addressed to several bots. Every queued prompt includes a
 ticket and commands to submit an answer or blocker (`reply ID --text ... --wait 45`),
-or to resolve a pure ACK/status without posting (`reply ID --skip "reason"`). A local
+or to resolve a pure ACK/status without posting (`reply ID --skip "reason"`). An answer
+that is only `NO_REPLY` is refused, since the transport never posts the sentinel. A local
 final answer alone does **not** send anything to Telegram.
 
 The bridge sends submitted replies with the sender's exact username and a reply-to ID,

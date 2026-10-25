@@ -10816,6 +10816,12 @@ class AgentChannel:
                 if telegram_message_id is _SEND_SUPPRESSED:
                     self.replies.release_claim(row['id'])
                     return
+                if telegram_message_id is None and \
+                        self.replies.get(row['id'])['state'] == 'claimed':
+                    # `send` posted nothing and never tried to (an answer that was only
+                    # NO_REPLY, say): `sent` would not apply, and the ticket would stay claimed.
+                    self.replies.unposted(row['id'], "answer not posted: there was nothing to send")
+                    return
                 self.replies.sent(row['id'], telegram_message_id)
             except BaseException:
                 # Cancellation before on_attempt is safely retryable; after it, Telegram may
