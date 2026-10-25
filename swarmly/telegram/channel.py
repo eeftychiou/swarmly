@@ -8820,7 +8820,7 @@ class AgentChannel:
         reply_to_message_id = event.message_id if event.replies_to_bot else None
         shown = strip_report_marker(body) if report is not None else body
         sent = await self.send(f"{shown}{suffix}", reply_to_message_id=reply_to_message_id,
-                               chat_id=event.chat_id, thread_id=event.thread_id)
+                               chat_id=event.chat_id, thread_id=event.thread_id, token=True)
         self._log_topic(event.chat_id, event.thread_id, self.config.identity.alias, shown,
                         self.last_first_message_id)
         self._mirror_handoffs(body, event.chat_id, event.thread_id, self.last_first_message_id,
@@ -8828,9 +8828,16 @@ class AgentChannel:
         if report is not None and origin is not None:
             self._topics_reported.add((event.chat_id, event.thread_id))
             link = topic_link(event.chat_id, event.thread_id) if event.thread_id else ""
-            # A summary for people: its @mentions would start turns for every bot it names.
-            await self.send(f"{defuse_mentions(report)}\n\n↩ from {link}".rstrip(),
-                            chat_id=origin[0], thread_id=origin[1])
+            if self.token_barred(*origin) is not None:
+                # The request came from General, which is transport-only: the summary stays in
+                # the topic, and General gets the transport's own line pointing at it.
+                name = self.topics.name(event.chat_id, event.thread_id) or "the topic"
+                await self.send(f"↩ «{name}» reported back: {link}".rstrip(": "),
+                                chat_id=origin[0], thread_id=origin[1], silent=True)
+            else:
+                # A summary for people: its @mentions would start turns for every bot it names.
+                await self.send(f"{defuse_mentions(report)}\n\n↩ from {link}".rstrip(),
+                                chat_id=origin[0], thread_id=origin[1], token=True)
         return sent
 
     @staticmethod
@@ -8923,7 +8930,10 @@ class AgentChannel:
         """Remember which topic first talked about each issue or PR (any bot's topic: every
         transport sees the group), so later work on it goes there, not to a new topic.
         An entry not seen for REF_TOPIC_SECONDS is let go: the item has moved on.
-        ``pin``: the admin's ``/topic #N`` -- this topic takes the item, whoever spoke first."""
+        ``pin``: the admin's ``/topic #N`` -- this topic takes the item, whoever spoke first.
+        Nothing is learned in Swarm pulse: bots' chatter there is not work about an item."""
+        if not self._work_topic((int(chat_id), int(thread_id))):
+            return
         now = time.time()
         changed = False
         topic = (int(chat_id), int(thread_id))
@@ -8961,14 +8971,18 @@ class AgentChannel:
         return tuple(place) not in self._dead_topics
 
     def topic_for_text(self, text: str) -> Optional[Tuple[int, int]]:
-        """The topic already about an issue or PR *text* names, if any (poll.py: a bus reply
-        is posted there rather than in General). With ``state.links: registry`` the topics'
+        """The topic already about an issue or PR *text* names, if any (the GitHub watch: a
+        notice or turn about #N goes there). With ``state.links: registry`` the topics'
         explicit links decide first; today's ref-learning is only the fallback."""
-        if self.state_link.links_mode == "registry":
-            found = self.state_link.topic_for_refs(issue_refs(text or ""))
-            if found is not None and self._work_topic(found):
-                return found
-        return self._topic_for_refs(text)
+        return self._linked_topic(text) or self._topic_for_refs(text)
+
+    def _linked_topic(self, text: str) -> Optional[Tuple[int, int]]:
+        """The work topic explicitly linked to an issue or PR *text* names, with
+        ``state.links: registry``; never one guessed from what was said in the chat."""
+        if self.state_link.links_mode != "registry":
+            return None
+        found = self.state_link.topic_for_refs(issue_refs(text or ""))
+        return found if found is not None and self._work_topic(found) else None
 
     def _forget_topic_refs(self, chat_id: Optional[int], thread_id: Optional[int]) -> None:
         """A topic was closed or deleted: work on its items no longer goes there."""
@@ -9043,6 +9057,11 @@ class AgentChannel:
                 or event.thread_id is None or int(event.chat_id) != int(home) \
                 or is_command_reply(body) or parse_report_back(body) is not None:
             return None
+        if self._transport_only_on():
+            # Where a post goes is the transport's decision, never the words of the reply
+            # (admin, 25 Oct, after a reply was moved into Swarm pulse by the items it named):
+            # a reply is posted in the topic of its turn (design §6, phase 4).
+            return None
         if not event.author_is_bot:
             # A person's question is answered where it was asked (live, 23 Oct: the admin asked
             # in Round 5 what /hold is; the answer named #218, so it went to Round 5.5, and the
@@ -9065,7 +9084,7 @@ class AgentChannel:
             return None
         target = targets.pop()
         if target == (int(event.chat_id), int(event.thread_id)) or target[0] != int(home) \
-                or target in self._gone_topics:
+                or target in self._gone_topics or not self._work_topic(target):
             return None
         return target
 
@@ -9074,7 +9093,7 @@ class AgentChannel:
         chat_id, thread_id = topic
         logger.info("moving work from %s to topic %s, which is about the same item",
                     event.thread_id or "General", thread_id)
-        await self.send(body, chat_id=chat_id, thread_id=thread_id)
+        await self.send(body, chat_id=chat_id, thread_id=thread_id, token=True)
         # A bot never receives its own posts: the new items the reply names are learned here,
         # in the topic it went to, as every peer learns them from seeing it there.
         self._learn_topic_refs(chat_id, thread_id, body)
@@ -9104,8 +9123,12 @@ class AgentChannel:
         home = self.config.identity.home_channel_id
         if not moved:
             # A topic already about the same issue or PR takes the work (round 2 export:
-            # "PR #37 re-review" was opened while a topic about #37 existed).
-            known = self._topic_for_refs(f"{title}\n{brief}")
+            # "PR #37 re-review" was opened while a topic about #37 existed). With General and
+            # pulse transport-only, only a topic explicitly linked to the item does: the
+            # numbers a brief names do not move it into a topic (admin, 25 Oct).
+            about = f"{title}\n{brief}"
+            known = self._linked_topic(about) if self._transport_only_on() \
+                else self._topic_for_refs(about)
             if known is not None and known not in self._dead_topics:
                 sent = await self._continue_in_topic(event, brief, known)
                 if known not in self._dead_topics:
@@ -9136,16 +9159,21 @@ class AgentChannel:
                 reason = str(exc)
         if (thread_id is None or home is None) and moved:
             logger.warning("could not move work to topic %r: %s", name, reason)
-            sent = await self.send(brief, chat_id=event.chat_id, thread_id=event.thread_id)
+            sent = await self.send(brief, chat_id=event.chat_id, thread_id=event.thread_id,
+                                   token=True)
             self._mirror_handoffs(brief, event.chat_id, event.thread_id,
                                   self.last_first_message_id, asker=self._asker(event))
             return sent
         if thread_id is None or home is None:
             logger.warning("could not open topic %r: %s", name, reason)
-            return await self.send(
-                f"{brief}\n\n(could not open a topic for this: {reason}; turn on Topics in "
-                "the group and give the bot the admin right to manage topics)",
-                chat_id=event.chat_id, thread_id=event.thread_id)
+            why = (f"could not open a topic for this: {reason}; turn on Topics in the group "
+                   "and give the bot the admin right to manage topics")
+            if self.token_barred(event.chat_id, event.thread_id) is not None:
+                # A request typed in General: the transport says why, the brief stays out.
+                return await self.send(f"⚠️ {why}", reply_to_message_id=event.message_id,
+                                       chat_id=event.chat_id, thread_id=event.thread_id)
+            return await self.send(f"{brief}\n\n({why})", chat_id=event.chat_id,
+                                   thread_id=event.thread_id, token=True)
         self._topics_opened.append(now)
         self.topics.remember(home, thread_id, name, current=True)
         self.topics.touch(home, thread_id)       # opened now: active, never "finished"
@@ -9161,7 +9189,7 @@ class AgentChannel:
             # A bot never receives its own posts: its topic memory learns the task here.
             self._log_topic(home, thread_id, self._alias_for(event), event.text or "",
                             self.last_first_message_id)
-        await self.send(brief, chat_id=home, thread_id=thread_id)
+        await self.send(brief, chat_id=home, thread_id=thread_id, token=True)
         self._log_topic(home, thread_id, self.config.identity.alias, brief,
                         self.last_first_message_id)
         self._mirror_handoffs(brief, home, thread_id, self.last_first_message_id,
@@ -9188,14 +9216,25 @@ class AgentChannel:
 
     def _transport_only_place(self, event: ChannelEvent) -> Optional[str]:
         """"General" or "Swarm pulse" when ``event`` is in one of them, else None."""
+        return self._home_place(event.chat_id, event.thread_id)
+
+    def _home_place(self, chat_id: Optional[int], thread_id: Optional[int]) -> Optional[str]:
+        """"General" or "Swarm pulse" for that place in the home group (``chat_id`` None is
+        the home group), else None."""
         home = self.config.identity.home_channel_id
-        if home is None or int(event.chat_id) != int(home):
+        if home is None or (chat_id is not None and int(chat_id) != int(home)):
             return None                                    # a DM, or another group
-        if event.thread_id is None:
+        if thread_id is None:
             return "General"
         pulse = self._pulse_topic()
-        return "Swarm pulse" if pulse is not None and int(event.thread_id) == int(pulse) \
-            else None
+        return "Swarm pulse" if pulse is not None and int(thread_id) == int(pulse) else None
+
+    def token_barred(self, chat_id: Optional[int], thread_id: Optional[int]) -> Optional[str]:
+        """"General" or "Swarm pulse" when text from token space -- a model's reply, a peer's
+        bus answer, an agent's own post -- may not be posted there: they are transport-only
+        (admin, 25 Oct: "a code block of posting token space posts in General, pulse").
+        None: it may be posted."""
+        return self._home_place(chat_id, thread_id) if self._transport_only_on() else None
 
     async def _general_request(self, event: ChannelEvent) -> Optional[Any]:
         """A person's message in General, with limits.general_turns "never": the coordinator
@@ -9270,7 +9309,7 @@ class AgentChannel:
         chat_id, thread_id = topic
         here = (int(event.chat_id), event.thread_id) == (chat_id, thread_id)
         logger.info("not opening a topic: topic %s is already about the same item", thread_id)
-        sent = await self.send(brief, chat_id=chat_id, thread_id=thread_id)
+        sent = await self.send(brief, chat_id=chat_id, thread_id=thread_id, token=True)
         if (chat_id, thread_id) in self._dead_topics:
             return sent                         # the caller opens a new topic instead
         self._log_topic(chat_id, thread_id, self.config.identity.alias, brief,
@@ -10191,7 +10230,7 @@ class AgentChannel:
                    *, chat_id: Optional[int] = None, thread_id: Optional[int] = None,
                    on_attempt=None, return_message_id: bool = False,
                    allow_when_frozen: bool = False, silent: bool = False,
-                   notice: bool = False, address_peers: bool = True):
+                   notice: bool = False, address_peers: bool = True, token: bool = False):
         """Post to the home channel, paced, escaped, and split when it is too long.
 
         A split message goes out as consecutive parts under one hold of the send lock, so
@@ -10209,8 +10248,17 @@ class AgentChannel:
         ``address_peers=False`` sends the text as it is: no @handle is appended for a peer
         it names. A command answer lists bots by name ("codex: agrees ..."), and appending
         their handles would call every one of them to a turn over a status line.
+
+        ``token=True`` marks text from token space: a model's reply or brief, a peer's answer
+        from the bus. Where :meth:`token_barred` says the place is transport-only (General,
+        Swarm pulse), it is not posted, whatever route it took to get here.
         """
         destination = self.config.identity.home_channel_id if chat_id is None else chat_id
+        barred = self.token_barred(destination, thread_id) if token else None
+        if barred is not None:
+            logger.warning("%s is transport-only: a post from token space is not posted "
+                           "there: %r", barred, (text if isinstance(text, str) else "")[:120])
+            return None
         if not callable(text):
             text = drop_stray_silence(text)          # the sentinel never reaches the group
             if not text.strip():

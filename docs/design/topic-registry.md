@@ -331,8 +331,9 @@ Rationale for "coordinator gets everything, others when named": it keeps the cos
   - **Allowed:** transport posts (status changes, deploy/online notices, refusals that aren't tied to a topic, round open/close announcements, admin command answers) and **admin commands** (`/pause`, `/hold`, `/role`, `/swarm`, `/usage`, `/drift`, `/cleanup`, …).
   - **Never:** a model turn.
   - **A person typing work in General:** the transport **opens a topic** for it (title from the request), records it in the registry, links the coordinator, delivers the request there as the first message, and answers in General: "↪ opened topic «…» for this, coordinator Claudebot". (Question 3 below.)
-  - **A bot's reply** can't be posted in General: replies are always posted in the topic of the turn.
-- **📡 Swarm pulse:** pulses, FROZEN/RESUMED, presence and the pinned dashboard. Nothing in it is ever routed to a CLI. (That's already true today; it becomes a hard rule with a test.)
+  - **A bot's reply** can't be posted in General: replies are always posted in the topic of the turn, and never moved to another topic by the items they name.
+  - **Nothing from token space**, whatever route it takes (a reply, a brief, a report-back summary, a peer's answer from the bus, a bus pointer's preview, an agent's own `send`), is posted in General or Swarm pulse: one check in the send path refuses it. A report-back for a request typed in General leaves its summary in the topic and puts only a link in General.
+- **📡 Swarm pulse:** pulses, FROZEN/RESUMED, presence and the pinned dashboard. Nothing in it is ever routed to a CLI, and nothing said there ties an item to it. (That's already true today; it becomes a hard rule with a test.)
 
 ## 4. One session per (topic, agent), for every adapter
 
