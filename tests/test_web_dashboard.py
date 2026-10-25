@@ -540,6 +540,18 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
         self.assertNotIn(str(GROUP), rendered)
         self.assertNotIn("TEST", rendered)                 # the bot token never reaches a page
 
+    def test_the_read_views_come_from_the_transports_own_records(self):
+        channel = self.channel()
+        rendered = channel.web_state()
+        self.assertTrue(rendered["roster"]["ready"])
+        self.assertEqual([bot["alias"] for bot in rendered["roster"]["bots"]], ["Hermes"])
+        self.assertTrue(rendered["settings"]["bots"])
+        self.assertEqual(rendered["store"]["backend"], "off")      # no state.backend here
+        self.assertIsNone(rendered["store"]["ready"])
+        self.assertTrue(rendered["drift"]["ready"])                 # its own ledger
+        self.assertIsNone(channel.web_memory())                     # no state folder
+        self.assertNotIn("memory-", json.dumps(rendered))
+
     def test_the_topics_panel_says_not_ready_without_a_store_then_follows_a_phase_change(self):
         from tests.test_telegram_channel import GROUP
         channel = self.channel()
@@ -756,7 +768,8 @@ class TestThePinnedCardsButton(unittest.TestCase):
 class TestTheLookAndLayout(unittest.TestCase):
     """#343: one shell (header, navigation, sections) and a design system behind it."""
 
-    SECTIONS = ("swarm", "round", "topics", "usage", "controls")
+    SECTIONS = ("swarm", "round", "topics", "usage", "settings", "drift", "state",
+                "memory", "controls")
 
     def page(self) -> str:
         return webui.page_html(title="Swarm")
@@ -1079,6 +1092,227 @@ class TestTheWritePath(unittest.TestCase):
         finally:
             server.stop()
 
+
+class TestTheReadCommandViews(unittest.TestCase):
+    """#344: one view per read command, each from fixed records, nothing unnamed on the wire."""
+
+    def state(self, **fields: Any) -> Dict[str, Any]:
+        base: Dict[str, Any] = dict(
+            now=NOW,
+            snapshots=[snap("Claudebot", BUSY, since=NOW - 180),
+                       snap("DeepSeek", IDLE, since=NOW - 720)],
+            usage={"Claudebot": usage(turns=9, cost_usd=22.33),
+                   "DeepSeek": usage(turns=4, tokens_out=None, cost_usd=0.42)},
+            roles={"Claudebot": "coordinator", "DeepSeek": "developer"},
+            coordinator="Claudebot",
+            peers=[{"alias": "Reasonix", "role": "reviewer", "term": 7, "rev": "6f9c90b",
+                    "frozen": False, "path": r"C:\Users\eftyc\secret",
+                    "chat_id": -1001234567890123}],
+            drift={"ready": True, "alias": "DeepSeek", "score": 3, "hard": 1, "remind": True,
+                   "reset": False, "resets_today": 0, "sessions": {}, "recent": []},
+            store={"ready": True, "backend": "telegram", "mode": "live", "enabled": True,
+                   "routing": "registry", "owed": "store", "note": ""},
+        )
+        base.update(fields)
+        return webui.watch_state(**base)
+
+    def test_status_and_swarm_are_one_roster(self):
+        roster = self.state()["roster"]
+        self.assertEqual([bot["alias"] for bot in roster["bots"]], ["Claudebot", "DeepSeek"])
+        self.assertEqual(roster["coordinator"], "Claudebot")
+        self.assertEqual([peer["alias"] for peer in roster["peers"]], ["Reasonix"])
+        bot = roster["bots"][1]
+        for name in ("role", "state", "badge", "model", "effort", "rev", "topic"):
+            self.assertIn(name, bot)
+        self.assertNotIn("path", roster["peers"][0])          # only named fields
+
+    def test_a_peer_that_is_already_a_card_is_not_listed_twice(self):
+        roster = self.state(peers=[{"alias": "DeepSeek", "role": "developer"}])["roster"]
+        self.assertEqual([peer["alias"] for peer in roster["peers"]], [])
+
+    @staticmethod
+    def rule(kind: str, severity: int, at: float) -> Any:
+        class Row:
+            pass
+        row = Row()
+        row.kind, row.severity, row.at = kind, severity, at
+        row.evidence = r"C:\Users\eftyc\swarm notes, chat -1001234567890123"
+        return row
+
+    def test_drift_publishes_kinds_and_weights_never_evidence_or_session_keys(self):
+        view = webui.drift_view(alias="DeepSeek",
+                                decided={"score": 3, "hard": 1, "remind": True,
+                                         "reset": False, "resets_today": 0},
+                                live=[self.rule("deploy_instruction", 2, NOW - 60)],
+                                now=NOW)
+        self.assertEqual((view["score"], view["hard"]), (3, 1))
+        self.assertEqual(view["recent"][0]["kind"], "deploy_instruction")
+        self.assertEqual(view["recent"][0]["age"], 60.0)
+        payload = json.dumps(view)
+        self.assertNotIn("evidence", payload)
+        self.assertNotIn("Users", payload)
+        # The ledger's own per-session keys are chat:thread, so they are not published at all.
+        self.assertNotIn("sessions", view)
+
+    def test_a_real_ledger_key_never_reaches_the_page(self):
+        """Review #349: the fixture fed a pre-redacted key, so this leak could not be seen."""
+        from tests.test_telegram_channel import GROUP, make_channel, make_config
+        channel = make_channel(make_config())
+        channel.record_violation("duplicate_reply", "a repeat", chat_id=GROUP, thread_id=19286)
+        payload = json.dumps(channel.web_state())
+        self.assertNotIn(str(GROUP), payload)
+        self.assertNotIn("19286", payload)
+        # ... while the ledger itself still holds that key, so a view that passed it on would
+        # have been caught here.
+        self.assertTrue(any(str(GROUP) in key for key in channel.drift.sessions()))
+
+    def test_state_says_which_backend_and_whether_it_is_ready(self):
+        view = webui.state_view(backend="telegram", mode="live", enabled=True, ready=True,
+                                routing="registry", owed="store")
+        self.assertEqual((view["backend"], view["mode"], view["ready"]),
+                         ("telegram", "live", True))
+        not_ready = webui.state_view(backend="telegram", mode="live", enabled=True, ready=False)
+        self.assertFalse(not_ready["ready"])
+        self.assertEqual(not_ready["note"], webui.NOT_READY)
+        # A bot with no store at all says so with a null, not a false "broken".
+        self.assertIsNone(webui.state_view(backend="off", enabled=False)["ready"])
+
+    def test_settings_show_the_bot_default_and_the_topic_override(self):
+        view = self.state(registry={"ready": True, "topics": [
+            {"topic": "Dashboard", "bindings": [{"agent": "DeepSeek", "role": "developer",
+                                                 "model": "deepseek", "effort": "high"}]}
+        ]})["settings"]
+        self.assertEqual(view["bots"][1]["model"], "deepseek")
+        self.assertEqual(view["topics"][0]["topic"], "Dashboard")
+        self.assertEqual(view["topics"][0]["effort"], "high")
+
+    def test_a_source_nobody_collected_is_null_and_never_an_empty_view(self):
+        rendered = self.state(drift=None, store=None, registry=None)
+        self.assertIsNone(rendered["drift"])
+        self.assertIsNone(rendered["store"])
+        # The registry was not read, so there is no answer about topic overrides either --
+        # an empty list would read as "no overrides" (review, #349).
+        self.assertIsNone(rendered["settings"]["topics"])
+        self.assertTrue(rendered["settings"]["bots"])
+        # ... while a source that *is* collected but not ready says so in words.
+        self.assertEqual(self.state(drift={"ready": False, "text": webui.NOT_READY})
+                         ["drift"]["ready"], False)
+
+    def test_only_named_fields_of_every_view_reach_the_wire(self):
+        payload = json.dumps(self.state(), sort_keys=True)
+        for secret in ("1001234567890123", "C:\\\\Users", "eftyc"):
+            self.assertNotIn(secret, payload)
+
+    def test_memory_is_words_and_a_size_never_a_path(self):
+        view = webui.memory_view(text="# lessons\n- be brief")
+        self.assertTrue(view["ready"])
+        self.assertEqual(view["bytes"], len("# lessons\n- be brief".encode("utf-8")))
+        self.assertNotIn("memory-", json.dumps(view))
+        self.assertFalse(webui.memory_view(text=None)["ready"])
+
+
+class TestTheMemoryEndpoint(unittest.TestCase):
+    """#344: ``/memory`` is the one view that always needs the admin's login."""
+
+    def server(self, text: Any = "# lessons\n- be brief") -> Any:
+        self.reads: list = []
+
+        def provider() -> Any:
+            self.reads.append(1)
+            return text
+
+        return webui.DashboardServer(lambda: {"bots": []}, port=0, bot_token=TOKEN,
+                                     admin_id=ADMIN_ID, memory=provider)
+
+    def get(self, url: str, *, init: str = "") -> Any:
+        headers = {webui.INIT_HEADER: init} if init else {}
+        request = urllib.request.Request(url.rstrip("/") + webui.MEMORY_PATH, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
+    def test_the_loopback_without_a_login_is_refused(self):
+        server = self.server()
+        try:
+            status, answer = self.get(server.start())
+            self.assertEqual(status, 403)
+            self.assertEqual(answer["refused"], "auth")
+            self.assertEqual(self.reads, [])                  # nothing was read at all
+        finally:
+            server.stop()
+
+    def test_a_forged_login_is_refused_too(self):
+        server = self.server()
+        try:
+            status, _answer = self.get(server.start(), init=init_data(hash_override="0" * 64))
+            self.assertEqual(status, 403)
+            self.assertEqual(self.reads, [])
+        finally:
+            server.stop()
+
+    def test_the_admin_reads_the_words_and_never_a_path(self):
+        server = self.server()
+        try:
+            status, view = self.get(server.start(), init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 200)
+            self.assertEqual(view["text"], "# lessons\n- be brief")
+            self.assertEqual(view["bytes"], len("# lessons\n- be brief".encode("utf-8")))
+            self.assertNotIn("memory-", json.dumps(view))
+        finally:
+            server.stop()
+
+    def test_a_stranger_cannot_tell_a_wired_page_from_an_unwired_one(self):
+        """Review #349: the login is checked before "is anything wired", so both are 403."""
+        wired = self.server()
+        unwired = webui.DashboardServer(lambda: {"bots": []}, port=0, bot_token=TOKEN,
+                                       admin_id=ADMIN_ID)
+        try:
+            self.assertEqual(self.get(wired.start())[0], 403)
+            self.assertEqual(self.get(unwired.start())[0], 403)
+        finally:
+            wired.stop()
+            unwired.stop()
+
+    def test_a_page_with_no_memory_wired_has_no_path(self):
+        server = webui.DashboardServer(lambda: {"bots": []}, port=0, bot_token=TOKEN,
+                                       admin_id=ADMIN_ID)
+        try:
+            status, _answer = self.get(server.start(), init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 404)
+        finally:
+            server.stop()
+
+
+class TestTheReadViewsOnThePage(unittest.TestCase):
+    def page(self) -> str:
+        return webui.page_html(title="Swarm")
+
+    def test_every_view_has_its_section_and_its_name_in_the_navigation(self):
+        page = self.page()
+        for name in ("settings", "drift", "state", "memory"):
+            self.assertIn('id="%s"' % name, page, name)
+            self.assertIn('href="#%s"' % name, page, name)
+
+    def test_the_memory_view_asks_its_own_path_behind_the_login(self):
+        page = self.page()
+        self.assertIn(webui.MEMORY_PATH, page)
+        self.assertIn("const MEMORY =", page)
+        self.assertIn("the admin's login is needed to read a bot's memory", page)
+
+    def test_a_view_nobody_read_is_hidden_rather_than_emptied(self):
+        page = self.page()
+        for marker in ("settings are not being read on this bot",
+                       "the state store is not read here",
+                       "the drift ledger is not read here",
+                       "the registry is not read here, so no topic override is known"):
+            self.assertIn(marker, page, marker)
+
+    def test_the_memory_is_not_refetched_on_every_poll(self):
+        page = self.page()
+        self.assertNotIn("setInterval(memory, EVERY)", page)
+        self.assertIn('location.hash === "#memory"', page)
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

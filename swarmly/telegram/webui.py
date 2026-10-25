@@ -55,7 +55,7 @@ BADGES: Dict[str, str] = {
     STUCK: "stuck", DOWN: "down",
 }
 
-#: The two paths the server knows. Anything else is a 404, and no other method is allowed.
+#: The paths the server knows. Anything else is a 404, and no other method is allowed.
 PAGE_PATH = "/"
 STATE_PATH = "/state.json"
 
@@ -67,6 +67,10 @@ ACTION_PATH = "/api/action"
 #: The most a write's body may carry: an action, a target, a value and a confirm code. A body
 #: larger than this is refused unread, so a page cannot be made to buffer something huge.
 MAX_BODY_BYTES = 8192
+#: ``/memory``'s own view (#344): this bot's lessons, for the admin's eyes and nobody else's.
+#: It asks for the verified login *always*, the loopback included -- a bot's working notes are
+#: not a status field, and the plain local page stays a page about the swarm.
+MEMORY_PATH = "/memory.json"
 
 #: Where the server binds. Loopback only: the page is reached through a tunnel, not a bind
 #: (#240 slice 2). The bind stays local so nothing on the network can talk to it directly.
@@ -206,6 +210,146 @@ def owed_rows(rows: Sequence[Any] = (), *, now: float) -> List[Dict[str, Any]]:
             "due_in": (deadline - moment) if deadline else None,
         })
     return out
+
+
+# ------------------------------------------------------------------------------------
+# The read commands' views (#344)
+# ------------------------------------------------------------------------------------
+#
+# Every read command the bots answer in Telegram gets a view here, built from the records the
+# transport already holds -- no model turn, no adapter call. Each one is picked by name, like
+# the rest of the page: a record carrying a chat id, a thread id, a token or a path shows none
+# of them.
+
+#: What a view says when the thing it would read is not running: words, never an empty list
+#: that would read as "there is nothing there".
+NOT_READY = "this bot is not reading that right now"
+
+
+def roster_view(*, cards: Sequence[Mapping[str, Any]] = (),
+                peers: Sequence[Mapping[str, Any]] = (),
+                coordinator: Optional[str] = None) -> Dict[str, Any]:
+    """``/status`` and ``/swarm``: who is in the swarm, what each one runs, who leads.
+
+    The bot cards are the same rows the Swarm section draws; *peers* adds what this bot knows
+    about the others from its own presence table (never a live probe), and *coordinator* is the
+    lease's own answer.
+    """
+    rows = [{
+        "alias": str(card.get("alias") or ""),
+        "role": card.get("role"),
+        "state": card.get("state"),
+        "badge": card.get("badge"),
+        "model": card.get("model"),
+        "effort": card.get("effort"),
+        "rev": card.get("rev"),
+        "topic": card.get("topic"),
+        "queue": card.get("queue"),
+    } for card in cards]
+    seen = []
+    for peer in peers:
+        data = dict(peer or {})
+        alias = str(data.get("alias") or "").strip()
+        if not alias or any(row["alias"].lower() == alias.lower() for row in rows):
+            continue
+        seen.append({
+            "alias": alias,
+            "role": str(data.get("role") or "").strip() or None,
+            # A peer's own liveness claim is not a state: its pulse is (the cards have it).
+            "term": int(_num(data.get("term"))) or None,
+            "rev": str(data.get("rev") or "").strip() or None,
+            "frozen": bool(data.get("frozen")),
+        })
+    return {"ready": True, "coordinator": coordinator or None,
+            "bots": rows, "peers": seen}
+
+
+def drift_view(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
+               live: Sequence[Any] = (), now: float = 0.0,
+               limit: int = 10) -> Dict[str, Any]:
+    """``/drift``: the score, where it stands, and the latest violations behind it.
+
+    Only the kind, its weight and its age are published. Two things the ledger holds stay home:
+    its ``evidence`` (the bot's own words, which can name a topic, a path or an id) and its
+    **per-session keys**, which are literally ``<chat id>:<thread id>`` -- the page draws no
+    per-session row, so publishing them was only ever a leak (review, #349). The score and the
+    hard count are the session's own, so nothing useful is lost.
+    """
+    moment = float(now)
+    rows = []
+    for row in list(live)[-int(limit):]:
+        at = _num(getattr(row, "at", 0.0))
+        rows.append({"kind": str(getattr(row, "kind", "") or "") or None,
+                     "severity": int(_num(getattr(row, "severity", 0))),
+                     "age": (max(0.0, moment - at) if at else None)})
+    decided = dict(decided or {})
+    return {
+        "ready": True,
+        "alias": str(alias or "") or None,
+        "score": int(_num(decided.get("score"))),
+        "hard": int(_num(decided.get("hard"))),
+        "remind": bool(decided.get("remind")),
+        "reset": bool(decided.get("reset")),
+        "resets_today": int(_num(decided.get("resets_today"))),
+        "recent": rows,
+    }
+
+
+def state_view(*, backend: str = "", mode: str = "", enabled: Any = None,
+               ready: Any = None, routing: str = "", owed: str = "") -> Dict[str, Any]:
+    """``/state``: how the shared state store is set up, and whether it is readable.
+
+    ``ready`` is ``None`` when this bot is not running the store at all -- an absent store is
+    not a broken one, and the page says which.
+    """
+    name = str(backend or "").strip().lower() or "off"
+    return {
+        "ready": bool(ready) if enabled else None,
+        "backend": name,
+        "mode": str(mode or "").strip().lower() or None,
+        "enabled": bool(enabled),
+        "routing": str(routing or "").strip().lower() or None,
+        "owed": str(owed or "").strip().lower() or None,
+        "note": ("" if not enabled else ("" if ready else NOT_READY)),
+    }
+
+
+def settings_view(*, cards: Sequence[Mapping[str, Any]] = (),
+                  topics: Optional[Sequence[Mapping[str, Any]]] = ()) -> Dict[str, Any]:
+    """``/model``, ``/reasoning`` and ``/role``: what each bot runs, and what a topic changes.
+
+    A bot's row is the setting it reports in its own pulse; a topic's row is its binding, which
+    wins over the bot's default while that topic's turns run.
+    """
+    bots = [{"alias": str(card.get("alias") or ""),
+             "role": card.get("role"),
+             "model": card.get("model"),
+             "effort": card.get("effort")}
+            for card in cards]
+    overrides: List[Dict[str, Any]] = []
+    for topic in topics or ():
+        for binding in topic.get("bindings") or ():
+            overrides.append({
+                "topic": topic.get("topic"),
+                "agent": binding.get("agent"),
+                "role": binding.get("role"),
+                "model": binding.get("model"),
+                "effort": binding.get("effort"),
+            })
+    return {"ready": True, "bots": bots,
+            # ``None``: the registry was not read, so there is no answer about overrides.
+            "topics": (None if topics is None else overrides)}
+
+
+def memory_view(*, text: Optional[str] = None) -> Dict[str, Any]:
+    """``/memory``: this bot's own lessons, for the admin's eyes only.
+
+    It reaches the wire through its own path, behind the same verified login as a write
+    (#342): a bot's notes are its private working memory, not a status field. The file's home
+    is never published -- only whether there is anything to read.
+    """
+    body = str(text or "")
+    return {"ready": text is not None, "bytes": len(body.encode("utf-8")), "text": body}
 
 
 # ------------------------------------------------------------------------------------
@@ -436,7 +580,9 @@ def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
                 usage: Optional[Mapping[str, Mapping[str, Any]]] = None,
                 roles: Optional[Mapping[str, str]] = None, coordinator: str = "",
                 lease: Optional[Any] = None, round_state: Optional[Any] = None,
-                owed: Sequence[Any] = (), registry: Optional[Mapping[str, Any]] = None
+                owed: Sequence[Any] = (), registry: Optional[Mapping[str, Any]] = None,
+                peers: Sequence[Any] = (), drift: Optional[Mapping[str, Any]] = None,
+                store: Optional[Mapping[str, Any]] = None
                 ) -> Dict[str, Any]:
     """The JSON the page polls: the same records the pinned card is built from, in full.
 
@@ -475,6 +621,17 @@ def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
         "registry": (None if registry is None else
                      {"ready": bool(registry.get("ready")),
                       "topics": list(registry.get("topics") or ())}),
+        # The read commands' own views (#344). Each is ``None`` when the caller did not collect
+        # it -- a view nobody read is not an empty one.
+        "roster": roster_view(cards=cards, peers=peers or (), coordinator=holder),
+        "drift": (None if drift is None else dict(drift)),
+        "store": (None if store is None else dict(store)),
+        # A registry nobody collected is ``None`` here too: an empty ``topics`` would read as
+        # "no topic overrides" instead of "not read" (review, #349).
+        "settings": (None if not cards else
+                     settings_view(cards=cards,
+                                   topics=(None if registry is None
+                                           else (registry.get("topics") or ())))),
     }
 
 
@@ -575,7 +732,8 @@ def page_html(*, title: str = "Swarm", every: float = 3.0) -> str:
     return (_PAGE
             .replace("__TITLE__", _escape(title))
             .replace("__EVERY_MS__", str(int(max(1.0, float(every)) * 1000)))
-            .replace("__STATE_PATH__", STATE_PATH))
+            .replace("__STATE_PATH__", STATE_PATH)
+            .replace("__MEMORY_PATH__", MEMORY_PATH))
 
 
 def _escape(text: str) -> str:
@@ -679,6 +837,9 @@ th:first-child, td:first-child { text-align: left; }
 thead th { border-top: 0; color: var(--dim); font: var(--font-tiny); text-transform: uppercase;
   letter-spacing: .04em; }
 tfoot td { font-weight: 600; color: var(--ink); }
+pre.memory { margin: var(--space-1) 0; padding: var(--space-2); background: var(--bg);
+  border: 1px solid var(--line); border-radius: var(--radius); font: var(--font-small);
+  white-space: pre-wrap; overflow-wrap: anywhere; }
 footer { color: var(--dim); font: var(--font-tiny); text-align: center;
   padding: var(--space-4) 0 var(--space-2); }
 @media (min-width: 760px) {
@@ -704,6 +865,10 @@ footer { color: var(--dim); font: var(--font-tiny); text-align: center;
     <a href="#round">Round &amp; owed</a>
     <a href="#topics">Topics</a>
     <a href="#usage">Usage</a>
+    <a href="#settings">Settings</a>
+    <a href="#drift">Drift</a>
+    <a href="#state">State</a>
+    <a href="#memory">Memory</a>
     <a href="#controls">Controls</a>
   </nav>
   <div class="health" id="health"></div>
@@ -731,6 +896,26 @@ footer { color: var(--dim); font: var(--font-tiny); text-align: center;
     <div id="usage"></div>
   </section>
 
+  <section class="panel" id="settings">
+    <h2>Settings</h2>
+    <div id="settings"></div>
+  </section>
+
+  <section class="panel" id="drift">
+    <h2>Drift</h2>
+    <div id="drift"></div>
+  </section>
+
+  <section class="panel" id="state">
+    <h2>State</h2>
+    <div id="state"></div>
+  </section>
+
+  <section class="panel" id="memory">
+    <h2>Memory</h2>
+    <div id="memory"></div>
+  </section>
+
   <section class="panel" id="controls">
     <h2>Controls</h2>
     <p class="note" id="controls-note">Every control needs the admin's verified Mini App login
@@ -742,6 +927,7 @@ footer { color: var(--dim); font: var(--font-tiny); text-align: center;
 </div>
 <script>
 const STATE = "__STATE_PATH__";
+const MEMORY = "__MEMORY_PATH__";
 const EVERY = __EVERY_MS__;
 const el = (tag, cls, text) => {
   const node = document.createElement(tag);
@@ -942,6 +1128,113 @@ function roundBoard(state) {
   });
 }
 
+// /model, /reasoning and /role: what each bot runs, and what a topic overrides (slice 3).
+function settings(state) {
+  const box = document.getElementById("settings");
+  box.replaceChildren();
+  const view = state.settings;
+  if (!view || !view.ready) {
+    box.append(el("p", "note", "settings are not being read on this bot"));
+    return;
+  }
+  (view.bots || []).forEach((bot) => {
+    const line = el("div", "line");
+    line.append(el("span", "ref", bot.alias || "?"));
+    if (bot.role) line.append(el("span", "sub", bot.role));
+    line.append(el("span", "sub", "model " + (bot.model || "?")));
+    line.append(el("span", "sub", "effort " + (bot.effort || "?")));
+    box.append(line);
+  });
+  if (view.topics === null || view.topics === undefined)
+    box.append(el("p", "note", "the registry is not read here, so no topic override is known"));
+  (view.topics || []).forEach((row) => {
+    const line = el("div", "line");
+    line.append(el("span", "ref", row.topic || "?"));
+    line.append(el("span", "sub", (row.agent || "?") + (row.role ? " " + row.role : "")));
+    line.append(el("span", "sub", "model " + (row.model || "?")));
+    line.append(el("span", "sub", "effort " + (row.effort || "?")));
+    line.append(el("span", "sub", "in this topic"));
+    box.append(line);
+  });
+  if (!(view.bots || []).length && !(view.topics || []).length)
+    box.append(el("p", "note", "no bot has reported a setting yet"));
+}
+
+// /drift: the score, and the newest rule breaks behind it -- kinds and weights, never evidence.
+function drift(state) {
+  const box = document.getElementById("drift");
+  box.replaceChildren();
+  const view = state.drift;
+  if (!view || !view.ready) {
+    box.append(el("p", "note", (view && view.text) || "the drift ledger is not read here"));
+    return;
+  }
+  const head = el("div", "health");
+  head.append(pill("score", num(view.score)));
+  head.append(pill("hard", num(view.hard)));
+  head.append(pill("resets today", num(view.resets_today)));
+  head.append(pill("standing", view.reset ? "a reset is due"
+    : (view.remind ? "a reminder rides the next turn" : "nothing due")));
+  box.append(head);
+  if (!(view.recent || []).length) {
+    box.append(el("p", "note", "no live violations"));
+    return;
+  }
+  view.recent.forEach((row) => {
+    const line = el("div", "line");
+    line.append(el("span", "ref", row.kind || "?"));
+    line.append(el("span", "sub", "+" + num(row.severity)));
+    line.append(el("span", "sub", ago(row.age) + " ago"));
+    box.append(line);
+  });
+}
+
+// /state: which backend, which mode, and whether it is readable.
+function storeState(state) {
+  const box = document.getElementById("state");
+  box.replaceChildren();
+  const view = state.store;
+  if (!view) {
+    box.append(el("p", "note", "the state store is not read here"));
+    return;
+  }
+  const head = el("div", "health");
+  head.append(pill("backend", view.backend || "off"));
+  head.append(pill("mode", view.mode || "?"));
+  head.append(pill("routing", view.routing || "?"));
+  head.append(pill("owed", view.owed || "?"));
+  head.append(pill("store", view.enabled ? (view.ready ? "ready" : "not ready") : "off",
+    view.enabled && !view.ready ? "bad" : ""));
+  box.append(head);
+  if (view.note) box.append(el("p", "note", view.note));
+}
+
+// /memory: this bot's own notes. It is a separate, admin-only request -- opened without the
+// Mini App's login it says so instead of showing anything.
+async function memory() {
+  const box = document.getElementById("memory");
+  box.replaceChildren();
+  if (!INIT) {
+    box.append(el("p", "note", "the admin's login is needed to read a bot's memory"));
+    return;
+  }
+  try {
+    const response = await fetch(MEMORY, {cache: "no-store",
+                                          headers: {"X-Telegram-Init-Data": INIT}});
+    if (!response.ok) throw new Error("status " + response.status);
+    const view = await response.json();
+    if (!view.ready) {
+      box.append(el("p", "note", "this bot keeps no memory yet"));
+      return;
+    }
+    const pre = el("pre", "memory", view.text);
+    box.append(pre);
+    box.append(el("p", "note", num(view.bytes) + " bytes"));
+  } catch (err) {
+    box.append(el("p", "note", "memory unavailable: " + err.message));
+  }
+}
+
 function render(state) {
   document.getElementById("stamp").textContent =
     "refreshed " + state.refreshed +
@@ -967,6 +1260,9 @@ function render(state) {
   }
 
   usage(state);
+  settings(state);
+  drift(state);
+  storeState(state);
 }
 
 // Opened as a Telegram Mini App, the page arrives with initData in its URL hash. It is sent
@@ -1030,6 +1326,12 @@ async function tick() {
 document.getElementById("every").textContent = String(EVERY / 1000);
 tick();
 setInterval(tick, EVERY);
+// The memory is read once, and again only when its section is opened: it never changes on a
+// 3 s beat, and a large memory.md must not be fetched forty times a heartbeat (review, #349).
+memory();
+window.addEventListener("hashchange", () => {
+  if (location.hash === "#memory") memory();
+});
 </script>
 </body>
 </html>
@@ -1077,8 +1379,8 @@ class DashboardServer:
                  host: str = HOST, title: str = "Swarm", every: float = 3.0,
                  public_host: str = "", bot_token: str = "", admin_id: Any = 0,
                  init_max_age: float = INIT_MAX_AGE,
-                 action: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None
-                 ) -> None:
+                 action: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None,
+                 memory: Optional[Callable[[], Optional[str]]] = None) -> None:
         self.provider = provider
         self.host = host
         self.requested_port = int(port)
@@ -1095,6 +1397,9 @@ class DashboardServer:
         self.bot_token = str(bot_token or "")
         self.admin_id = admin_id
         self.init_max_age = float(init_max_age)
+        #: ``/memory``'s text (#344), served only to a verified admin login. ``None`` means this
+        #: page has no memory to show, and that path stays a 404.
+        self.memory = memory
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -1220,6 +1525,21 @@ class DashboardServer:
                     return True
                 return name in server.hosts or given in server.hosts
 
+            def _admin_ok(self) -> bool:
+                """Whether this request carries a valid admin ``initData``, wherever it came from.
+
+                The state has a loopback exception (#258: the operator on the host is not a
+                stranger); the memory does not (#344) -- so the check is repeated here rather
+                than reusing the one that may have answered "yes" for a local request.
+                """
+                raw = str(self.headers.get(INIT_HEADER, "") or "")
+                ok, why = verify_init_data(raw, bot_token=server.bot_token,
+                                           admin_id=server.admin_id,
+                                           now=time.time(), max_age=server.init_max_age)
+                if not ok:
+                    logger.info("web dashboard: refused a memory read (%s)", why)
+                return ok
+
             def _init_ok(self, query: str) -> bool:
                 """Whether this request carries a valid Mini App ``initData`` for the admin."""
                 if not server.needs_init(self.headers.get("Host", "")):
@@ -1245,6 +1565,30 @@ class DashboardServer:
                 if path in (PAGE_PATH, "/index.html"):
                     body = page_html(title=server.title, every=server.every)
                     self._send(200, body.encode("utf-8"), "text/html; charset=utf-8")
+                    return
+                if path == MEMORY_PATH:
+                    # Always behind the login, loopback included (#344): a bot's own notes are
+                    # its private working memory. The login is checked **first**, so a stranger
+                    # cannot tell a page with a memory hook from one without by 404 vs 403
+                    # (review, #349) -- and only then does "is anything wired" get answered.
+                    if not self._admin_ok():
+                        self._send(403, json.dumps(
+                            {"ready": False, "refused": "auth",
+                             "text": "the admin's login is needed to read this"}).encode("utf-8"),
+                            "application/json")
+                        return
+                    if server.memory is None:
+                        self._not_found()
+                        return
+                    try:
+                        text = server.memory()
+                    except Exception:                       # noqa: BLE001 - never on the wire
+                        self._send(503, b'{"ready":false,"text":"unavailable"}',
+                                   "application/json")
+                        return
+                    body = json.dumps(memory_view(text=text),
+                                      sort_keys=True, default=str)
+                    self._send(200, body.encode("utf-8"), "application/json")
                     return
                 if path == STATE_PATH:
                     if not self._init_ok(query):

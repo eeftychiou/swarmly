@@ -173,6 +173,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A **view per read command** on the dashboard (`#344`, control centre 3/4): the roster behind
+  `/status` and `/swarm` (role, state, model, effort, rev, and the peers this bot knows), the
+  usage table behind `/usage all`, the round board, the settings section behind `/model`,
+  `/reasoning` and `/role` (bot defaults plus the binding a topic overrides them with), the
+  drift section behind `/drift` (score, hard count, resets today, and the kinds and weights of
+  the live violations — never the ledger's evidence, which can name a topic or a path) and the
+  state section behind `/state` (backend, mode, routing and whether the store is readable). A
+  source nobody collected is `null`, never an empty list; one collected but not ready says so in
+  words. `/memory` is served at `GET /memory.json` and only to a verified admin `initData`, the
+  loopback included — checked before the page admits whether it has a memory at all — returning
+  the bot's words and their size and never the file's home; a bot without a memory file answers
+  `ready: false`, the page's Memory section says the login is needed when it is opened without
+  one, and it is fetched once rather than on every poll. New sections: Settings, Drift, State,
+  Memory, each linked from the header navigation.
+
 - The dashboard's **look and layout** (`#343`, control centre 2/4): a header with the swarm's
   health (round, coordinator, lease, bots by state, today's spend), section navigation over
   **Swarm**, **Round & owed**, **Topics**, **Usage** (a per-bot table plus the swarm total) and

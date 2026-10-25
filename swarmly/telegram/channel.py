@@ -3852,7 +3852,77 @@ class AgentChannel:
             now=moment, snapshots=self.control_snapshots(moment),
             usage=self.control_usage(), roles=self.control_roles(),
             coordinator=str(self.current_coordinator(now=moment) or ""), lease=lease,
-            round_state=self.control_round(), owed=owed, registry=registry)
+            round_state=self.control_round(), owed=owed, registry=registry,
+            peers=self.web_peers(), drift=self.web_drift(moment),
+            store=self.web_store())
+
+    # -- the read commands' views (control centre 3/4, #344) ---------------------------
+    def web_peers(self) -> List[Dict[str, Any]]:
+        """What this bot knows of its peers, from its own presence table (#344).
+
+        Named fields only: an alias, the role and term it last published, its revision. A
+        peer's record carries more than a page should, so nothing is passed through.
+        """
+        rows: List[Dict[str, Any]] = []
+        try:
+            for alias, peer in (self.presence().peers or {}).items():
+                rows.append({"alias": str(alias), "role": getattr(peer, "role", "") or "",
+                             "term": int(getattr(peer, "term", 0) or 0),
+                             "rev": getattr(peer, "rev", "") or "",
+                             "frozen": bool(getattr(peer, "frozen", False))})
+        except Exception:                          # noqa: BLE001 - a page without peers
+            logger.warning("web dashboard: the presence table is not readable", exc_info=True)
+        return rows
+
+    def web_drift(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """``/drift`` for the page: this bot's own ledger, inside the `/drift` vocabulary.
+
+        Only the kinds and weights of the live violations are published -- the ledger's own
+        ``evidence`` can name a topic, a path or an id, so it stays on the host.
+        """
+        from swarmly.telegram import webui
+        moment = self.presence_clock() if now is None else float(now)
+        try:
+            self.drift.fold_inbox()
+            decision = self.drift.decide()
+            # The ledger's per-session keys are ``<chat>:<thread>``; they stay home (the page
+            # draws no per-session row), so only the decision and the live rows go on (#349).
+            return webui.drift_view(alias=self.config.identity.alias, decided=decision.__dict__,
+                                    live=self.drift.live(), now=moment)
+        except Exception:                          # noqa: BLE001 - a page without drift
+            logger.warning("web dashboard: the drift ledger is not readable", exc_info=True)
+            return {"ready": False, "text": webui.NOT_READY}
+
+    def web_store(self) -> Dict[str, Any]:
+        """``/state`` as data: which backend, which mode, and whether it is readable (#344)."""
+        from swarmly.telegram import webui
+        link = self.state_link
+        store = getattr(link, "store", None)
+        try:
+            return webui.state_view(backend=getattr(link, "backend", ""),
+                                    mode=getattr(link, "mode", ""),
+                                    enabled=getattr(link, "enabled", False),
+                                    ready=getattr(store, "ready", None),
+                                    routing=getattr(link, "routing_mode", ""),
+                                    owed=getattr(link, "owed_mode", ""))
+        except Exception:                          # noqa: BLE001 - a page without a store
+            logger.warning("web dashboard: the state store is not readable", exc_info=True)
+            return {"ready": False, "text": webui.NOT_READY}
+
+    def web_memory(self) -> Optional[str]:
+        """``/memory``: this bot's own lessons, or ``None`` when it keeps none (#344).
+
+        Nothing about the file's home is returned: the page is told the words, never a path.
+        """
+        from swarmly.telegram import lessons
+        try:
+            path = lessons.memory_path(self.config)
+            if path is None or not path.exists():
+                return None
+            return path.read_text(encoding="utf-8", errors="replace")
+        except Exception:                          # noqa: BLE001 - a page without a memory
+            logger.warning("web dashboard: the memory is not readable", exc_info=True)
+            return None
 
     def registry_store(self) -> Any:
         """The shared state store the topic registry lives in, or ``None`` (#332).
@@ -3931,7 +4001,7 @@ class AgentChannel:
             bot_token=str(getattr(self.config.identity, "bot_token", "") or ""),
             admin_id=getattr(self.config.identity, "admin_user_id", 0),
             init_max_age=float(getattr(web, "init_max_age", 300.0) or 0.0),
-            action=self.web_action)
+            action=self.web_action, memory=self.web_memory)
         try:
             url = server.start()
         except OSError as exc:
