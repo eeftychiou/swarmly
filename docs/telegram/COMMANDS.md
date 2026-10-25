@@ -100,4 +100,5 @@ are admin only, and the ones that change the most ask for a second tap. Typing a
 | Reassign role | `/role @bot <role>` |
 | Cleanup | `/cleanup@bot` (the dry run) |
 | Sync | `/sync` |
+| Admit bot | `/admit @bot` |
 | Nudge | no command: wakes the bot that owes an `/owed` row, which costs it a turn |
