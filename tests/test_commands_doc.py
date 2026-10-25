@@ -9,7 +9,7 @@ import re
 import unittest
 from pathlib import Path
 
-from swarmly.telegram.commands import DIAG_COMMANDS, MENU_COMMANDS
+from swarmly.telegram.commands import MENU_COMMANDS
 
 PAGE = Path(__file__).resolve().parent.parent / "docs" / "telegram" / "COMMANDS.md"
 
@@ -24,7 +24,7 @@ class TheCommandsPageTests(unittest.TestCase):
     def test_the_commands_outside_the_menu_are_on_it_too(self):
         text = PAGE.read_text(encoding="utf-8")
         written = set(re.findall(r"`/([a-z_]+)", text))
-        hidden = {*DIAG_COMMANDS, "effort", "bus"}
+        hidden = {"diag", "effort", "bus"}           # answered, but not in the menu
         self.assertEqual(sorted(hidden - written), [])
 
 
