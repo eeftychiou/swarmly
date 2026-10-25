@@ -183,6 +183,17 @@ All notable changes to this project are documented here. The format follows
   measured 1.7-2.2:1 before this, 5.6-8.0:1 after), the chat's own theme params are applied on
   top, and a chat that sends colours without a scheme gets its palette from `bg_color`'s
   luminance. No external references, unknown values still `?`.
+- The dashboard's one **write path**, `POST /api/action` (`#342`, control centre 1/4): a body
+  of `{action, target?, value?, code?}` carried out by the same dispatch the Telegram dashboard
+  buttons use (`control.CONTROLS` through `control_press`), so there is one table of actions,
+  one admin check and one second tap. The answer is the policy's own words plus `ok`,
+  `verdict`, and the single-use `confirm` code a second POST sends back. Every write needs a
+  valid admin Mini App `initData`, the loopback included — a local request without one is a
+  `403` and the plain page stays read-only — a cross-site `Origin` is refused, a body over
+  8 KiB or not a JSON object is a `400`, and every executed action leaves one line in the
+  control topic marked `via=dashboard`. No field of the answer is an id or a path. The action
+  runs on the transport's event loop through `agent.web_action` (bounded at 30 s), so the page
+  thread never touches the adapter and a slow control answers "no" instead of hanging.
 
 - A **Topics panel** on the local dashboard (`#332`): one card per open work topic from the
   state store's registry — most recently active first, with the topic's name, each link's ref,

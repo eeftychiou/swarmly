@@ -10,6 +10,7 @@ stopped what and when.
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from unittest import mock
 
@@ -1226,6 +1227,105 @@ class TestTheSwarmControls(unittest.TestCase):
         channel = self.channel()
         self.assertIn("swarm.sync", channel.control_actions())
         self.assertIn("swarm.cleanup", channel.control_actions())
+
+
+class TestTheDashboardWritePath(unittest.TestCase):
+    """#342: the page's write path runs the same press, with its code and its audit line."""
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        return channel
+
+    def ask(self, channel, **request):
+        return run(channel.dashboard_action(request))
+
+    def test_a_plain_action_runs_once_and_answers_with_the_policys_words(self):
+        channel = self.channel()
+        answer = self.ask(channel, action="bot.pause")
+        self.assertTrue(answer["ok"])
+        self.assertEqual(answer["verdict"], cp.RUN)
+        self.assertTrue(channel._frozen)                      # it actually ran
+        self.assertIn("Pause done", answer["text"])
+        self.assertNotIn("confirm", answer)
+
+    def test_a_control_that_stops_something_needs_its_code(self):
+        channel = self.channel()
+        asked = self.ask(channel, action="bot.restart")
+        self.assertEqual((asked["ok"], asked["verdict"]), (False, cp.CONFIRM))
+        self.assertFalse(channel.restart_requested)           # the first post changes nothing
+        code = asked["confirm"]
+        self.assertTrue(code, "a confirm answer must carry the code the second post sends")
+        done = self.ask(channel, action="bot.restart", code=code)
+        self.assertTrue(done["ok"])
+        self.assertTrue(channel.restart_requested)
+
+    def test_a_code_is_single_use(self):
+        channel = self.channel()
+        code = self.ask(channel, action="bot.restart")["confirm"]
+        self.ask(channel, action="bot.restart", code=code)
+        again = self.ask(channel, action="bot.restart", code=code)
+        self.assertEqual(again["verdict"], cp.REFUSED)
+        self.assertEqual(again["refused"], cp.EXPIRED)
+
+    def test_an_action_with_no_controls_entry_is_refused(self):
+        channel = self.channel()
+        answer = self.ask(channel, action="bot.selfdestruct")
+        self.assertEqual(answer["verdict"], cp.REFUSED)
+        self.assertEqual(answer["refused"], cp.UNKNOWN)
+        self.assertNotIn("selfdestruct", channel.control_actions())
+
+    def test_a_malformed_request_is_refused_without_running_anything(self):
+        channel = self.channel()
+        self.assertEqual(self.ask(channel)["refused"], cp.UNKNOWN)          # nothing asked
+        self.assertEqual(self.ask(channel, action="bot:pause")["refused"], cp.UNKNOWN)
+        self.assertEqual(self.ask(channel, action="bot.pause",
+                                  target="a:b")["refused"], cp.TARGET)
+        self.assertFalse(channel._frozen)
+
+    def test_one_audit_line_per_executed_action_says_via_dashboard(self):
+        channel = self.channel()
+        self.ask(channel, action="bot.pause")
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL bot.pause" in entry["text"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("via=dashboard", notes[0])
+        self.assertIn("by=%d" % ADMIN_ID, notes[0])
+        self.assertIn("target=", notes[0])
+
+    def test_a_refused_or_confirming_write_leaves_no_audit_line(self):
+        channel = self.channel()
+        self.ask(channel, action="bot.restart")               # only a code is minted
+        self.ask(channel, action="bot.selfdestruct")
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL bot.restart" in entry["text"]
+                 or "CONTROL bot.selfdestruct" in entry["text"]]
+        self.assertEqual(notes, [])
+
+    def test_the_answer_carries_no_identifier(self):
+        from tests.test_telegram_channel import GROUP
+        channel = self.channel()
+        payload = json.dumps(self.ask(channel, action="bot.pause"))
+        for secret in (str(GROUP), str(ADMIN_ID), "TEST"):
+            self.assertNotIn(secret, payload)
+
+    def test_a_transport_that_is_not_running_answers_instead_of_hanging(self):
+        channel = self.channel()
+        self.assertIn("not running", channel.web_action({"action": "bot.pause"})["text"])
+
+    def test_the_server_is_wired_to_the_write_path(self):
+        channel = make_channel(make_config(web={"enabled": True, "port": 0},
+                                           control={"chat_id": -1001234567890,
+                                                    "topic_id": 307}))
+        channel.is_coordinator = lambda now=None: True
+        channel._sync_web_dashboard()
+        try:
+            wired = channel._web_server.action
+            self.assertIsNotNone(wired)
+            self.assertIs(wired.__self__, channel)             # this transport's own dispatch
+        finally:
+            channel.is_coordinator = lambda now=None: False
+            channel._sync_web_dashboard()
 
 
 def round_state(items):

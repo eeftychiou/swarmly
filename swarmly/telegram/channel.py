@@ -36,13 +36,14 @@ import secrets
 import socket
 import subprocess
 import types
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import time
 import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Set,
+                    Tuple, Union)
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -3929,7 +3930,8 @@ class AgentChannel:
             public_host=str(getattr(web, "public_host", "") or ""),
             bot_token=str(getattr(self.config.identity, "bot_token", "") or ""),
             admin_id=getattr(self.config.identity, "admin_user_id", 0),
-            init_max_age=float(getattr(web, "init_max_age", 300.0) or 0.0))
+            init_max_age=float(getattr(web, "init_max_age", 300.0) or 0.0),
+            action=self.web_action)
         try:
             url = server.start()
         except OSError as exc:
@@ -4173,6 +4175,10 @@ class AgentChannel:
     #: twice and name the wrong thing once.
     CONTROL_BROADCASTS = ("swarm.pause_all", "swarm.lease", "swarm.failback")
 
+    #: How long a dashboard write may wait for the event loop before the page is told no
+    #: (#342). A control that answers slower than this is one the page must not hang on.
+    ACTION_TIMEOUT = 30.0
+
     def _control_event(self, command: str, argument: str = "") -> ChannelEvent:
         """A synthetic event for a report control: the admin, typing a bare command.
 
@@ -4379,15 +4385,19 @@ class AgentChannel:
         self._control_policy = policy
         return policy
 
-    async def handle_control_press(self, press: Any) -> str:
+    async def handle_control_press(self, press: Any, *, via: str = "") -> str:
         """One button press: decide, act, log, answer. Never raises.
 
         Answering is what the presser sees in the chat; the log line rides the channel NOTE
         path (and so the bus, when ``bus.repo`` is set), so a control leaves a record of who
-        stopped what.
+        stopped what. *via* names another way of pressing -- ``dashboard`` for the page (#342)
+        -- and is written into that line, so the record says where the press came from.
         """
         try:
             decision = self.control_policy().decide(press, actor=str(press.user_id))
+            # The decision is kept for a caller that needs more than the words: the dashboard's
+            # write path returns the confirm code the page must send back (#342).
+            self._control_decision = decision
             if decision.verdict == press_mod.REFUSED:
                 # Every policy refusal is answered before anything about the lease: "<bot>
                 # coordinates now" is a small disclosure of who leads, and a stranger (or
@@ -4421,7 +4431,8 @@ class AgentChannel:
             if decision.log and decision.action not in self.CONTROL_BROADCASTS:
                 # A swarm-wide control posts its own ``target=*`` note (which already names
                 # the pressing bot); a second, local note would double every press on the bus.
-                await self._post_control_note(decision.log)
+                await self._post_control_note(f"{decision.log} via={via}" if via
+                                              else decision.log)
             self._control_answer = decision.text
             return decision.text
         except ControlRefused as exc:
@@ -4429,6 +4440,75 @@ class AgentChannel:
         except Exception:                      # noqa: BLE001 - a press must not break the bot
             logger.warning("control centre: the press failed", exc_info=True)
             return "the press failed; the log has the reason"
+
+    # -- the dashboard's write path (control centre 1/4, #342) ---------------------------
+    def web_action(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+        """One write from the page, carried out on the transport's own loop (#342).
+
+        The HTTP server runs in a thread of its own and every control is a coroutine on the
+        event loop, so the request is handed over and its answer waited for -- with a bound,
+        because a page that never hears back is worse than one told "no".
+        """
+        loop = self.__dict__.get("_loop")
+        if loop is None or loop.is_closed():
+            return {"ok": False, "refused": "not_running",
+                    "text": "the transport is not running its controls"}
+        try:
+            future = asyncio.run_coroutine_threadsafe(self.dashboard_action(request), loop)
+            return dict(future.result(self.ACTION_TIMEOUT) or {})
+        except FuturesTimeout:
+            logger.warning("web dashboard: a control did not answer in %gs",
+                           self.ACTION_TIMEOUT)
+            return {"ok": False, "refused": "timeout",
+                    "text": "the control did not answer in time"}
+        except Exception:                          # noqa: BLE001 - a page, not a traceback
+            logger.warning("web dashboard: the dashboard action failed", exc_info=True)
+            return {"ok": False, "refused": "failed",
+                    "text": "the action failed; the log has the reason"}
+
+    async def dashboard_action(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+        """Carry out one action asked for by the page (#342).
+
+        It becomes the same press a Telegram button delivers -- ``ctl:<action>[:<target>]``,
+        or ``ctl:confirm:<code>`` for the second tap -- so there is one policy (admin-only,
+        a second tap for anything that stops, one log line) and one set of actions. The answer
+        says whether it ran, gives the policy's own words, and hands back the code a second
+        POST needs when the control asks again.
+        """
+        action = str(request.get("action") or "").strip()
+        target = str(request.get("target") or "").strip()
+        value = str(request.get("value") or "").strip()
+        code = str(request.get("code") or "").strip()
+        if not action and not code:
+            return {"ok": False, "refused": press_mod.UNKNOWN,
+                    "text": "a write needs an action or a confirm code"}
+        if action and (":" in action or any(ch.isspace() for ch in action)):
+            return {"ok": False, "refused": press_mod.UNKNOWN, "action": action,
+                    "text": "there is no control by that name"}
+        if ":" in target or any(ch.isspace() for ch in target):
+            return {"ok": False, "refused": press_mod.TARGET, "action": action,
+                    "text": "that target is not one this page can name"}
+        if any(ch.isspace() for ch in code):
+            return {"ok": False, "refused": press_mod.EXPIRED, "action": action,
+                    "text": "that confirmation expired or was already used"}
+        data = (press_mod.confirm_data(code) if code
+                else press_mod.callback_data(action, target, value))
+        press = press_mod.Press(user_id=int(self.config.identity.admin_user_id or 0),
+                                data=data, at=time.time())
+        # The admin's identity is not taken from the request: the page has already checked the
+        # Mini App's signed login against admin_user_id, and the policy checks it again below.
+        self._control_decision = None
+        text = await self.handle_control_press(press, via="dashboard")
+        decision = getattr(self, "_control_decision", None)
+        verdict = str(getattr(decision, "verdict", "") or "") or press_mod.REFUSED
+        answer: Dict[str, Any] = {"ok": verdict == press_mod.RUN, "verdict": verdict,
+                                  "action": action or str(getattr(decision, "action", "") or ""),
+                                  "target": target, "text": text}
+        if verdict == press_mod.CONFIRM:
+            answer["confirm"] = str(getattr(decision, "code", "") or "")
+        if verdict == press_mod.REFUSED:
+            answer["refused"] = str(getattr(decision, "reason", "") or press_mod.REFUSED)
+        return answer
 
     async def _handle_control_text(self, event: ChannelEvent) -> Optional[str]:
         """A control typed into the chat: the press handler, fed by text instead of a callback.
