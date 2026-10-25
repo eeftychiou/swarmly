@@ -270,3 +270,15 @@ class TestTheRealReader(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheRealClientTests(unittest.TestCase):
+    """Live, 25 Oct: #308 removed _github_client and the settle check raised every heartbeat;
+    the tests had all stubbed it."""
+
+    def test_the_channel_builds_its_own_client(self):
+        from tests.test_telegram_channel import make_channel
+        channel = make_channel()
+        client = channel._github_client()
+        self.assertIs(channel._github_client(), client)
+        self.assertTrue(hasattr(client, "ref_state"))

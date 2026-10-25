@@ -2108,6 +2108,17 @@ class AgentChannel:
                 return f"open work item {link.get('id', '?')} {link.get('title') or ''}".strip()
         return None
 
+    def _github_client(self) -> Any:
+        """One GitHub client for the transport's own checks (the owed settlement, ref states)."""
+        if self._gh_client is None:
+            from swarmly.github.client import GitHubClient
+            self._gh_client = GitHubClient(
+                token_env=(self.config.github.token_env if self.config.github
+                           else "GH_TOKEN"),
+                alias=self.config.identity.alias,
+                redact=Redactor.from_config(self.config).text)
+        return self._gh_client
+
     async def cleanup_delete_topic(self, chat_id: int, thread_id: int) -> bool:
         """Delete one forum topic with all its messages (any age: that is deleteForumTopic)."""
         if self.bot is None:
