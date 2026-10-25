@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 
 from swarmly.telegram.commands import MENU_COMMANDS
+from swarmly.telegram.control import CONTROLS
+from tests.test_telegram_channel import make_channel
 
 PAGE = Path(__file__).resolve().parent.parent / "docs" / "telegram" / "COMMANDS.md"
 
@@ -26,6 +28,20 @@ class TheCommandsPageTests(unittest.TestCase):
         written = set(re.findall(r"`/([a-z_]+)", text))
         hidden = {"diag", "effort", "bus"}           # answered, but not in the menu
         self.assertEqual(sorted(hidden - written), [])
+
+    def test_every_dashboard_button_is_in_the_table(self):
+        """Every button the dashboard offers (a control this build has wired; the rest of
+        ``CONTROLS`` is never shown) has a row."""
+        text = PAGE.read_text(encoding="utf-8")
+        section = text.split("## Dashboard buttons", 1)[1].split("\n## ", 1)[0]
+        rows = [line for line in section.splitlines() if line.startswith("|")]
+        buttons = set()
+        for row in rows[2:]:                    # skip the header and its rule
+            cell = row.strip("|").split("|")[0]
+            buttons |= {part.strip() for part in cell.split(",")}
+        offered = set(make_channel().control_actions())
+        listed = {control.label for control in CONTROLS if control.action in offered}
+        self.assertEqual(sorted(listed - buttons), [])
 
 
 if __name__ == "__main__":
