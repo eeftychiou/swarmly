@@ -714,6 +714,80 @@ class TelegramStoreTests(unittest.TestCase):
             self.assertEqual(b.read("topic/7"), {"n": 1})
         run(go())
 
+    def _stale_pin_bot(self):
+        """Claudebot publishes twice; DeepSeek holds the first pin and misses its lines.
+
+        Returns (a, b, stale, true_pin, caption) -- the caption being the newer SNAPSHOT
+        line, which the retry tests deliver before the pin has moved (#303).
+        """
+        async def build():
+            a = self.store("Claudebot")
+            await a.start()
+            await a.claim_lease(10 ** 6)
+            await a.write("topic/7", {"n": 1})
+            self.clock.t += 60
+            self.assertTrue(await a.publish_snapshot())
+            a.io.hold_for = {"DeepSeek"}
+            b = self.store("DeepSeek")
+            await b.start()
+            stale = b.snapshot_message
+            await a.write("topic/7", {"n": 2})
+            self.clock.t += 60
+            self.assertTrue(await a.publish_snapshot())
+            true_pin = a.snapshot_message
+            self.assertNotEqual(true_pin, stale)
+            return a, b, stale, true_pin, self.group.files[true_pin][0]
+        return build()
+
+    def _lag_pin(self, store, stale, times):
+        """``store.io.pinned`` lags: it answers the old pin for the next ``times`` reads."""
+        real = store.io.pinned
+        lag = {"left": times, "reads": 0}
+
+        async def lagging():
+            lag["reads"] += 1
+            if lag["left"] > 0:
+                lag["left"] -= 1
+                caption, data = self.group.files[stale]
+
+                async def read(d=data):
+                    return d
+                return Pinned(stale, caption, read)
+            return await real()
+        store.io.pinned = lagging
+        return lag
+
+    def test_a_snapshot_line_before_its_pin_heals_on_a_later_refresh(self):
+        async def go():
+            a, b, stale, true_pin, caption = await self._stale_pin_bot()
+            # The SNAPSHOT line reaches this bot first; Telegram's pin has not moved yet.
+            lag = self._lag_pin(b, stale, times=2)
+            self.group.deliver("Claudebot", true_pin, caption)
+            await b.refresh()                    # reads a pin that still is the old one
+            self.assertEqual(b.snapshot_message, stale)
+            await b.refresh()                    # still behind: the retry is armed again
+            self.assertEqual(b.snapshot_message, stale)
+            await b.refresh()                    # the pin has caught up: the heal lands
+            self.assertEqual(b.snapshot_message, true_pin)
+            self.assertEqual(lag["reads"], 3)
+            self.assertEqual(b.read("topic/7"), {"n": 2})
+            self.assertEqual(b.state_hash(), a.state_hash())
+        run(go())
+
+    def test_the_pin_reread_gives_up_after_three_retries(self):
+        async def go():
+            _a, b, stale, true_pin, caption = await self._stale_pin_bot()
+            lag = self._lag_pin(b, stale, times=99)      # the pin never catches up
+            self.group.deliver("Claudebot", true_pin, caption)
+            for _ in range(6):
+                await b.refresh()
+            # The line's own read, then three retries: the pin is not re-read forever.
+            self.assertEqual(lag["reads"], 4, "the pin is read, retried three times, then left")
+            self.assertEqual(b._pin_tries, 3)
+            self.assertFalse(b.log.late, "nothing is left armed once the retries are spent")
+            self.assertEqual(b.snapshot_message, stale)
+        run(go())
+
     def test_telegram_down_fails_closed(self):
         async def go():
             a = self.store("Claudebot")
