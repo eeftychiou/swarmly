@@ -10816,6 +10816,16 @@ class AgentChannel:
                 if telegram_message_id is _SEND_SUPPRESSED:
                     self.replies.release_claim(row['id'])
                     return
+                if telegram_message_id is None:
+                    # Nothing was posted: `send` never tried (an answer that was only NO_REPLY,
+                    # stored before submissions refused it), or Telegram said the topic is gone
+                    # and the post was dropped. Neither is `sent`, and neither may stay claimed.
+                    gone = (row.get("thread_id") is not None
+                            and (row["chat_id"], row["thread_id"]) in self._dead_topics)
+                    if gone or self.replies.get(row['id'])['state'] == 'claimed':
+                        self.replies.unposted(row['id'], "answer not posted: " + (
+                            "its topic is gone" if gone else "there was nothing to send"))
+                        return
                 self.replies.sent(row['id'], telegram_message_id)
             except BaseException:
                 # Cancellation before on_attempt is safely retryable; after it, Telegram may

@@ -21,6 +21,11 @@ revocation, addressing and the seen-ledger behave the same on every transport. L
 (locks, heartbeats, seen-ledgers, caches) always stays in `.agents/state/` of the agent's
 own checkout (`bus.repo`). It is never written to a shared folder.
 
+With no `bus.repo`, the state root is `SWARMLY_STATE_ROOT` when it is set, otherwise the
+checkout the transport runs from (`~/.a2a` for an installed wheel). The test suite sets it
+so parallel workers never share a state file. The run lock moves with it: every process for
+one agent on a host must see the same value, or two transports can each take their own lock.
+
 ### `git`: gitbus (default)
 
 Envelopes are committed to `.agents/inbox/` on the project repository's default branch.

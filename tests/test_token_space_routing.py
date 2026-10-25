@@ -403,6 +403,112 @@ class TicketRepliesTests(unittest.TestCase):
             self.assertEqual(len(spy.posts), channel.config.limits.overdue_alert_cap, spy.posts)
             self.assertFalse([text for _, _, text in spy.posts if "the answer" in text])
 
+    def test_a_late_answer_still_raises_its_alert(self):
+        """The ticket's overdue alerts were spent before the answer came: its `unposted`
+        alert must still go out (#321 review)."""
+        from swarmly.telegram.replies import ReplyStore
+        with TemporaryDirectory() as folder:
+            channel = channel_for("never")
+            channel.replies = ReplyStore(Path(folder) / "replies.db")
+            ticket, _ = channel.replies.register(chat_id=GROUP, message_id=5, recipient="alice",
+                                                 text="q?", thread_id=PULSE, timeout=1, now=0)
+            channel.replies.queued(ticket["id"])
+            spy = Spy(channel)
+            for _ in range(3):
+                run(channel.flush_replies())             # overdue: both alerts spent
+            spent = len(spy.posts)
+            self.assertEqual(spent, channel.config.limits.overdue_alert_cap)
+            channel.replies.submit(ticket["id"], text="the answer, late")
+            run(channel.flush_replies())                 # refused: unposted
+            run(channel.flush_replies())                 # and alerted
+            self.assertEqual(channel.replies.get(ticket["id"])["state"], "unposted")
+            self.assertEqual(len(spy.posts), spent + 1, spy.posts)
+            self.assertIn("unposted for message 5", spy.posts[-1][2])
+
+    def late_answer(self, channel, folder, thread_id=9400):
+        """A ticket whose overdue alerts are spent, then answered."""
+        from swarmly.telegram.replies import ReplyStore
+        channel.replies = ReplyStore(Path(folder) / "replies.db")
+        ticket, _ = channel.replies.register(chat_id=GROUP, message_id=5, recipient="alice",
+                                             text="q?", thread_id=thread_id, timeout=1, now=0)
+        channel.replies.queued(ticket["id"])
+        spy = Spy(channel)
+        for _ in range(3):
+            run(channel.flush_replies())
+        self.assertEqual(len(spy.posts), channel.config.limits.overdue_alert_cap)
+        channel.replies.submit(ticket["id"], text="the answer, late")
+        return ticket, spy
+
+    def test_a_late_answer_whose_send_fails_still_raises_its_alert(self):
+        with TemporaryDirectory() as folder:
+            channel = channel_for("never")
+            ticket, spy = self.late_answer(channel, folder)
+            spent = len(spy.posts)
+
+            def down(payload, reply_to):
+                raise RuntimeError("network down")
+            real, channel._sender = channel._sender, down
+            with self.assertRaises(RuntimeError):
+                run(channel.flush_replies())
+            channel._sender = real
+            run(channel.flush_replies())
+            self.assertEqual(channel.replies.get(ticket["id"])["state"], "delivery_unknown")
+            self.assertEqual(len(spy.posts), spent + 2, spy.posts)   # the answer, then its alert
+            self.assertIn("delivery_unknown", spy.posts[-1][2])
+
+    def test_a_late_answer_cut_off_by_a_restart_still_raises_its_alert(self):
+        with TemporaryDirectory() as folder:
+            channel = channel_for("never")
+            ticket, spy = self.late_answer(channel, folder)
+            spent = len(spy.posts)
+            channel.replies.claim_ready()
+            channel.replies.attempting(ticket["id"])           # the process died mid-send
+            channel.replies.recover()
+            run(channel.flush_replies())
+            self.assertEqual(channel.replies.get(ticket["id"])["state"], "delivery_unknown")
+            self.assertEqual(len(spy.posts), spent + 1, spy.posts)
+            self.assertIn("delivery_unknown", spy.posts[-1][2])
+
+    def test_an_answer_dropped_because_its_topic_is_gone_is_not_recorded_as_sent(self):
+        from swarmly.telegram.channel import TopicGone
+        from swarmly.telegram.replies import ReplyStore
+        with TemporaryDirectory() as folder:
+            channel = channel_for("never")
+            channel.replies = ReplyStore(Path(folder) / "replies.db")
+            ticket, _ = channel.replies.register(chat_id=GROUP, message_id=5, recipient="alice",
+                                                 text="q?", thread_id=9400)
+            channel.replies.submit(ticket["id"], text="the answer")
+
+            def gone(payload, reply_to):
+                raise TopicGone()
+            real, channel._sender = channel._sender, gone
+            spy = Spy(channel)
+            run(channel.flush_replies())
+            row = channel.replies.get(ticket["id"])
+            self.assertEqual((row["state"], row["detail"]),
+                             ("unposted", "answer not posted: its topic is gone"))
+            channel._sender = real
+            run(channel.flush_replies())
+            self.assertEqual(channel.replies.get(ticket["id"])["alerts"], 1)
+            self.assertIn("its topic is gone", spy.posts[-1][2])
+
+    def test_an_answer_with_nothing_to_send_does_not_stay_claimed(self):
+        """An answer stored before submissions refused a bare NO_REPLY: `send` posts nothing
+        and never tries, so `sent` did not apply and the ticket stayed `claimed`."""
+        from swarmly.telegram.replies import ReplyStore
+        with TemporaryDirectory() as folder:
+            channel = channel_for("never")
+            channel.replies = ReplyStore(Path(folder) / "replies.db")
+            ticket, _ = channel.replies.register(chat_id=GROUP, message_id=5, recipient="alice",
+                                                 text="q?", thread_id=9400)
+            with channel.replies._db() as db:
+                db.execute("UPDATE replies SET state='ready', text='@alice: NO_REPLY' WHERE id=?",
+                           (ticket["id"],))
+            run(channel.flush_replies())
+            row = channel.replies.get(ticket["id"])
+            self.assertEqual(row["state"], "unposted")
+            self.assertIn("nothing to send", row["detail"])
+
 
 class TheSendCommandTests(unittest.TestCase):
 

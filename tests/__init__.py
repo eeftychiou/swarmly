@@ -22,6 +22,8 @@ gitenv.scrub_process()
 # points it at a throwaway directory **unconditionally** -- a path the runner exported is
 # overridden too, not trusted (issue #22 review: trusting a pre-set value let a test touch
 # the host's own secret).
+import atexit
+import shutil
 import tempfile
 
 _redaction_dir = tempfile.mkdtemp(prefix="swarmly-redaction-")
@@ -31,4 +33,8 @@ os.environ["SWARMLY_REDACTION_SECRET_FILE"] = os.path.join(_redaction_dir, "reda
 # Under `pytest -n auto` every worker would share those files (boots, admitted, inbox,
 # owed rows) and race on them: a restart test read back another worker's write (#320
 # review). Each test process gets a state root of its own, unconditionally like the above.
-os.environ["SWARMLY_STATE_ROOT"] = tempfile.mkdtemp(prefix="swarmly-state-")
+os.environ["SWARMLY_STATE_ROOT"] = _state_dir = tempfile.mkdtemp(prefix="swarmly-state-")
+
+# Both folders are this process's own; leave nothing behind in the temp directory.
+for _throwaway in (_redaction_dir, _state_dir):
+    atexit.register(shutil.rmtree, _throwaway, True)
