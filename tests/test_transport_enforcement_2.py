@@ -124,7 +124,8 @@ class PRCheckTests(unittest.IsolatedAsyncioTestCase):
                 {"number": 251, "headRefOid": B, "body": "Closes #87"},
                 {"number": 252, "headRefOid": M, "body": "Fixes #87"},
                 {"number": 253, "headRefOid": A, "body": "Part of #260. Phase 3."},
-                {"number": 254, "headRefOid": B, "body": "part of #260: phase 9"}]
+                {"number": 254, "headRefOid": B, "body": "part of #260: phase 9"},
+                {"number": 255, "headRefOid": M, "body": "Builds on work done as part of #120."}]
             client.pr_diff.side_effect = lambda repo, n: (
                 "-    def test_old(self):\n+    x = 1\n" if n == 251 else
                 "+    @unittest.skip('later')\n+    def test_new(self):\n" if n == 252 else "")
@@ -144,8 +145,9 @@ class PRCheckTests(unittest.IsolatedAsyncioTestCase):
             # issue are not "one issue, one pull request" (live, 25 Oct: #298 was flagged).
             self.assertNotIn(253, said)
             self.assertNotIn(254, said)
+            self.assertIn("names no issue", said[255])     # "part of" in passing is not one
             await watcher().poll_once()                       # same heads: not again
-            self.assertEqual(client.comment.call_count, 3)
+            self.assertEqual(client.comment.call_count, 4)
 
 
 if __name__ == "__main__":

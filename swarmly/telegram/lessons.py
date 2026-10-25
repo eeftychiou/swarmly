@@ -21,9 +21,10 @@ Where it lives:
   to compress. It is never truncated silently, because a half-cut lesson reads as a whole one.
 * **The outcome** (saved, refused and why) is told to the bot in its *next* turn's prompt,
   never posted: it is the bot's feedback, not the people's (admin, 25 Oct: "Memory refused"
-  lines in a work topic). A refusal asks for the update again on that next turn, once; a
-  second refusal in a row waits for the normal count, so a bot that cannot compress is not
-  asked on every turn.
+  lines in a work topic). A refusal asks for the update again on that next turn; a refusal
+  of that re-asked block waits for the normal count, so a bot that cannot compress is not
+  asked on every turn. Both are spent only by a turn that ran: a turn stopped, paused or
+  failed before the model answered leaves them for the next one.
 
 Lessons, not logs: one line each, what happened and what to do next time.
 """
@@ -116,10 +117,22 @@ def extract_block(text: str) -> Tuple[str, Optional[str], Optional[str]]:
         else after.lstrip("\n")
     if _OPEN.search(body):                            # a second block: take the first only
         reason = "more than one memory block; the first one is used"
+        body = _strip_blocks(body)                    # and post none of them
     block = block.strip("\n")
     if not block.strip():
         return body.strip(), None, "the memory block was empty"
     return body.strip(), block, reason
+
+
+def _strip_blocks(text: str) -> str:
+    """*text* without any memory block: each runs to its END MEMORY, or to the end."""
+    while True:
+        opened = _OPEN.search(text)
+        if opened is None:
+            return text.strip()
+        closing = _CLOSE.search(text, opened.end())
+        after = text[closing.end():] if closing is not None else ""
+        text = text[:opened.start()].rstrip() + "\n" + after.lstrip("\n")
 
 
 def size_of(text: str) -> int:
@@ -167,9 +180,12 @@ class Lessons:
         self.turns = int(state.get("turns", 0) or 0)
         #: What became of the last memory block, for the next turn's prompt; "" once told.
         self.said = str(state.get("said") or "")
-        #: Ask for the update again on the next turn (one refusal in a row, not more).
+        #: Ask for the update again on the next turn that runs (after a refusal).
         self.again = bool(state.get("again"))
-        self.refusals = int(state.get("refusals", 0) or 0)
+        #: The last turn that ran carried that re-ask: its refused block is not re-asked.
+        self.reasked = bool(state.get("reasked"))
+        #: Bumped by :meth:`tell`: a turn built before a newer outcome must not spend it.
+        self.seq = 0
 
     # -- the file ----------------------------------------------------------------------
     def _load(self) -> str:
@@ -226,24 +242,31 @@ class Lessons:
     def tell(self, note: str, *, refused: bool) -> None:
         """Keep the outcome of a memory block for the bot's next turn, where it is told.
 
-        A refusal asks for the update again on that turn, but only the first in a row: a bot
-        whose re-asked block is refused too goes back to the normal count.
+        A refusal asks for the update again on that turn, unless the refused block was itself
+        the answer to a re-ask: that bot goes back to the normal count.
         """
         self.said = (note or "").strip()
-        if refused:
-            self.refusals += 1
-            self.again = self.refusals <= 1
-        else:
-            self.refusals = 0
-            self.again = False
+        self.again = refused and not self.reasked
+        self.reasked = False
+        self.seq += 1
         self._save_counter()
 
-    def told(self) -> str:
-        """The outcome kept by :meth:`tell`, once: "" afterwards."""
-        said, self.said = self.said, ""
-        if said:
-            self._save_counter()
-        return said
+    def note(self) -> str:
+        """The outcome kept by :meth:`tell`, for a prompt; it stays until a turn ran."""
+        return self.said
+
+    def turn_ran(self, seq: Optional[int] = None) -> None:
+        """A turn whose prompt was built at *seq* reached the model and answered: the
+        outcome it carried is told, and a re-ask it carried is spent. A newer outcome (a
+        parallel turn's block, told since) stays for the next turn."""
+        if seq is not None and seq != self.seq:
+            return
+        if not (self.said or self.again or self.reasked):
+            return
+        self.said = ""
+        self.reasked = self.again
+        self.again = False
+        self._save_counter()
 
     # -- the turn counter ---------------------------------------------------------------
     def note_turn(self) -> bool:
@@ -254,9 +277,8 @@ class Lessons:
         due = self.again or self.since_asked >= self.every_turns
         if due:
             # Reset on the *ask*, not on the write: a bot that ignores the instruction must
-            # not be asked on every turn from then on.
+            # not be asked on every turn from then on. A re-ask is spent by turn_ran().
             self.since_asked = 0
-            self.again = False
         self._save_counter()
         return due
 
@@ -265,7 +287,7 @@ class Lessons:
             return
         save_state(self.counter_path,
                    {"turns": self.turns, "since_asked": self.since_asked, "said": self.said,
-                    "again": self.again, "refusals": self.refusals},
+                    "again": self.again, "reasked": self.reasked},
                    "memory turn counter")
 
 
