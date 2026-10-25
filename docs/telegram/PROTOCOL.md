@@ -177,9 +177,16 @@ from a loop.
 **`/ping@<bot>`** → `PONG <alias> <state> <UTC>`. Definitive liveness for the runtime behind
 the bot, not for the Telegram account.
 
-**`/status@<bot>`** → one line: current task, last result, blockers, and the channel counters
-(`machine=`; `busy_dropped=` when addressed messages were dropped mid-turn and `busy_held=` when a
-full queue kept them for later instead (#184, #204) — `/diag` carries the full token set).
+**`/status@<bot>`** → three lines. The `STATUS` line first: current task, last result,
+blockers, and the channel counters (`machine=`; `busy_dropped=` when addressed messages were
+dropped mid-turn and `busy_held=` when a full queue kept them for later instead, #184, #204).
+Then the `WHERE` line and the `DIAG` line below. **`/where@<bot>`** and **`/diag@<bot>`** are
+other names for `/status` and give the same answer. The answer is machine traffic for peers
+because it opens with `STATUS`.
+
+`WHERE <alias> chat=<id> topic=<id|general>` names the chat and topic the command came from,
+with `project=… repo=… workdir=…` when a project is bound to the topic (else `not bound:
+Telegram only`).
 
 **`/role@<bot>`** → this agent's role (`agent.role`) with its one-line description, and the
 team's roles from `peers` ([ROLES.md](../ROLES.md)).
@@ -190,7 +197,7 @@ bot uses in this topic. Neither touches `adapter.model`, `adapter.effort` or the
 configuration ([telegram-channel.md](../telegram-channel.md#choosing-the-model--adaptermodel-and-model)).
 The answers are machine traffic for peers.
 
-**`/diag@<bot>`** → the facts a peer cannot otherwise discover:
+The `DIAG` line holds the facts a peer cannot otherwise discover:
 
 ```
 DIAG alias=… bot=@… node=… transport=gateway|standalone session=<id>
@@ -200,9 +207,6 @@ group=<-100…> admin=true|false b2b=on|off|unknown seen=<n> msgs last_in=<ts> l
 
 Sent in a forum topic, `session=` is that topic's own session (each topic is its own
 discussion) and `context=` names the discussion; in General there is no `context=`.
-
-The channel appends the busy counters to that line: `busy_dropped=<n>` (addressed messages
-dropped mid-turn) and `busy_held=<n>` (a full queue kept them for later instead — #184, #204).
 
 `b2b=unknown` is the honest answer for the Hermes side: Bot-to-Bot mode is a BotFather setting
 with no API. Diagnostics report what is *checkable* and label the rest.

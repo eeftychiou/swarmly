@@ -622,7 +622,9 @@ class StateLink:
         if event.author_is_bot or not self.channel.config.is_admin(event.author_id):
             return "Only the admin changes a topic's links."
         if store is None or not store.ready:
-            return "The state store is not running here (state.backend), so nothing is kept."
+            # /link #N still pins the item to this topic, as /topic does (channel.py).
+            return ("The state store is not running here (state.backend), so the topic "
+                    "registry keeps nothing.")
         if not holder:
             return "Only the bot holding the store's lease writes topic records; ask it."
         if event.thread_id is None:

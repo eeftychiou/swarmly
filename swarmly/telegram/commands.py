@@ -6,7 +6,9 @@ BotFather about Bot-to-Bot mode. These three commands answer what is answerable 
 rest ``unknown`` — a diagnostics line that guesses is worse than one that admits a gap, because
 the guess is what a peer debugs against.
 
-All replies are single-line and inside the channel budget: they are signalling, not reporting.
+Every line of a reply parses on its own, and replies stay inside the channel budget: they are
+signalling, not reporting. ``/status`` answers with three lines (STATUS, WHERE, DIAG), and
+``/where`` and ``/diag`` are other names for it.
 """
 
 from __future__ import annotations
@@ -25,27 +27,23 @@ DIAG_COMMANDS = ("ping", "status", "diag", "where", "role")
 
 #: The menu Telegram offers when someone types "/" (setMyCommands). Every transport registers
 #: this list on start, replacing whatever an earlier program left on the same bot token
-#: (live: one bot still offered another tool's /memory, /cron and /session).
+#: (live: one bot still offered another tool's /memory, /cron and /session). A group's menu
+#: lists each command once per bot, so the rarer ones are left to docs/telegram/COMMANDS.md:
+#: /where and /diag (other names for /status), /storetest, /link, /unlink, /phase, /wakes.
 MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
-    ("status", "This bot's state, model and peers"),
+    ("status", "This bot's state, peers, and where it runs"),
     ("usage", "What this bot spent today; add 'all' for the swarm"),
     ("swarm", "The swarm: bus, coordinator and members"),
     ("round", "What the open round waits on"),
-    ("wakes", "Retired: a promise is a row now -- see /owed"),
     ("owed", "What is owed right now: the open rows"),
     ("drift", "Rule violations this bot made, and its drift score"),
-    ("storetest", "Admin: check the Telegram facts the state store relies on (-Alias skips)"),
     ("state", "The shared state store as this bot sees it"),
     ("topics", "The topic registry: topics, their links, agents and sessions"),
-    ("link", "Admin, in a topic: /link @bot or /link <ref> [as work|reference]"),
-    ("unlink", "Admin, in a topic: /unlink @bot"),
-    ("phase", "Admin, in a topic: /phase <ref|L1> <phase>"),
     ("model", "Show or set the model for this topic"),
     ("reasoning", "Show or set the reasoning effort for this topic"),
     ("memory", "Admin: show this bot's memory.md, or clear it"),
     ("role", "Show or set a bot's role"),
     ("ping", "Check that the bot answers"),
-    ("where", "Where this bot runs"),
     ("stop", "Admin: stop this bot's running turn"),
     ("pause", "Admin: pause this bot"),
     ("resume", "Admin: resume a paused bot"),

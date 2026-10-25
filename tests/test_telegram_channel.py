@@ -2065,7 +2065,7 @@ class TestBusyDropVisibility(unittest.TestCase):
 
         self.assertIn("DIAG alias=Hermes", diag)
         self.assertIn("busy_dropped=1", diag)
-        self.assertEqual(len(diag.splitlines()), 1)
+        self.assertEqual(len(diag.splitlines()), 3)              # STATUS, WHERE, DIAG
 
     def test_unknown_busy_behavior_is_rejected_when_the_config_loads(self):
         with self.assertRaises(ConfigError) as caught:
@@ -2096,7 +2096,8 @@ class TestBusyDropVisibility(unittest.TestCase):
         self.assertEqual(_token(status, "busy_dropped"), 3,
                          "three addressed messages were dropped, not a hardcoded 1")
         self.assertIn("machine=", status, "the existing /status tokens must survive")
-        self.assertEqual(len(status.splitlines()), 1)
+        self.assertEqual(len(status.splitlines()), 3)            # STATUS, WHERE, DIAG
+        status = status.splitlines()[0]                          # the bound is the STATUS line's
         # Not a guarantee — /status is unbounded in general (`stats.last_error` carries `str(exc)`,
         # and `replies.summary()` grows with its row count). It holds here because this fixture has
         # `replies is None` and no error set, so the bound catches only a token explosion.

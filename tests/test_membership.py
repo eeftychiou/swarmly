@@ -1095,6 +1095,17 @@ class TheSwarmCommandsAnswerTests(unittest.TestCase):
         self.say(channel, "/role@HermesBot researcher")          # and the bot it names
         self.assertEqual(channel.membership.state.role, "researcher")
 
+    def test_a_role_change_is_confirmed_once(self):
+        """The coordinator confirms a bare one, the bot named a targeted one, nobody else."""
+        channel = self.channel()
+        channel._test_sender.sent.clear()
+        self.assertIn("Codex is researcher now", self.say(channel, "/role @codex_x_bot researcher"))
+        self.assertEqual(len(channel._test_sender.sent), 1)
+        channel._test_sender.sent.clear()
+        self.say(channel, "/role@codex_x_bot reviewer")         # Codex is named: it confirms
+        self.assertEqual(channel._test_sender.sent, [])
+        self.assertEqual(channel.config.peer_roles["Codex"], "reviewer")
+
     def test_any_member_may_ask_for_the_swarm_and_a_stranger_learns_nothing(self):
         channel = self.channel()
         self.assertNotIn("SWARM bus:", self.say(channel, "/swarm", author_id=77))

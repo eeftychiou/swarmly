@@ -26,7 +26,8 @@ class TheCommandsPageTests(unittest.TestCase):
     def test_the_commands_outside_the_menu_are_on_it_too(self):
         text = PAGE.read_text(encoding="utf-8")
         written = set(re.findall(r"`/([a-z_]+)", text))
-        hidden = {"diag", "effort", "bus"}           # answered, but not in the menu
+        hidden = {"diag", "effort", "bus", "where", "storetest", "link", "unlink", "phase",
+                  "wakes"}                              # answered, but not in the menu
         self.assertEqual(sorted(hidden - written), [])
 
     def test_every_dashboard_button_is_in_the_table(self):

@@ -225,7 +225,7 @@ class TestTypingAndStop(unittest.TestCase):
         channel = bot_channel(adapter=adapter)
 
         async def during(ch):
-            await ch.handle_event(human("/pause", message_id=2))
+            await ch.handle_event(human("/pause@HermesBot", message_id=2))
             await ch.handle_event(human("@HermesBot new work", message_id=3))
             return [sent["text"] for sent in ch.bot.sent]
 
@@ -238,11 +238,67 @@ class TestTypingAndStop(unittest.TestCase):
         self.assertTrue(channel._frozen)
         run(channel.handle_event(human("@HermesBot still there?", message_id=4)))
         self.assertEqual(adapter.calls, 1, "held while paused")
-        run(channel.handle_event(human("/resume", message_id=5)))
+        run(channel.handle_event(human("/resume@HermesBot", message_id=5)))
         self.assertFalse(channel._frozen)
         adapter.release.set()
         run(channel.handle_event(human("@HermesBot go on", message_id=6)))
         self.assertEqual(adapter.calls, 2)
+
+    def test_a_bare_pause_holds_every_bot_and_only_the_coordinator_says_so(self):
+        """One answer per command (the admin, 25 Oct): every bot applies a bare /pause, and
+        no bot posts a line of its own, not even when its running turn ends."""
+        for coordinator in (False, True):
+            with self.subTest(coordinator=coordinator):
+                adapter = _GatedAdapter("Hermes")
+                channel = bot_channel(adapter=adapter)
+                channel.is_coordinator = lambda **_: coordinator
+
+                async def during(ch):
+                    await ch.handle_event(human("/pause", message_id=2))
+                    return [sent["text"] for sent in ch.bot.sent]
+
+                _, early = self.hold(channel, adapter, during)
+                run(_settle())
+                self.assertTrue(channel._frozen)
+                texts = [sent["text"] for sent in channel.bot.sent]
+                said = [t for t in texts if "Paus" in t or "paused" in t]
+                if coordinator:
+                    self.assertEqual(len(said), 1, texts)
+                    self.assertIn("Pausing every bot", said[0])
+                    self.assertTrue(any("Pausing every bot" in t for t in early))
+                else:
+                    self.assertEqual(said, [], texts)
+                self.assertFalse(any("intent=FROZEN" in t for t in texts), texts)
+                # The turn running at the pause still posted its reply.
+                self.assertTrue(any("long job" in t for t in texts), texts)
+
+    def test_a_bare_resume_lifts_every_bot_and_clears_the_freezes_it_knew(self):
+        for coordinator in (False, True):
+            with self.subTest(coordinator=coordinator):
+                channel = bot_channel()
+                channel.is_coordinator = lambda **_: coordinator
+                back = []
+                channel._peer_back = back.append
+                run(channel.handle_event(human("/pause", message_id=2)))
+                channel._peers_frozen["Codex"] = {"ref": "pause", "until": None}
+                channel.bot.sent.clear()
+                run(channel.handle_event(human("/resume", message_id=3)))
+                self.assertFalse(channel._frozen)
+                self.assertEqual(channel.frozen_peers(), {})
+                self.assertEqual(back, ["Codex"])      # the coordinator still re-balances
+                texts = [sent["text"].split("</b> ")[-1] for sent in channel.bot.sent]
+                self.assertEqual(texts, ["▶ Every bot resumed."] if coordinator else [])
+
+    def test_a_pause_that_names_a_bot_is_that_bots(self):
+        """``/pause @bot`` is ``/pause@bot``: the named bot pauses, the others are left alone."""
+        channel = bot_channel()
+        channel.is_coordinator = lambda **_: True
+        run(channel.handle_event(human("/pause @CodexBot", message_id=2)))
+        self.assertFalse(channel._frozen)
+        self.assertEqual(channel.bot.sent, [])
+        run(channel.handle_event(human("/pause @HermesBot", message_id=3)))
+        self.assertTrue(channel._frozen)
+        self.assertIn("intent=FROZEN", channel.bot.sent[-1]["text"])
 
     def test_only_the_admin_pauses_and_a_bare_pause_from_others_is_silent(self):
         channel = bot_channel()

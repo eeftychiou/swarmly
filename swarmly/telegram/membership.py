@@ -917,6 +917,8 @@ class Membership:
         else:
             self._set_peer_role(alias, role, coordinator=True)
             self._save()
+        if speaks:
+            await self._answer(event, f"✅ {alias} is {role} now.")
         return True
 
     def _demote_coordinators(self, but: str) -> None:
