@@ -11,11 +11,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import time
 import unittest
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from swarmly.state import keys as K
@@ -734,6 +735,80 @@ class TestThePinnedCardsButton(unittest.TestCase):
             self.assertIsNone(getattr(channel, "_web_server", None))
         finally:
             webui.DashboardServer.start = original
+
+class TestTheLookAndLayout(unittest.TestCase):
+    """#343: one shell (header, navigation, sections) and a design system behind it."""
+
+    SECTIONS = ("swarm", "round", "topics", "usage", "controls")
+
+    def page(self) -> str:
+        return webui.page_html(title="Swarm")
+
+    def blocks(self) -> Tuple[str, str]:
+        """The light token block and the dark one, so both can be checked as sets."""
+        page = self.page()
+        light = re.search(r":root\s*\{(.*?)\}", page, re.S)
+        dark = re.search(r"@media \(prefers-color-scheme: dark\)\s*\{\s*:root\s*\{(.*?)\}",
+                         page, re.S)
+        self.assertIsNotNone(light, "the light token block is missing")
+        self.assertIsNotNone(dark, "the dark token block is missing")
+        return light.group(1), dark.group(1)
+
+    @staticmethod
+    def tokens(block: str) -> Dict[str, str]:
+        return dict(re.findall(r"(--[\w-]+):\s*([^;]+);", block))
+
+    def test_every_navigation_anchor_lands_on_a_section(self):
+        page = self.page()
+        anchors = set(re.findall(r'href="#([\w-]+)"', page))
+        self.assertEqual(anchors, set(self.SECTIONS))
+        for name in self.SECTIONS:
+            self.assertIn('id="%s"' % name, page, name)
+
+    def test_the_header_shows_the_swarms_health_at_a_glance(self):
+        page = self.page()
+        self.assertIn('id="health"', page)
+        for marker in ("round", "coordinator", "lease", "bots", "today"):
+            self.assertIn('pill("%s"' % marker, page, marker)
+        # The counts come from the same cards the swarm section draws: one source, two views.
+        self.assertIn("counts[bot.badge]", page)
+
+    def test_both_colour_schemes_define_every_colour_token(self):
+        light, dark = self.blocks()
+        colours = {name: value for name, value in self.tokens(light).items()
+                   if "#" in value or "rgb" in value}
+        self.assertTrue(colours, "no colour tokens at all")
+        missing = sorted(set(colours) - set(self.tokens(dark)))
+        self.assertEqual(missing, [], "the dark scheme leaves these undefined")
+
+    def test_every_token_the_stylesheet_uses_is_defined_once(self):
+        page = self.page()
+        light, _dark = self.blocks()
+        defined = set(self.tokens(light))
+        used = set(re.findall(r"var\((--[\w-]+)\)", page))
+        self.assertEqual(sorted(used - defined), [], "a var() names a token nothing defines")
+
+    def test_it_stays_phone_width_first_and_two_columns_when_there_is_room(self):
+        page = self.page()
+        self.assertIn('name="viewport"', page)
+        self.assertIn("width=device-width", page)
+        self.assertIn("@media (min-width: 760px)", page)
+        self.assertIn("grid-template-columns", page)
+        # Nothing may be pinned to a fixed pixel width that a 360px phone cannot hold.
+        self.assertNotIn("width: 3", page)
+
+    def test_the_telegram_theme_params_are_read_without_loading_anything(self):
+        page = self.page()
+        self.assertIn("tgWebAppThemeParams", page)
+        self.assertIn("tgWebAppColorScheme", page)
+        for marker in ("http://", "https://", "<script src", "<link rel=\"stylesheet\""):
+            self.assertNotIn(marker, page)
+
+    def test_unknown_values_still_read_as_a_question_mark(self):
+        page = self.page()
+        self.assertIn('? "?" : String(value)', page)          # num()
+        self.assertIn('? "?" : "$" + Number(value).toFixed(2)', page)   # money()
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

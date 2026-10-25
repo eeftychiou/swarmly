@@ -580,62 +580,141 @@ _PAGE = """<!doctype html>
 <meta name="color-scheme" content="light dark">
 <title>__TITLE__</title>
 <style>
+/* The design system (#343). Every colour is a token here, and the dark block defines every
+   one of those names again, so no part of the page is left unstyled in either scheme. Spacing
+   and type are tokens too, but they never change with the scheme. Contrast is WCAG AA or
+   better against the surface each token is used on. */
 :root {
-  --bg: #f6f7f9; --card: #fff; --ink: #14181f; --dim: #5b6472; --line: #e3e6ea;
-  --working: #2f6fed; --idle: #1f9d55; --paused: #8a93a0; --frozen: #6f5bd3;
-  --stuck: #c47f00; --down: #cf2f2f;
+  --bg: #f4f6f9; --card: #ffffff; --ink: #10151c; --dim: #4b5563; --line: #d7dde6;
+  --accent: #1f5fd1; --ok: #14683f; --warn: #7a4f00; --bad: #b3261e; --frozen: #4c3aa8;
+  --shadow: 0 1px 2px rgba(16, 21, 28, .07);
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 24px;
+  --radius: 12px; --pill: 999px; --wrap: 1180px;
+  --font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-small: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-tiny: 12px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-title: 600 19px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-head: 600 13px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f1216; --card: #171c22; --ink: #e8ecf1; --dim: #9aa4b2; --line: #262d36;
-    --working: #6f9dff; --idle: #4fd18b; --paused: #98a2b0; --frozen: #a795ff;
-    --stuck: #f0b429; --down: #ff6b6b;
+    --bg: #0d1117; --card: #161b22; --ink: #eef2f7; --dim: #a7b2c0; --line: #29313c;
+    --accent: #8fbaff; --ok: #5ad597; --warn: #f0b429; --bad: #ff9a94; --frozen: #b8a9ff;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .5);
   }
 }
 * { box-sizing: border-box; }
-body { margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
-  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-h1 { font-size: 17px; margin: 0 0 2px; }
-.sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; }
-.strip, .card, .owed { background: var(--card); border: 1px solid var(--line);
-  border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
-.strip b { font-weight: 600; }
-.strip .row { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; color: var(--dim); }
-.card .top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; padding: var(--space-3); background: var(--bg); color: var(--ink);
+  font: var(--font); overflow-wrap: anywhere; }
+.wrap { max-width: var(--wrap); margin: 0 auto; }
+
+/* The header: the round, who coordinates, the lease, how the bots stand, what it costs. */
+header.top { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: var(--space-3); margin-bottom: var(--space-3); }
+.title { display: flex; align-items: baseline; gap: var(--space-2); flex-wrap: wrap; }
+h1 { font: var(--font-title); margin: 0; }
+.sub { color: var(--dim); font: var(--font-small); }
+nav.tabs { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-3); }
+nav.tabs a { text-decoration: none; color: var(--ink); border: 1px solid var(--line);
+  border-radius: var(--pill); padding: 3px 10px; font: var(--font-small); }
+nav.tabs a:hover, nav.tabs a:focus-visible { border-color: var(--accent); color: var(--accent); }
+.health { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-2);
+  margin-top: var(--space-3); }
+.pill { font: var(--font-small); color: var(--dim); border: 1px solid var(--line);
+  border-radius: var(--pill); padding: 2px 9px; }
+.pill b { color: var(--ink); font-weight: 600; }
+.pill.bad { color: var(--bad); border-color: currentColor; }
+
+main { display: grid; gap: var(--space-3); }
+section.panel { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: var(--space-3); scroll-margin-top: var(--space-3); }
+h2 { font: var(--font-head); text-transform: uppercase; letter-spacing: .05em; color: var(--dim);
+  margin: 0 0 var(--space-2); }
+.note { font: var(--font-small); color: var(--dim); margin: 0; }
+.card { border: 1px solid var(--line); border-radius: var(--radius); padding: var(--space-2)
+  var(--space-3); margin-bottom: var(--space-2); }
+.card:last-child { margin-bottom: 0; }
+.card .top { display: flex; align-items: baseline; gap: var(--space-2); flex-wrap: wrap; }
 .alias { font-weight: 600; }
-.badge { font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px;
+.badge { font: var(--font-tiny); font-weight: 600; padding: 1px 8px; border-radius: var(--pill);
   border: 1px solid currentColor; }
-.badge.working { color: var(--working); } .badge.idle { color: var(--idle); }
-.badge.paused { color: var(--paused); } .badge.frozen { color: var(--frozen); }
-.badge.stuck { color: var(--stuck); } .badge.down { color: var(--down); }
-.card .doing { margin-top: 4px; font-size: 14px; }
-.card .meta { margin-top: 4px; color: var(--dim); font-size: 13px;
-  display: flex; flex-wrap: wrap; gap: 2px 12px; }
-.owed h2, .strip h2, .topics h2 { font-size: 13px; text-transform: uppercase;
-  letter-spacing: .04em; color: var(--dim); margin: 0 0 6px; }
-.owed .line { font-size: 13px; padding: 3px 0; border-top: 1px solid var(--line); }
-.owed .line:first-of-type { border-top: 0; }
-.topics .card .line { font-size: 13px; padding: 3px 0; border-top: 1px solid var(--line);
-  display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; }
-.topics .card .line:first-of-type { border-top: 0; }
-.topics .ref { font-weight: 600; }
-.topics .binding { color: var(--dim); font-size: 13px; padding: 2px 0;
-  display: flex; flex-wrap: wrap; gap: 2px 10px; }
-.badge.due { color: var(--stuck); }
-footer { color: var(--dim); font-size: 12px; text-align: center; padding: 6px 0 2px; }
-@media (min-width: 720px) { body { padding: 20px; } .grid { column-gap: 10px; } }
+.badge.working { color: var(--accent); } .badge.idle { color: var(--ok); }
+.badge.paused { color: var(--dim); } .badge.frozen { color: var(--frozen); }
+.badge.stuck, .badge.due { color: var(--warn); } .badge.down { color: var(--bad); }
+.card .doing { margin-top: var(--space-1); font: var(--font); }
+.card .meta, .line, .binding { margin-top: var(--space-1); color: var(--dim);
+  font: var(--font-small); display: flex; flex-wrap: wrap; gap: 2px var(--space-2); }
+.line { margin-top: 0; padding: var(--space-1) 0; border-top: 1px solid var(--line); }
+.line:first-of-type { border-top: 0; }
+.ref { font-weight: 600; color: var(--ink); }
+table { width: 100%; border-collapse: collapse; font: var(--font-small); }
+th, td { text-align: right; padding: 5px 4px; border-top: 1px solid var(--line); }
+th:first-child, td:first-child { text-align: left; }
+thead th { border-top: 0; color: var(--dim); font: var(--font-tiny); text-transform: uppercase;
+  letter-spacing: .04em; }
+tfoot td { font-weight: 600; color: var(--ink); }
+footer { color: var(--dim); font: var(--font-tiny); text-align: center;
+  padding: var(--space-4) 0 var(--space-2); }
+@media (min-width: 760px) {
+  body { padding: var(--space-5); }
+  /* Two columns from tablet up: the swarm beside everything else. */
+  main { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+  #swarm { grid-row: span 2; }
+  #bots { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: var(--space-2); }
+  #bots .card { margin-bottom: 0; }
+}
 </style>
 </head>
 <body>
-<header>
-  <h1>Swarm</h1>
-  <div class="sub" id="stamp">loading&hellip;</div>
+<div class="wrap">
+<header class="top">
+  <div class="title">
+    <h1>Swarm</h1>
+    <span class="sub" id="stamp">loading&hellip;</span>
+  </div>
+  <nav class="tabs" id="tabs">
+    <a href="#swarm">Swarm</a>
+    <a href="#round">Round &amp; owed</a>
+    <a href="#topics">Topics</a>
+    <a href="#usage">Usage</a>
+    <a href="#controls">Controls</a>
+  </nav>
+  <div class="health" id="health"></div>
 </header>
-<section class="strip" id="strip"><div class="row" id="strip-row"></div></section>
-<main id="bots"></main>
-<section class="owed" id="owed" hidden><h2>Owed</h2><div id="owed-rows"></div></section>
-<section class="topics" id="topics" hidden><h2>Topics</h2><div id="topic-cards"></div></section>
+
+<main>
+  <section class="panel" id="swarm">
+    <h2>Swarm</h2>
+    <div id="bots"></div>
+  </section>
+
+  <section class="panel" id="round">
+    <h2>Round &amp; owed</h2>
+    <div class="health" id="round-strip"></div>
+    <div id="owed-rows"></div>
+  </section>
+
+  <section class="panel" id="topics">
+    <h2>Topics</h2>
+    <div id="topic-cards"></div>
+  </section>
+
+  <section class="panel" id="usage">
+    <h2>Usage</h2>
+    <div id="usage"></div>
+  </section>
+
+  <section class="panel" id="controls">
+    <h2>Controls</h2>
+    <p class="note" id="controls-note">Every control needs the admin's verified Mini App login
+      and a confirm step. This page's own controls arrive with the next slice.</p>
+  </section>
+</main>
+
 <footer>read-only &middot; refreshes every <span id="every"></span>s</footer>
+</div>
 <script>
 const STATE = "__STATE_PATH__";
 const EVERY = __EVERY_MS__;
@@ -662,6 +741,40 @@ const ago = (seconds) => {
 };
 const money = (value) => (value === null || value === undefined)
   ? "?" : "$" + Number(value).toFixed(2);
+
+// One chip: a quiet label and its value in the ink colour.
+function pill(label, value, cls) {
+  const node = el("span", "pill" + (cls ? " " + cls : ""));
+  if (label) node.append(el("span", "", label + " "));
+  node.append(el("b", "", value));
+  return node;
+}
+
+function health(state) {
+  const box = document.getElementById("health");
+  box.replaceChildren();
+  box.append(pill("round", state.round
+    ? (state.round.name || "?") + " " + state.round.done + "/" + state.round.total
+    : "none"));
+  box.append(pill("coordinator", state.coordinator || "none"));
+  box.append(state.lease && state.lease.term
+    ? pill("lease", "term " + state.lease.term +
+        (state.lease.expires_in === null || state.lease.expires_in === undefined
+          ? "" : ", " + ago(state.lease.expires_in) + " left"))
+    : pill("lease", "no term"));
+  const counts = {};
+  (state.bots || []).forEach((bot) => {
+    counts[bot.badge] = (counts[bot.badge] || 0) + 1;
+  });
+  const stand = ["working", "idle", "paused", "frozen", "stuck", "down"]
+    .filter((name) => counts[name]).map((name) => name + " " + counts[name]);
+  box.append(pill("bots", stand.length ? stand.join(" · ") : "none",
+    counts.down ? "bad" : ""));
+  const total = state.total || {};
+  box.append(pill("today", num(total.turns) + " turns · " +
+    compact(total.tokens_in) + "/" + compact(total.tokens_out) + " tok · " +
+    money(total.cost)));
+}
 
 function card(bot) {
   const box = el("article", "card");
@@ -703,7 +816,10 @@ function topicCard(topic) {
   (topic.links || []).forEach((link) => {
     const line = el("div", "line");
     line.append(el("span", "ref", link.ref || link.name || link.id || "?"));
-    if (link.ref && link.name) line.append(el("span", "sub", link.name));
+    // The title is shown beside a ref, but never twice: a link titled "#342" and reffed
+    // "#342" is one thing, not two.
+    if (link.name && link.name !== link.ref && link.name !== link.id)
+      line.append(el("span", "sub", link.name));
     if (link.kind) line.append(el("span", "sub", link.kind));
     // A work item's status is on the card beside its phase: closed work must not read open.
     if (link.status) line.append(el("span", "badge " + (link.status === "open"
@@ -730,64 +846,102 @@ function topicCard(topic) {
   return box;
 }
 
+// What the swarm spent today, a row per bot and a total: the /usage answer, on the page.
+function usage(state) {
+  const box = document.getElementById("usage");
+  box.replaceChildren();
+  const bots = state.bots || [];
+  if (!bots.length) {
+    box.append(el("p", "note", "no bot has reported yet"));
+    return;
+  }
+  const table = el("table", "");
+  const head = el("thead", "");
+  const headRow = el("tr", "");
+  ["Bot", "Turns", "Tokens in", "Tokens out", "Cost"].forEach((name) => {
+    headRow.append(el("th", "", name));
+  });
+  head.append(headRow);
+  table.append(head);
+  const body = el("tbody", "");
+  bots.forEach((bot) => {
+    const row = el("tr", "");
+    row.append(el("td", "", bot.alias));
+    row.append(el("td", "", num(bot.turns)));
+    row.append(el("td", "", compact(bot.tokens_in)));
+    row.append(el("td", "", compact(bot.tokens_out)));
+    row.append(el("td", "", money(bot.cost)));
+    body.append(row);
+  });
+  table.append(body);
+  const total = state.total || {};
+  const foot = el("tfoot", "");
+  const footRow = el("tr", "");
+  footRow.append(el("td", "", "swarm"));
+  footRow.append(el("td", "", num(total.turns)));
+  footRow.append(el("td", "", compact(total.tokens_in)));
+  footRow.append(el("td", "", compact(total.tokens_out)));
+  footRow.append(el("td", "", money(total.cost)));
+  foot.append(footRow);
+  table.append(foot);
+  box.append(table);
+}
+
+function roundBoard(state) {
+  const row = document.getElementById("round-strip");
+  row.replaceChildren();
+  if (state.round) {
+    row.append(pill("round", (state.round.name || "?") + ": " +
+      state.round.done + "/" + state.round.total + " done"));
+    (state.round.items || []).forEach((item) => {
+      row.append(pill(item.item, (item.state || "?") +
+        (item.owner ? " · " + item.owner : "")));
+    });
+  } else {
+    row.append(el("span", "note", "no round in flight"));
+  }
+  const rows = document.getElementById("owed-rows");
+  rows.replaceChildren();
+  if (!(state.owed || []).length) {
+    rows.append(el("p", "note", "nothing owed"));
+    return;
+  }
+  state.owed.forEach((debt) => {
+    const line = el("div", "line");
+    line.textContent = (debt.debtor || "?") + " owes " + (debt.owes || "?") +
+      (debt.item ? " on " + debt.item : "") +
+      (debt.waiting_on ? " (waiting: " + debt.waiting_on + ")" : "") +
+      " · open " + ago(debt.open_seconds) +
+      (debt.stalls ? " · stall " + debt.stalls : "");
+    rows.append(line);
+  });
+}
+
 function render(state) {
   document.getElementById("stamp").textContent =
     "refreshed " + state.refreshed +
     (state.coordinator ? " · coordinator " + state.coordinator : " · no coordinator");
-  const row = document.getElementById("strip-row");
-  row.replaceChildren();
-  if (state.lease && state.lease.term) row.append(el("span", "", "term " + state.lease.term));
-  if (state.lease && state.lease.expires_in !== null)
-    row.append(el("span", "", "lease " + ago(state.lease.expires_in) + " left"));
-  if (state.round) {
-    row.append(el("span", "", "round " + (state.round.name || "?") + ": " +
-      state.round.done + "/" + state.round.total + " done"));
-  } else {
-    row.append(el("span", "", "no round in flight"));
-  }
-  const total = state.total || {};
-  row.append(el("span", "", total.bots + " bots"));
-  row.append(el("span", "", num(total.turns) + " turns today"));
-  row.append(el("span", "", compact(total.tokens_in) + "/" + compact(total.tokens_out) + " tok"));
-  row.append(el("span", "", money(total.cost)));
+  health(state);
 
   const bots = document.getElementById("bots");
   bots.replaceChildren();
   (state.bots || []).forEach((bot) => bots.append(card(bot)));
 
-  const owed = document.getElementById("owed");
-  const rows = document.getElementById("owed-rows");
-  rows.replaceChildren();
-  if ((state.owed || []).length) {
-    owed.hidden = false;
-    state.owed.forEach((debt) => {
-      const line = el("div", "line");
-      line.textContent = (debt.debtor || "?") + " owes " + (debt.owes || "?") +
-        (debt.item ? " on " + debt.item : "") +
-        (debt.waiting_on ? " (waiting: " + debt.waiting_on + ")" : "") +
-        " · open " + ago(debt.open_seconds) +
-        (debt.stalls ? " · stall " + debt.stalls : "");
-      rows.append(line);
-    });
-  } else {
-    owed.hidden = true;
-  }
+  roundBoard(state);
 
-  const topics = document.getElementById("topics");
   const cards = document.getElementById("topic-cards");
   cards.replaceChildren();
-  if (state.registry) {
-    topics.hidden = false;
-    if (!state.registry.ready) {
-      cards.append(el("div", "line", "registry not ready"));
-    } else if (!(state.registry.topics || []).length) {
-      cards.append(el("div", "line", "no open topics yet"));
-    } else {
-      state.registry.topics.forEach((topic) => cards.append(topicCard(topic)));
-    }
+  if (!state.registry) {
+    cards.append(el("p", "note", "the registry is not read on this bot"));
+  } else if (!state.registry.ready) {
+    cards.append(el("p", "note", "registry not ready"));
+  } else if (!(state.registry.topics || []).length) {
+    cards.append(el("p", "note", "no open topics yet"));
   } else {
-    topics.hidden = true;
+    state.registry.topics.forEach((topic) => cards.append(topicCard(topic)));
   }
+
+  usage(state);
 }
 
 // Opened as a Telegram Mini App, the page arrives with initData in its URL hash. It is sent
@@ -796,6 +950,27 @@ function render(state) {
 const INIT = (() => {
   const match = location.hash.match(/tgWebAppData=([^&]*)/);
   return match ? decodeURIComponent(match[1]) : "";
+})();
+
+// A Mini App also hands its own theme colours in the hash. When they are there they win over
+// both built-in palettes (they are the chat's colours); nothing is loaded to read them.
+document.documentElement.dataset.theme = (() => {
+  const match = location.hash.match(/tgWebAppColorScheme=(dark|light)/);
+  return match ? match[1] : "";
+})();
+(() => {
+  const match = location.hash.match(/tgWebAppThemeParams=([^&]*)/);
+  if (!match) return;
+  try {
+    const raw = JSON.parse(decodeURIComponent(match[1]));
+    const root = document.documentElement.style;
+    [["bg_color", "--bg"], ["secondary_bg_color", "--card"], ["text_color", "--ink"],
+     ["hint_color", "--dim"], ["button_color", "--accent"]].forEach(([key, token]) => {
+      if (raw[key]) root.setProperty(token, raw[key]);
+    });
+  } catch (err) {
+    return;
+  }
 })();
 
 async function tick() {
