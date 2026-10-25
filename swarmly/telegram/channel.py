@@ -2614,12 +2614,28 @@ class AgentChannel:
             saved = load_state(_state_file(self.config, "work-place"), "work place")
             if isinstance(saved.get("chat_id"), int) and isinstance(saved.get("thread_id"), int):
                 where = (saved["chat_id"], saved["thread_id"])
-        return where if where is not None and where[1] is not None else None
+        if where is not None and where[1] is not None and self._work_topic(where):
+            return where
+        # Never Swarm pulse, never a topic found gone (live, 25 Oct: own briefs went to the
+        # pulse topic, the last place a turn had run): the most recently active work topic.
+        home = self.config.identity.home_channel_id
+        best: Optional[Tuple[int, int]] = None
+        best_seen = float("-inf")
+        for chat_id, thread_id, _name in self.topics.entries():
+            if thread_id is None or home is None or int(chat_id) != int(home):
+                continue
+            place = (int(chat_id), int(thread_id))
+            seen = self.topics.last_seen(chat_id, thread_id)
+            if seen is not None and seen > best_seen and self._work_topic(place):
+                best, best_seen = place, seen
+        return best
 
     def _remember_work_place(self, chat_id: int, thread_id: Optional[int]) -> None:
         """Keep the forum topic of this turn, across restarts; a General turn is not one."""
         if thread_id is None or (chat_id, thread_id) == getattr(self, "_last_turn_place", None):
             return
+        if not self._work_topic((chat_id, thread_id)):
+            return                                   # Swarm pulse is never a work place
         self._last_turn_place = (chat_id, thread_id)
         save_state(_state_file(self.config, "work-place"),
                    {"chat_id": int(chat_id), "thread_id": int(thread_id)}, "work place")
