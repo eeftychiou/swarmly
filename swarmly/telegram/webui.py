@@ -43,7 +43,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import parse_qsl
 
 from swarmly.state import keys as K
-from swarmly.state.records import Profile, RecordError, Topic
+from swarmly.state.records import Profile, RecordError, Topic, as_dict
 from swarmly.telegram.drift import RESET_AT as DRIFT_RESET_AT
 from swarmly.telegram.snapshot import (BUSY, DOWN, FROZEN, IDLE, PAUSED, STUCK, Snapshot)
 
@@ -206,20 +206,13 @@ def owed_rows(rows: Sequence[Any] = (), *, now: float) -> List[Dict[str, Any]]:
 #: the stall ladder never disagree about when a thing has gone quiet.
 STALL_SECONDS = 30 * 60.0
 
-#: The providers whose ``ref`` is safe to publish: a URL, a short ``#12``, a task id. A
-#: ``local`` ref is a filesystem path, so only that link's title goes on the wire.
-PUBLIC_PROVIDERS = ("github", "gitlab", "gdrive", "cloud", "topic")
+#: The providers whose ``ref`` is safe to publish: a URL or a short ``#12``. A ``local`` ref
+#: is a filesystem path and a ``topic`` ref is ``T-<thread>-<n>`` -- a thread id -- so for
+#: those two only the link's title goes on the wire.
+PUBLIC_PROVIDERS = ("github", "gitlab", "gdrive", "cloud")
 
 #: The phases in which a work item is finished, so no phase change is ever due.
 DONE_PHASES = ("done",)
-
-
-def _as_dict(raw: Any) -> Dict[str, Any]:
-    """A record or a plain dict, as a plain dict: the panel is built from either."""
-    to_dict = getattr(raw, "to_dict", None)
-    if callable(to_dict):
-        return dict(to_dict())
-    return dict(raw) if isinstance(raw, Mapping) else {}
 
 
 def _iso_seconds(text: Any) -> Optional[float]:
@@ -249,7 +242,7 @@ def link_cards(links: Sequence[Any] = (), *, now: float,
     moment = float(now)
     out: List[Dict[str, Any]] = []
     for raw in links:
-        data = _as_dict(raw)
+        data = as_dict(raw)
         provider = str(data.get("provider") or "").strip().lower()
         ref = str(data.get("ref") or "").strip()
         name = str(data.get("title") or "").strip()
@@ -272,8 +265,8 @@ def link_cards(links: Sequence[Any] = (), *, now: float,
                 "stalled": bool(status != "closed" and phase not in DONE_PHASES
                                 and age is not None and age >= float(stall_seconds)),
                 "assignees": [{
-                    "agent": str(_as_dict(a).get("agent") or "").strip() or None,
-                    "as": str(_as_dict(a).get("as") or _as_dict(a).get("role")
+                    "agent": str(as_dict(a).get("agent") or "").strip() or None,
+                    "as": str(as_dict(a).get("as") or as_dict(a).get("role")
                               or "").strip() or None,
                 } for a in data.get("assignees") or ()],
             })
@@ -364,7 +357,7 @@ def topic_cards(*, now: float, topics: Sequence[Any] = (),
     moment = float(now)
     cards: List[Dict[str, Any]] = []
     for raw in topics:
-        data = _as_dict(raw)
+        data = as_dict(raw)
         if str(data.get("status") or "open").strip().lower() != "open":
             continue                                    # closed topics carry no live work
         thread = data.get("topic_id")
@@ -711,6 +704,10 @@ function topicCard(topic) {
     const line = el("div", "line");
     line.append(el("span", "ref", link.ref || link.name || link.id || "?"));
     if (link.ref && link.name) line.append(el("span", "sub", link.name));
+    if (link.kind) line.append(el("span", "sub", link.kind));
+    // A work item's status is on the card beside its phase: closed work must not read open.
+    if (link.status) line.append(el("span", "badge " + (link.status === "open"
+      ? "idle" : "paused"), link.status));
     if (link.phase) line.append(el("span", "badge " + (link.stalled ? "stuck" : "idle"),
       link.phase));
     if (link.stalled) line.append(el("span", "sub",

@@ -32,6 +32,7 @@ CHAT = -1001234567890123
 THREAD = 19286
 OTHER = 4242
 SECRET_PATH = r"C:\Users\eftyc\swarm\notes.md"
+TASK_REF = "T-19286-7"
 
 
 def iso(at: float) -> str:
@@ -54,9 +55,11 @@ class FakeStore:
 
 def records(*, phase_at: float = NOW - 3600, last_activity: Optional[str] = None,
             max_turns: int = 50) -> Dict[str, Any]:
-    """Two open topics: a stalled work item, a reference, a local path, a due binding."""
-    def work(link_id: str, ref: str, kind: str, phase: str, at: float) -> Link:        return Link(id=link_id, provider="github", kind=kind, ref=ref, role="work", title=ref,
-                    added_by="Claudebot", added_at=iso(NOW - 7200), status="open", phase=phase,
+    """Two open topics: a stalled item, closed work, a local path, a task ref, a due binding."""
+    def work(link_id: str, ref: str, kind: str, phase: str, at: float,
+             status: str = "open") -> Link:
+        return Link(id=link_id, provider="github", kind=kind, ref=ref, role="work", title=ref,
+                    added_by="Claudebot", added_at=iso(NOW - 7200), status=status, phase=phase,
                     phase_at=iso(at), assignees=[
                         Assignment(agent="DeepSeek", role="developer", assigned_by="Claudebot",
                                    assigned_at=iso(NOW - 7200))])
@@ -70,7 +73,10 @@ def records(*, phase_at: float = NOW - 3600, last_activity: Optional[str] = None
                     ref="https://github.com/eeftychiou/swarmly/issues/240", role="reference",
                     title="#240", added_by="Claudebot", added_at=iso(NOW - 7200)),
                Link(id="L3", provider="local", kind="file", ref=SECRET_PATH, role="reference",
-                    title="UX notes", added_by="admin", added_at=iso(NOW - 7200))],
+                    title="UX notes", added_by="admin", added_at=iso(NOW - 7200)),
+               work("L4", "#300", "issue", "done", NOW - 7200, status="closed"),
+               Link(id="L5", provider="topic", kind="task", ref=TASK_REF, role="reference",
+                    title="A task", added_by="admin", added_at=iso(NOW - 7200))],
         agents={"Claudebot": Binding(role="coordinator", runtime="claude", model="opus",
                                      effort="high", linked_by="transport",
                                      linked_at=iso(NOW - 7200)),
@@ -376,7 +382,8 @@ class TestTheTopicsPanel(unittest.TestCase):
         cards = self.panel()["topics"]
         self.assertEqual([card["topic"] for card in cards], ["Dashboard", "Registry"])
         dashboard = cards[0]
-        self.assertEqual([link["id"] for link in dashboard["links"]], ["L1", "L2", "L3"])
+        self.assertEqual([link["id"] for link in dashboard["links"]],
+                         ["L1", "L2", "L3", "L4", "L5"])
         work = dashboard["links"][0]
         self.assertEqual((work["ref"], work["status"], work["phase"]),
                          ("#332", "open", "review"))
@@ -401,6 +408,19 @@ class TestTheTopicsPanel(unittest.TestCase):
         self.assertTrue(cards[0]["stalled"])
         self.assertFalse(cards[1]["stalled"])
         self.assertFalse(cards[0]["links"][1].get("stalled"))   # a reference has no phase
+
+    def test_closed_work_reads_closed_and_is_never_stalled(self):
+        closed = self.panel()["topics"][0]["links"][3]
+        self.assertEqual((closed["status"], closed["phase"]), ("closed", "done"))
+        self.assertFalse(closed["stalled"])
+
+    def test_a_task_ref_withholds_its_thread_id_and_a_local_ref_its_path(self):
+        links = self.panel()["topics"][0]["links"]
+        task = links[4]
+        self.assertIsNone(task["ref"])                     # T-<thread>-<n> carries a thread id
+        self.assertEqual((task["role"], task["name"]), ("reference", "A task"))
+        self.assertIsNone(links[2]["ref"])                 # a local ref is a path
+        self.assertEqual(links[2]["name"], "UX notes")
 
     def test_a_phase_change_clears_the_stall(self):
         fresh = records(phase_at=NOW - 60)
@@ -436,7 +456,8 @@ class TestTheTopicsPanel(unittest.TestCase):
 
     def test_only_aliases_names_and_refs_reach_the_wire(self):
         payload = json.dumps(self.panel(), sort_keys=True)
-        for secret in (str(CHAT), str(THREAD), str(OTHER), "Users", "notes.md", "C:\\\\"):
+        for secret in (str(CHAT), str(THREAD), str(OTHER), "Users", "notes.md", "C:\\\\",
+                       TASK_REF):
             self.assertNotIn(secret, payload)
         for kept in ("Dashboard", "Registry", "#332", "#335", "DeepSeek", "UX notes"):
             self.assertIn(kept, payload)
@@ -452,6 +473,10 @@ class TestTheTopicsPanel(unittest.TestCase):
         for marker in ('id="topics"', "topicCard(", "registry not ready", "no open topics yet",
                        "rotation due"):
             self.assertIn(marker, page)
+        # The card paints a work item's status and kind beside its phase: closed work must
+        # not read as open (review, #337).
+        self.assertIn('if (link.status) line.append(el("span", "badge "', page)
+        self.assertIn('if (link.kind) line.append(el("span", "sub", link.kind))', page)
         rendered = webui.watch_state(now=NOW, registry={"ready": False, "topics": []})
         self.assertFalse(rendered["registry"]["ready"])
 
@@ -514,6 +539,11 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
         self.assertNotIn(str(GROUP), json.dumps(panel))
         # The threshold is the stall ladder's own, and 0 (the ladder off) flags nothing.
         self.assertEqual(channel.registry_stall_seconds(), 30 * 60.0)
+        from tests.test_telegram_channel import make_channel, make_config
+        off = make_channel(make_config(limits={"stall_minutes": 0}))
+        self.assertEqual(off.registry_stall_seconds(), float("inf"))
+        off.state_link.store = FakeStore(records())
+        self.assertFalse(off.web_state()["registry"]["topics"][0]["links"][0]["stalled"])
 
 
 ADMIN_ID = 424242

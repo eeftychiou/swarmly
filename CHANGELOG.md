@@ -182,9 +182,9 @@ All notable changes to this project are documented here. The format follows
   **rotation due** badge. The records are the ones `/topics` reads (`topic/<id>`,
   `agent/<alias>/profile`), so a refresh costs no model turn and no gitbus read, and a
   `PHASE:` change shows on the next poll. Only public refs reach the wire — a `local` link's
-  ref is a path, so only its title is published — and only this bot's own drift score is
-  known, a peer's staying `null`. A store that is not ready says **registry not ready**
-  rather than drawing an empty panel.
+  ref is a path and a `topic` link's is `T-<thread>-<n>`, so for those only the title is
+  published — and only this bot's own drift score is known, a peer's staying `null`. A store
+  that is not ready says **registry not ready** rather than drawing an empty panel.
 
 - The dashboard page as a **Telegram Mini App** (`#240`, slice 2): set `web.public_host` to the
   name a tunnel gives the host and the pinned card grows an **Open dashboard** button
