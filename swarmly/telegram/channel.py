@@ -2108,6 +2108,17 @@ class AgentChannel:
                 return f"open work item {link.get('id', '?')} {link.get('title') or ''}".strip()
         return None
 
+    def _github_client(self) -> Any:
+        """One GitHub client for the transport's own checks (the owed settlement, ref states)."""
+        if self._gh_client is None:
+            from swarmly.github.client import GitHubClient
+            self._gh_client = GitHubClient(
+                token_env=(self.config.github.token_env if self.config.github
+                           else "GH_TOKEN"),
+                alias=self.config.identity.alias,
+                redact=Redactor.from_config(self.config).text)
+        return self._gh_client
+
     async def cleanup_delete_topic(self, chat_id: int, thread_id: int) -> bool:
         """Delete one forum topic with all its messages (any age: that is deleteForumTopic)."""
         if self.bot is None:
@@ -8810,7 +8821,10 @@ class AgentChannel:
                 # test, each with a fresh context.
                 return await self._open_topic(event, title_from(event.text or ""), body,
                                               moved=True)
-        elsewhere = self._topic_elsewhere(event, body)
+        # With registry routing a reply is posted in its turn's topic, always: where a post goes
+        # is the transport's decision in code, never one the reply's words steer (admin, 25 Oct:
+        # a reply that named an item was moved into Swarm pulse).
+        elsewhere = None if self._transport_only_on() else self._topic_elsewhere(event, body)
         if elsewhere is not None:
             return await self._post_in_known_topic(event, body, elsewhere)
         origin = self._topic_origins.get((event.chat_id, event.thread_id))
