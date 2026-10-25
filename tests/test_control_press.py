@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from typing import Any
 from unittest import mock
 
 from swarmly.telegram import channel as channel_mod
@@ -1301,6 +1302,60 @@ class TestTheDashboardWritePath(unittest.TestCase):
                  if "CONTROL bot.restart" in entry["text"]
                  or "CONTROL bot.selfdestruct" in entry["text"]]
         self.assertEqual(notes, [])
+
+    def test_two_presses_at_once_do_not_swap_their_answers(self):
+        """Review #347: the answer must be this press's outcome, not a shared slot's."""
+        channel = self.channel()
+        slow = channel._offer_confirm
+
+        async def slow_offer(decision: Any) -> None:
+            await asyncio.sleep(0.05)                    # the send yields, as in production
+            await slow(decision)
+
+        channel._offer_confirm = slow_offer
+
+        async def both() -> Any:
+            return await asyncio.gather(
+                channel.dashboard_action({"action": "bot.restart"}),
+                channel.dashboard_action({"action": "bot.pause"}))
+
+        restart, pause = asyncio.run(both())
+        self.assertEqual(restart["verdict"], cp.CONFIRM)
+        self.assertTrue(restart["confirm"], "the restart lost its confirm code")
+        self.assertFalse(restart["ok"])
+        self.assertFalse(channel.restart_requested)
+        self.assertEqual(pause["verdict"], cp.RUN)
+        self.assertTrue(pause["ok"])
+        self.assertNotIn("confirm", pause)
+        self.assertTrue(channel._frozen)
+
+    def test_a_stale_coordinator_is_told_that_nothing_ran(self):
+        """Review #347: a press refused for a stale lease answered ok:true and a dead code."""
+        channel = self.channel()
+        channel.current_coordinator = lambda now=None: "Claudebot"
+        answer = self.ask(channel, action="bot.pause")
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["verdict"], cp.REFUSED)
+        self.assertEqual(answer["refused"], cp.NOT_COORDINATOR)
+        self.assertFalse(channel._frozen)
+        asked = self.ask(channel, action="bot.restart")
+        self.assertFalse(asked["ok"])
+        self.assertNotIn("confirm", asked)               # never offer a code that was dropped
+        self.assertEqual(asked["refused"], cp.NOT_COORDINATOR)
+        self.assertEqual(channel.control_policy().pending(), [])
+
+    def test_a_swarm_wide_control_carries_the_marker_on_its_own_note(self):
+        """Review #347: the three broadcast controls post one note -- it must say via."""
+        channel = self.channel()
+        code = self.ask(channel, action="swarm.pause_all")["confirm"]
+        done = self.ask(channel, action="swarm.pause_all", code=code)
+        self.assertTrue(done["ok"])
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL swarm.pause_all" in entry["text"]]
+        self.assertEqual(len(notes), 1, notes)            # one line, not a duplicate
+        self.assertIn("target=*", notes[0])
+        self.assertIn("via=dashboard", notes[0])
+        self.assertIn("by=%d" % ADMIN_ID, notes[0])
 
     def test_the_answer_carries_no_identifier(self):
         from tests.test_telegram_channel import GROUP

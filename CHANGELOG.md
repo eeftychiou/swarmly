@@ -191,9 +191,13 @@ All notable changes to this project are documented here. The format follows
   valid admin Mini App `initData`, the loopback included — a local request without one is a
   `403` and the plain page stays read-only — a cross-site `Origin` is refused, a body over
   8 KiB or not a JSON object is a `400`, and every executed action leaves one line in the
-  control topic marked `via=dashboard`. No field of the answer is an id or a path. The action
-  runs on the transport's event loop through `agent.web_action` (bounded at 30 s), so the page
-  thread never touches the adapter and a slow control answers "no" instead of hanging.
+  control topic marked `via=dashboard` — on a swarm-wide control, on its own `target=*` note.
+  No field of the answer is an id or a path. The action runs on the transport's event loop
+  through `agent.web_action` (bounded at 30 s), so the page thread never touches the adapter;
+  a slow control answers "did not answer in time, it may still have run" rather than hanging.
+  The answer carries the outcome that actually happened, from this press's own record: a write
+  refused because another bot coordinates reports `not_coordinator` with no confirm code rather
+  than claiming success, and two presses at once never swap answers (review, #347).
 
 - A **Topics panel** on the local dashboard (`#332`): one card per open work topic from the
   state store's registry — most recently active first, with the topic's name, each link's ref,

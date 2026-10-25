@@ -564,6 +564,7 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
         self.assertFalse(off.web_state()["registry"]["topics"][0]["links"][0]["stalled"])
 
 
+
 ADMIN_ID = 424242
 TOKEN = "123456:TEST-TOKEN"
 
@@ -891,7 +892,7 @@ class TestTheWritePath(unittest.TestCase):
         return webui.DashboardServer(**base)
 
     def post(self, url: str, body: Any = None, *, init: str = "", origin: str = "",
-             method: str = "POST") -> Any:
+             method: str = "POST", path: str = "") -> Any:
         data = body if isinstance(body, bytes) else json.dumps(body or {"action": "bot.pause"})
         if not isinstance(data, bytes):
             data = data.encode("utf-8")
@@ -900,7 +901,7 @@ class TestTheWritePath(unittest.TestCase):
             headers[webui.INIT_HEADER] = init
         if origin:
             headers["Origin"] = origin
-        request = urllib.request.Request(url.rstrip("/") + webui.ACTION_PATH,
+        request = urllib.request.Request(url.rstrip("/") + (path or webui.ACTION_PATH),
                                          data=data, headers=headers,
                                          method=method)
         try:
@@ -1017,20 +1018,39 @@ class TestTheWritePath(unittest.TestCase):
         finally:
             server.stop()
 
-    def test_another_path_is_still_read_only_and_an_unwired_server_stays_so(self):
+    def test_another_path_is_still_read_only(self):
         server = self.server()
-        wired = self.server(action=None)
-        wired.action = None
         try:
             url = server.start()
-            request = urllib.request.Request(url.rstrip("/") + webui.STATE_PATH,
-                                             data=b"{}", method="POST")
-            with self.assertRaises(urllib.error.HTTPError) as caught:
-                urllib.request.urlopen(request, timeout=5)
-            self.assertEqual(caught.exception.code, 405)
+            status, _answer = self.post(url, b"{}", path=webui.STATE_PATH,
+                                        init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 405)
+            self.assertEqual(self.asked, [])
         finally:
             server.stop()
-        self.assertIsNone(wired.action)
+
+    def test_a_server_with_no_action_wired_refuses_the_write_path(self):
+        server = webui.DashboardServer(lambda: {"bots": []}, port=0, bot_token=TOKEN,
+                                       admin_id=ADMIN_ID)          # no action: read-only
+        self.assertIsNone(server.action)
+        try:
+            url = server.start()
+            status, answer = self.post(url, init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 405)
+            self.assertIn("error", answer)
+        finally:
+            server.stop()
+
+    def test_a_page_with_no_init_data_window_refuses_every_write(self):
+        server = self.server(init_max_age=0)                        # fails closed (#347)
+        try:
+            url = server.start()
+            status, answer = self.post(url, init=init_data(auth_date=time.time()))
+            self.assertEqual(status, 403)
+            self.assertEqual(answer["refused"], "auth")
+            self.assertEqual(self.asked, [])
+        finally:
+            server.stop()
 
     def test_a_body_that_is_not_json_or_is_too_big_is_a_400(self):
         server = self.server()

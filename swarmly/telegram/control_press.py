@@ -47,6 +47,14 @@ UNKNOWN = "unknown_action"
 EXPIRED = "expired_code"
 NOT_OURS = "not_a_control"
 TARGET = "unknown_target"
+#: The press was fine but this bot no longer coordinates: another bot's dashboard owns
+#: the controls, and the presser is told where to press (#133, #342).
+NOT_COORDINATOR = "not_coordinator"
+#: The action itself refused -- a bad target, a nudge with nobody to nudge, a lease that
+#: could not be claimed. The words say which; the code says it never ran.
+ACTION_REFUSED = "action_refused"
+#: The press raised: nothing can promise it ran, and nothing can promise it did not.
+FAILED = "failed"
 
 
 @dataclass(frozen=True)

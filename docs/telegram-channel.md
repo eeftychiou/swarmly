@@ -1251,8 +1251,11 @@ policy's own words plus `ok`, `verdict`, and — when the control asks again —
 `confirm` code a second POST sends back. Every write needs a valid admin `initData`, the
 loopback included: a local request without one is a `403` and the plain page stays read-only. A
 cross-site `Origin` is refused, a body over 8 KiB or not a JSON object is a `400`, and every
-executed action leaves one line in the control topic (`via=dashboard`) naming who did what. No
-field of the answer is an id or a path.
+executed action leaves one line in the control topic (`via=dashboard`) naming who did what — on
+a swarm-wide control that line is its own `target=*` note, marked the same way. No field of the
+answer is an id or a path, and the answer reports what *actually* happened: a press refused
+because another bot coordinates now says `refused: not_coordinator` with no confirm code
+instead of claiming it ran, and two presses at once never swap their answers.
 
 The page follows the lease like the pin: the first heartbeat that finds this bot coordinating
 starts the server, and the first that finds another bot coordinating stops it — so a failover

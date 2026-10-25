@@ -1301,6 +1301,13 @@ class DashboardServer:
                 # Every write needs a verified admin Mini App login -- the loopback included
                 # (#342). The plain local page stays read-only, and a write is never weaker
                 # than the state read the same page already has to pass.
+                if server.init_max_age <= 0:
+                    # A write fails closed: the age check is what makes a captured payload
+                    # useless, and config refuses a window of 0 anyway (review, #347).
+                    logger.info("web dashboard: refused a write (no init_max_age window)")
+                    self._write(403, {"ok": False, "refused": "auth",
+                                      "text": "this page has no initData window to check"})
+                    return
                 ok, why = verify_init_data(str(self.headers.get(INIT_HEADER, "") or ""),
                                           bot_token=server.bot_token,
                                           admin_id=server.admin_id,
