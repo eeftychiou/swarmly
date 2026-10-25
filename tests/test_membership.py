@@ -1071,7 +1071,7 @@ class LauncherTests(unittest.TestCase):
 
 
 class TheSwarmCommandsAnswerTests(unittest.TestCase):
-    """``/role@bot <role>`` works, ``/swarm`` is open to everyone, and a refusal or a malformed
+    """``/role@bot <role>`` works, ``/swarm`` is open to every member, and a refusal or a malformed
     command is answered once (by the bot named, or the coordinator) instead of dropped."""
 
     def setUp(self):
@@ -1093,8 +1093,10 @@ class TheSwarmCommandsAnswerTests(unittest.TestCase):
         self.say(channel, "/role@codex_x_bot researcher")
         self.assertEqual(channel.config.peer_roles["Codex"], "researcher")
 
-    def test_anyone_may_ask_for_the_swarm(self):
+    def test_any_member_may_ask_for_the_swarm_and_a_stranger_learns_nothing(self):
         channel = self.channel()
+        self.assertNotIn("SWARM bus:", self.say(channel, "/swarm", author_id=77))
+        channel.config.identity.allowed_users = ["77"]
         self.assertIn("SWARM bus:", self.say(channel, "/swarm", author_id=77))
 
     def test_someone_elses_role_change_is_refused_out_loud_once(self):

@@ -1,17 +1,25 @@
 # Commands — one page
 
 Every command below is answered by the bot's **transport**, never by a model turn, so none of
-them costs tokens (except where a command asks a model to work). Details live in
+them costs tokens (the dashboard's Nudge is the one exception: it wakes a bot). Details live in
 [`docs/telegram-channel.md`](../telegram-channel.md); this page is the overview.
 
-**Who answers.** `/cmd@bot` is answered by that bot, and so is a command sent as a reply to one
-of its messages, or with `@bot` in it. Most commands need that: a bare `/status`, `/ping` or
-`/stop` in the group gets no answer. A bare `/pause`, `/resume`, `/hold`, `/release`, `/topic`,
-`/admit`, `/remove`, `/sync` or `/role @bot <role>` reaches **every** bot; for `/hold`,
-`/release`, `/topic` and `/swarm` the coordinator answers. The topic-registry commands
-(`/link`, `/unlink`, `/phase`) are written by the bot holding the state store's lease.
-"Admin" means only `agent.admin_user_id` may use it; anyone in the swarm may use the rest.
-Anyone else who names a bot gets a one-line "⛔ only the admin" refusal from it.
+**Who answers.** `/cmd@bot` is answered by that bot, and so is `/cmd @bot`, a command sent as a
+reply to one of its messages, or a command in the admin's private chat with it. The command has
+to come first: `@bot /status` is an ordinary message, and starts a turn. Most commands need the
+bot named that way, and a bare `/status`, `/ping` or `/stop` in the group gets no answer.
+
+A bare `/pause`, `/resume`, `/hold`, `/release`, `/topic`, `/admit`, `/remove`, `/sync` or
+`/role @bot <role>` reaches **every** bot, and so does a bare `/bus` (every bot that has no bus
+yet). For `/hold`, `/release`, `/topic` and `/swarm`, the coordinator answers, or every bot
+while no coordinator is recorded. The topic-registry commands (`/link`, `/unlink`, `/phase`)
+are written by the bot holding the state store's lease. `/swarm`, `/admit`, `/remove`, `/sync`,
+`/bus` and setting a role work in the home group only.
+
+"Admin" means only `agent.admin_user_id` may use it. Any other member of the swarm (people in
+`agent.allowed_users`, and peer bots) may use the rest; strangers are ignored unless
+`limits.strangers` lets them in. Anyone else who names a bot with an admin command gets a
+one-line "⛔ only the admin" refusal from it.
 
 **The `/` menu adds the bot.** In a group with several bots, Telegram sends a command picked
 from the menu as `/cmd@thatbot`. That is right for the commands below that name a bot, but
@@ -24,13 +32,15 @@ all) taking turns; **hold** keeps everyone answering but starting nothing new.
 
 | Command | Admin | What it does | Undo |
 |---|---|---|---|
-| `/stop@bot` | yes | Cancels the bot's running turn, ends its CLI process and clears its queue (in a topic: that topic only; `/stop@bot all`: everything). | — (one-off) |
-| `/pause` / `/pause@bot` | yes | The bot (bare: every bot) finishes the turn in flight, then takes **no more turns** — from Telegram or the bus — and says "paused". Survives restarts. Use it to stop a bot at its budget. | `/resume` / `/resume@bot` |
+| `/stop@bot` | yes | Cancels the bot's running turn, ends its CLI process and drops the messages queued behind it: in a topic, that topic's only; in General or with `/stop@bot all`, everything. Messages held past the queue's limit still run afterwards. A paused bot ignores it. | — (one-off) |
+| `/pause` / `/pause@bot` | yes | The bot (bare: every bot) finishes the turn in flight, then takes **no more turns**, from Telegram or the bus, and says "paused". The messages queued behind that turn are dropped, and nothing sent while it is paused is kept for later: a person gets one 🧊 line saying it is paused. A paused coordinator stops renewing its lease, so another bot takes over coordinating. The pause survives a restart once the running turn has ended. | `/resume` / `/resume@bot` |
 | `/resume` / `/resume@bot` | yes | Lifts a pause. Also ends a quota freeze early (or switch model with `/model@bot`). | — |
-| `/hold [reason]` | yes | Holds the **whole swarm** (`/hold@bot` only picks who answers). Bots still **answer** what they are asked, but **start nothing**: no reminders, no stall ladder, no hand-offs, no merges, no PRs. Survives restarts and reaches a bot that was down within one pulse. | `/release` |
+| `/hold [reason]` | yes | Holds the **whole swarm** (`/hold@bot` only picks who answers). Bots still take turns for what they are asked, GitHub notices included, but every turn is told to start no new work, merge nothing, open no pull request and hand nothing off. The timers that wake bots stop: owed wakes, the stall ladder, hand-off reminders. Survives restarts, and reaches a bot that was down within one pulse. | `/release` |
 | `/release` | yes | Lifts the hold, swarm-wide. The latest of hold/release always wins. | — |
 
 ## Looking at the swarm
+
+Any member may use these.
 
 | Command | What it shows |
 |---|---|
@@ -38,7 +48,7 @@ all) taking turns; **hold** keeps everyone answering but starting nothing new.
 | `/status@bot` | The bot's state, running revision, model, effort, peers (up/held/frozen/DOWN). |
 | `/where@bot` | The chat and topic ids, and the project, repository and working folder bound to this topic. |
 | `/diag@bot` | Transport facts for debugging: host, session, messages seen, held and dropped. Not in the `/` menu. |
-| `/swarm` | The bus, the coordinator, and every member with its role and whether it is online. A bare `/swarm` is answered by the coordinator. |
+| `/swarm` | The bus, the coordinator, and every member with its role and whether it is online. Home group only. |
 | `/usage@bot` (`/usage@bot all`) | What the bot spent today from its turn ledger: turns, tokens, cost where the CLI reports it; `all` lists every bot. |
 | `/round@bot` | What the open round waits on. |
 | `/owed@bot` | The open "owed" rows: who owes what to whom (reviews, merges, CI, hand-offs). Rows close themselves from facts (verdicts, CI, merges, GitHub's own state). |
@@ -64,19 +74,19 @@ all) taking turns; **hold** keeps everyone answering but starting nothing new.
 | `/unlink @bot` | yes | Unlinks a bot (the coordinator is never unlinked). |
 | `/phase <ref\|L1> <phase>` | yes | Moves a work item: `research`, `design`, `development`, `review`, `qa`, `done`, `blocked`. GitHub also moves linked items by itself (open PR → review, merged → done). |
 | `/topic #N …` | yes | Says that these issues/PRs live in this topic (today's routing). |
-| `/cleanup@bot …` | yes | Tidies the group: a dry run without arguments; `topics done`, `topic <id>`, `topics all`, `general`; deletions need `confirm <code>`. |
 
-The coordinator records the same things with lines in its replies: `LINK: …`, `ASSIGN: @bot
-<ref|L1> as <role>`, `PHASE: <ref|L1> <phase>`.
+These work inside a topic. The coordinator records the same things with lines in its replies:
+`LINK: …`, `ASSIGN: @bot <ref|L1> as <role>`, `PHASE: <ref|L1> <phase>`.
 
 ## Membership and tools
 
 | Command | Admin | What it does |
 |---|---|---|
-| `/admit @bot` | yes | Admits a bot to the swarm. |
-| `/remove @bot` | yes | Removes a bot from the swarm. |
+| `/admit @bot` | yes | Admits a bot to the swarm. A bot you made a group admin joins by itself. |
+| `/remove @bot` | yes | Removes a bot from the swarm until you `/admit` it again. A bot listed under `peers:` in a config stays. |
 | `/sync` | yes | Every bot re-introduces itself, so their peer lists match again. |
 | `/bus <location>` | yes | Sets the bus of a bot that has none yet; `/bus@bot <location>` moves that bot to another bus. Bots set up by hand keep their configured bus. |
+| `/cleanup@bot …` | yes | Tidies the whole group, sent from anywhere: a dry run without arguments; `topics done`, `topic <id>`, `topics all`, `general`; deletions need `confirm <code>`. |
 | `/memory@bot` (`clear`) | yes | Shows (or empties) the bot's `memory.md` of lessons. |
 | `/cli@bot <command>` | yes | Runs a native CLI command with no model turn: e.g. `/cli@bot --version`, `/cli@bot /cost`, `/cli@bot /context`. Commands that change something need `/cli!@bot`. |
 | `/wakes` | — | Retired; see `/owed`. |
@@ -84,21 +94,23 @@ The coordinator records the same things with lines in its replies: `LINK: …`, 
 ## Dashboard buttons
 
 With `control:` set, the coordinator keeps a pinned dashboard in the chat it names. Its buttons
-are admin only, and the ones that change the most ask for a second tap. Typing a button's
-`ctl:` code does the same as pressing it.
+are admin only, and some ask for a second tap. The per-bot buttons act on the coordinator, the
+bot that holds the dashboard; a typed `ctl:bot.pause:Codex` sends one to another bot. A typed
+`ctl:` code reaches every bot, so the others answer that the coordinator has the dashboard:
+pressing the button is quieter.
 
-| Button | Same as |
+| Button | What it does |
 |---|---|
-| Pause, Resume | `/pause@bot`, `/resume@bot` |
-| Stop turn | `/stop@bot all` |
-| Restart | no command: restarts the bot once its queue is empty |
-| Model, Effort | `/model@bot`, `/reasoning@bot`, with a picker |
-| CLI | `/cli@bot`, read-only commands only |
-| WAKE | retired, like `/wakes` |
-| Freeze | `/pause@bot`; the bot's status says "frozen" instead of "paused" |
-| Pause all | a bare `/pause` |
-| Hand lease, Fail back | no command: hand the coordinator lease to another bot, or back to the named coordinator |
-| Reassign role | `/role @bot <role>` |
-| Cleanup | `/cleanup@bot` (the dry run) |
-| Sync | `/sync` |
-| Nudge | no command: wakes the bot that owes an `/owed` row, which costs it a turn |
+| Pause, Resume | Pause freezes the coordinator at once. Unlike `/pause`, a turn already running finishes without posting its reply, and no "paused" line goes out. Resume lifts it. |
+| Stop turn | Stops the coordinator's turns and drops its queue, like `/stop@bot all`. |
+| Restart | Restarts the coordinator now; a turn it cuts off is replayed when it starts again. The `swarmly --cli` launcher starts it again; `swarmly-telegram run` just exits. |
+| Model, Effort | Picks the coordinator's model or effort, for the dashboard's own topic only. |
+| CLI | Lists the `/cli` commands the coordinator may run; it runs nothing. |
+| WAKE | Retired, like `/wakes`: there is nothing to pick. |
+| Freeze | The same as Pause, after a second tap; `/status` gives the reason as "frozen". |
+| Pause all | Freezes every bot at once, the way Pause does. |
+| Hand lease, Fail back | Hands the coordinator lease to another bot, or back to the named coordinator. |
+| Reassign role | Like `/role @bot <role>`, but it never gives or takes the coordinator role. |
+| Cleanup | The `/cleanup` dry run. |
+| Sync | The coordinator re-posts its peer list. A bare `/sync` makes every bot do it. |
+| Nudge | On a round item's line, or typed as `ctl:item.nudge:<issue>`: wakes the bot that owes that item, which costs it a turn. |

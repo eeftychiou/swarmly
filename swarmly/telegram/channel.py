@@ -3719,7 +3719,8 @@ class AgentChannel:
            a known peer's when it is not. Without this, ``by=`` -- which is free text -- would
            let any bot on the bus write an admin's id and stop the swarm. A note from this bot
            itself, or from nobody, is never a peer's press.
-        2. **Who it names.** This bot, ``self``, or ``*`` for a swarm-wide control.
+        2. **Who it names.** This bot by its alias, or ``*`` for a swarm-wide control.
+           ``self`` is the sender's own bot (the one the dashboard's buttons act on).
         3. **Which admin pressed.** The id must be *this* bot's admin, so a peer repeats the
            authorisation against its own config instead of trusting whoever passed it on.
 
@@ -3734,7 +3735,11 @@ class AgentChannel:
                            self.config.identity.alias, sender)
             return f"refused: {sender or 'an unknown bot'} does not hold the dashboard"
         target = note.target.strip().lower()
-        if target not in ("", "self", "*", self.config.identity.alias.lower()):
+        if target in ("", "self"):
+            # The presser's bot wrote "self" about itself: it names the sender, never the bot
+            # reading it (a dashboard Pause, pressed for the coordinator, froze every peer).
+            target = str(sender or "").strip().lower()
+        if target not in ("*", self.config.identity.alias.lower()):
             return f"for {note.target}: not mine"
         if not self._is_my_admin(note.by):
             logger.warning("control note for %s refused: by=%s is not the admin",

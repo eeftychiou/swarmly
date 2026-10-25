@@ -831,7 +831,8 @@ class Membership:
                            address_peers=False)
 
     async def handle_command(self, event: "ChannelEvent") -> bool:
-        """``/bus`` and ``/role`` from the admin, and ``/swarm`` from anyone; True when consumed.
+        """``/bus`` and ``/role`` from the admin, and ``/swarm`` from any member; True when
+        consumed.
 
         Every bot applies a ``/role``, ``/role@bot <role>`` included (that bot is the one it
         names), so they all agree. A refusal or a malformed one is answered by the bot named,
@@ -848,10 +849,14 @@ class Membership:
         speaks = mine if target else self.is_coordinator()
         args = (event.text or "").split()[1:]
         if command == "swarm":
-            # Anyone may ask (it changes nothing). With no coordinator every agent answers, but
-            # not a newcomer still joining: it knows nothing yet (live test: a starting agent
-            # answered a /swarm from its backlog with "bus: unknown, coordinator: none" while
-            # the coordinator was up).
+            # Any member may ask (it changes nothing); a stranger learns nothing, the bus's
+            # location included, unless limits.strangers lets strangers in. With no coordinator
+            # every agent answers, but not a newcomer still joining: it knows nothing yet (live
+            # test: a starting agent answered a /swarm from its backlog with "bus: unknown,
+            # coordinator: none" while the coordinator was up).
+            if getattr(self.cfg.limits, "strangers", "ignore") == "ignore" and \
+                    not self.cfg.is_member(event.author_id, event.author_username, False):
+                return True
             joining = self.dynamic and not self.joined()
             if self.is_coordinator() or target or (not self.state.coordinator and not joining):
                 # It lists every bot by name: an answer, never a call to each of them.
