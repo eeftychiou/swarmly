@@ -274,6 +274,16 @@ class ReplyStore:
             db.execute("UPDATE replies SET state='sent', telegram_message_id=? WHERE id=? AND state='sending'",
                        (message_id, request_id))
 
+    def unposted(self, request_id, detail):
+        """The transport refused the answer before sending it (its topic is transport-only).
+
+        Nothing was posted, and a retry would be refused the same way, so the ticket stops
+        here. Its overdue alert then tells the admin the answer was not posted.
+        """
+        with self._db() as db:
+            db.execute("UPDATE replies SET state='unposted', notified=0, detail=? "
+                       "WHERE id=? AND state='claimed'", (detail, request_id))
+
     def uncertain(self, request_id):
         with self._db() as db:
             db.execute("UPDATE replies SET state='delivery_unknown', notified=0, detail='send interrupted or failed; inspect Telegram before retry' WHERE id=? AND state='sending'",
@@ -298,7 +308,8 @@ class ReplyStore:
             db.execute("UPDATE replies SET state='overdue', detail='task reply deadline exceeded' WHERE state='queued' AND deadline <= ?", (now,))
             rows = []
             for row in db.execute("""SELECT * FROM replies
-                WHERE alerts < ? AND state IN ('overdue','delivery_unknown','queue_failed')
+                WHERE alerts < ? AND state IN ('overdue','delivery_unknown','queue_failed',
+                                                'unposted')
                 ORDER BY created""", (alert_cap,)):
                 item = dict(row)
                 item['alert_kind'] = 'task_overdue'

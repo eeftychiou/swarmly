@@ -378,6 +378,31 @@ class TicketRepliesTests(unittest.TestCase):
     def test_an_older_ticket_follows_its_message_as_before(self):
         self.assertEqual([(c, t) for c, t, _ in self.flush("never", None)], [(GROUP, None)])
 
+    def test_a_ticket_in_the_pulse_stops_and_raises_an_alert(self):
+        """#313: `send` refused the answer before any attempt, so the ticket stayed `claimed`
+        for good, with no retry, no alert, and the answer gone except for a log line."""
+        from swarmly.telegram.replies import ReplyStore
+        with TemporaryDirectory() as folder:
+            channel = channel_for("never")
+            channel.replies = ReplyStore(Path(folder) / "replies.db")
+            ticket, _ = channel.replies.register(chat_id=GROUP, message_id=5,
+                                                 recipient="alice", text="q?", thread_id=PULSE)
+            channel.replies.submit(ticket["id"], text="the answer")
+            spy = Spy(channel)
+            run(channel.flush_replies())
+            row = channel.replies.get(ticket["id"])
+            self.assertEqual(row["state"], "unposted")
+            self.assertIn("Swarm pulse is transport-only", row["detail"])
+            self.assertEqual(spy.posts, [], "the answer is not handed to send at all")
+            run(channel.flush_replies())                  # the next pass raises its alert
+            self.assertEqual(len(spy.posts), 1, spy.posts)
+            self.assertIn("unposted for message 5", spy.posts[0][2])
+            self.assertIn("answer not posted", spy.posts[0][2])
+            for _ in range(3):                            # the answer is never retried, and
+                run(channel.flush_replies())              # the alert stops at its cap (#49)
+            self.assertEqual(len(spy.posts), channel.config.limits.overdue_alert_cap, spy.posts)
+            self.assertFalse([text for _, _, text in spy.posts if "the answer" in text])
+
 
 class TheSendCommandTests(unittest.TestCase):
 
