@@ -677,6 +677,25 @@ class TestProjectChannel(unittest.TestCase):
             self.assertIn("repo=example-org/webapp", reply)
             self.assertIn(f"workdir={Path(tmp).resolve()}", reply)
 
+    def test_status_names_a_topics_worktree_without_making_it(self):
+        """/status (and /where in it) is asked by peers too: it never fetches or adds a
+        worktree; only a turn does."""
+        with TemporaryDirectory() as tmp:
+            cfg = make_config(projects={"webapp": {"repo": "example-org/webapp", "cwd": tmp,
+                                                   "topics": [12], "worktrees": True}})
+            channel = AgentChannel(cfg, sender=FakeSender())
+            import subprocess
+            with patch("swarmly.telegram.projects.subprocess.run",
+                       wraps=subprocess.run) as run_:
+                reply = channel._command_reply("status", event("/status@HermesBot",
+                                                               thread_id=12))
+            argvs = [" ".join(map(str, call.args[0])) for call in run_.call_args_list]
+            self.assertFalse([a for a in argvs if " fetch " in f"{a} " or " worktree " in a],
+                             argvs)                    # the revision lookup is fine
+            target = Path(tmp).resolve() / ".swarmly-worktrees" / "topic-12"
+            self.assertIn(f"workdir={target}", reply)
+            self.assertFalse(target.parent.exists())
+
     def test_where_command_unbound_topic(self):
         cfg = make_config()
         channel = AgentChannel(cfg, sender=FakeSender())

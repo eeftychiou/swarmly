@@ -83,17 +83,19 @@ class ProjectRouter:
                 return out
         return []
 
-    def workdir_for(self, project: ProjectSettings, thread_id: int) -> Path:
+    def workdir_for(self, project: ProjectSettings, thread_id: int, *,
+                    create: bool = True) -> Path:
         """Return the working directory for this project and thread.
         Returns ``cwd`` when worktrees is false, or ``<cwd>/.swarmly-worktrees/topic-<thread_id>``
         when worktrees is true (created on first use). A failed worktree creation falls back
-        to ``cwd`` and logs a warning; it never blocks the turn.
+        to ``cwd`` and logs a warning; it never blocks the turn. ``create=False`` only names
+        the folder (for /status): no fetch, no worktree.
         """
         base_cwd = Path(project.cwd).expanduser().resolve()
         if not project.worktrees:
             return base_cwd
         target = base_cwd / ".swarmly-worktrees" / f"topic-{thread_id}"
-        if target.exists():
+        if target.exists() or not create:
             return target
         _ensure_git_exclude(base_cwd)
         try:

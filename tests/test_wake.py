@@ -177,17 +177,16 @@ class TestChannelWiring(unittest.TestCase):
 
     def test_slash_wakes_points_at_the_rows_instead(self):
         """#215: the command outlives the timers, as a pointer to what replaced them."""
-        channel, _event = self.channel()
-        said = channel.control_report("bot.wake")     # the picker's report, and /wakes' own text
+        channel, event = self.channel()
+        said = channel._handle_command(event("/wakes@HermesBot"))
         self.assertIn("retired", said)
         self.assertIn("/owed", said)
 
-    def test_the_menu_does_not_promise_timers(self):
-        """#220 review: the one place a person reads what a command does must not lie."""
+    def test_the_menu_does_not_offer_timers(self):
+        """#220 review: the menu must not promise timers; since 25 Oct it leaves /wakes out,
+        and the commands page says where it went."""
         from swarmly.telegram.commands import MENU_COMMANDS
-        said = dict(MENU_COMMANDS)
-        self.assertIn("owed", said["wakes"].lower())
-        self.assertNotIn("armed", said["wakes"].lower())
+        self.assertNotIn("wakes", dict(MENU_COMMANDS))
 
     def test_status_no_longer_counts_timers(self):
         channel, _event = self.channel()

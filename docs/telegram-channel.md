@@ -994,10 +994,13 @@ to N topics run a turn at the same time.
   POSIX — and leaves alone a live transport's children, a pid whose start time no longer
   matches (the pid was reused), and anything whose identity it cannot read. The record is
   dropped when the child exits, so the file only ever holds live pids.
-- `/pause` from the admin holds every bot (`/pause@<bot>` holds one): a turn already running
-  finishes and posts its answer, then the bot takes no more turns, from Telegram or the bus,
-  and says "paused". The hold survives restarts. `/resume` (or `/resume@<bot>`) lifts it.
-  Use it to stop a run at its budget without killing processes.
+- `/pause` from the admin holds every bot (`/pause@<bot>` or `/pause @<bot>` holds one): a
+  turn already running finishes and posts its answer, then the bot takes no more turns, from
+  Telegram or the bus. A paused bot says "paused" with the `FROZEN` line its peers route by;
+  for a bare `/pause` only the coordinator answers, once for the swarm, and every bot marks
+  its peers paused at once, since each saw the same command. The hold survives restarts. `/resume` (or
+  `/resume@<bot>`) lifts it; a bare one clears every freeze each bot knew of, and only the
+  coordinator answers. Use it to stop a run at its budget without killing processes.
 - `/hold [reason]` from the admin holds the **whole swarm** (`/hold@<bot>` too: the mention only
   picks which bot answers; holding one bot is what `/pause@<bot>` is for). Unlike `/pause`,
   nobody stops taking turns: the bots still answer what they are asked, but they start
@@ -1167,11 +1170,12 @@ pressed on a bot the lease no longer names as coordinator is refused, so a stale
 never a failed heartbeat, and an unchanged dashboard sends nothing at all.
 
 The buttons under it come from `CONTROLS` in `swarmly/telegram/control.py` — pause, resume,
-stop turn, restart, model, effort, WAKE, freeze and read-only `/cli` per bot; pause-all, the
-lease, roles, cleanup, sync and admit for the swarm; and a nudge that costs the owner a turn.
-Only a control the running transport can actually carry out is shown, so a button that exists
-is a button that works (today: pause, resume, freeze, a safe restart and a stop of one bot;
-model, effort, WAKE and read-only `/cli`, which only *report*; pause *everything*; hand the
+stop turn, restart, model, effort and read-only `/cli` per bot; pause-all, the lease, roles,
+cleanup and sync for the swarm; and a nudge that costs the owner a turn. Only a control the
+running transport can actually carry out is shown, so a button that exists is a button that
+works (today: pause and resume, which work like `/pause@<bot>` and `/resume@<bot>`; a safe
+restart and a stop of one bot; model, effort and read-only `/cli`, which only *report*; pause
+*everything*, like a bare `/pause`; hand the
 lease over and fail it back (#154, below); reassign a role; a resync of the swarm; the
 cleanup dry run; and a nudge to an item's owner, which costs that bot a turn).
 A press on a reporting control answers with what the setting is now and the command that
@@ -1308,9 +1312,9 @@ record is the log and the answer is the presser's own (#157).
 One press is one line on the bus: a swarm-wide control posts its own `target=*` note, and the
 pressing bot does not add a second, local one.
 
-**A control that needs a value carries it on the button (#153).** Model, effort and WAKE are
-pickers: pressing one sends a short list — the models `/model` already knows, the effort
-levels, the timers this bot holds — as a message of its own (the dashboard's keyboard is
+**A control that needs a value carries it on the button (#153).** Model, effort, the role and
+the lease are pickers: pressing one sends a short list — the models `/model` already knows,
+the effort levels, the bots and roles — as a message of its own (the dashboard's keyboard is
 rewritten on every beat, so a picker cannot live there), and the chosen value rides that
 button's own callback data, `ctl:<action>:<target>:<value>`. Nothing is kept on disk, so a
 press that arrives after a restart still means what the button said, and the value is capped
@@ -1325,8 +1329,9 @@ carrying the whole choice. Offering a list is not confirmed — it changes nothi
 arrives with the finished pick. The picker is posted where the dashboard lives
 (`control.chat_id`/`control.topic_id`, else the home channel) and it names the bot the press will
 *change*, so the role pick's first step asks which bot rather than claiming one is already chosen.
-The role list includes the project's own role files (`<bus repo>/.agents/roles`), and the WAKE
-picker says what it does — it cancels a timer, so its buttons read `cancel <id>`.
+The role list includes the project's own role files (`<bus repo>/.agents/roles`). The WAKE
+picker and the Freeze button are gone (25 Oct): there were no timers left to cancel (#215), and
+Freeze was Pause behind a second tap.
 
 **Hand the lease over, and fail it back (#154).** Holding the coordinator role is automatic
 (#83, #126) — it is renewed on the bus, taken over when it lapses, and reclaimed by the

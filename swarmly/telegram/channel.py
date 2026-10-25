@@ -575,6 +575,8 @@ class AgentChannel:
         # /pause with turns running: take no new ones, freeze when the last one ends.
         self._pause_pending = False
         self._pause_where: Tuple[Optional[int], Optional[int]] = (None, None)
+        # A swarm-wide pause (a bare /pause, Pause all) freezes without a line of its own.
+        self._pause_quiet = False
         self._queue_full_noticed = float("-inf")
         #: #184 review: when the held queue is at its ceiling the *drop* is news too, and it
         #: must not be swallowed by the "kept" notice that just went out in the same window --
@@ -1400,11 +1402,15 @@ class AgentChannel:
         if not self.config.is_admin(event.author_id):
             logger.warning("/%s from @%s ignored: only the admin changes the swarm",
                            command, event.author_username)
-            if target or self.is_coordinator():
-                # The bot named, or the coordinator for a bare one: one line, not one per bot.
+            member = getattr(self.config.limits, "strangers", "ignore") != "ignore" or \
+                self.config.is_member(event.author_id, event.author_username, False)
+            if target or (member and self.is_coordinator()):
+                # The bot named, or the coordinator for a member's bare one: one line, not one
+                # per bot, and no line a stranger can set off.
                 await self.send(f"⛔ only the admin can use /{command}",
                                 reply_to_message_id=event.message_id, chat_id=event.chat_id,
-                                thread_id=event.thread_id, allow_when_frozen=True)
+                                thread_id=event.thread_id, allow_when_frozen=True,
+                                address_peers=False)
             return True
         if command == "sync":
             await self._sync_now(chat_id=event.chat_id, thread_id=event.thread_id)
@@ -1444,65 +1450,11 @@ class AgentChannel:
         alias = self.config.identity.alias
         if command == "ping":
             return ping_reply(alias, state="online")   # wall-clock time; _clock is monotonic
-        if command == "status":
-            result = f"handled={self.stats.handled} machine={self.stats.machine_events}"
-            # Issue #32: the revision the process really runs, and the checkout's own HEAD when
-            # the two disagree -- an admin switch moves the deploy dir while this process keeps
-            # the code it started with, and "rev:" alone would look current.
-            result += f" rev={self._running_revision}"
-            checkout = _local_revision()
-            if checkout != self._running_revision:
-                result += f" checkout={checkout} drift=restart-needed"
-            # #93(1): busy drops are counted inside `seen` (they bump `ignored`, which /diag sums
-            # into it) and additionally surfaced here as their own `busy_dropped=` token. /status is
-            # the lighter surface where a loss anomaly is first noticed, so it must not hide it.
-            # #204: and `busy_held=` beside it -- since #184 a full queue holds more than it drops,
-            # so `busy_dropped` alone reads as "nothing was lost" when work is in fact waiting.
-            result += (f" busy_dropped={self.stats.busy_dropped}"
-                       f" busy_held={self.stats.busy_held}")
-            try:
-                result += f" {self.lease_store().state().describe()}"
-            except Exception:                          # noqa: BLE001 - /status must answer
-                result += " coordinator=none(unverifiable)"
-            result += f" {self.presence_line()}"
-            # #234 review: `/status` shows this bot's own hold too, not only the peers' -- a
-            # held bot's line must say so even when no peer has been heard from yet.
-            # #245 review (Reasonix): the reason is free text, so it is quoted -- otherwise
-            # `held=until the drill is done` reads as if the rest of the line were the reason.
-            if self._hold:
-                why = str(self._hold.get("reason") or "").strip().replace('"', "'")
-                result += f' held="{why}"' if why else " held=_"
-            if self.config.identity.role:
-                result += f" role={self._role_name()}"
-            if self.replies is not None:
-                result += f" replies={self.replies.summary()}"
-            if self.config.adapter.model_switchable:
-                result += f" model={self._model_for(event) or 'cli-default'}"
-                result += f" effort={self._effort_for(event) or 'cli-default'}"
-            if event is not None:
-                proj = self.router.project_for(event.chat_id, event.thread_id)
-                if proj:
-                    result += f" project={proj.key}"
-            if self.config.github and self.config.github.login:
-                last_poll = getattr(self, "_github_last_poll", None) or "never"
-                result += f" github: @{self.config.github.login} (backstop: {self.config.github.poll_minutes}m, last: {last_poll})"
-            else:
-                result += " github: disabled"
-            frozen_peers = self.frozen_peers()
-            if frozen_peers:
-                result += " frozen_peers=" + ",".join(
-                    f"{peer}({entry.get('ref') or 'frozen'})"
-                    for peer, entry in sorted(frozen_peers.items()))
-            old_releases = self.old_releases()
-            if old_releases:
-                result += " old_releases=" + ",".join(
-                    f"{peer}(running an old release)"
-                    for peer in sorted(old_releases))
-            blocker = self.stats.last_error or "none"
-            if self._frozen:
-                blocker = f"frozen: {self._freeze_reason()} (/resume@{self.config.identity.name})"
-            return status_reply(alias, task=f"adapter:{self.config.adapter.type}",
-                                result=result, blocker=blocker)
+        if command in ("status", "where", "diag"):
+            # One answer (the admin, 25 Oct: /where and /diag repeated parts of /status, so
+            # they are other names for it): the state, where it runs, the transport's facts.
+            return "\n".join((self._status_line(event), self._where_line(event),
+                              self._diag_line(event)))
         if command == "role":
             role = self._role()
             if role is None:
@@ -1513,39 +1465,115 @@ class AgentChannel:
             from swarmly.telegram.roles import team_line
             team = team_line(self.config.peer_roles)
             return f"{mine}\n{team}" if team else mine
-        if command == "where":
-            chat_id = event.chat_id if event is not None else int(self.config.identity.home_channel_id or 0)
-            thread_id = event.thread_id if event is not None else None
-            project = self.router.project_for(chat_id, thread_id)
-            workdir = str(self.router.workdir_for(project, thread_id)) if project and thread_id is not None else None
-            return where_reply(
-                alias=alias,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                project=project.key if project else None,
-                repo=project.repo if project else None,
-                workdir=workdir,
-            )
+        return ""
+
+    def _status_line(self, event: Optional[ChannelEvent]) -> str:
+        """The STATUS line: what this bot is doing, its revision, model, peers and lease."""
+        alias = self.config.identity.alias
+        result = f"handled={self.stats.handled} machine={self.stats.machine_events}"
+        # Issue #32: the revision the process really runs, and the checkout's own HEAD when
+        # the two disagree -- an admin switch moves the deploy dir while this process keeps
+        # the code it started with, and "rev:" alone would look current.
+        result += f" rev={self._running_revision}"
+        checkout = _local_revision()
+        if checkout != self._running_revision:
+            result += f" checkout={checkout} drift=restart-needed"
+        # #93(1): busy drops are counted inside `seen` (they bump `ignored`, which /diag sums
+        # into it) and additionally surfaced here as their own `busy_dropped=` token. /status is
+        # the lighter surface where a loss anomaly is first noticed, so it must not hide it.
+        # #204: and `busy_held=` beside it -- since #184 a full queue holds more than it drops,
+        # so `busy_dropped` alone reads as "nothing was lost" when work is in fact waiting.
+        result += (f" busy_dropped={self.stats.busy_dropped}"
+                   f" busy_held={self.stats.busy_held}")
+        try:
+            result += f" {self.lease_store().state().describe()}"
+        except Exception:                          # noqa: BLE001 - /status must answer
+            result += " coordinator=none(unverifiable)"
+        result += f" {self.presence_line()}"
+        # #234 review: `/status` shows this bot's own hold too, not only the peers' -- a
+        # held bot's line must say so even when no peer has been heard from yet.
+        # #245 review (Reasonix): the reason is free text, so it is quoted -- otherwise
+        # `held=until the drill is done` reads as if the rest of the line were the reason.
+        if self._hold:
+            why = str(self._hold.get("reason") or "").strip().replace('"', "'")
+            result += f' held="{why}"' if why else " held=_"
+        if self.config.identity.role:
+            result += f" role={self._role_name()}"
+        if self.replies is not None:
+            result += f" replies={self.replies.summary()}"
+        if self.config.adapter.model_switchable:
+            result += f" model={self._model_for(event) or 'cli-default'}"
+            result += f" effort={self._effort_for(event) or 'cli-default'}"
+        if event is not None:
+            proj = self.router.project_for(event.chat_id, event.thread_id)
+            if proj:
+                result += f" project={proj.key}"
+        if self.config.github and self.config.github.login:
+            last_poll = getattr(self, "_github_last_poll", None) or "never"
+            result += f" github: @{self.config.github.login} (backstop: {self.config.github.poll_minutes}m, last: {last_poll})"
+        else:
+            result += " github: disabled"
+        frozen_peers = self.frozen_peers()
+        if frozen_peers:
+            result += " frozen_peers=" + ",".join(
+                f"{peer}({entry.get('ref') or 'frozen'})"
+                for peer, entry in sorted(frozen_peers.items()))
+        old_releases = self.old_releases()
+        if old_releases:
+            result += " old_releases=" + ",".join(
+                f"{peer}(running an old release)"
+                for peer in sorted(old_releases))
+        blocker = self.stats.last_error or "none"
+        if self._frozen:
+            blocker = f"frozen: {self._freeze_reason()} (/resume@{self.config.identity.name})"
+        return status_reply(alias, task=f"adapter:{self.config.adapter.type}",
+                            result=result, blocker=blocker)
+
+    def _where_line(self, event: Optional[ChannelEvent]) -> str:
+        """The WHERE line: the chat and topic asked in, and the project bound to it."""
+        alias = self.config.identity.alias
+        chat_id = event.chat_id if event is not None else int(self.config.identity.home_channel_id or 0)
+        thread_id = event.thread_id if event is not None else None
+        project = self.router.project_for(chat_id, thread_id)
+        # create=False: /status must not fetch or add a worktree (only a turn does).
+        workdir = (str(self.router.workdir_for(project, thread_id, create=False))
+                   if project and thread_id is not None else None)
+        return where_reply(
+            alias=alias,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            project=project.key if project else None,
+            repo=project.repo if project else None,
+            workdir=workdir,
+        )
+
+    def _diag_line(self, event: Optional[ChannelEvent]) -> str:
+        """The DIAG line: the facts a peer cannot otherwise discover (host, session, seen)."""
+        alias = self.config.identity.alias
         context = (self.topics.context(event.chat_id, event.thread_id)
                    if event is not None else None)
         diag = diag_reply(alias, bot=self.config.identity.username, node=socket.gethostname(),
                           transport="standalone", session=self._session_label(context, event),
                           group=str(self.config.identity.home_channel_id),
                           admin=None, seen=self.stats.handled + self.stats.ignored)
-        # #9: a busy drop is inside `seen` — it bumps `ignored`, which the sum above counts — and is
-        # also surfaced as its own `busy_dropped=` token. The separate token is the property to pin,
-        # since `seen` alone cannot tell a drop apart from any other ignored message.
-        # #204: `busy_held` sits next to it. A held message is *not* a drop, so `busy_dropped=0`
-        # with work waiting is exactly the reading this token exists to make impossible to miss.
+        # #9: a busy drop is inside `seen` -- it bumps `ignored`, which the sum above counts --
+        # and the STATUS line above it carries `busy_dropped=` and `busy_held=` (#204).
         topic = f" context={context}" if context else ""
-        return (f"{diag} busy_dropped={self.stats.busy_dropped}"
-                f" busy_held={self.stats.busy_held}{topic}")
+        return f"{diag}{topic}"
 
     def _session_label(self, context_id: Optional[str], event: Optional[ChannelEvent] = None) -> Optional[str]:
         """The adapter session a turn in this discussion resumes, when the adapter keeps one
         per discussion; else the configured conversation."""
-        adapter = (self._adapter_for(event.chat_id, event.thread_id)
-                   if event is not None else self.adapter)
+        adapter: Optional[AgentAdapter] = self.adapter
+        project = (self.router.project_for(event.chat_id, event.thread_id)
+                   if event is not None and event.thread_id is not None else None)
+        if project is not None and event is not None and event.thread_id is not None:
+            # The adapter a turn made for this topic, never a new one: /status is asked by
+            # peers too, and making the adapter adds the topic's worktree.
+            adapter = self._project_adapters.get(
+                str(self.router.workdir_for(project, event.thread_id, create=False)))
+            if adapter is None:
+                return None                            # no turn here yet, so no session
         session_for = getattr(adapter, "session_for", None)
         if callable(session_for):
             try:
@@ -3227,7 +3255,8 @@ class AgentChannel:
         return Pulse(alias=self.config.identity.alias, at=now, rev=self._running_revision,
                      role=self._role_name() if self.config.identity.role else "", term=term,
                      busy_since=now - max(durations) if durations else None,
-                     frozen=bool(self._frozen), status=status, held=held,
+                     # A bot finishing its last turn before a pause takes no new work either.
+                     frozen=bool(self._frozen or self._pause_pending), status=status, held=held,
                      released_at=None if self._hold else (self._hold_released_at or None))
 
     def _pulse_usage(self, now: float, *, advance: bool = True) -> Dict[str, Any]:
@@ -3948,11 +3977,15 @@ class AgentChannel:
         swarm-wide pause happened on a bot that never froze (review, #133).
         """
         if action == "bot.pause":
-            self._set_frozen(True, "pause")
+            # What /pause@bot does: a turn already running finishes and posts first, and the
+            # FROZEN line its peers route by goes out once it holds.
+            if self._pause_self(None) == "paused":
+                self._notice_soon(self._paused_notice())
         elif action == "bot.resume":
-            self._set_frozen(False, None)
-        elif action == "bot.freeze":
-            self._set_frozen(True, "freeze")
+            if self._resume_self():
+                self._notice_soon(format_message(Envelope(
+                    type=MessageType.STATUS, to="*", intent="RESUMED", ref="pause",
+                    rev=self._running_revision), f"▶ {self.config.identity.alias} resumed."))
         elif action == "bot.restart":
             self.request_restart()
         elif action == "bot.stop_turn":
@@ -3968,11 +4001,19 @@ class AgentChannel:
                     f"term now")
         elif action == "swarm.pause_all":
             # The broadcast half: the presser holds itself, and every peer that receives
-            # ``target=*`` holds itself here.
-            self._set_frozen(True, "pause")
+            # ``target=*`` holds itself here -- quietly, as for a bare /pause.
+            self._pause_self(None, quiet=True)
         else:
             return False
         return True
+
+    def _notice_soon(self, text: str) -> None:
+        """Post a machine line from synchronous code (a control note), once the loop runs."""
+        try:
+            self._self_tasks.add(asyncio.get_running_loop().create_task(self.send(
+                text, silent=True, notice=True, allow_when_frozen=True)))
+        except RuntimeError:                   # no loop (a test applying a note directly)
+            pass
 
     def _stop_every_turn(self) -> str:
         """Stop this bot's turns and queued messages: what ``/stop all`` does, from a button.
@@ -3998,12 +4039,11 @@ class AgentChannel:
     def control_actions(self) -> Tuple[str, ...]:
         """The controls this build can actually carry out, so no button is offered in vain.
 
-        The rest of the table in :mod:`swarmly.telegram.control` -- the swarm-wide controls
-        (lease, fail back, roles, cleanup, sync, admit) -- joins this tuple as each is wired;
-        until then they are neither shown nor run.
+        A control added to the table in :mod:`swarmly.telegram.control` joins this tuple once
+        it is wired; until then it is neither shown nor run.
         """
-        return ("bot.pause", "bot.resume", "bot.freeze", "bot.restart", "bot.stop_turn",
-                "bot.model", "bot.effort", "bot.wake", "bot.cli",
+        return ("bot.pause", "bot.resume", "bot.restart", "bot.stop_turn",
+                "bot.model", "bot.effort", "bot.cli",
                 "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
                 "swarm.lease", "swarm.failback",
                 "item.nudge")
@@ -4025,7 +4065,7 @@ class AgentChannel:
         """A synthetic event for a report control: the admin, typing a bare command.
 
         The report answers through the *same* functions the typed commands use (``/model``,
-        ``/reasoning``, ``/wakes``), so a button and a command can never drift apart. It
+        ``/reasoning``), so a button and a command can never drift apart. It
         carries no arguments on purpose: a press says what the setting is and how to change
         it, it never changes one -- a one-tap button that silently switched a bot's model
         would be the wrong shape for a control that is not asked twice.
@@ -4041,7 +4081,7 @@ class AgentChannel:
         """The live choices a picker offers, read in code and costing no turn (#153).
 
         Model names come from the list the CLI already reported (``/model``'s own cache), the
-        effort levels from the config's own set, and the timers from what this bot holds. An
+        effort levels from the config's own set, and the bots and roles from the roster. An
         unreadable list is an empty one, and the press then says there is nothing to pick.
         """
         adapter = self.config.adapter
@@ -4156,16 +4196,14 @@ class AgentChannel:
                           presser: str = "") -> str:
         """Set what a picker chose -- through the same function the typed command runs.
 
-        ``/model <name>``, ``/reasoning <level>`` and ``/wakes cancel <id>`` are the transport's
-        own answers, so a picked value behaves exactly like a typed one: same validation, same
-        limits, same words back.
+        ``/model <name>`` and ``/reasoning <level>`` are the transport's own answers, so a
+        picked value behaves exactly like a typed one: same validation, same limits, same
+        words back.
         """
         if action == "bot.model":
             return self._model_command(self._control_event("model", value))
         if action == "bot.effort":
             return self._reasoning_command(self._control_event("reasoning", value))
-        if action == "bot.wake":
-            return WAKES_RETIRED
         if action == "swarm.lease":
             return await self.hand_over_lease(value, presser=presser)
         if action == "swarm.role":
@@ -4184,8 +4222,6 @@ class AgentChannel:
             return self._model_command(self._control_event("model"))
         if action == "bot.effort":
             return self._reasoning_command(self._control_event("reasoning"))
-        if action == "bot.wake":
-            return WAKES_RETIRED
         if action == "bot.cli":
             return self._cli_report()
         return None
@@ -4525,7 +4561,7 @@ class AgentChannel:
         if action == "swarm.pause_all":
             # Hold this bot, and broadcast the hold: every peer applies the same note, so one
             # press stops the swarm instead of only the bot that owns the message.
-            self._set_frozen(True, "pause")
+            self._pause_self(None, quiet=True)
             await self._post_control_note(press_mod.every_bot(action, presser or "0"))
             return
         if action == "item.nudge":
@@ -7437,9 +7473,17 @@ class AgentChannel:
 
         # Topic registry, phase 5: /link, /unlink, /phase -- the store lease holder answers.
         parsed_command = parse_command(event.text or "")
+        pinned = (self._pin_linked_item(event)
+                  if parsed_command and parsed_command[0] == "link" else [])
         registry_reply = (await self.state_link.registry_command(event)
                           if parsed_command and parsed_command[0] in ("link", "unlink", "phase")
                           else None)
+        if registry_reply == "" and pinned and not self.state_link.enabled \
+                and parsed_command and not parsed_command[1] and self._answers_for_swarm():
+            # No store, so no lease holder answers a bare /link; the pin still happened.
+            registry_reply = (f"📌 {', '.join(pinned)} live in this topic now: replies about "
+                              "them are posted here. The state store is off, so the topic "
+                              "registry keeps nothing.")
         if registry_reply == "":
             return None
         if registry_reply is not None:
@@ -7878,9 +7922,39 @@ class AgentChannel:
             return
         self._pause_pending = False
         self._set_frozen(True, "pause")
+        if self._pause_quiet:
+            return                  # every bot paused: the coordinator has said it once
         chat_id, thread_id = self._pause_where
         await self.send(self._paused_notice(), chat_id=chat_id, thread_id=thread_id,
                         allow_when_frozen=True, silent=True, notice=True)
+
+    def _pause_self(self, where: Optional[Tuple[Optional[int], Optional[int]]], *,
+                    quiet: bool = False) -> str:
+        """Pause this bot the way /pause does: at once when idle, else once the turns running
+        now have ended and posted. ``quiet``: the whole swarm pauses, so this bot posts no
+        FROZEN line when its turn ends (its pulse tells the peers). Returns what happened:
+        "already", "paused" or "pausing"."""
+        if self._frozen and self._freeze_ref != "quota":
+            return "already"
+        if self._frozen or not self._turn_running():
+            # Out of quota counts too: a quota freeze lifts itself when the quota resets, and
+            # the pause must outlast that.
+            self._set_frozen(True, "pause")
+            return "paused"
+        if not self._pause_pending:
+            self._note_state(paused=True)
+        self._pause_quiet = quiet if not self._pause_pending else self._pause_quiet and quiet
+        self._pause_pending = True
+        self._pause_where = where or (None, None)
+        return "pausing"
+
+    def _resume_self(self) -> bool:
+        """Lift a pause, a pending one or a quota freeze. Whether there was one to lift."""
+        was = self._frozen or self._pause_pending
+        self._pause_pending = False
+        self._pause_quiet = False
+        self._set_frozen(False, None)
+        return was
 
     def held(self) -> bool:
         """Whether the admin has put the swarm on hold (/hold, until /release)."""
@@ -7982,47 +8056,91 @@ class AgentChannel:
             text = ("▶ The swarm is released: work goes on." if was
                     else "▶ The swarm was not on hold.")
         logger.info("%s: /%s from the admin", self.config.identity.alias, command)
-        speaks = mine if target else self.is_coordinator()
+        speaks = mine if target else (self._answers_for_swarm() or self._direct_chat(event))
         return text if speaks else ""
 
     def _handle_pause(self, event: ChannelEvent) -> Optional[str]:
-        """``/pause`` and ``/resume`` from the admin: a bare one reaches every bot, and
-        ``/pause@bot`` one. Turns already running finish and post first; then the bot holds
-        (the freeze persists across restarts) until ``/resume``. Anyone else's bare command
-        is ignored silently, so four bots don't answer it four times."""
+        """``/pause`` and ``/resume`` from the admin. ``/pause@bot`` (or ``/pause @bot``)
+        pauses that bot, which answers with the FROZEN line its peers route by. A bare one
+        reaches every bot and each applies it, but only the coordinator answers, once for the
+        swarm (the admin, 25 Oct: one reply per command). Turns already running finish and
+        post first; then the bot holds (the freeze persists across restarts) until
+        ``/resume``. Anyone else's bare command is ignored silently."""
         parsed = parse_command(event.text or "")
         if not parsed or parsed[0] not in ("pause", "resume"):
             return None
         command, target = parsed
-        named = bool(target) or self.mentions_me(event.text or "")
-        if target and target.lstrip("@").lower() != self.config.identity.name.lstrip(
-                "@").lower():
-            return ""
+        text = event.text or ""
+        if target:
+            if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
+                return ""
+            named = True
+        else:
+            # @username or @alias (not @all), or the admin's private chat with this bot.
+            named = bool(self._dropped_handles(text)) or self._direct_chat(event)
+            if not named and self._mentions_other_peer(text):
+                return ""                      # /pause @Codex is for Codex
         if not self.config.is_admin(event.author_id):
             return "⛔ only the admin can pause or resume the bots" \
                 if named and not event.author_is_bot else ""
+        if not named:
+            return self._pause_every_bot(command, event)
         alias = self.config.identity.alias
         if command == "resume":
-            was = self._frozen or self._pause_pending
             self._announce_resumed = self._freeze_ref == "quota"     # peers route around it
-            self._pause_pending = False
-            self._set_frozen(False, None)
-            if not was:
+            if not self._resume_self():
                 return f"▶ {alias} was not paused."
             # A machine RESUMED line too: peers drop the freeze and route work here again.
             return format_message(Envelope(type=MessageType.STATUS, to="*", intent="RESUMED",
                                            ref="pause", rev=self._running_revision),
                                   f"▶ {alias} resumed.")
-        if self._frozen:
+        done = self._pause_self((event.chat_id, event.thread_id))
+        if done == "already":
             return f"⏸ {alias} is already paused. /resume to continue."
-        if not self._turn_running():
-            self._set_frozen(True, "pause")
+        if done == "paused":
             return self._paused_notice()
-        self._pause_pending = True
-        self._note_state(paused=True)
-        self._pause_where = (event.chat_id, event.thread_id)
         return (f"⏸ {alias} pausing: it finishes the turn it is running, then holds. "
                 "/resume to continue.")
+
+    def _pause_every_bot(self, command: str, event: ChannelEvent) -> str:
+        """A bare /pause or /resume: this bot applies it to itself, and only the coordinator
+        answers. No bot posts a FROZEN or RESUMED line of its own: every peer saw the same
+        command, so a resume clears every freeze it knew of, and a pause reaches the peers in
+        each paused bot's next pulse (by then no bot hands out work anyway)."""
+        if command == "resume":
+            self._resume_self()
+            back = sorted(self._peers_frozen)
+            if back:
+                self._peers_frozen.clear()
+                save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
+                for alias in back:
+                    self._peer_back(alias)
+            text = "▶ Every bot resumed."
+        else:
+            self._pause_self((event.chat_id, event.thread_id), quiet=True)
+            # Every peer saw the same command: route around all of them now, without waiting
+            # for their pulses (a bus-plane pulse never updates this table).
+            fresh = [alias for alias in (getattr(self.config, "peers", None) or {})
+                     if alias not in self._peers_frozen]
+            for alias in fresh:
+                self._peers_frozen[alias] = {"ref": "pause", "until": None}
+            if fresh:
+                save_state(self._peers_frozen_path, self._peers_frozen, "peer freezes")
+            text = ("⏸ Pausing every bot: each finishes the turn it is running, then takes no "
+                    "more. /resume to continue.")
+        logger.info("%s: a bare /%s from the admin", self.config.identity.alias, command)
+        return text if self._answers_for_swarm() else ""
+
+    def _answers_for_swarm(self) -> bool:
+        """Whether this bot answers a bare swarm-wide command: the coordinator, or, while no
+        lease is live, the coordinator the admin named. A paused swarm renews no lease, so
+        after a long /pause the lease has lapsed and the /resume would get no answer."""
+        if self.is_coordinator():
+            return True
+        try:
+            return self.current_coordinator() is None and self.is_named_coordinator()
+        except Exception:                          # noqa: BLE001 - unknown is not the one
+            return False
 
     async def _hold_for_cooldown(self, event: ChannelEvent, key: Any, lock: asyncio.Lock,
                                  stopped: Callable[[], bool]) -> Optional[asyncio.Lock]:
@@ -8838,6 +8956,22 @@ class AgentChannel:
         self.state_link.note_pin(event.chat_id, event.thread_id, refs, event.author_id)
         return (f"📌 {', '.join(refs)} live in this topic now: replies about them are "
                 "posted here.") if speaks else ""
+
+    def _pin_linked_item(self, event: ChannelEvent) -> List[str]:
+        """The admin's ``/link #N`` (as work) says what ``/topic #N`` says: the item lives in
+        this topic, for today's routing too. Every bot applies it to its own topic map, as it
+        does /topic; the registry answer stays the lease holder's. Returns the items pinned."""
+        args = command_args(event.text or "")
+        if event.author_is_bot or not self.config.is_admin(event.author_id) \
+                or event.thread_id is None or not args:
+            return []
+        from swarmly.state.links import LinkLine, parse_lines
+        refs = [ref for line in parse_lines("LINK: " + " ".join(args))
+                if isinstance(line, LinkLine) and line.role == "work"
+                for ref in issue_refs(line.ref)]
+        if refs:
+            self._learn_topic_refs(event.chat_id, event.thread_id, " ".join(refs), pin=True)
+        return refs
 
     def _topic_elsewhere(self, event: ChannelEvent, body: str) -> Optional[Tuple[int, int]]:
         """The topic a reply in another topic belongs in, when it is only about items that

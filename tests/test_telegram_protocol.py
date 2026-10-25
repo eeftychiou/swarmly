@@ -391,15 +391,21 @@ class TestChannelCommandWiring(unittest.TestCase):
         self.assertTrue(reply.startswith("PONG Hermes"))
         channel.adapter.respond.assert_not_called()
 
-    def test_status_and_diag_replies_are_single_line_and_in_budget(self):
+    def test_status_answers_with_three_lines_and_where_and_diag_are_other_names(self):
+        """One answer for /status, /where and /diag (the admin, 25 Oct): the STATUS line
+        first, so a peer still reads the answer as machine traffic, then WHERE and DIAG."""
         channel = _wiring_channel()
         status = _wiring_run(channel.handle_event(_wiring_event("/status@HermesBot", message_id=2)))
         self.assertTrue(status.startswith("STATUS Hermes"))
-        self.assertEqual(len(status.splitlines()), 1)
-        diag = _wiring_run(channel.handle_event(_wiring_event("/diag@HermesBot", message_id=3)))
-        self.assertIn("DIAG alias=Hermes", diag)
-        self.assertIn("b2b=unknown", diag)
-        self.assertEqual(len(diag.splitlines()), 1)
+        self.assertEqual([line.split()[0] for line in status.splitlines()],
+                         ["STATUS", "WHERE", "DIAG"])
+        self.assertIn("b2b=unknown", status)
+        for name, message_id in (("diag", 3), ("where", 4)):
+            same = _wiring_run(channel.handle_event(_wiring_event(f"/{name}@HermesBot",
+                                                                  message_id=message_id)))
+            self.assertEqual([line.split()[0] for line in same.splitlines()],
+                             ["STATUS", "WHERE", "DIAG"], name)
+            self.assertEqual(same.splitlines()[1], status.splitlines()[1], name)
         channel.adapter.respond.assert_not_called()
 
     def test_a_command_for_another_bot_is_never_answered(self):

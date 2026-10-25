@@ -224,8 +224,10 @@ class TestBusyQueue(unittest.TestCase):
         # The token the #93(1) review pinned must still be there, on the same line.
         self.assertIn("DIAG alias=Hermes", diag)
         self.assertIn("STATUS Hermes", status)
-        self.assertEqual(len(diag.splitlines()), 1)
-        self.assertEqual(len(status.splitlines()), 1)
+        # /diag is another name for /status: one answer, STATUS, WHERE and DIAG lines.
+        self.assertTrue(diag.startswith("STATUS Hermes"), diag)
+        self.assertEqual([line.split()[0] for line in status.splitlines()],
+                         ["STATUS", "WHERE", "DIAG"])
 
     def test_diag_reports_a_drop_and_a_hold_apart(self):
         """`busy_held` and `busy_dropped` are different facts and must not read as one."""

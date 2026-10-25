@@ -842,11 +842,15 @@ class Membership:
             return False
         command, target = parsed
         mine = bool(target) and str(target).lstrip("@").lower() == self._me()
-        if target and not mine and command != "role":
-            return True
+        if target and not mine and (command != "role" or not command_args(event.text or "")):
+            return True                               # for another bot (its diagnostic too)
         if command == "role" and not command_args(event.text or ""):
             return False                              # plain /role: the diagnostic answer
-        speaks = mine if target else self.is_coordinator()
+        # The bot named answers; a bare one, the coordinator, and only to a member: a stranger
+        # gets no line to set off and learns nothing about who coordinates.
+        member = getattr(self.cfg.limits, "strangers", "ignore") != "ignore" or \
+            self.cfg.is_member(event.author_id, event.author_username, False)
+        speaks = mine if target else (member and self.is_coordinator())
         args = (event.text or "").split()[1:]
         if command == "swarm":
             # Any member may ask (it changes nothing); a stranger learns nothing, the bus's
@@ -854,8 +858,7 @@ class Membership:
             # every agent answers, but not a newcomer still joining: it knows nothing yet (live
             # test: a starting agent answered a /swarm from its backlog with "bus: unknown,
             # coordinator: none" while the coordinator was up).
-            if getattr(self.cfg.limits, "strangers", "ignore") == "ignore" and \
-                    not self.cfg.is_member(event.author_id, event.author_username, False):
+            if not member:
                 return True
             joining = self.dynamic and not self.joined()
             if self.is_coordinator() or target or (not self.state.coordinator and not joining):
@@ -886,21 +889,24 @@ class Membership:
         roles = [a for a in args if not a.startswith("@")]
         if len(handles) != 1 or len(roles) != 1 or not _ROLE_NAME(roles[0].lower()):
             if speaks:
-                await self._answer(event, "/role takes one bot and one role: "
+                # An answer never opens with a command or names a bot with "@": another bot
+                # would read it as a /role addressed to it.
+                await self._answer(event, "⚠️ A role change takes one bot and one role: "
                                           "/role @bot <role>, or /role@bot <role>")
             return True
         role = roles[0].lower()
         if role not in self._role_names():
             logger.warning("/role: unknown role %r", role)
             if speaks:
-                await self._answer(event, f"/role: there is no role {role}; the roles are "
+                await self._answer(event, f"⚠️ There is no role {role}; the roles are "
                                           f"{', '.join(self._role_names()) or 'none'}")
             return True
         mine = handles[0].lower() == self._me()
         alias = self.alias if mine else self.cfg.peer_alias_for(handles[0])
         if alias is None:
             if speaks:
-                await self._answer(event, f"/role: @{handles[0]} is not a bot of this swarm")
+                await self._answer(event, f"⚠️ {handles[0]} is not in my peer list, so I "
+                                          "kept no role for it")
             return True
         if role == "coordinator":
             self._demote_coordinators(but=alias)
@@ -911,6 +917,8 @@ class Membership:
         else:
             self._set_peer_role(alias, role, coordinator=True)
             self._save()
+        if speaks and role != "coordinator":       # a new coordinator announces itself
+            await self._answer(event, f"✅ {alias} is {role} now.")
         return True
 
     def _demote_coordinators(self, but: str) -> None:

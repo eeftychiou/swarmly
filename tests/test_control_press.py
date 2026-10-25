@@ -283,7 +283,7 @@ class TestAnotherBotsControl(unittest.TestCase):
 
     def test_a_note_for_a_control_this_build_lacks_is_refused(self):
         channel = self.channel()
-        # `swarm.admit` is in the table and not yet wired, so it is the one this build lacks.
+        # `swarm.admit` was never wired (and has left the table), so this build lacks it.
         self.assertNotIn("swarm.admit", channel.control_actions())
         self.assertIn("not a control here",
                       apply(channel, self.note("swarm.admit", "Hermes")))
@@ -310,15 +310,50 @@ class TestAnotherBotsControl(unittest.TestCase):
         run(channel.handle_event(event(payload, author_id=303, username="SomebodyElseBot")))
         self.assertFalse(channel._frozen)
 
-    def test_freeze_holds_the_bot_until_it_is_resumed(self):
+    def test_pause_holds_the_bot_says_so_and_resume_lifts_it(self):
+        """The Pause button is /pause@bot for the bot that holds the dashboard: it freezes
+        an idle bot and posts the FROZEN line its peers route by; Resume posts RESUMED."""
         channel = self.channel()
-        run(channel.handle_control_press(press("ctl:" + "bot.freeze")))
-        asked = channel.control_policy().pending()                 # freeze asks twice
-        self.assertTrue(asked)
-        run(channel.handle_control_press(press("ctl:confirm:" + asked[0].code)))
-        self.assertTrue(channel._frozen)
-        run(channel.handle_control_press(press("ctl:bot.resume")))
+
+        async def scenario():
+            await channel.handle_control_press(press("ctl:bot.pause"))
+            await asyncio.sleep(0)
+            paused = channel._frozen
+            await channel.handle_control_press(press("ctl:bot.resume"))
+            await asyncio.sleep(0)
+            return paused
+
+        self.assertTrue(run(scenario()))
         self.assertFalse(channel._frozen)
+        texts = [entry["text"] for entry in channel._test_sender.sent]
+        self.assertTrue(any("intent=FROZEN" in text and "paused" in text for text in texts))
+        self.assertTrue(any("intent=RESUMED" in text for text in texts))
+
+    def test_pause_lets_a_running_turn_finish_and_post(self):
+        """Like /pause: the turn running at the press posts its reply, then the bot holds."""
+        from tests.test_telegram_channel import _GatedAdapter
+        adapter = _GatedAdapter("Hermes")
+        channel = self.channel()
+        channel.adapter = adapter
+
+        async def scenario():
+            turn = asyncio.create_task(channel.handle_event(
+                event("@HermesBot long job", author_id=ADMIN_ID, username="alice",
+                      is_bot=False, message_id=1)))
+            await adapter.entered.wait()
+            await channel.handle_control_press(press("ctl:bot.pause"))
+            pending = (channel._frozen, channel._pause_pending)
+            adapter.release.set()
+            await turn
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return pending
+
+        self.assertEqual(run(scenario()), (False, True))
+        self.assertTrue(channel._frozen)
+        texts = [entry["text"] for entry in channel._test_sender.sent]
+        self.assertTrue(any("received: @HermesBot long job" in text for text in texts), texts)
+        self.assertTrue(any("intent=FROZEN" in text for text in texts), texts)
 
 
 class TestStoppingEverything(unittest.TestCase):
@@ -458,7 +493,8 @@ class TestAPeerAppliesWhatItCanAndSaysWhatItCannot(unittest.TestCase):
         note says ``target=self``: from the coordinator's mouth that is the coordinator."""
         channel = self.channel()
         self.assertIn("not mine", apply(channel, self.note("bot.pause", "self")))
-        self.assertIn("not mine", apply(channel, self.note("bot.stop_turn", "")))
+        empty = "CONTROL bot.stop_turn target= by=%d at=2027-01-15T08:00:00Z state=done" % ADMIN_ID
+        self.assertIn("not mine", apply(channel, empty))
         self.assertFalse(channel._frozen)
         self.assertEqual(apply(channel, self.note("bot.pause", "Hermes")), "applied: bot.pause")
         self.assertTrue(channel._frozen)
@@ -480,11 +516,11 @@ class TestAPeerAppliesWhatItCanAndSaysWhatItCannot(unittest.TestCase):
 
 
 class TestTheReportControls(unittest.TestCase):
-    """Model, effort, WAKE and /cli: a press answers, and changes nothing (issue #117).
+    """Model, effort and /cli: a press answers, and changes nothing (issue #117).
 
-    A one-tap button cannot take the value a change would need, so these four *report*: what
+    A one-tap button cannot take the value a change would need, so these three *report*: what
     the setting is now, and the command that changes it. They answer through the same code the
-    typed commands use, so a button never drifts from ``/model``, ``/reasoning`` or ``/wakes``.
+    typed commands use, so a button never drifts from ``/model`` or ``/reasoning``.
     """
 
     def channel(self, **adapter):
@@ -520,8 +556,9 @@ class TestTheReportControls(unittest.TestCase):
 
     def test_a_picker_with_nothing_to_offer_says_so(self):
         channel = self.channel()
-        self.assertIn("nothing to pick",
-                      run(channel.handle_control_press(press("ctl:bot.wake"))))
+        with mock.patch.object(channel_mod, "cached_models", return_value=[]):
+            self.assertIn("nothing to pick",
+                          run(channel.handle_control_press(press("ctl:bot.model"))))
 
     def test_a_press_on_cli_lists_the_allowlist_and_runs_nothing(self):
         from swarmly.telegram import native as native_cli
@@ -763,7 +800,7 @@ class TestTheSecondTapIsDeliverable(unittest.TestCase):
 
     def test_a_stopping_control_offers_the_same_button(self):
         channel = self.channel()
-        run(channel.handle_control_press(press("ctl:bot.freeze")))
+        run(channel.handle_control_press(press("ctl:swarm.pause_all")))
         code = channel.control_policy().pending()[0].code
         button = buttons_of(channel.bot.sent[0]["reply_markup"])[0][0]
         self.assertEqual(button[1], "ctl:confirm:" + code)
@@ -807,9 +844,6 @@ class TestTheSecondTapIsDeliverable(unittest.TestCase):
         values = [pair[1] for line in buttons_of(channel.bot.sent[0]["reply_markup"])
                   for pair in line]
         self.assertIn("ctl:swarm.role:Codex:wrangler", values)
-
-    def test_the_wake_pick_says_it_cancels(self):
-        self.assertIn("cancel", ct.picker_text("bot.wake", "Hermes"))
 
     # -- the typed form ----------------------------------------------------------------
     def test_a_typed_code_runs_it_through_the_press_handler(self):

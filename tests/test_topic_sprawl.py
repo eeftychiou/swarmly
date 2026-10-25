@@ -253,6 +253,36 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
         run(channel.handle_event(peer("@HermesBot status?", thread_id=77, message_id=5)))
         self.assertTrue(any("#37 passed QA." in t for t in self._sent_in(channel, 88)))
 
+    def test_the_admins_link_as_work_moves_an_item_like_topic_does(self):
+        """``/link #N`` is ``/topic #N`` (the admin, 25 Oct): every bot applies it to its own
+        topic map, whoever answers for the registry. ``as reference`` moves nothing."""
+        channel = self._channel("unused")
+        channel._learn_topic_refs(GROUP, 77, "#52 tracking")
+        run(channel.handle_event(ask("/link #52 as reference", thread_id=88, message_id=3)))
+        self.assertEqual(channel.topic_for_text("#52"), (GROUP, 77))
+        run(channel.handle_event(event("/link #52", thread_id=88, message_id=4,
+                                       username="CodexBot", is_bot=True)))
+        self.assertEqual(channel.topic_for_text("#52"), (GROUP, 77))     # a bot's moves nothing
+        run(channel.handle_event(ask("/link@CodexBot #37", thread_id=88, message_id=5)))
+        self.assertEqual(channel.topic_for_text("#37"), (GROUP, 88))
+        self.assertEqual(self._sent_in(channel, 88), [])            # Codex's to answer
+
+    def test_a_bare_link_with_the_store_off_is_still_answered_once(self):
+        """No store, so no lease holder answers; the coordinator says the item moved."""
+        for coordinator in (True, False):
+            with self.subTest(coordinator=coordinator):
+                channel = self._channel("unused")
+                channel.is_coordinator = lambda **_: coordinator
+                run(channel.handle_event(ask("/link #37", thread_id=88, message_id=4)))
+                self.assertEqual(channel.topic_for_text("#37"), (GROUP, 88))
+                said = self._sent_in(channel, 88)
+                if coordinator:
+                    self.assertEqual(len(said), 1, said)
+                    self.assertIn("#37 live in this topic now", said[0])
+                    self.assertIn("state store is off", said[0])
+                else:
+                    self.assertEqual(said, [])
+
     def test_only_the_admin_moves_items_and_other_bots_apply_it_silently(self):
         channel = self._channel("unused")
         run(channel.handle_event(event("/topic #37", thread_id=88, message_id=4,
