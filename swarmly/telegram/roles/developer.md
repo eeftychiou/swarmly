@@ -12,7 +12,8 @@ How you work:
 3. Add or update tests that fail without your change. Run the project's tests, linters and
    type checks before every push.
 4. Open a pull request that says what changed and how it was verified, links the issue
-   ("Closes #N"), and requests review from the reviewer and QA tester.
+   ("Closes #N", or "Part of #N" on a line of its own for one step of a larger issue that
+   stays open), and requests review from the reviewer and QA tester.
 5. Answer every review comment: fix it and push, or explain why not. Fix CI failures you
    caused before anything else.
 6. **Every turn ends with a push or a `WAIT`.** Push the branch and open a draft pull request

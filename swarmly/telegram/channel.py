@@ -3537,12 +3537,15 @@ class AgentChannel:
                 "CLI does not report is left out:\n" + "\n".join(lines))
 
     def _memory_note(self) -> str:
-        """This bot's own lessons, and — every ``limits.memory_every_turns`` turns — the one
-        instruction to update them (#226).
+        """This bot's own lessons, what became of its last memory block, and — every
+        ``limits.memory_every_turns`` turns, or right after a refusal — the one instruction to
+        update them (#226, #301).
 
         The lessons ride in the *message*, not the system prompt: the system prompt is cached
         and fixed, and this file changes when the bot writes it. The counter is kept beside
-        the file, so a restart does not restart the count.
+        the file, so a restart does not restart the count. The outcome and a re-ask stay
+        until a turn has run (``Lessons.turn_ran``), so a turn that never reached the model
+        does not spend them.
         """
         try:
             block = self.lessons.block()
