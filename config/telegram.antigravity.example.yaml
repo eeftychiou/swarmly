@@ -1,0 +1,38 @@
+# config.yaml for the Antigravity agent — lives ON THE ANTIGRAVITY MACHINE.
+#
+# `agy -p` runs locally there; this host never invokes it.
+
+agent:
+  name: example_agy_bot                      # Telegram bot username (e.g. example_agy_bot)
+  alias: Antigravity                    # addressed as "@example_agy_bot: ..." or "Antigravity, ..."
+  bot_token_env: A2A_TELEGRAM_BOT_TOKEN_ANTIGRAVITY
+  # maintainer_username: your_handle      # optional — the human's Telegram @username (no @)
+  home_channel_id: -1001234567890
+  admin_user_id: 0                      # YOUR Telegram user id
+
+peers:
+  Hermes: example_hermes_bot
+  Codex: example_codex_bot
+  Claude: ClaudeBot
+
+adapter:
+  # Recommended for active development: routes incoming messages directly into the
+  # open IDE conversation via `agentapi send-message`, sharing memory and model.
+  type: antigravity_thread
+  cwd: /home/user/your-project
+  conversation: auto                   # automatically detects most recent active conversation in cwd
+  timeout_seconds: 1500
+
+  # Alternative (Headless One-Shot CLI subprocess):
+  # type: antigravity
+  # cwd: /home/user/your-project
+  # timeout_seconds: 1500
+  # conversation: auto
+  # command: "agy -p {prompt} --print-timeout 20m --dangerously-skip-permissions"
+
+limits:
+  min_seconds_between_messages: 3.0     # at least 3s between sends (per topic at N>1)
+  max_messages_per_minute: 18          # max 18 msg/min (per topic at N>1)
+  min_seconds_between_agent_turns: 60.0 # 60s between bot-to-bot turns in General (not in topics)
+  max_agent_turns: 6                  # deprecated no-op: the loop guard is removed; loop safety is routing
+  respond_without_mention: false       # zero-token directive: only pass message to agent if mentioned

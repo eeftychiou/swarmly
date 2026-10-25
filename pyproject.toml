@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarmly"
+dynamic = ["version"]
+description = "Coordinate coding-agent CLIs (Claude Code, Codex, Antigravity, DeepSeek via Reasonix) across machines over Telegram and a git-backed message bus"
+readme = "README.md"
+authors = [
+    { name = "Eftychios Eftychiou", email = "eftychios.eftychiou@gmail.com" },
+    { name = "swarmly contributors" },
+]
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.10"
+# A plain `pip install swarmly` runs everything the quickstart uses: the Telegram transport,
+# Ed25519 signing (swarmly-keygen) and the swarm kernel. Only Google Drive is an extra.
+dependencies = [
+    "aiogram>=3.13.0",
+    "pyyaml>=6.0",
+    "cryptography>=42.0.0",
+    "tomli>=1.1.0; python_version < '3.11'",
+]
+keywords = ["agents", "multi-agent", "a2a", "telegram", "claude", "codex", "antigravity", "deepseek", "reasonix", "gitbus", "google-drive"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/eeftychiou/swarmly"
+Documentation = "https://github.com/eeftychiou/swarmly/blob/main/docs/GETTING-STARTED.md"
+Source = "https://github.com/eeftychiou/swarmly"
+Issues = "https://github.com/eeftychiou/swarmly/issues"
+
+[project.scripts]
+swarmly-telegram = "swarmly.telegram.cli:main"
+swarmly = "swarmly.swarm.cli:main"
+swarmly-keygen = "swarmly.keygen:main"
+# The names before the rename to Swarmly, kept for one release so existing launchers and
+# scheduled tasks keep working; each prints a one-line notice naming its replacement.
+a2a-telegram = "swarmly._aliases:a2a_telegram"
+a2a = "swarmly._aliases:a2a"
+a2a-keygen = "swarmly._aliases:a2a_keygen"
+
+# crypto, telegram and swarm are part of the base install now; the names stay so existing
+# `pip install "swarmly[telegram,crypto]"` lines keep working.
+[project.optional-dependencies]
+crypto = ["cryptography>=42.0.0"]
+telegram = ["aiogram>=3.13.0", "pyyaml>=6.0"]
+gdrive = ["google-api-python-client>=2.100.0", "google-auth>=2.23.0"]
+swarm = ["cryptography>=42.0.0", "pyyaml>=6.0", "tomli>=1.1.0; python_version < '3.11'"]
+test = ["coverage>=7.4", "pytest>=8.0", "pytest-xdist>=3.5", "pytest-cov>=5.0"]
+
+[tool.setuptools.dynamic]
+version = { attr = "swarmly.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["swarmly*"]
+
+[tool.setuptools.package-data]
+"swarmly.swarm" = ["protocol.yaml"]
+"swarmly.telegram" = ["templates/*.yaml", "templates/*.json"]
+"swarmly.telegram.roles" = ["*.md"]
+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = [".agents"]
+
+[tool.ruff.lint]
+# Start with the rules that catch real bugs (syntax errors, undefined names, broken
+# comparisons); widen once the existing findings are worked off.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+follow_imports = "silent"
+files = ["swarmly/swarm"]
+
+[tool.coverage.run]
+source = ["swarmly"]
+branch = true

@@ -1,0 +1,13 @@
+{
+  "$schema": "../schemas/a2a_config.schema.json",
+  "protocol_version": "a2a/v1.0",
+  "coordination": {
+    "primary_master": "antigravity",
+    "failover_master": "hermes"
+  },
+  "authorized_agents": {},
+  "revocation_list": [],
+  "fast_plane": {
+    "enabled": true
+  }
+}

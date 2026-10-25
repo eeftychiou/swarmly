@@ -1,0 +1,132 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are pinned by commit SHA; the comment names the release.
+jobs:
+  unittest:
+    name: unittest (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    # The identifier list (tests/hygiene_digests.txt) never ships: the hygiene scan runs where
+    # a maintainer keeps it, and skips in CI.
+    defaults:
+      run:
+        # bash everywhere: Windows' default pwsh reports only the last command's exit code,
+        # which once let a failing suite pass.
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python: "3.11"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install (telegram + swarm + test extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      # One pytest worker per core (pytest-xdist): the suite is ~3,300 tests, and one at a time
+      # it was most of every job's wall time (6 minutes on Windows). Workers share the
+      # checkout, so each test process keeps its transport state in its own temporary folder
+      # (SWARMLY_STATE_ROOT, set in tests/__init__.py). -v keeps one line per test in the log.
+      - name: Run the suite with coverage
+        run: python -m pytest -n auto -v --cov --cov-report= tests
+      - name: Coverage report
+        run: python -m coverage report --skip-covered --sort=cover
+      # Issue #7 / brainstorm 2.4-2.5. A host that runs an agent hands the suite its role
+      # guard -- git hooks that refuse a push to main, plus SWARMLY_ROLE and the guard
+      # directory on PATH -- under the agent's commit identity. The suite must test the
+      # code, not that guard: tests/gitenv.py scrubs the inherited environment, and
+      # tests/test_git_env_guard.py fails a git spawn that bypasses it. This run proves the
+      # scrub end to end: it fails if a test picks up the outer hooks or identity.
+      - name: Env-scrub guard (inherited guard environment)
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
+        run: |
+          guard="$(mktemp -d)"
+          for hook in pre-commit pre-push; do
+            printf '#!/bin/sh\necho "swarmly guard: refused" >&2\nexit 1\n' \
+              > "$guard/$hook"
+            chmod +x "$guard/$hook"
+          done
+          GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=core.hooksPath \
+            GIT_CONFIG_VALUE_0="$guard" \
+            GIT_AUTHOR_NAME=Guard GIT_AUTHOR_EMAIL=guard@a2a.local \
+            GIT_COMMITTER_NAME=Guard GIT_COMMITTER_EMAIL=guard@a2a.local \
+            SWARMLY_ROLE=developer \
+            python -m pytest -n auto -q tests
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install tools and the package
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy types-PyYAML -e .
+      - name: ruff
+        run: ruff check .
+      - name: mypy (swarmly/swarm)
+        run: mypy
+      - name: Markdown links and anchors
+        run: python scripts/check_docs_links.py
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: uv.lock is current
+        run: |
+          python -m pip install --upgrade pip uv
+          uv lock --check
+      - name: Build the wheel and install it into a clean venv
+        run: |
+          pip install build
+          python -m build --wheel
+          python -m venv --upgrade-deps /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+      - name: Import and run the entry points from the wheel
+        working-directory: /tmp
+        run: |
+          /tmp/smoke/bin/python -c "import swarmly, swarmly.telegram.cli, swarmly.swarm.protocol as p; assert p.PROTOCOL_PATH.exists(), 'protocol.yaml missing from the wheel'; print(swarmly.__version__)"
+          /tmp/smoke/bin/swarmly-telegram --help
+          /tmp/smoke/bin/swarmly --help
+          /tmp/smoke/bin/swarmly-keygen --help
+          # The README quickstart on a plain install: init, then an Ed25519 key.
+          mkdir -p /tmp/proj && cd /tmp/proj
+          /tmp/smoke/bin/swarmly-telegram init --alias Tester --adapter echo --bus-repo .
+          /tmp/smoke/bin/swarmly-keygen --agent tester --env-file /tmp/t.env --registry config/a2a_config.json
+          # The import package is swarmly only: a top-level a2a would clash with a2a-sdk.
+          /tmp/smoke/bin/python -c "import importlib.util as u; assert u.find_spec('a2a') is None, 'a2a is packaged'"
+      - name: Dependency audit
+        run: |
+          # Audit our dependencies, not the runner's bundled pip/setuptools.
+          /tmp/smoke/bin/pip install --upgrade pip setuptools pip-audit
+          # Every extra, so the signing (cryptography) and Drive clients are audited too.
+          /tmp/smoke/bin/pip install "$(ls dist/*.whl)[telegram,swarm,gdrive]"
+          /tmp/smoke/bin/pip-audit

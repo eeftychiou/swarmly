@@ -1,0 +1,508 @@
+"""
+Adapters for **Claude Code** (`claude`).
+
+Verified headless surface (``claude --help``, Claude Code 2.1, checked 2026-10-07):
+
+* ``claude -p "<prompt>"``         — print mode: one non-interactive turn, then exit. The
+                                     working directory's ``CLAUDE.md`` loads as normal.
+* ``--output-format json``         — one JSON object on stdout: ``result`` (the reply text),
+                                     ``is_error``, ``session_id``, ``total_cost_usd``, ...
+* ``--permission-mode MODE``       — ``acceptEdits`` lets the run edit files without asking;
+                                     ``bypassPermissions`` also runs shell commands unprompted
+* ``--session-id UUID``            — start a new session with this id
+* ``--resume ID``                  — run the turn inside an existing session (its whole
+                                     history is in context); unknown ids exit 1 with
+                                     ``No conversation found with session ID: ...``
+* ``--append-system-prompt-file F`` — add F's text to the system prompt; the channel rules
+                                     go there, so each message carries one framing line
+* ``--``                           — end of options, so a prompt can never be read as a flag
+
+Two adapter types:
+
+``claude``
+    One fresh session per incoming message (stateless, like ``codex`` and ``hermes``)::
+
+        claude -p --output-format json --permission-mode acceptEdits -- {prompt}
+
+``claude_thread``
+    Every message continues one persistent session, so the agent remembers the channel's
+    earlier messages. The session is ``adapter.conversation`` when set (a session id from
+    ``claude --resume``'s picker or ``~/.claude/projects/``), else a stable id derived from
+    the alias and working directory, created on first use.
+
+``adapter.command`` overrides the template for both (for example to add ``--model`` or to
+choose ``--permission-mode bypassPermissions`` on a sandboxed host); keep ``-p``, the JSON
+output format and the ``{prompt}`` placeholder.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+import contextvars
+import dataclasses
+import json
+import logging
+import os
+import shlex
+import shutil
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from swarmly.telegram.cli_defaults import reported_model
+from swarmly.telegram.adapters.base import (
+    AdapterReply,
+    IncomingMessage,
+    SubprocessAdapter,
+    channel_envelope,
+    channel_rules,
+    discussion_line,
+    format_channel_prompt,
+    is_silent_reply,
+    load_state,
+    looks_like_event_stream,
+    usage_tokens,
+    project_line,
+    rules_digest,
+    save_state,
+    turn_card,
+)
+from swarmly.telegram.config import AdapterSettings
+
+_SESSION_NAMESPACE = uuid.UUID("6f1c2a7e-5d4b-4c1e-9a0f-a2a0c1a0de00")
+_NO_SESSION_MARKER = "no conversation found"
+_SESSION_IN_USE_MARKER = "is already in use"
+_SYSTEM_PROMPT_FLAGS = ("--system-prompt", "--system-prompt-file", "--append-system-prompt",
+                        "--append-system-prompt-file")
+
+
+_rules_dir: Optional[str] = None
+
+
+def rules_file(alias: str, rules: str) -> Path:
+    """A file holding ``rules``, named by their hash so a changed roster gets a new file.
+
+    A file rather than an argument: on Windows a multi-line argument may pass through
+    ``cmd.exe`` (an npm ``.cmd`` shim), which cuts it at the first line break. It lives in
+    a folder only this process can write (``mkdtemp``, mode 0700), removed at exit, so no
+    other user can plant or swap the rules."""
+    global _rules_dir
+    if _rules_dir is None or not os.path.isdir(_rules_dir):
+        _rules_dir = tempfile.mkdtemp(prefix="a2a-rules-")
+        atexit.register(shutil.rmtree, _rules_dir, True)
+    safe = "".join(c if c.isalnum() else "-" for c in alias.lower()) or "agent"
+    path = Path(_rules_dir) / f"{safe}-{rules_digest(rules)}.txt"
+    if not path.is_file():
+        path.write_text(rules, encoding="utf-8")
+    return path
+
+
+def parse_claude_json(out: str) -> Optional[dict]:
+    """The result object a run printed, or ``None`` when stdout carries none.
+
+    ``--output-format json`` prints one object; ``--output-format stream-json`` prints one
+    per line, ending with the ``result`` event (round 5.5, #161: a streaming run is what lets
+    the transport see progress, so its output has to be read here too). In both shapes the
+    reply is the ``result`` object and nothing else: a stream that stopped before it has no
+    answer, which is said plainly instead of posting half a turn as if it were complete.
+    """
+    text = (out or "").strip()
+    if not text:
+        return None
+    found: List[dict] = []
+    try:
+        whole = json.loads(text)
+        if isinstance(whole, dict):
+            found.append(whole)
+    except ValueError:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                found.append(event)
+    if not found:
+        return None
+    for data in reversed(found):
+        if data.get("type") == "result":
+            return data
+    if any(str(data.get("type") or "") for data in found):
+        return None                          # a truncated stream: progress, but no answer
+    return found[-1]                         # a wrapper's stray object, as before
+
+
+class ClaudeAdapter(SubprocessAdapter):
+    WANTS_TOPIC_RECAP = True                  # one fresh session per turn
+    """Drive Claude Code in print mode, one process (and one fresh session) per message."""
+
+    TYPE = "claude"
+    #: ``claude -p`` reads the prompt from stdin when none follows on the command line (#179).
+    STDIN_PROMPT = True
+
+    @classmethod
+    def default_settings(cls, cwd: Optional[str] = None, model: Optional[str] = None,
+                         permission_mode: str = "acceptEdits",
+                         timeout_seconds: int = 900) -> AdapterSettings:
+        parts = ["claude", "-p", "--output-format", "json"]
+        if permission_mode:
+            parts += ["--permission-mode", permission_mode]
+        if model:
+            parts += ["--model", model]
+        parts += ["--", "{prompt}"]
+        return AdapterSettings(type=cls.TYPE, cwd=cwd, timeout_seconds=timeout_seconds,
+                               command=" ".join(parts))
+
+    def build_prompt(self, message: IncomingMessage) -> Optional[str]:
+        """Claude Code loads the working directory's ``CLAUDE.md`` itself, so the prompt
+        carries only the channel framing: who is asking, plus the reply rules when they
+        cannot go in the system prompt."""
+        text = (message.text or "").strip()
+        if not text:
+            return None
+        rules = self.system_rules(message)
+        if rules and not self.rules_inline(rules):
+            return f"{channel_envelope(message)}\n{text}"
+        return format_channel_prompt(
+            message.author_alias,
+            text,
+            author_username=getattr(message, "author_username", None),
+            peer_username=getattr(message, "peer_username", None),
+            mentions=getattr(message, "mentions", None),
+            maintainer=getattr(message, "maintainer_username", None),
+            discussion=discussion_line(message),
+            project=project_line(message),
+            role=self.role_text,
+            me=self.alias,
+            card=turn_card(message),
+            reply_chars=getattr(message, "reply_chars", None),
+        )
+
+    def system_rules(self, message: IncomingMessage) -> Optional[str]:
+        """The channel rules, unless the command is not ``claude`` or sets its own."""
+        template = shlex.split(self.settings.command_template(), posix=(os.name != "nt"))
+        if not template or Path(template[0].strip("'\"")).stem.lower() != "claude" \
+                or any(t.split("=", 1)[0] in _SYSTEM_PROMPT_FLAGS for t in template):
+            return None
+        return channel_rules(getattr(message, "mentions", None),
+                             getattr(message, "maintainer_username", None),
+                             role=self.role_text,
+                             me=self.alias,
+                             reply_chars=getattr(message, "reply_chars", None))
+
+    def rules_inline(self, rules: str) -> bool:
+        """Whether this turn also needs the rules in the message (a fresh session never does)."""
+        return False
+
+    def add_system_rules(self, argv: List[str], rules: str) -> List[str]:
+        flags = ["--append-system-prompt-file", str(rules_file(self.alias, rules))]
+        at = argv.index("--") if "--" in argv else len(argv) - 1
+        return argv[:at] + flags + argv[at:]
+
+    def environment(self, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        env = super().environment(base)
+        # A turn is one headless process whose last answer is its reply. A command Claude Code
+        # moves to the background keeps that process alive, and the notice that it finished
+        # starts one more answer, which replaces the real one (live, round 5: a full report
+        # written at 10:14 was replaced by a NO_REPLY to a `find` that ended at 10:22). Long
+        # commands run inside the turn instead. adapter.extra_env can still set it to 0.
+        env.setdefault("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
+        return env
+
+    def parse_output(self, out: str, duration: float) -> AdapterReply:
+        data = parse_claude_json(out)
+        if data is None:
+            if looks_like_event_stream(out):
+                # A stream-json run that ended before its result event: progress lines are
+                # not an answer, and posting them as prose would put machine noise in the topic.
+                return AdapterReply(
+                    ok=False, duration_seconds=duration,
+                    error=f"{self.alias} streamed no result (the run ended before its "
+                          "result event)")
+            return super().parse_output(out, duration)
+        meta = {key: data[key] for key in ("session_id", "total_cost_usd", "num_turns")
+                if key in data}
+        # Issue #125: the turn ledger wants the tokens, not just the money.
+        meta.update(usage_tokens(data))
+        model = reported_model(data.get("modelUsage"))
+        if model:
+            meta["model"] = model                         # the online notice names it
+        result = str(data.get("result") or "").strip()
+        if data.get("is_error") or data.get("subtype") not in (None, "success"):
+            reason = result or str(data.get("subtype") or "error")
+            return AdapterReply(ok=False, error=f"{self.alias} failed: {reason}",
+                                duration_seconds=duration, meta=meta)
+        if not result:
+            return AdapterReply(ok=False, error=f"{self.alias} produced an empty result",
+                                duration_seconds=duration, meta=meta)
+        origin = data.get("origin")
+        if is_silent_reply(result) and isinstance(origin, dict) \
+                and origin.get("kind") == "task-notification":
+            # The last answer was to a background task's notice, not to the message: whatever
+            # the turn said before it is gone, so say that rather than stay silent.
+            return AdapterReply(
+                ok=False, duration_seconds=duration, meta=meta,
+                error=f"{self.alias}: the turn ended on a background task's notice, so its "
+                      "answer was lost; ask again for it")
+        return AdapterReply(text=self.trim(result), duration_seconds=duration, meta=meta)
+
+
+class ClaudeThreadAdapter(ClaudeAdapter):
+    WANTS_TOPIC_RECAP = False
+    KEEPS_TOPIC_SESSION = True                # resumes the topic's session
+    """Continue one persistent Claude Code session with every incoming message.
+
+    Each discussion (forum topic) has its own session: the General topic uses
+    ``adapter.conversation`` or the derived id, and a topic's ``context_id`` derives its
+    own, so parallel topics never share a conversation. Turns on one session are
+    serialised: two messages never resume the same session at once.
+    """
+
+    TYPE = "claude_thread"
+    SESSIONS_STATE = "claude-sessions"
+
+    @classmethod
+    def default_settings(cls, cwd: Optional[str] = None, session: Optional[str] = None,
+                         model: Optional[str] = None, permission_mode: str = "acceptEdits",
+                         timeout_seconds: int = 900) -> AdapterSettings:
+        settings = super().default_settings(cwd=cwd, model=model,
+                                            permission_mode=permission_mode,
+                                            timeout_seconds=timeout_seconds)
+        settings.type = cls.TYPE
+        settings.conversation = session
+        return settings
+
+    def __init__(self, alias: str, settings: Optional[AdapterSettings] = None,
+                 runner=None, git_identity=None):
+        super().__init__(alias, settings, runner=runner, git_identity=git_identity)
+        configured = (self.settings.conversation or "").strip()
+        self.session_id = configured or self.derived_session_id(alias, self.settings.cwd)
+        self.session_configured = bool(configured)
+        # Per turn, so turns in different topics can run at once: which session this turn
+        # resumes, and whether to create it instead (resume first; create once if missing).
+        self._session: contextvars.ContextVar[str] = contextvars.ContextVar(
+            "a2a_claude_session", default=self.session_id)
+        self._create: contextvars.ContextVar[bool] = contextvars.ContextVar(
+            "a2a_claude_create", default=False)
+        self._turns: Dict[str, asyncio.Lock] = {}
+        self._known: set = set()            # sessions this process has seen work
+        # session -> hash of the rules it is known to hold. Claude Code records a session's
+        # system prompt on its first request and replays that record on resume, so a
+        # session made before the rules moved there, or with an older roster, gets them
+        # inline once.
+        self._rules_held: Dict[str, str] = {}
+        self._state_path: Optional[Path] = None
+        #: context id -> how often its session was replaced (a drift reset, a deleted topic).
+        #: The generation is part of the derived id, so a replaced session is really new:
+        #: re-creating the old id is refused as "in use" and would resume it.
+        self._generations: Dict[str, int] = {}
+        self._generations_path: Optional[Path] = None
+        from swarmly.telegram.adapters.handover import Handovers
+        self._handovers = Handovers(self.alias)
+        self._session_turns: Dict[str, int] = {}     # session -> turns this process ran in it
+
+    def use_state_file(self, path: Optional[Path]) -> None:
+        """Keep, per session, the hash of the channel rules it holds in ``path`` (JSON), so a
+        restart does not send them inline again to sessions that already have them."""
+        self._state_path = path
+        self._handovers.attach(path)
+        held = load_state(path, f"{self.alias}: Claude sessions")
+        self._rules_held.update({str(k): str(v) for k, v in held.items() if v})
+        self._known.update(self._rules_held)    # these exist: resume them, never re-create
+        if path is not None:
+            self._generations_path = Path(path).with_name(
+                Path(path).name.replace("claude-sessions", "claude-generations"))
+            if self._generations_path == Path(path):
+                self._generations_path = Path(path).with_suffix(".generations.json")
+            saved = load_state(self._generations_path, f"{self.alias}: Claude generations")
+            self._generations.update({str(k): int(v) for k, v in saved.items()
+                                      if isinstance(v, int) and not isinstance(v, bool)})
+
+    @property
+    def _create_next(self) -> bool:
+        return self._create.get()
+
+    @staticmethod
+    def derived_session_id(alias: str, cwd: Optional[str],
+                           context_id: Optional[str] = None, generation: int = 0) -> str:
+        """A stable session id per agent, working directory, discussion and generation."""
+        seed = f"a2a:{alias.strip().lower()}:{os.path.abspath(cwd or os.getcwd())}"
+        if context_id:
+            seed += f":{context_id}"
+        if generation:
+            seed += f":g{int(generation)}"
+        return str(uuid.uuid5(_SESSION_NAMESPACE, seed))
+
+    def topic_session(self, context_id: Optional[str]) -> str:
+        """The session a discussion resumes now (its current generation)."""
+        if not context_id:
+            return self.session_id
+        return self.derived_session_id(self.alias, self.settings.cwd, context_id,
+                                       self._generations.get(context_id, 0))
+
+    def session_for(self, message: IncomingMessage) -> str:
+        return self.topic_session(getattr(message, "context_id", None))
+
+    def forget_session(self, context_id: Optional[str]) -> bool:
+        """A deleted topic's Claude session is dropped (issue #63).
+
+        The session id is derived from the discussion, so there is nothing to keep: dropping
+        the id from the known set means the topic -- if a new one ever reused the id, which it
+        cannot -- would start fresh rather than resume a discussion that is gone.
+        """
+        if not context_id:
+            return False
+        session = self.topic_session(context_id)
+        known = session in self._known or session in self._rules_held
+        self._known.discard(session)
+        self._rules_held.pop(session, None)
+        save_state(self._state_path, self._rules_held, f"{self.alias}: Claude sessions")
+        # The next turn gets a new id: re-creating this one would be refused as in use, and
+        # the old session resumed (a drift reset that reset nothing).
+        # Always, known or not: a session on disk that this process never recorded would
+        # otherwise be resumed by the next turn's "in use" retry.
+        self._generations[context_id] = self._generations.get(context_id, 0) + 1
+        save_state(self._generations_path, dict(self._generations),
+                   f"{self.alias}: Claude generations")
+        return known
+
+    async def rotate(self, context_id: str, message: IncomingMessage, prefix: str = "") -> bool:
+        """Retire the topic's session now (a drift reset): it writes its handover, and the
+        next turn creates a new session (the next generation) from ``prefix`` and it."""
+        from swarmly.telegram.adapters.handover import HANDOVER_PROMPT
+        text: Optional[str] = None
+        # One lock per topic for turns and rotations alike, and the session read *inside* it:
+        # a turn queued behind a rotation must run in the new session, not the retired one
+        # (review: it resumed the old one and used up the lead).
+        async with self._turns.setdefault(self._lock_key(context_id), asyncio.Lock()):
+            session = self.topic_session(context_id)
+            if session not in self._known and session not in self._rules_held:
+                if self._handovers.pending(context_id):
+                    return False                   # already rotated, its lead still pending
+                self._handovers.save(context_id, None, prefix)
+                self.forget_session(context_id)
+                return True
+            self._session.set(session)
+            self._create.set(False)
+            try:
+                reply = await ClaudeAdapter.respond(self, dataclasses.replace(
+                    message, text=HANDOVER_PROMPT, fresh_text=None, context_id=context_id))
+                text = reply.text if reply is not None and reply.ok else None
+            except Exception:                              # noqa: BLE001 - fall back
+                logging.getLogger(__name__).warning(
+                    "%s: the handover turn failed", self.alias, exc_info=True)
+            self._handovers.save(context_id, text, prefix)
+            self.forget_session(context_id)                # the next generation
+            return True
+
+    @staticmethod
+    def _lock_key(context_id: Optional[str]) -> str:
+        return f"topic:{context_id}" if context_id else "general"
+
+    def _can_create(self, session_id: Optional[str] = None) -> bool:
+        try:
+            uuid.UUID(session_id or self._session.get())
+        except ValueError:
+            return False                 # a session *name* can be resumed, not created
+        return True
+
+    def build_argv(self, prompt: str) -> List[str]:
+        argv = super().build_argv(prompt)
+        session = self._session.get()
+        flags = (["--session-id", session] if self._create.get()
+                 else ["--resume", session])
+        # Insert before the end-of-options marker (or before the prompt when there is none).
+        at = argv.index("--") if "--" in argv else len(argv) - 1
+        return argv[:at] + flags + argv[at:]
+
+    def rules_inline(self, rules: str) -> bool:
+        return (not self._create.get()
+                and self._rules_held.get(self._session.get()) != rules_digest(rules))
+
+    def accepts_explicit_username_delivery(self) -> bool:
+        """A persistent session should see every message explicitly addressed to it."""
+        return True
+
+    async def respond(self, message: IncomingMessage) -> Optional[AdapterReply]:
+        key = self._lock_key(getattr(message, "context_id", None))
+        rotating = getattr(self, "_rotating", {}).get(key)
+        if rotating is not None and not rotating.done():
+            # A rotation started by the previous turn goes first: this turn belongs to the
+            # new session and starts from the handover.
+            await asyncio.shield(rotating)
+        lock = self._turns.setdefault(key, asyncio.Lock())
+        rotate_now = False
+        async with lock:
+            session = self.session_for(message)            # read under the lock (rotation)
+            self._session.set(session)
+            # A topic's session is usually new: create it first rather than fail a resume.
+            # One that exists already (after a restart) refuses, and is then resumed.
+            # A configured session is the user's existing one: resume it first.
+            configured = self.session_configured and session == self.session_id
+            create_first = (not configured and session not in self._known
+                            and self._can_create(session))
+            self._create.set(create_first)
+            first = message
+            context_id = str(getattr(message, "context_id", None) or "")
+            taking_over = create_first and context_id and self._handovers.pending(context_id)
+            if create_first and (message.fresh_text or taking_over):
+                # A new session needs the task and the progress, not only the last messages --
+                # and, after a rotation, the old session's handover ahead of them.
+                lead = self._handovers.lead(context_id) if taking_over else ""
+                first = dataclasses.replace(message, text=lead + (message.fresh_text
+                                                                   or message.text or ""))
+            try:
+                reply = await super().respond(first)
+            finally:
+                self._create.set(False)
+            if (create_first and reply is not None and not reply.ok
+                    and _SESSION_IN_USE_MARKER in (reply.error or "").lower()):
+                reply = await super().respond(message)
+            elif (reply is not None and not reply.ok
+                    and _NO_SESSION_MARKER in (reply.error or "").lower()):
+                if not self._can_create(session):
+                    return AdapterReply(
+                        ok=False, duration_seconds=reply.duration_seconds,
+                        error=(f"{self.alias}: no Claude Code session named "
+                               f"{session!r} in {self.settings.cwd or 'this directory'}"
+                               " (set adapter.conversation to an existing session id)"))
+                self._create.set(True)
+                try:
+                    reply = await super().respond(
+                        dataclasses.replace(message, text=message.fresh_text)
+                        if message.fresh_text else message)
+                finally:
+                    self._create.set(False)
+            if reply is not None and reply.ok:
+                if taking_over:
+                    self._handovers.done(context_id)
+                self._known.add(session)
+                rules = self.system_rules(message)
+                if rules and self._rules_held.get(session) != rules_digest(rules):
+                    self._rules_held[session] = rules_digest(rules)
+                    save_state(self._state_path, self._rules_held,
+                               f"{self.alias}: Claude sessions")
+            if reply is not None:
+                reply.meta.setdefault("conversation", session)
+                if getattr(message, "context_id", None):
+                    reply.meta.setdefault("context_id", message.context_id)
+            if reply is not None and reply.ok and context_id:
+                # adapter.session_turn_limit: past it, the session hands over to a new one
+                # (none by default: Claude Code compacts a long session by itself).
+                turns = self._session_turns.get(session, 0) + 1
+                self._session_turns[session] = turns
+                limit = self.settings.session_turn_limit
+                rotate_now = bool(limit) and turns >= int(limit)
+        if rotate_now and reply is not None:
+            # In the background: the reply that reached the limit is posted now, and the next
+            # turn in the topic waits on the lock until the handover is written.
+            task = asyncio.get_running_loop().create_task(self.rotate(context_id, message))
+            self._rotating = getattr(self, "_rotating", {})
+            self._rotating[key] = task
+            reply.meta["rotated"] = True
+        return reply

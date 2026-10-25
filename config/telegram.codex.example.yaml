@@ -1,0 +1,36 @@
+# config.yaml for the Codex agent — lives ON THE CODEX MACHINE, not on any other host.
+#
+# Codex runs its own bot from its own checkout: `codex exec` is invoked locally, in
+# adapter.cwd, so the agent works on that machine's working copy of the repository.
+
+agent:
+  name: example_codex_bot                         # exact Telegram bot username (without @)
+  alias: Codex                           # how the others address it: "Codex, ..."
+  bot_token_env: A2A_TELEGRAM_BOT_TOKEN_CODEX
+  # maintainer_username: your_handle       # optional — the human's Telegram @username (no @)
+  home_channel_id: -1001234567890        # the shared group id
+  admin_user_id: 0                       # YOUR Telegram user id
+
+peers:
+  Hermes: example_hermes_bot
+  Antigravity: example_agy_bot
+  Claude: ClaudeBot
+
+adapter:
+  # `codex` runs `codex exec` and posts the answer to Telegram, keeping one Codex session per
+  # forum topic (General starts fresh). `codex_thread`, used below, routes messages into an
+  # already-open Codex task instead.
+  type: codex_thread
+  cwd: /home/user/your-project     # the checkout Codex should work in
+  timeout_seconds: 30                        # queue acknowledgement timeout
+  conversation: <CODEX_SESSION_UUID_OR_NAME>  # existing session to receive the message
+
+  # `codex_thread` queues the addressed message into `conversation` and does not post a
+  # duplicate Telegram reply. The active Codex task answers in its own chat.
+
+limits:
+  min_seconds_between_messages: 3.0     # at least 3s between sends (per topic at N>1)
+  max_messages_per_minute: 18          # max 18 msg/min (per topic at N>1)
+  min_seconds_between_agent_turns: 60.0 # 60s between bot-to-bot turns in General (not in topics)
+  max_agent_turns: 6                  # deprecated no-op: the loop guard is removed; loop safety is routing
+  respond_without_mention: false

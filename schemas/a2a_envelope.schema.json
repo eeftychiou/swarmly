@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UniversalA2AMessage",
+  "description": "Canonical message envelope for Universal Heterogeneous Agent-to-Agent (A2A) protocol",
+  "type": "object",
+  "required": [
+    "protocol",
+    "message_id",
+    "timestamp_utc",
+    "sender",
+    "recipient",
+    "intent",
+    "priority",
+    "signature",
+    "payload"
+  ],
+  "properties": {
+    "protocol": {
+      "type": "string",
+      "const": "a2a/v1.0",
+      "description": "Protocol version identifier"
+    },
+    "message_id": {
+      "type": "string",
+      "pattern": "^msg-[0-9]{8}T[0-9]{6}Z-[a-z0-9_]{4,16}$",
+      "description": "Unique timestamped message identifier"
+    },
+    "correlation_id": {
+      "type": ["string", "null"],
+      "description": "Correlation identifier linking replies to original request or task"
+    },
+    "timestamp_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC creation timestamp"
+    },
+    "sender": {
+      "type": "object",
+      "required": ["agent_id", "model_family", "framework"],
+      "properties": {
+        "agent_id": { "type": "string", "pattern": "^[a-z0-9_-]{2,32}$" },
+        "model_family": {
+          "type": "string",
+          "enum": ["gemini", "hermes", "deepseek", "minimax", "openai", "claude", "human", "custom"]
+        },
+        "framework": {
+          "type": "string",
+          "enum": ["antigravity", "autogen", "crewai", "langgraph", "swarm", "aider", "cli_bus", "custom"]
+        }
+      }
+    },
+    "recipient": {
+      "type": "object",
+      "required": ["agent_id"],
+      "properties": {
+        "agent_id": {
+          "type": "string",
+          "description": "Target agent_id, or '*' for broadcast to all authorized agents"
+        }
+      }
+    },
+    "intent": {
+      "type": "string",
+      "enum": [
+        "TASK_PROPOSE",
+        "TASK_CLAIM",
+        "TASK_APPROVE",
+        "TASK_HANDOFF",
+        "PR_REVIEW_REQUEST",
+        "PR_REVIEW_VERDICT",
+        "FALSIFICATION_REPORT",
+        "EXPERIMENT_REGISTER",
+        "HEARTBEAT_PING",
+        "HEARTBEAT_ACK",
+        "QUERY_REQUEST",
+        "QUERY_RESPONSE",
+        "ESCALATE_BLOCKER"
+      ]
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["ROUTINE", "HIGH", "BLOCKING"],
+      "default": "ROUTINE"
+    },
+    "timeout_utc": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Optional deadline for expected reply before triggering watchdog alert"
+    },
+    "signature": {
+      "type": "string",
+      "description": "Cryptographic signature (HMAC-SHA256 or Ed25519) of message payload"
+    },
+    "payload": {
+      "type": "object",
+      "description": "Structured message payload validated against intent-specific schemas"
+    }
+  }
+}

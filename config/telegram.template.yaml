@@ -1,0 +1,179 @@
+# =============================================================================
+#  TEMPLATE — copy this file to config.yaml on the agent's own machine and
+#  replace every <FILL IN> marker. Nothing else needs editing to get started.
+#
+#  Verify with:   python -m swarmly.telegram.cli --config config.yaml check
+#  Find the group id with:  python -m swarmly.telegram.cli --config config.yaml discover
+# =============================================================================
+
+agent:
+  # The bot username you created in @BotFather (no @ needed here).
+  name: <FILL IN>                      # e.g. example_hermes_bot, example_agy_bot, or example_codex_bot
+
+  # The alias everyone uses to address this agent — in chat, on GitHub, in A2A.
+  # Keep it identical to the agent's GitHub identity so logs and commits agree.
+  alias: <FILL IN>                     # e.g. Hermes, Antigravity, or Codex
+
+  # The bot token. Put it in the environment and reference it by name (preferred),
+  # or paste it inline. NEVER commit a filled-in config.yaml that contains a token.
+  bot_token_env: <FILL IN>             # e.g. A2A_TELEGRAM_BOT_TOKEN_HERMES
+  # bot_token: "<FILL IN>"             # only if you must inline it
+
+  # How this agent's commits are authored. The channel exports these to every run as
+  # GIT_AUTHOR_*/GIT_COMMITTER_*, so work an agent does is committed by the agent, not by
+  # the human whose account owns the machine. Both default to the alias:
+  #   git_name  -> alias                 (e.g. "Hermes")
+  #   git_email -> <alias lowercase>@a2a.local
+  # Uncomment and set a GitHub machine account's noreply address if the commits should
+  # link to that account (the id is on the account's email settings page):
+  # git_name: Hermes Agent
+  # git_email: 1234567+hermesbot@users.noreply.github.com
+
+  # The group ("home channel") every bot joins and talks in. Get it with `discover`.
+  home_channel_id: <FILL IN>           # e.g. -1001234567890
+
+  # YOUR Telegram user id. This is the human who controls everything: this id can
+  # always address the agent directly, and admin-gated commands answer only to it.
+  admin_user_id: <FILL IN>             # e.g. 1234567890
+  # maintainer_username: your_handle   # optional — how agents @-address the human in routing prompts
+  # allowed_users: [123456789]         # other people who may start turns: numeric user ids only
+
+# The other bots in the group, so this agent can tell who is talking. Never list the
+# human owner here (that is admin_user_id); `check` rejects it.
+# Left side = alias used in chat; right side = Telegram username or numeric user id.
+# When bots address each other, they MUST use the Telegram username (e.g. @example_codex_bot).
+peers:
+  Codex: example_codex_bot                  # alias -> Telegram username
+  Antigravity: example_agy_bot
+  Hermes: example_hermes_bot
+
+adapter:
+  # codex | codex_thread | claude | claude_thread | hermes | antigravity | echo | custom
+  #   codex        -> codex exec --skip-git-repo-check <model> <permission flags> <prompt>
+  #   codex_thread -> codex queue --thread <conversation> --message <prompt>
+  #   claude       -> claude -p --output-format json <model> <permission flags> -- <prompt>
+  #   claude_thread -> the same, continuing one persistent session (--resume <conversation>)
+  #   hermes       -> hermes -z <prompt>
+  #   antigravity  -> agy -p <prompt> --print-timeout 20m
+  #   echo         -> in-process reply, for bring-up with no runtime installed
+  #   custom       -> your own command line, with {prompt} where the text goes
+  type: <FILL IN>
+
+  # Working directory the CLI runs in (usually the repository this agent works on).
+  cwd: <FILL IN>                       # e.g. /home/user/your-project
+
+  # For codex_thread only: UUID or exact name of the existing Codex session to receive
+  # addressed Telegram messages. The active Codex task produces the reply in its own chat.
+  # conversation: <CODEX_SESSION_UUID_OR_NAME>
+
+  # Kill the run after this many seconds. Give long coding tasks room.
+  timeout_seconds: 900
+
+  # codex only: once a topic's session has read this many input tokens in one turn, the next
+  # turn starts a new session from the topic recap (0 never rotates).
+  # session_token_limit: 10000000
+  # reasonix only: turns a topic's session may run before the next one starts fresh (0 = never).
+  # session_turn_limit: 150
+
+  # What the CLI may do without asking (codex, claude, claude_thread; ignored when `command`
+  # is set). strict: edit files only. standard: also git (not gh), Python/pytest and network.
+  # full: no checks and no sandbox, for a dedicated machine, VM or container only.
+  # Left out: full, for every runtime. Keep the group and the bus repository private:
+  # anyone who can post in either can make the agent run anything as its user.
+  # permissions: full
+  # Claude at standard only (ignored otherwise): more commands it may run, e.g. [gh]. gh acts
+  # as the GitHub account signed in on this machine: it can comment, merge, change settings
+  # and print the token (gh auth token). AGENTS.md section 4 still applies: sign comments
+  # with the agent name, merge with local git merge --no-ff, never gh pr merge.
+  # allow_commands: [gh]
+
+  # The model the CLI runs (codex: -m, claude / claude_thread: --model). Unset: the CLI's
+  # default. The admin can switch it per topic at runtime with /model@<bot> <name>.
+  # model: opus                        # e.g. opus, sonnet, claude-opus-4-1, gpt-5-codex, o3
+
+  # Replies longer than this are truncated before posting (Telegram's own limit
+  # is 4096; leave headroom for the alias banner).
+  max_output_chars: 3500
+
+  # Override the default command for the type, e.g.
+  #   command: 'codex exec --sandbox workspace-write resume --last {prompt}'
+  #   command: "agy -p {prompt} --print-timeout 30m --model 'Gemini 3.1 Pro (High)'"
+  # command: <FILL IN>
+
+  # Extra environment variables for the CLI, e.g. Hermes profiles:
+  #   extra_env: { HERMES_PROFILE: coding }
+  # extra_env: {}
+
+fallback:
+  # Durable git bus: messages addressed to this agent that were committed to a project's
+  # `.agents/inbox/` are delivered even when the Telegram channel is down or throttled.
+  # Poll interval in minutes (0 disables).
+  gitbus_poll_minutes: 10
+  # Legacy alias of bus.repo below.
+  # gitbus_root: /path/to/project
+  # gitbus_ref: origin/main            # ref read for the freshest view (fetch-only)
+
+bus:
+  # First-class durable-bus settings (issue #59). The fallback.gitbus_* keys above are
+  # accepted as aliases; when both are set, this section wins.
+  enabled: true
+  # Interval in minutes for the scheduled one-shot poller (bus-poll --once) and the
+  # in-transport fallback tick (0 disables). Default when unset: 30. This template
+  # keeps the legacy 10-minute cadence explicitly.
+  poll_minutes: 10
+  # REQUIRED for polling: the project repository whose .agents/inbox/ is polled (and the
+  # home of local state). Unset, the bus is not polled. On its first cycle (or whenever
+  # its seen-ledger is missing or corrupt) the poller records what is already on the bus
+  # and delivers none of it, including anything that arrived since the last poll.
+  # repo: /path/to/project
+  ref: origin/main
+  # Settle window (seconds) between a delivery and its first delivery-verify probe:
+  # adapter sessions show a just-injected message asynchronously, so probing too
+  # early fabricates a false ESCALATE_BLOCKER. 0 disables; capped at 30.
+  verify_settle_seconds: 3
+  # Where envelopes live (docs/TRANSPORTS.md). Every agent on a project uses the same one.
+  #   git    - .agents/inbox/ of `repo` (default)
+  #   folder - <folder>/inbox/ of a synced or shared directory (Drive, Dropbox, OneDrive, ...)
+  #   gdrive - a Google Drive folder through the API: pip install "swarmly[gdrive]"
+  # Local state (locks, ledgers, caches) always stays under `repo`/.agents/state/.
+  # transport: git
+  # folder: ~/Google Drive/My Drive/a2a-bus
+  # gdrive:
+  #   folder_id: <FILL IN>               # the last part of the Drive folder's URL
+  #   credentials: ~/.config/a2a/gdrive.json   # optional; default: Application Default Credentials
+  # a2a/2 swarm lanes (docs/SWARM.md). Each cycle also delivers the signed lane envelopes
+  # addressed to this agent; unsigned or illegal ones are quarantined and only logged.
+  # Needs pip install "swarmly[swarm]".
+  # swarm: /path/to/project/swarm.yaml
+  # swarm_agent: codex                   # the roster name; default: agent.alias, lower-cased
+  # Only messages whose signature verifies against config/a2a_config.json in `repo` (and a
+  # key this host holds: A2A_KEY_<SENDER> for HMAC) are delivered (docs/telegram-channel.md).
+  # senders: [codex, claude]             # optional: deliver only these senders
+  # allow_unsigned: false                # true turns off signature checks: local demos only
+
+limits:
+  max_message_chars: 4096              # Telegram's hard limit for text messages
+  max_reply_parts: 4                   # a longer reply is split into up to this many messages
+  selftest_seconds: 180                # after start, report which peers can see this bot (0 = off)
+  multi_mention: first                 # a person names several bots: only the first acts ("all": each acts)
+  strangers: ignore                    # people and bots outside the swarm start no turns ("answer": they do)
+  busy_behavior: queue                 # message during a running turn: queue (run it next), drop, or notice
+  busy_queue_max: 12                   # queue: at most this many messages wait behind a turn (per topic when parallel); more are held
+  busy_held_max: 50                    # queue: ceiling for messages held past that limit; at it the newest is dropped, the oldest kept
+  max_parallel_turns: 1                # forum topics: up to this many topics run a turn at once (1-8); above 1, send pacing is per topic
+  allow_shared_cwd: false              # parallel topics share adapter.cwd; must be true when max_parallel_turns > 1
+  max_peer_turns_per_topic: 8          # peer-started turns in a row per forum topic without progress (a new issue/PR/commit, a merge) until a human posts (0 = no cap)
+  work_in_topics: true                 # General is for setup: bots' work there (and long answers) moves to its own topic
+  handoff_nudge_minutes: 10            # a hand-off with no answer: remind its bot, then the admin at twice this; 0 = off
+  memory_every_turns: 10               # every this many turns, ask the bot to update its memory.md (its own lessons, read into every turn)
+  memory_max_bytes: 2048               # cap on that file, in UTF-8 bytes: a bigger block is refused (the old memory stays), never cut
+  typing_indicator: true               # show "typing…" while a turn runs
+  ack_reaction: true                   # react 👀 to a person's message when a turn starts on it
+  max_attachment_mb: 20                # incoming files above this size are not downloaded
+  min_seconds_between_messages: 3.0     # at least 3s between sends (per topic at N>1)
+  max_messages_per_minute: 18          # max 18 msg/min (per topic at N>1)
+  max_group_messages_per_minute: 1     # alias
+  min_seconds_between_agent_turns: 60.0 # 60s between bot-to-bot turns in General (not in topics)
+  max_agent_turns: 6                   # deprecated no-op: the loop guard is removed; loop safety is routing (PROTOCOL.md §8)
+  respond_without_mention: false       # zero-token directive: chat message is passed to agent ONLY if mentioned
+  require_admin_for_broadcast: true

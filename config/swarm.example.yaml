@@ -1,0 +1,54 @@
+# swarm.yaml: who is in the swarm, and where the lanes live.
+# Copy to the root of your project as swarm.yaml. Changing it is on the safety list.
+#
+# The rules themselves are in swarmly/swarm/protocol.yaml (rendered in docs/SWARM-PROTOCOL.md).
+
+project: my-project
+owner: alice            # the human; paged only for the safety and stuck lists
+planner: claude        # offers work, rules on disputes, merges
+standby: hermes        # takes over as planner when the planner lease lapses (phase 4)
+
+agents:
+  # Each key line comes from `swarmly --as <name> keygen` on that agent's host.
+  alice:
+    vendor: human
+    key: REPLACE_WITH_PUBLIC_KEY
+  claude:
+    vendor: anthropic
+    key: REPLACE_WITH_PUBLIC_KEY
+    telegram: "@my_claude_bot"   # optional: who the doorbell mentions when claude must act
+  codex:
+    vendor: openai
+    key: REPLACE_WITH_PUBLIC_KEY
+  antigravity:
+    vendor: google
+    key: REPLACE_WITH_PUBLIC_KEY
+  hermes:
+    vendor: nous
+    key: REPLACE_WITH_PUBLIC_KEY
+
+bus:
+  # git: each lane is an orphan branch refs/heads/a2a/lane/<agent> in this repository.
+  # The bus clone is bare and lives outside every agent's workspace.
+  backend: git
+  url: git@github.com:you/my-project.git
+  path: ~/.a2a/bus/my-project
+  # dir: one folder per lane under `path`. Works in a synced cloud folder
+  # (Google Drive for desktop, Dropbox, OneDrive), since each folder has one writer.
+  # backend: dir
+  # path: ~/Google Drive/My Drive/a2a-lanes/my-project
+
+# Optional: after every post the governor sends a one-line pointer to the shared group
+# ("codex:12 READY task=fix-poller -> @my_claude_bot"), never the body. A failed ping is
+# only logged; the lanes stay the record. Each agent sends with its own bot token.
+# doorbell:
+#   telegram:
+#     chat_id: -1001234567890
+#     token_env: A2A_TELEGRAM_BOT_TOKEN_{AGENT}   # {AGENT} = the sender, upper-cased
+#     quiet: [HEARTBEAT]
+
+# Overrides for the default policy in protocol.yaml. Lists replace, mappings merge.
+policy:
+  stuck:
+    max_dispute_rounds: 3
+  token_budget_per_task: 0
