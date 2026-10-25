@@ -214,7 +214,8 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     "web": ("enabled", "port", "public_host", "init_max_age"),
     "swarm": ("succession",),
     # topic registry, phase 1: the shared state store, in shadow unless the operator says
-    "state": ("backend", "mode", "heartbeat_minutes", "lease", "links", "routing", "owed"),
+    "state": ("backend", "mode", "heartbeat_minutes", "lease", "links", "routing", "owed",
+              "dir"),
 }
 
 
@@ -1018,6 +1019,10 @@ class StateSettings:
     #: store; ``store`` -- the store holds it: each bot publishes its own rows every heartbeat
     #: and reads the others' from there, and nothing goes to gitbus.
     owed: str = "shadow"
+    #: Where this bot keeps its own state files (``<dir>/.agents/state``): the store's cache,
+    #: sessions, the topic map, its owed rows. Unset: the bus checkout when there is one, else
+    #: the folder of config.yaml -- never a folder shared with other bots.
+    dir: Optional[str] = None
 
 
 @dataclass
@@ -1449,8 +1454,10 @@ class AgentConfig:
                 raise ConfigError(f"state.owed must be shadow or store (got {owed!r})")
             if owed == "store" and backend != "telegram":
                 raise ConfigError("state.owed: store needs state.backend: telegram")
+            state_dir = str(state_raw.get("dir") or "").strip() or None
             state = StateSettings(backend=backend, mode=mode, heartbeat_minutes=minutes,
-                                  lease=lease, links=links, routing=routing, owed=owed)
+                                  lease=lease, links=links, routing=routing, owed=owed,
+                                  dir=state_dir)
         elif state_raw is not None:
             raise ConfigError("'state' must be a mapping")
 

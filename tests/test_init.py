@@ -286,3 +286,49 @@ class TestInitRole(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStateRootWithoutABus(unittest.TestCase):
+    """Live, 25 Oct: bots whose bus section was removed fell back to one shared folder and
+    came up with no state. Without a bus the state stays with the bot."""
+
+    def setUp(self):
+        from unittest import mock
+        no_override = mock.patch.dict(os.environ)       # the suite's own root, set aside
+        no_override.start()
+        self.addCleanup(no_override.stop)
+        os.environ.pop("SWARMLY_STATE_ROOT", None)
+
+    def cfg(self, home, state_dir=None):
+        from types import SimpleNamespace
+        return SimpleNamespace(bus=SimpleNamespace(repo=None), fallback=None,
+                               state=SimpleNamespace(dir=state_dir),
+                               source_path=Path(home) / "config.yaml")
+
+    def test_the_config_folder_is_the_default(self):
+        from swarmly.telegram import poll
+        with TemporaryDirectory() as tmp:
+            self.assertEqual(poll.transport_state_root(self.cfg(tmp)), Path(tmp).resolve())
+
+    def test_a_former_bus_checkout_keeps_its_state(self):
+        from swarmly.telegram import poll
+        with TemporaryDirectory() as tmp:
+            old = Path(tmp) / "bus" / ".agents" / "bus"
+            (old / ".agents" / "state").mkdir(parents=True)
+            self.assertEqual(poll.transport_state_root(self.cfg(tmp)), old.resolve())
+
+    def test_state_dir_and_the_env_override(self):
+        from swarmly.telegram import poll
+        with TemporaryDirectory() as tmp:
+            cfg = self.cfg(tmp, state_dir=str(Path(tmp) / "here"))
+            self.assertEqual(poll.transport_state_root(cfg), Path(tmp) / "here")
+            os.environ["SWARMLY_STATE_ROOT"] = str(Path(tmp) / "env")
+            self.assertEqual(poll.transport_state_root(cfg), Path(tmp) / "env")
+
+    def test_state_dir_is_read_from_config(self):
+        config = AgentConfig.from_dict({
+            "agent": {"name": "b", "alias": "A", "bot_token": "1:x", "home_channel_id": -1,
+                      "admin_user_id": 1},
+            "adapter": {"type": "echo"},
+            "state": {"backend": "telegram", "dir": "C:/bots/a"}})
+        self.assertEqual(config.state.dir, "C:/bots/a")

@@ -253,14 +253,18 @@ def state_dir(cfg: Any) -> Path:
 
 
 def transport_state_root(cfg: Any) -> Path:
-    """Root of the checkout whose ``.agents/state`` holds the transport's lock.
+    """Root of the folder whose ``.agents/state`` holds this transport's own state and lock.
 
     ``bus.repo`` (or its legacy ``fallback.gitbus_root`` alias) wins -- the same
     resolution the poller and the heartbeat use. Next comes ``SWARMLY_STATE_ROOT`` when it
     is set: the test suite gives each of its processes one, so parallel workers never share
-    a state file in the checkout. The default is the checkout the transport runs from
-    (``~/.a2a`` for an installed wheel), never the process CWD, so a ``run`` started from a
-    scheduler directory and one started from a shell still meet on the same lock.
+    a state file in the checkout. Then ``state.dir``. With none of those, the folder of
+    ``config.yaml`` -- one per bot -- or, where a bus checkout was cloned there before
+    (``swarmly --cli`` puts it in ``<config folder>/bus``), that checkout, so turning gitbus
+    off keeps the bot's state instead of starting it empty (live, 25 Oct: four bots that
+    lost their bus section fell back to one shared folder and came up with no state). The
+    last resort is the checkout the transport runs from (``~/.a2a`` for an installed wheel),
+    never the process CWD.
     """
     candidate = getattr(getattr(cfg, "bus", None), "repo", None) \
         or getattr(getattr(cfg, "fallback", None), "gitbus_root", None)
@@ -269,6 +273,16 @@ def transport_state_root(cfg: Any) -> Path:
     override = os.environ.get("SWARMLY_STATE_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
+    explicit = getattr(getattr(cfg, "state", None), "dir", None)
+    if explicit:
+        return Path(str(explicit)).expanduser()
+    source = getattr(cfg, "source_path", None)
+    if source:
+        home = Path(source).expanduser().resolve().parent
+        joined_bus = home / "bus" / ".agents" / "bus"
+        if (joined_bus / ".agents" / "state").is_dir():
+            return joined_bus
+        return home
     checkout = Path(__file__).resolve().parents[2]
     if (checkout / "pyproject.toml").is_file():
         return checkout
