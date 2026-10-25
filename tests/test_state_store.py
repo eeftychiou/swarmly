@@ -661,6 +661,59 @@ class TelegramStoreTests(unittest.TestCase):
             self.assertEqual(b.read("topic/7"), {"n": 2})
         run(go())
 
+    def test_a_peers_snapshot_line_heals_a_stale_pin(self):
+        async def go():
+            a = self.store("Claudebot")
+            await a.start()
+            await a.claim_lease(10 ** 6)
+            await a.write("topic/7", {"n": 1})
+            self.clock.t += 60
+            self.assertTrue(await a.publish_snapshot())
+            a.io.hold_for = {"DeepSeek"}            # its lines reach DeepSeek late (#268)
+            b = self.store("DeepSeek")
+            await b.start()                         # reads the pin as it stands: n=1
+            stale = b.snapshot_message
+            self.assertEqual(b.read("topic/7"), {"n": 1})
+            await a.write("topic/7", {"n": 2})
+            self.clock.t += 60
+            self.assertTrue(await a.publish_snapshot())
+            true_pin = a.snapshot_message
+            self.assertNotEqual(true_pin, stale)
+            caption, _data = self.group.files[true_pin]
+            self.group.deliver("Claudebot", true_pin, caption)   # the SNAPSHOT line itself
+            self.assertEqual(b.snapshot_message, stale, "nothing is read on arrival")
+            await b.refresh()                       # no _load_snapshot() by hand
+            self.assertEqual(b.snapshot_message, true_pin)
+            self.assertEqual(b.read("topic/7"), {"n": 2})
+            self.assertEqual(b.state_hash(), a.state_hash())
+        run(go())
+
+    def test_the_same_snapshot_line_does_not_force_a_reread(self):
+        async def go():
+            a = self.store("Claudebot")
+            await a.start()
+            await a.claim_lease(10 ** 6)
+            await a.write("topic/7", {"n": 1})
+            self.clock.t += 60
+            self.assertTrue(await a.publish_snapshot())
+            a.io.hold_for = {"DeepSeek"}            # b's state comes from the pin, not a line
+            b = self.store("DeepSeek")
+            await b.start()
+            self.assertEqual(b.read("topic/7"), {"n": 1})
+            reads = []
+            original = b.io.pinned
+
+            async def counted():
+                reads.append(1)
+                return await original()
+            b.io.pinned = counted
+            caption, _data = self.group.files[a.snapshot_message]
+            self.group.deliver("Claudebot", a.snapshot_message, caption)   # this bot's own pin
+            await b.refresh()
+            self.assertEqual(reads, [], "a pin this bot already holds is not read again")
+            self.assertEqual(b.read("topic/7"), {"n": 1})
+        run(go())
+
     def test_telegram_down_fails_closed(self):
         async def go():
             a = self.store("Claudebot")
