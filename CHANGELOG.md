@@ -183,6 +183,7 @@ All notable changes to this project are documented here. The format follows
   measured 1.7-2.2:1 before this, 5.6-8.0:1 after), the chat's own theme params are applied on
   top, and a chat that sends colours without a scheme gets its palette from `bg_color`'s
   luminance. No external references, unknown values still `?`.
+
 - The dashboard's one **write path**, `POST /api/action` (`#342`, control centre 1/4): a body
   of `{action, target?, value?, code?}` carried out by the same dispatch the Telegram dashboard
   buttons use (`control.CONTROLS` through `control_press`), so there is one table of actions,

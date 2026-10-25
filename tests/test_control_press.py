@@ -1052,6 +1052,20 @@ class TestTheLeaseControls(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("target=Codex", notes[0])
 
+    def test_a_fail_back_from_the_page_marks_its_hand_over_note(self):
+        """Twin of the picker test: fail_back's hand-over branch must carry the marker (#347)."""
+        channel = self.channel(named="Codex")
+        asked = asyncio.run(channel.dashboard_action({"action": "swarm.failback"}))
+        self.assertEqual(asked["verdict"], cp.CONFIRM)
+        done = asyncio.run(channel.dashboard_action(
+            {"action": "swarm.failback", "code": asked["confirm"]}))
+        self.assertTrue(done["ok"])
+        self.assertEqual(len(channel.store.yielded), 1)        # the hand-over really ran
+        notes = self.notes(channel)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("target=Codex", notes[0])
+        self.assertIn("via=dashboard", notes[0])
+
     def test_fail_back_with_no_named_coordinator_says_so(self):
         channel = self.channel(named="")
         _, answer = self.confirm(channel, "ctl:swarm.failback")

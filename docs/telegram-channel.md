@@ -1237,8 +1237,9 @@ App, over HTTPS with `initData` checked — is the admin's decision, not a confi
 **No identifiers, no external references:** every field is picked by name, so a record carrying
 a chat id, a token or a path shows none of them, and the page loads nothing from anywhere (no
 CDN, no font host), so it works on a LAN with no route out. It follows the system's light or
-dark preference and is built phone-width first, ready to be the Mini App's page unchanged. As a Mini App it also takes the chat's own theme: `tgWebAppColorScheme` becomes
-the page's `data-theme`, which selects a **whole palette** (every colour token, not a hint), so
+dark preference and is built phone-width first, ready to be the Mini App's page
+unchanged. As a Mini App it also takes the chat's own theme: `tgWebAppColorScheme`
+becomes the page's `data-theme`, which selects a **whole palette** (every colour token, not a hint), so
 no status colour is left over from the other scheme, and the chat's `tgWebAppThemeParams`
 colours go on top of it as overrides. A chat that sends colours but no scheme gets its palette
 from the luminance of `bg_color`.

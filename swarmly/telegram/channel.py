@@ -4673,7 +4673,8 @@ class AgentChannel:
                                  "peer's role), so there is nobody to fail back to")
         me = str(self.config.identity.alias)
         if named.lower() != me.lower():
-            return await self.hand_over_lease(named, presser=presser)
+            # This branch *is* a hand-over, so the marker follows it too (#347 review).
+            return await self.hand_over_lease(named, presser=presser, via=via)
         if await asyncio.to_thread(self.lease_fence):
             raise ControlRefused(f"fail back: {me} already holds the lease")
         term = await self._take_handed_lease(presser=presser, via=via)
