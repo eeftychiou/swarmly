@@ -453,6 +453,16 @@ class TestAPeerAppliesWhatItCanAndSaysWhatItCannot(unittest.TestCase):
         self.assertTrue(channel._frozen)                      # the blocker: it used to stay up
         self.assertEqual(channel._freeze_ref, "pause")
 
+    def test_a_note_about_the_pressers_own_bot_does_not_freeze_a_peer(self):
+        """A dashboard button with no bot in it acts on the bot holding the dashboard, and its
+        note says ``target=self``: from the coordinator's mouth that is the coordinator."""
+        channel = self.channel()
+        self.assertIn("not mine", apply(channel, self.note("bot.pause", "self")))
+        self.assertIn("not mine", apply(channel, self.note("bot.stop_turn", "")))
+        self.assertFalse(channel._frozen)
+        self.assertEqual(apply(channel, self.note("bot.pause", "Hermes")), "applied: bot.pause")
+        self.assertTrue(channel._frozen)
+
     def test_a_control_this_bot_cannot_carry_out_says_failed(self):
         channel = self.channel()
         # `swarm.sync` is wired on the press path but there is nothing to apply from a note.

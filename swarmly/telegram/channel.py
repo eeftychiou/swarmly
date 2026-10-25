@@ -1313,6 +1313,11 @@ class AgentChannel:
         if not self.config.is_admin(event.author_id):
             logger.warning("/%s from @%s ignored: only the admin changes the swarm",
                            command, event.author_username)
+            if target or self.is_coordinator():
+                # The bot named, or the coordinator for a bare one: one line, not one per bot.
+                await self.send(f"⛔ only the admin can use /{command}",
+                                reply_to_message_id=event.message_id, chat_id=event.chat_id,
+                                thread_id=event.thread_id, allow_when_frozen=True)
             return True
         if command == "sync":
             await self._sync_now(chat_id=event.chat_id, thread_id=event.thread_id)
@@ -3744,7 +3749,8 @@ class AgentChannel:
            a known peer's when it is not. Without this, ``by=`` -- which is free text -- would
            let any bot on the bus write an admin's id and stop the swarm. A note from this bot
            itself, or from nobody, is never a peer's press.
-        2. **Who it names.** This bot, ``self``, or ``*`` for a swarm-wide control.
+        2. **Who it names.** This bot by its alias, or ``*`` for a swarm-wide control.
+           ``self`` is the sender's own bot (the one the dashboard's buttons act on).
         3. **Which admin pressed.** The id must be *this* bot's admin, so a peer repeats the
            authorisation against its own config instead of trusting whoever passed it on.
 
@@ -3759,7 +3765,11 @@ class AgentChannel:
                            self.config.identity.alias, sender)
             return f"refused: {sender or 'an unknown bot'} does not hold the dashboard"
         target = note.target.strip().lower()
-        if target not in ("", "self", "*", self.config.identity.alias.lower()):
+        if target in ("", "self"):
+            # The presser's bot wrote "self" about itself: it names the sender, never the bot
+            # reading it (a dashboard Pause, pressed for the coordinator, froze every peer).
+            target = str(sender or "").strip().lower()
+        if target not in ("*", self.config.identity.alias.lower()):
             return f"for {note.target}: not mine"
         if not self._is_my_admin(note.by):
             logger.warning("control note for %s refused: by=%s is not the admin",
@@ -8118,7 +8128,8 @@ class AgentChannel:
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
                 return None
-        elif not (self.mentions_me(event.text or "") or event.replies_to_bot):
+        elif not (self.mentions_me(event.text or "") or event.replies_to_bot
+                  or self._direct_chat(event)):
             return None
         return command
 

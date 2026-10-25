@@ -315,6 +315,13 @@ class TestTypingAndStop(unittest.TestCase):
         run(channel.handle_event(human("/stop@CodexBot")))
         self.assertEqual(channel.bot.sent, [])
 
+    def test_a_bare_stop_in_the_admins_private_chat_is_for_this_bot(self):
+        """Like every other command there: a private chat holds one bot, so a bare /stop can
+        only mean it (it used to be ignored there)."""
+        channel = bot_channel()
+        run(channel.handle_event(human("/stop", chat_id=ADMIN_ID)))
+        self.assertIn("nothing was running", channel.bot.sent[-1]["text"])
+
 
 class HangingProcess:
     def __init__(self):
