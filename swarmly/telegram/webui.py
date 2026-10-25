@@ -341,6 +341,51 @@ def settings_view(*, cards: Sequence[Mapping[str, Any]] = (),
             "topics": (None if topics is None else overrides)}
 
 
+def controls_view(controls: Optional[Mapping[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """The page's controls, picked by name: what a press does, and what it needs (#345).
+
+    Nothing here is an id or a path: an action name, a label, a note, and the values that can
+    be picked (a model, an effort level, a bot's alias, a role, a round item's key). A caller
+    that collected no controls says so with ``None`` -- an empty list would read as "this bot
+    offers nothing", which is a different fact from "nobody read the table".
+    """
+    if controls is None:
+        return None
+    if not controls.get("ready"):
+        return {"ready": False, "controls": [],
+                "text": str(controls.get("text") or NOT_READY)}
+    rows: List[Dict[str, Any]] = []
+    for raw in controls.get("controls") or ():
+        if not isinstance(raw, Mapping):
+            continue
+        row: Dict[str, Any] = {
+            "action": str(raw.get("action") or ""),
+            "label": str(raw.get("label") or ""),
+            "confirm": bool(raw.get("confirm")),
+            "report": bool(raw.get("report")),
+            "note": str(raw.get("note") or ""),
+            "typed": str(raw.get("typed") or ""),
+            "where": str(raw.get("where") or ""),
+            # A control that reads or sets *this* bot's own runtime: drawn on this bot's card
+            # and nowhere else, because the press lands here (review, #345).
+            "self_only": bool(raw.get("self_only")),
+            "choices": _picks(raw.get("choices")),
+        }
+        if raw.get("then"):
+            row["then"] = _picks(raw.get("then"))
+        rows.append(row)
+    return {"ready": True, "self": str(controls.get("self") or ""), "controls": rows}
+
+
+def _picks(raw: Any) -> List[Dict[str, str]]:
+    """``[[label, value], …]`` as the page reads it: a pair that is not a pair is dropped."""
+    out: List[Dict[str, str]] = []
+    for pair in raw or ():
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            out.append({"label": str(pair[0]), "value": str(pair[1])})
+    return out
+
+
 def memory_view(*, text: Optional[str] = None) -> Dict[str, Any]:
     """``/memory``: this bot's own lessons, for the admin's eyes only.
 
@@ -582,7 +627,8 @@ def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
                 lease: Optional[Any] = None, round_state: Optional[Any] = None,
                 owed: Sequence[Any] = (), registry: Optional[Mapping[str, Any]] = None,
                 peers: Sequence[Any] = (), drift: Optional[Mapping[str, Any]] = None,
-                store: Optional[Mapping[str, Any]] = None
+                store: Optional[Mapping[str, Any]] = None,
+                controls: Optional[Mapping[str, Any]] = None
                 ) -> Dict[str, Any]:
     """The JSON the page polls: the same records the pinned card is built from, in full.
 
@@ -626,6 +672,9 @@ def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
         "roster": roster_view(cards=cards, peers=peers or (), coordinator=holder),
         "drift": (None if drift is None else dict(drift)),
         "store": (None if store is None else dict(store)),
+        # The controls the page may press (#345). ``None`` when the caller did not collect
+        # them, exactly like the views above: a page nobody wired must not draw buttons.
+        "controls": controls_view(controls),
         # A registry nobody collected is ``None`` here too: an empty ``topics`` would read as
         # "no topic overrides" instead of "not read" (review, #349).
         "settings": (None if not cards else
@@ -733,7 +782,8 @@ def page_html(*, title: str = "Swarm", every: float = 3.0) -> str:
             .replace("__TITLE__", _escape(title))
             .replace("__EVERY_MS__", str(int(max(1.0, float(every)) * 1000)))
             .replace("__STATE_PATH__", STATE_PATH)
-            .replace("__MEMORY_PATH__", MEMORY_PATH))
+            .replace("__MEMORY_PATH__", MEMORY_PATH)
+            .replace("__ACTION_PATH__", ACTION_PATH))
 
 
 def _escape(text: str) -> str:
@@ -842,6 +892,47 @@ pre.memory { margin: var(--space-1) 0; padding: var(--space-2); background: var(
   white-space: pre-wrap; overflow-wrap: anywhere; }
 footer { color: var(--dim); font: var(--font-tiny); text-align: center;
   padding: var(--space-4) 0 var(--space-2); }
+
+/* The control centre (#345): one control per admin command, where the thing it changes is.
+   The buttons are the page's only write path, so their disabled state is drawn, not implied. */
+.controls { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-2); }
+.control { display: inline-flex; align-items: center; gap: var(--space-1); flex-wrap: wrap; }
+.controls button, .controls select, .controls input { font: var(--font-small);
+  color: var(--ink); background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--pill); padding: 3px 10px; max-width: 15rem; }
+.controls button { cursor: pointer; }
+.controls button:hover:enabled, .controls button:focus-visible:enabled {
+  border-color: var(--accent); color: var(--accent); }
+.controls button.danger:enabled { color: var(--bad); border-color: currentColor; }
+.controls button:disabled, .controls select:disabled, .controls input:disabled {
+  opacity: .55; cursor: not-allowed; }
+/* Without the admin's verified login nothing is pressable: the whole row is drawn disabled,
+   and the panel says why, rather than a button that looks live and answers 403. */
+body[data-admin="0"] .controls button, body[data-admin="0"] .controls select,
+body[data-admin="0"] .controls input { opacity: .55; cursor: not-allowed; }
+/* The second tap: exactly what will happen, and the two answers to it. */
+.veil { position: fixed; inset: 0; background: rgba(16, 21, 28, .45); display: flex;
+  align-items: center; justify-content: center; padding: var(--space-3); z-index: 20; }
+.veil[hidden] { display: none; }
+.sheet { background: var(--card); color: var(--ink); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow); padding: var(--space-3);
+  max-width: 26rem; }
+.sheet h3 { font: var(--font-head); margin: 0 0 var(--space-2); }
+.sheet p { margin: 0 0 var(--space-3); font: var(--font-small); }
+.sheet .row { display: flex; gap: var(--space-2); justify-content: flex-end; }
+.sheet button { font: var(--font-small); color: var(--ink); background: var(--card);
+  border: 1px solid var(--line); border-radius: var(--pill); padding: 3px 12px;
+  cursor: pointer; }
+.sheet button#veil-go { color: var(--bad); border-color: currentColor; }
+/* What a press answered, until the next press. */
+#toast { position: fixed; left: 50%; bottom: var(--space-4); transform: translateX(-50%);
+  max-width: min(92vw, 32rem); background: var(--card); color: var(--ink);
+  border: 1px solid var(--line); border-left: 4px solid var(--accent);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: var(--space-2) var(--space-3); font: var(--font-small); z-index: 30; }
+#toast[hidden] { display: none; }
+#toast.ok { border-left-color: var(--ok); }
+#toast.bad { border-left-color: var(--bad); }
 @media (min-width: 760px) {
   body { padding: var(--space-5); }
   /* Two columns from tablet up: the swarm beside everything else. */
@@ -918,13 +1009,30 @@ footer { color: var(--dim); font: var(--font-tiny); text-align: center;
 
   <section class="panel" id="controls">
     <h2>Controls</h2>
-    <p class="note" id="controls-note">Every control needs the admin's verified Mini App login
-      and a confirm step. This page's own controls arrive with the next slice.</p>
+    <p class="note" id="controls-note">Every press needs the admin's verified Mini App login,
+      and one that stops or changes something asks again before it runs. A press writes the
+      same CONTROL line a Telegram button does, so who pressed what is on the record.</p>
+    <p class="note" id="controls-reason" hidden></p>
+    <div id="controls-rows"></div>
+    <p class="note" id="controls-where"></p>
   </section>
 </main>
 
-<footer>read-only &middot; refreshes every <span id="every"></span>s</footer>
+<footer>refreshes every <span id="every"></span>s &middot; the controls need the admin's
+  login</footer>
 </div>
+
+<div class="veil" id="veil" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="veil-title">
+    <h3 id="veil-title">Confirm</h3>
+    <p id="veil-text"></p>
+    <div class="row">
+      <button type="button" id="veil-cancel">Cancel</button>
+      <button type="button" id="veil-go">Confirm</button>
+    </div>
+  </div>
+</div>
+<div id="toast" role="status" hidden></div>
 <script>
 const STATE = "__STATE_PATH__";
 const MEMORY = "__MEMORY_PATH__";
@@ -987,7 +1095,7 @@ function health(state) {
     money(total.cost)));
 }
 
-function card(bot) {
+function card(bot, state) {
   const box = el("article", "card");
   const top = el("div", "top");
   top.append(el("span", "alias", bot.alias));
@@ -1012,6 +1120,8 @@ function card(bot) {
   meta.append(el("span", "", money(bot.cost)));
   if (bot.queue) meta.append(el("span", "", "queue " + bot.queue));
   box.append(meta);
+  const own = controlsFor(state, "bot", bot.alias);
+  if (own.children.length) box.append(own);
   return box;
 }
 
@@ -1104,9 +1214,12 @@ function roundBoard(state) {
   if (state.round) {
     row.append(pill("round", (state.round.name || "?") + ": " +
       state.round.done + "/" + state.round.total + " done"));
+    const nudge = control(state, "item.nudge");
     (state.round.items || []).forEach((item) => {
       row.append(pill(item.item, (item.state || "?") +
         (item.owner ? " · " + item.owner : "")));
+      // The nudge belongs under the item it nudges, and the item's own key is its target.
+      if (nudge) row.append(controlNode(nudge, item.item));
     });
   } else {
     row.append(el("span", "note", "no round in flight"));
@@ -1235,7 +1348,183 @@ async function memory() {
   }
 }
 
+// ---- The control centre (#345) -----------------------------------------------------
+// One POST is one press, and the server runs the same policy a Telegram button does: a
+// control that stops or changes something answers `confirm` with a one-use code, and only
+// that code runs it. Nothing here decides what a control may do -- it draws what the bot
+// says is wired, and shows what the policy answered.
+function control(state, action) {
+  const view = state.controls;
+  if (!view || !view.ready) return null;
+  return (view.controls || []).find((row) => row.action === action) || null;
+}
+
+function picker(forAction, choices, first) {
+  const select = el("select", "");
+  select.dataset.for = forAction;
+  select.disabled = !ADMIN;
+  const blank = el("option", "", first);
+  blank.value = "";
+  select.append(blank);
+  (choices || []).forEach((choice) => {
+    const option = el("option", "", choice.label);
+    option.value = choice.value;
+    select.append(option);
+  });
+  return select;
+}
+
+// One control, drawn where the thing it changes is: what it needs to know, then its button.
+function controlNode(button, target) {
+  const box = el("span", "control");
+  box.dataset.action = button.action;
+  let pick = null, then = null, typed = null;
+  if ((button.choices || []).length) {
+    pick = picker(button.action + ":pick", button.choices,
+      button.then ? "which bot: pick one" : button.label + ": pick one");
+    box.append(pick);
+  }
+  if ((button.then || []).length) {
+    then = picker(button.action + ":then", button.then, "which role: pick one");
+    box.append(then);
+  }
+  if (button.typed) {
+    typed = el("input", "");
+    typed.type = "text";
+    typed.placeholder = button.typed;
+    typed.setAttribute("aria-label", button.label + ": " + button.typed);
+    typed.disabled = !ADMIN;
+    box.append(typed);
+  }
+  const go = el("button", button.confirm ? "danger" : "", button.label);
+  go.type = "button";
+  go.disabled = !ADMIN;
+  if (button.note) go.title = button.note;
+  go.addEventListener("click", () => {
+    let who = target || "";
+    let value = "";
+    if (then) { who = pick ? pick.value : ""; value = then.value; }
+    else if (pick) value = pick.value;
+    else if (typed) value = typed.value.trim();
+    if (pick && !pick.value) {
+      toast((button.then ? "a bot" : button.label) + " is needed first", "bad");
+      return;
+    }
+    if (then && !then.value) { toast("a role is needed first", "bad"); return; }
+    if (typed && !value) { toast(button.typed + " is needed first", "bad"); return; }
+    press(button.action, who, value);
+  });
+  box.append(go);
+  return box;
+}
+
+// Every control the bot offers for one place: on a bot's card, on its round item, or in the
+// panel for the swarm.
+function controlsFor(state, where, target) {
+  const box = el("div", "controls");
+  const view = state.controls;
+  if (view && view.ready) {
+    const mine = !target || target === view.self;
+    (view.controls || [])
+      // Model, effort, CLI and memory are this bot's own: drawn on its card, never on a
+      // peer's, because a pick is applied by the bot the press lands on (review, #345).
+      .filter((row) => row.where === where && (mine || !row.self_only))
+      .forEach((row) => box.append(controlNode(row, target)));
+  }
+  return box;
+}
+
+function controlsPanel(state) {
+  const box = document.getElementById("controls-rows");
+  const reason = document.getElementById("controls-reason");
+  const where = document.getElementById("controls-where");
+  box.replaceChildren();
+  reason.hidden = ADMIN;
+  // Without the admin's verified login there is nothing to press, and the page says so
+  // instead of drawing a button that answers 403.
+  if (!ADMIN) {
+    reason.textContent = "the controls are disabled: this page needs the admin's verified " +
+      "Mini App login and this request did not carry one (open the dashboard from Telegram " +
+      "as the admin).";
+  }
+  const view = state.controls;
+  if (!view || !view.ready) {
+    box.append(el("p", "note", (view && view.text) || "the controls are not read on this bot"));
+    where.textContent = "";
+    return;
+  }
+  const row = el("div", "controls");
+  (view.controls || []).filter((item) => item.where === "swarm")
+    .forEach((item) => row.append(controlNode(item, "")));
+  if (row.children.length) box.append(row);
+  else box.append(el("p", "note", "no swarm control is wired on this bot"));
+  where.textContent = "the per-bot controls sit on each card, and the nudge on its round item";
+}
+
+function toast(text, cls) {
+  const box = document.getElementById("toast");
+  box.textContent = text || "done";
+  box.className = cls || "";
+  box.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { box.hidden = true; }, 15000);
+}
+
+// One press, one POST. The answer is the policy's own words, which are what a Telegram
+// presser reads for the same control.
+async function post(body) {
+  try {
+    const headers = {"Content-Type": "application/json"};
+    if (INIT) headers["X-Telegram-Init-Data"] = INIT;
+    const response = await fetch(ACTION, {method: "POST", cache: "no-store", headers,
+                                          body: JSON.stringify(body)});
+    const answer = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return {ok: false,
+              text: answer.text || answer.error ||
+                ("the press was refused (status " + response.status + ")")};
+    }
+    return answer;
+  } catch (err) {
+    return {ok: false, text: "the press failed: " + err.message};
+  }
+}
+
+async function press(action, target, value) {
+  if (!ADMIN) { toast("the admin's verified Mini App login is needed", "bad"); return; }
+  const body = {action};
+  if (target) body.target = target;
+  if (value) body.value = value;
+  const answer = await post(body);
+  if (answer.verdict === "confirm") { askSecond(answer); return; }
+  toast(answer.text, answer.ok ? "ok" : "bad");
+  if (answer.ok) tick();                     // the card that changed is redrawn at once
+}
+
+// The second tap: exactly what it will do, and the only two answers to it.
+function askSecond(answer) {
+  const veil = document.getElementById("veil");
+  document.getElementById("veil-text").textContent =
+    answer.text || "Tap Confirm to carry it out.";
+  veil.dataset.code = answer.confirm || "";
+  veil.hidden = false;
+  document.getElementById("veil-go").focus();
+}
+
+async function confirmPress() {
+  const veil = document.getElementById("veil");
+  const code = veil.dataset.code || "";
+  veil.dataset.code = "";
+  veil.hidden = true;
+  if (!code) { toast("that confirmation expired", "bad"); return; }
+  const answer = await post({code});
+  toast(answer.text, answer.ok ? "ok" : "bad");
+  if (answer.ok) tick();
+}
+
 function render(state) {
+  ADMIN = Boolean(state.admin);
+  document.body.dataset.admin = ADMIN ? "1" : "0";
   document.getElementById("stamp").textContent =
     "refreshed " + state.refreshed +
     (state.coordinator ? " · coordinator " + state.coordinator : " · no coordinator");
@@ -1243,7 +1532,7 @@ function render(state) {
 
   const bots = document.getElementById("bots");
   bots.replaceChildren();
-  (state.bots || []).forEach((bot) => bots.append(card(bot)));
+  (state.bots || []).forEach((bot) => bots.append(card(bot, state)));
 
   roundBoard(state);
 
@@ -1263,6 +1552,7 @@ function render(state) {
   settings(state);
   drift(state);
   storeState(state);
+  controlsPanel(state);
 }
 
 // Opened as a Telegram Mini App, the page arrives with initData in its URL hash. It is sent
@@ -1272,6 +1562,13 @@ const INIT = (() => {
   const match = location.hash.match(/tgWebAppData=([^&]*)/);
   return match ? decodeURIComponent(match[1]) : "";
 })();
+
+// The write path, and whether this page has the admin's verified login to use it. That is
+// the server's answer (`state.admin`), not the mere presence of some initData in the URL: a
+// member's login is a valid one and still not the admin's. A page opened locally has none
+// either way, so its controls are drawn disabled -- and the server refuses the POST anyway.
+const ACTION = "__ACTION_PATH__";
+let ADMIN = false;
 
 // A Mini App also hands its chat's theme in the hash: which scheme it is, and some of its
 // colours. Nothing is loaded to read them.
@@ -1322,6 +1619,20 @@ async function tick() {
     document.getElementById("stamp").textContent = "dashboard unavailable: " + err.message;
   }
 }
+
+document.getElementById("veil-cancel").addEventListener("click", () => {
+  const veil = document.getElementById("veil");
+  veil.dataset.code = "";
+  veil.hidden = true;
+  toast("cancelled: nothing ran", "");
+});
+document.getElementById("veil-go").addEventListener("click", confirmPress);
+document.getElementById("veil").addEventListener("click", (event) => {
+  if (event.target.id === "veil") {                 // a tap on the veil cancels too
+    document.getElementById("veil").dataset.code = "";
+    document.getElementById("veil").hidden = true;
+  }
+});
 
 document.getElementById("every").textContent = String(EVERY / 1000);
 tick();
@@ -1525,19 +1836,21 @@ class DashboardServer:
                     return True
                 return name in server.hosts or given in server.hosts
 
-            def _admin_ok(self) -> bool:
+            def _admin_ok(self, what: str = "a memory read") -> bool:
                 """Whether this request carries a valid admin ``initData``, wherever it came from.
 
                 The state has a loopback exception (#258: the operator on the host is not a
                 stranger); the memory does not (#344) -- so the check is repeated here rather
-                than reusing the one that may have answered "yes" for a local request.
+                than reusing the one that may have answered "yes" for a local request. Since
+                #345 the state read also reports the answer (``admin``), which is what the page
+                draws its controls from: a member's *valid* login is still not the admin's.
                 """
                 raw = str(self.headers.get(INIT_HEADER, "") or "")
                 ok, why = verify_init_data(raw, bot_token=server.bot_token,
                                            admin_id=server.admin_id,
                                            now=time.time(), max_age=server.init_max_age)
                 if not ok:
-                    logger.info("web dashboard: refused a memory read (%s)", why)
+                    logger.info("web dashboard: refused %s (%s)", what, why)
                 return ok
 
             def _init_ok(self, query: str) -> bool:
@@ -1595,7 +1908,12 @@ class DashboardServer:
                         self._send(403, b'{"error":"not the admin"}', "application/json")
                         return
                     try:
-                        payload = server.state()
+                        payload = dict(server.state())
+                        # Whether this very request carries the admin's verified login: the
+                        # page draws its controls enabled from *this*, never from the mere
+                        # presence of some initData in its URL -- a member's login is valid
+                        # and still not the admin's (review, #345).
+                        payload["admin"] = self._admin_ok("a state read")
                     except Exception:                       # noqa: BLE001 - never on the wire
                         self._send(503, b'{"error":"unavailable"}', "application/json")
                         return

@@ -112,9 +112,16 @@ pressing the button is quieter.
 | Restart | Restarts the coordinator now; a turn it cuts off is replayed when it starts again. The `swarmly --cli` launcher starts it again; `swarmly-telegram run` just exits. |
 | Model, Effort | Picks the coordinator's model or effort, for the dashboard's own topic only. |
 | CLI | Lists the `/cli` commands the coordinator may run; it runs nothing. |
+| Memory | `clear`: empties the coordinator's own `memory.md`, after a second tap. It is that bot's own file, so a press aimed at another bot's card is refused. |
 | Pause all | Pauses every bot, the way a bare `/pause` does, after a second tap. |
+| Hold, Release | `/hold` and `/release`: held, every bot still answers but starts nothing. Both ask for a second tap, and the hold rides the pulse to the peers as a typed one does. |
 | Hand lease, Fail back | Hands the coordinator lease to another bot, or back to the named coordinator. |
 | Reassign role | Like `/role @bot <role>`, but it never gives or takes the coordinator role. |
 | Cleanup | `/cleanup preview`: what `/cleanup` would delete; a press deletes nothing. |
 | Sync | The coordinator re-posts its peer list. A bare `/sync` makes every bot do it. |
+| Admit, Remove | `/admit @name` and `/remove @name`: admit adds a bot whose HELLO has already reached this one (the `@username` is typed), remove takes a bot out of the roster. Both ask for a second tap — Admit came back to the table in #345, wired for the first time, and a control that changes the roster is confirmed. |
 | Nudge | On a round item's line, or typed as `ctl:item.nudge:<issue>`: wakes the bot that owes that item, which costs it a turn. |
+
+The live page (#345) draws the same controls from the same table — a `bot.` button on that bot's
+card, an `item.` button on its round item, the `swarm.` ones in its Controls panel — and each press
+takes the same route and leaves the same `via=dashboard` line.

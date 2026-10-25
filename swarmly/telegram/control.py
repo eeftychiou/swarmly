@@ -84,6 +84,10 @@ class Control:
     #: A control that only *reports*: it changes nothing, so it is never confirmed and never
     #: leaves a CONTROL note (there is no "who stopped what" in reading a setting).
     report: bool = False
+    #: A control whose value cannot be picked from a list because it names something the bot
+    #: does not have yet (an ``/admit`` handle): the prompt the page shows beside its button,
+    #: and empty for every control that either needs no value or picks one (#345).
+    typed: str = ""
 
 
 CONTROLS: Tuple[Control, ...] = (
@@ -96,6 +100,8 @@ CONTROLS: Tuple[Control, ...] = (
     Control("bot.model", "Model", report=True),
     Control("bot.effort", "Effort", report=True),
     Control("bot.cli", "CLI", note="read-only commands only", report=True),
+    Control("bot.memory", "Memory", confirm=True,
+            note="empties this bot's memory.md for good"),
     # the swarm
     Control("swarm.pause_all", "Pause all", confirm=True),
     Control("swarm.lease", "Hand lease", confirm=True),
@@ -104,6 +110,14 @@ CONTROLS: Tuple[Control, ...] = (
     Control("swarm.cleanup", "Cleanup", report=True,
             note="a preview: nothing is deleted"),
     Control("swarm.sync", "Sync"),
+    Control("swarm.hold", "Hold", confirm=True,
+            note="every bot still answers, but starts nothing"),
+    Control("swarm.release", "Release", confirm=True,
+            note="every bot may start turns again"),
+    Control("swarm.admit", "Admit", confirm=True, typed="a bot's @username",
+            note="adds a bot whose HELLO has already reached this one"),
+    Control("swarm.remove", "Remove", confirm=True,
+            note="takes the bot out of this roster"),
     Control("item.nudge", "Nudge", note="costs the owner a turn"),
 )
 
@@ -123,6 +137,142 @@ def needs_confirm(action: str) -> bool:
     """Whether a press of *action* must be confirmed. Unknown actions are never run."""
     found = control(action)
     return bool(found and found.confirm)
+
+def typed(action: str) -> str:
+    """The prompt a page shows for a control whose value is typed, and ``""`` for the others."""
+    found = control(action)
+    return str(found.typed) if found else ""
+
+
+#: The controls that read or change **this bot's own** runtime -- its model, its effort, its
+#: CLI allowlist, its memory file. A press for another bot would either change the wrong bot
+#: (the pick is applied by the bot the press lands on) or answer about the wrong one (a report
+#: describes the bot that answers), so the page draws them on this bot's own card only, and the
+#: transport refuses the press however it arrives (review, #345).
+SELF_ONLY: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.cli", "bot.memory")
+
+
+def self_only(action: str) -> bool:
+    """Whether *action* only makes sense on the bot it lands on, never addressed to a peer."""
+    return str(action) in SELF_ONLY
+
+
+def page_actions() -> Tuple[str, ...]:
+    """Every control this module's own table offers on the page, in table order (#345).
+
+    The page draws what is here, so a control that is added to :data:`CONTROLS` and forgotten
+    nowhere else is a button; what keeps the *commands* in step is :data:`MENU_COVERAGE`.
+    """
+    return tuple(row.action for row in CONTROLS)
+
+
+# ------------------------------------------------------------------------------------
+# Every admin command, and where it lives on the page (#345)
+# ------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """One entry of ``commands.MENU_COMMANDS``, and what the page does with it.
+
+    Either it is a page control (:attr:`actions`), or a panel answers it (``view``), or it is
+    deliberately left to the chat and :attr:`why` says so in words. A row with none of the
+    three is a gap, and :func:`menu_gaps` names it, so the suite fails rather than a command
+    quietly disappearing from the control centre.
+    """
+
+    command: str
+    actions: Tuple[str, ...] = ()
+    view: str = ""
+    why: str = ""
+
+
+#: The whole menu, mapped. One table, read by one test: the page and the chat commands stay in
+#: step because a command the bots take and the page does not offer has to be written *down*
+#: here, with its reason, next to the ones that became buttons.
+MENU_COVERAGE: Tuple[Coverage, ...] = (
+    # The read commands: a panel of the page is their answer (slice 3, #344). /ping is the
+    # pulse age on every bot card, which is what "is it there" asks.
+    Coverage("status", view="swarm"),
+    Coverage("usage", view="usage"),
+    Coverage("swarm", view="swarm"),
+    Coverage("round", view="round"),
+    Coverage("owed", view="round"),
+    Coverage("drift", view="drift"),
+    Coverage("state", view="state"),
+    Coverage("topics", view="topics"),
+    Coverage("ping", view="swarm"),
+    # The admin commands: one control each, so a press and a typed command meet the same
+    # policy -- admin only, a second tap for anything that stops or changes, one CONTROL line.
+    Coverage("model", actions=("bot.model",)),
+    Coverage("reasoning", actions=("bot.effort",)),
+    Coverage("memory", actions=("bot.memory",)),
+    Coverage("role", actions=("swarm.role",)),
+    Coverage("stop", actions=("bot.stop_turn",)),
+    Coverage("pause", actions=("bot.pause",)),
+    Coverage("resume", actions=("bot.resume",)),
+    Coverage("hold", actions=("swarm.hold",)),
+    Coverage("release", actions=("swarm.release",)),
+    Coverage("cli", actions=("bot.cli",)),
+    Coverage("cleanup", actions=("swarm.cleanup",)),
+    Coverage("admit", actions=("swarm.admit",)),
+    Coverage("remove", actions=("swarm.remove",)),
+    Coverage("sync", actions=("swarm.sync",)),
+    # And the one that is deliberately *not* a control.
+    Coverage("topic", why=(
+        "/topic binds items to the topic it is typed in, and the page never publishes a "
+        "topic's thread id -- the one identifier a record may not carry -- so a press made "
+        "from it could not name the topic it would bind. It stays a command typed inside "
+        "that topic.")),
+)
+
+_COVERAGE: Dict[str, Coverage] = {row.command: row for row in MENU_COVERAGE}
+
+
+def coverage(command: str) -> Optional[Coverage]:
+    """The page's answer for one menu command, or None when the table does not mention it."""
+    return _COVERAGE.get(str(command))
+
+
+def is_admin_command(description: str) -> bool:
+    """Whether a menu line describes an admin-only command: the menu says so in one word."""
+    return str(description).strip().lower().startswith("admin:")
+
+
+def menu_gaps(commands: Iterable[str]) -> List[str]:
+    """The menu entries with no control, no panel and no reason: empty when the table is whole.
+
+    A read-only command is covered by the panel that answers it, so ``view`` counts. Stale
+    rows (a command the menu no longer lists) are reported by :func:`stale_coverage`.
+    """
+    gaps: List[str] = []
+    for name in commands:
+        row = _COVERAGE.get(str(name))
+        if row is None or not (row.actions or row.view or row.why):
+            gaps.append(str(name))
+    return gaps
+
+
+def admin_gaps(menu: Iterable[Tuple[str, str]]) -> List[str]:
+    """The admin-only menu entries that are neither a control nor a written exclusion.
+
+    A read panel does not count here: a command only the admin may use has to be pressable
+    from the page, or say in words why it is not (#345).
+    """
+    gaps: List[str] = []
+    for name, description in menu:
+        if not is_admin_command(description):
+            continue
+        row = _COVERAGE.get(str(name))
+        if row is None or not (row.actions or row.why):
+            gaps.append(str(name))
+    return gaps
+
+
+def stale_coverage(commands: Iterable[str]) -> List[str]:
+    """The table's rows for commands the menu no longer has: they would hide a renaming."""
+    listed = {str(name) for name in commands}
+    return [row.command for row in MENU_COVERAGE if row.command not in listed]
 
 
 #: How many buttons fit on one row of the keyboard.
