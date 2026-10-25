@@ -123,6 +123,14 @@ class TestTheBlockInTheReply(unittest.TestCase):
                 body, block, reason = extract_block(whole)
                 self.assertEqual((body, block, reason), (whole, None, None))
 
+    def test_a_second_block_is_not_posted_either(self):
+        text = (f"PR is up.\n\nMEMORY:\n{LESSON}\n{END_MARKER}\n\nMEMORY:\n- another\n"
+                f"{END_MARKER}\nMEMORY:\n- a third, unclosed")
+        body, block, reason = extract_block(text)
+        self.assertEqual(body, "PR is up.")
+        self.assertEqual(block, LESSON)
+        self.assertIn("more than one", reason or "")
+
     def test_a_reply_without_a_block_is_untouched(self):
         text = "PR is up. Nothing learned this time."
         self.assertEqual(extract_block(text), (text, None, None))
@@ -209,6 +217,7 @@ class TestTheTurnPrompt(unittest.TestCase):
             self.assertIn("After your last reply: Memory refused", note)
             self.assertIn("the cap is 100", note)
             self.assertIn("Update your memory now", note)     # compress it on this turn
+            channel.lessons.turn_ran()
             later = channel._memory_note()
             self.assertNotIn("Memory refused", later)          # told once
             self.assertNotIn("Update your memory now", later)  # and asked once
@@ -219,10 +228,62 @@ class TestTheTurnPrompt(unittest.TestCase):
             channel.lessons.save(LESSON)
             self.oversize(channel)
             self.assertIn("Update your memory now", channel._memory_note())
+            channel.lessons.turn_ran()
             self.oversize(channel)                             # the re-asked block, too big
             note = channel._memory_note()
             self.assertIn("Memory refused", note)
             self.assertNotIn("Update your memory now", note)
+
+    def test_a_saved_block_after_a_refusal_lets_the_next_refusal_be_re_asked(self):
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, memory_max_bytes=100, memory_every_turns=99)
+            self.oversize(channel)
+            channel._memory_note()
+            channel.lessons.turn_ran()                         # the re-ask went out
+            channel.apply_memory_block(f"ok\n\nMEMORY:\n{LESSON}\n{END_MARKER}", event("hi"))
+            channel._memory_note()
+            channel.lessons.turn_ran()
+            self.oversize(channel)                             # a fresh refusal
+            self.assertIn("Update your memory now", channel._memory_note())
+
+    def test_a_turn_that_never_ran_does_not_spend_the_note(self):
+        """Review of #302: the note was spent when the prompt was built, so a turn stopped,
+        paused or failed before the model answered lost the refusal and its re-ask."""
+        from swarmly.telegram.adapters import EchoAdapter
+        from swarmly.telegram.adapters.base import AdapterReply
+
+        class _FailsOnce(EchoAdapter):
+            calls = 0
+
+            def __init__(self):
+                super().__init__("Hermes")
+
+            async def respond(self, message):
+                _FailsOnce.calls += 1
+                if _FailsOnce.calls == 1:
+                    return AdapterReply(ok=False, error="quota exceeded")
+                return AdapterReply(text=message.text)        # the framed prompt, echoed
+
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, adapter=_FailsOnce(), memory_max_bytes=100,
+                                   memory_every_turns=99)
+            self.oversize(channel)
+            run(channel.handle_event(event("@HermesBot: first", message_id=1)))   # fails
+            second = run(channel.handle_event(event("@HermesBot: second", message_id=2)))
+            self.assertIn("Memory refused", second)
+            self.assertIn("Update your memory now", second)
+            third = run(channel.handle_event(event("@HermesBot: third", message_id=3)))
+            self.assertNotIn("Memory refused", third)
+            self.assertNotIn("Update your memory now", third)
+
+    def test_a_reply_that_is_only_a_memory_block_posts_nothing(self):
+        with TemporaryDirectory() as tmp:
+            channel = self.channel(tmp, adapter=_reply_with(
+                f"MEMORY:\n{LESSON}\n{END_MARKER}"))
+            run(channel.handle_event(event("@HermesBot: anything learned?")))
+            self.assertEqual(channel.lessons.text(), LESSON)
+            self.assertFalse([sent for sent in channel._test_sender.sent
+                              if "Memory" in sent["text"] or LESSON in sent["text"]])
 
     def test_the_refusal_survives_a_restart(self):
         with TemporaryDirectory() as tmp:

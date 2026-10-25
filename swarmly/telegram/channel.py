@@ -3546,7 +3546,7 @@ class AgentChannel:
         """
         try:
             block = self.lessons.block()
-            told = self.lessons.told()
+            told = self.lessons.note()
             told = f"After your last reply: {told}" if told else ""
             due = self.lessons.note_turn()
             instruction = self.lessons_update_instruction() if due else ""
@@ -7797,6 +7797,7 @@ class AgentChannel:
         text += self.state_link.registry_note(event.chat_id, event.thread_id)
         text += self._swarm_usage_note()
         text += self._memory_note()
+        event.__dict__["memory_seq"] = self.lessons.seq    # spent once the turn has run
         if not event.self_task and asks_for_topic(event.text or ""):
             text += f"\n\n{TOPIC_ASKED_NOTE}"
         incoming = IncomingMessage(
@@ -8684,6 +8685,9 @@ class AgentChannel:
                 self._run_own_task(CONTINUE_NOTE, event.chat_id, event.thread_id,
                                    self.topics.name(event.chat_id, event.thread_id))
             return None
+
+        # The model answered: the memory outcome and any re-ask in this turn's prompt are told.
+        self.lessons.turn_ran(event.__dict__.get("memory_seq"))
 
         if reply.meta.get("queued"):
             if ticket:
