@@ -92,7 +92,7 @@ same things with lines in its replies: `LINK: …`, `ASSIGN: @bot <ref|L1> as <r
 | `/remove @bot` | yes | Removes a bot from the swarm until you `/admit` it again. A bot listed under `peers:` in a config stays. |
 | `/sync` | yes | Every bot re-introduces itself, so their peer lists match again. |
 | `/bus <location>` | yes | Sets the bus of a bot that has none yet; `/bus@bot <location>` moves that bot to another bus. Bots set up by hand keep their configured bus. |
-| `/cleanup@bot …` | yes | Tidies the whole group, sent from anywhere: a dry run without arguments; `topics done`, `topic <id>`, `topics all`, `general`; deletions need `confirm <code>`. |
+| `/cleanup` | yes | Deletes every finished topic at once and lists what it deleted and what it kept. Finished means: not Swarm pulse or a `limits.cleanup_keep` topic, no open work (an open registry work item, an open owed row, a turn running) and no activity in the last hour. The coordinator answers a bare `/cleanup`. Also `preview` (deletes nothing), `topic <id>`, `general` (General messages under 48h). |
 | `/memory@bot` (`clear`) | yes | Shows (or empties) the bot's `memory.md` of lessons. |
 | `/cli@bot <command>` | yes | Runs a native CLI command with no model turn: e.g. `/cli@bot --version`, `/cli@bot /cost`, `/cli@bot /context`. Commands that change something need `/cli!@bot`. |
 | `/wakes` | — | Retired; see `/owed`. Not in the `/` menu. |
@@ -115,6 +115,6 @@ pressing the button is quieter.
 | Pause all | Pauses every bot, the way a bare `/pause` does, after a second tap. |
 | Hand lease, Fail back | Hands the coordinator lease to another bot, or back to the named coordinator. |
 | Reassign role | Like `/role @bot <role>`, but it never gives or takes the coordinator role. |
-| Cleanup | The `/cleanup` dry run. |
+| Cleanup | `/cleanup preview`: what `/cleanup` would delete; a press deletes nothing. |
 | Sync | The coordinator re-posts its peer list. A bare `/sync` makes every bot do it. |
 | Nudge | On a round item's line, or typed as `ctl:item.nudge:<issue>`: wakes the bot that owes that item, which costs it a turn. |

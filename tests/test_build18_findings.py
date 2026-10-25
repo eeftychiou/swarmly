@@ -102,3 +102,31 @@ class TestARegistryReplyIsNeverMovedToGeneral(unittest.TestCase):
         channel.bot = DeadTopicBot()
         run(channel.send("the answer", thread_id=307))
         self.assertEqual(channel.bot.accepted, [])
+
+
+class TestWorkForAGoneTopicGetsANewOne(unittest.TestCase):
+    """Live, 25 Oct: NEW_TOPIC found a topic "already about the same item" that had just
+    been deleted; the assignment went to General. Now the work gets a topic of its own."""
+
+    def test_a_new_topic_is_opened(self):
+        from swarmly.telegram.channel import ChannelEvent
+        channel = make_channel()
+        channel._sender = None
+        bot = DeadTopicBot()
+        opened = []
+
+        async def create_forum_topic(**kw):
+            opened.append(kw)
+            return types.SimpleNamespace(message_thread_id=900, name=kw.get("name"))
+        bot.create_forum_topic = create_forum_topic
+        channel.bot = bot
+        channel.state_link.routing_mode = "registry"
+        channel._topic_for_refs = lambda text: (channel.config.identity.home_channel_id, 307)
+        ev = ChannelEvent(text="go", chat_id=channel.config.identity.home_channel_id,
+                          author_id=1, author_username="admin", message_id=5, thread_id=55)
+        run(channel._open_topic(ev, "#268 SNAPSHOT heal", "@CodexBot please take #268"))
+        self.assertEqual(len(opened), 1)
+        texts = [a.get("text", "") for a in bot.accepted]
+        self.assertFalse(any("continued in" in t for t in texts), texts)
+        self.assertFalse(any(a.get("message_thread_id") is None and "take #268" in
+                             a.get("text", "") for a in bot.accepted), texts)

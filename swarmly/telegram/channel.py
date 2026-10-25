@@ -615,6 +615,7 @@ class AgentChannel:
         self._split_pending: Dict[Tuple[Any, ...], _PendingSplit] = {}
         self._split_tasks: Set[asyncio.Task] = set()
         self._gone_topics: set = set()             # topics a reply in flight found closed
+        self._dead_topics: set = set()             # topics a dropped post found gone (kept)
         # Whether a post to a closed or deleted topic goes to General with a note (a reply
         # must land somewhere); ``swarmly-telegram send --topic`` turns it off so a wrong
         # topic id fails instead of posting in General.
@@ -784,9 +785,7 @@ class AgentChannel:
         # command deletes topics and messages only after one explicit confirmation.
         self.ledger = GeneralLedger(_state_file(config, "general"))
         self.cleanup = Cleanup(
-            self, self.ledger,
-            handle=f"@{config.identity.name.lstrip('@')}",
-            idle_hours=float(getattr(config.limits, "cleanup_idle_hours", 24.0)),
+            self, self.ledger, handle=config.identity.alias,
             keep=getattr(config.limits, "cleanup_keep", ()) or ())
         self._gh_client: Any = None
         self._github_task: Optional[asyncio.Task] = None
@@ -1846,11 +1845,19 @@ class AgentChannel:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
                 return None
         elif not (self.mentions_me(event.text or "") or event.replies_to_bot
-                  or self._direct_chat(event)):
+                  or self._direct_chat(event)
+                  or (self._answers_for_swarm() and not self._peer_handles_named(event.text or "")
+                      and not event.replies_to_peer and not event.replies_to_bot)):
             return None
         return await self.cleanup.handle_args(
             command_args(event.text or ""),
             is_admin=self.config.is_admin(event.author_id), chat_id=event.chat_id)
+
+    def _answers_for_swarm(self) -> bool:
+        """A bare swarm-wide command (``/cleanup``) is answered by one bot: the store's
+        lease holder -- the coordinator."""
+        store = self.state_link.store
+        return bool(store is not None and store.ready and store.holds_lease())
 
     async def _transport_command(self, event: ChannelEvent) -> Optional[str]:
         """A command answered by the transport: /cleanup first (it awaits), then the rest."""
@@ -2036,89 +2043,70 @@ class AgentChannel:
         return int(home) if home is not None else None
 
     def cleanup_topics(self) -> List[TopicInfo]:
-        """Every topic this transport knows in the home group, with what /cleanup decided from.
+        """Every topic this transport knows in the home group, with what /cleanup decides by.
 
         Telegram cannot list a group's topics, so these are the ones the transports recorded
-        (``topics-<alias>.json``): names, when each was last active, and the issue or PR its
-        name or its messages point at.
+        (``topics-<alias>.json``): names, when each was last active, and -- on the loop, from
+        the topic registry and the owed table -- whether it still has open work.
         """
         home = self.cleanup_home_chat()
+        owed = self._open_owed_topics()
         topics: List[TopicInfo] = []
         for chat_id, thread_id, name in self.topics.entries():
-            if home is not None and int(chat_id) != int(home):
+            if thread_id is None or (home is not None and int(chat_id) != int(home)):
                 continue
             if name == PULSE_TOPIC_NAME:
                 continue                           # the swarm's heartbeat, never cleaned up
-            refs = list(dict.fromkeys(
-                list(issue_refs(name or "")) + self._refs_of_topic(chat_id, thread_id)))
             topics.append(TopicInfo(
                 chat_id=int(chat_id), thread_id=int(thread_id), title=name,
                 last_activity=self.topics.last_seen(chat_id, thread_id),
-                refs=tuple(refs), states=self._ref_states(refs, chat_id, thread_id)))
+                open_reason=self._open_work_in(int(chat_id), int(thread_id), owed)))
         return topics
 
-    def _refs_of_topic(self, chat_id: int, thread_id: int) -> List[str]:
-        """The issues and PRs this transport learned the topic is about."""
-        return [ref for ref, topic in self._ref_topics.items()
-                if topic == (int(chat_id), int(thread_id))]
+    def _open_owed_topics(self) -> Dict[str, str]:
+        """Topic token (``tg-<id>``) -> one open owed row in it, as a short line."""
+        out: Dict[str, str] = {}
+        try:
+            store = self.owed_store()
+            rows = store.load()
+        except Exception:                                  # noqa: BLE001 - keep, do not guess
+            logger.warning("cleanup: the owed table could not be read", exc_info=True)
+            return {"*": "the owed table could not be read"}
+        if getattr(store, "unreadable", None):
+            return {"*": "the owed table is partly unreadable"}   # never guess: keep them all
+        for row in rows:
+            if row.is_open and row.topic and row.topic not in out:
+                out[row.topic] = f"{row.debtor} owes {row.kind} on {row.subject}"
+        return out
 
-    def _cleanup_repo(self, chat_id: int, thread_id: Optional[int]) -> Optional[str]:
-        """The repo whose issues decide a topic's state: its project's, else the first."""
-        project = self.router.project_for(chat_id, thread_id)
-        if project is not None and project.repo:
-            return project.repo
-        for settings in self.config.projects.values():
-            if settings.repo:
-                return settings.repo
-        return None
-
-    def _github_client(self) -> Any:
-        if self._gh_client is None:
-            from swarmly.github.client import GitHubClient
-            self._gh_client = GitHubClient(
-                token_env=(self.config.github.token_env if self.config.github
-                           else "GH_TOKEN"),
-                alias=self.config.identity.alias,
-                redact=Redactor.from_config(self.config).text)
-        return self._gh_client
-
-    def _ref_states(self, refs: List[str], chat_id: int,
-                    thread_id: Optional[int]) -> Dict[str, Optional[str]]:
-        """Each ref's state (``open``/``closed``/``merged``), or None when gh cannot say.
-
-        A topic is only ever called *done* when every item it links is known to be closed or
-        merged, so an unreachable GitHub keeps its topics: a deletion cannot be undone, and a
-        failure to check is not a reason to delete.
-        """
-        if not refs:
-            return {}
-        repo = self._cleanup_repo(chat_id, thread_id)
-        if not repo or self.config.github is None:
-            return {ref: None for ref in refs}
-        client = self._github_client()
-        numbers: Dict[str, int] = {}
-        for ref in refs:
-            try:
-                numbers[ref] = int(str(ref).lstrip("#"))
-            except (TypeError, ValueError):
+    def _open_work_in(self, chat_id: int, thread_id: int, owed: Dict[str, str]) -> Optional[str]:
+        """Why a topic is not finished, or None: a turn running in it, an open owed row, or
+        an open work item in the topic registry."""
+        place = (int(chat_id), int(thread_id))
+        running = {tuple(key) for turn, key in (getattr(self, "_turn_keys", {}) or {}).items()
+                   if key and key[1] is not None and not getattr(turn, "done", lambda: False)()}
+        lock = self._turn_locks.get(place)
+        if place in running or (lock is not None and lock.locked()):
+            return "a turn is running"
+        if "*" in owed:
+            return owed["*"]
+        token = self._topic_token(chat_id, thread_id)
+        if token and token in owed:
+            return "open: " + owed[token]
+        store = self.state_link.store
+        if store is None or not store.ready:
+            if self.state_link.routing_mode == "registry" or \
+                    self.state_link.links_mode == "registry":
+                return "the topic registry is not readable yet"   # never guess: keep it
+            return None
+        from swarmly.state import keys as K
+        record = store.read(K.topic(thread_id))
+        for link in (record.get("links") if isinstance(record, dict) else None) or []:
+            if not isinstance(link, dict) or link.get("role") != "work":
                 continue
-        cache = self.__dict__.setdefault("_ref_state_cache", {})
-        now = time.time()
-
-        def lookup(number: int) -> Optional[str]:
-            key = (repo, number)
-            hit = cache.get(key)
-            if hit is not None and now - hit[0] < _REF_STATE_CACHE_SECONDS:
-                return hit[1]
-            state = _ref_state(client.ref_state(repo, number))   # one call, issue or PR
-            if state is not None:
-                cache[key] = (now, state)
-            return state
-
-        # A topic links a dozen items: ask about them side by side, not one after another.
-        with ThreadPoolExecutor(max_workers=_REF_LOOKUP_WORKERS) as pool:
-            found = dict(zip(numbers, pool.map(lookup, numbers.values())))
-        return found
+            if link.get("status") not in ("closed", "abandoned") and link.get("phase") != "done":
+                return f"open work item {link.get('id', '?')} {link.get('title') or ''}".strip()
+        return None
 
     async def cleanup_delete_topic(self, chat_id: int, thread_id: int) -> bool:
         """Delete one forum topic with all its messages (any age: that is deleteForumTopic)."""
@@ -2307,6 +2295,7 @@ class AgentChannel:
         self._topics_reported.discard(key)
         self._report_asked.discard(key)
         self._gone_topics.discard(key)
+        self._dead_topics.discard(key)
         if context:
             for adapter in [self.adapter, *self._project_adapters.values()]:
                 forget = getattr(adapter, "forget_session", None)
@@ -4559,10 +4548,9 @@ class AgentChannel:
         if action == "swarm.sync":
             return await self._sync_now()
         if action == "swarm.cleanup":
-            # The dry run *is* the control: it deletes nothing, and the words it answers with
-            # name the command that would (with its own confirmation code).
+            # A preview: a button press never deletes; /cleanup does, in one go.
             return await self.cleanup.handle_args(
-                [], is_admin=True,
+                ["preview"], is_admin=True,
                 chat_id=self.config.identity.home_channel_id)
         if action == "swarm.pause_all":
             # Hold this bot, and broadcast the hold: every peer applies the same note, so one
@@ -7091,6 +7079,8 @@ class AgentChannel:
         A message accepted for a turn is kept in the inbox until this returns, so a restart
         that cuts a turn (or a queued message, or a reply not yet posted) runs it again.
         """
+        # A message in a topic shows it is there again (a closed topic can be reopened).
+        self._dead_topics.discard((event.chat_id, event.thread_id))
         key = (event.chat_id, event.message_id)
         tracked = event.message_id is not None and not event.self_task
         if tracked:
@@ -8923,9 +8913,20 @@ class AgentChannel:
         now = time.time()
         for ref in issue_refs(text):
             if ref in self._ref_topics \
-                    and now - self._ref_seen.get(ref, now) < REF_TOPIC_SECONDS:
+                    and now - self._ref_seen.get(ref, now) < REF_TOPIC_SECONDS \
+                    and self._work_topic(self._ref_topics[ref]):
                 return self._ref_topics[ref]
         return None
+
+    def _work_topic(self, place: Optional[Tuple[int, int]]) -> bool:
+        """A topic work may be moved into: not Swarm pulse (live, 25 Oct: refs learned from
+        bots' chatter there moved a reply into it), not one found gone."""
+        if place is None:
+            return False
+        pulse = self._pulse_topic()
+        if pulse is not None and int(place[1]) == int(pulse):
+            return False
+        return tuple(place) not in self._dead_topics
 
     def topic_for_text(self, text: str) -> Optional[Tuple[int, int]]:
         """The topic already about an issue or PR *text* names, if any (poll.py: a bus reply
@@ -8933,7 +8934,7 @@ class AgentChannel:
         explicit links decide first; today's ref-learning is only the fallback."""
         if self.state_link.links_mode == "registry":
             found = self.state_link.topic_for_refs(issue_refs(text or ""))
-            if found is not None:
+            if found is not None and self._work_topic(found):
                 return found
         return self._topic_for_refs(text)
 
@@ -9073,8 +9074,14 @@ class AgentChannel:
             # A topic already about the same issue or PR takes the work (round 2 export:
             # "PR #37 re-review" was opened while a topic about #37 existed).
             known = self._topic_for_refs(f"{title}\n{brief}")
-            if known is not None:
-                return await self._continue_in_topic(event, brief, known)
+            if known is not None and known not in self._dead_topics:
+                sent = await self._continue_in_topic(event, brief, known)
+                if known not in self._dead_topics:
+                    return sent
+                # That topic turned out to be gone (deleted since): the work gets a topic of
+                # its own instead of being lost (live, 25 Oct: a round's assignment went to
+                # General for a just-deleted topic).
+                logger.info("topic %s is gone; opening a new topic for the work", known[1])
         now = self._clock()
         self._topics_opened = [t for t in self._topics_opened if now - t < 3600]
         reason = ""
@@ -9109,6 +9116,7 @@ class AgentChannel:
                 chat_id=event.chat_id, thread_id=event.thread_id)
         self._topics_opened.append(now)
         self.topics.remember(home, thread_id, name, current=True)
+        self.topics.touch(home, thread_id)       # opened now: active, never "finished"
         self._learn_topic_refs(home, thread_id, f"{title}\n{brief}\n{event.text or ''}")
         self._topic_origins[(home, thread_id)] = (event.chat_id, event.thread_id)
         logger.info("opened topic %r (thread %s) for message %s", name, thread_id,
@@ -9139,6 +9147,13 @@ class AgentChannel:
             self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", home, thread_id, name)
         return sent
 
+    def _transport_only_on(self) -> bool:
+        """General and Swarm pulse are transport-only -- no model turn there, nothing from token
+        space posted there -- with ``limits.general_turns: never``, and always with registry
+        routing (admin, 25 Oct: "a block on posting token space posts in General, pulse")."""
+        return (getattr(self.config.limits, "general_turns", "allow") == "never"
+                or getattr(self.state_link, "routing_mode", "legacy") == "registry")
+
     def _transport_only_place(self, event: ChannelEvent) -> Optional[str]:
         """"General" or "Swarm pulse" when ``event`` is in one of them, else None."""
         home = self.config.identity.home_channel_id
@@ -9155,7 +9170,7 @@ class AgentChannel:
         opens a topic for it whichever bot it names (the named bot is addressed again in the
         topic, by the request quoted there); every other bot leaves it to the coordinator.
         None: not such a message, the normal path goes on."""
-        if getattr(self.config.limits, "general_turns", "allow") != "never":
+        if not self._transport_only_on():
             return None
         if event.self_task or event.author_is_bot or \
                 self._transport_only_place(event) != "General":
@@ -9176,7 +9191,7 @@ class AgentChannel:
         one place a message on its way to a turn passes, own briefs and transport turns
         included (the #257 class of bug: a turn that fell back to General).
         """
-        if getattr(self.config.limits, "general_turns", "allow") != "never":
+        if not self._transport_only_on():
             return None
         where = self._transport_only_place(event)
         if where is None:
@@ -9224,6 +9239,8 @@ class AgentChannel:
         here = (int(event.chat_id), event.thread_id) == (chat_id, thread_id)
         logger.info("not opening a topic: topic %s is already about the same item", thread_id)
         sent = await self.send(brief, chat_id=chat_id, thread_id=thread_id)
+        if (chat_id, thread_id) in self._dead_topics:
+            return sent                         # the caller opens a new topic instead
         self._log_topic(chat_id, thread_id, self.config.identity.alias, brief,
                         self.last_first_message_id)
         self._mirror_handoffs(brief, chat_id, thread_id, self.last_first_message_id,
@@ -10205,6 +10222,7 @@ class AgentChannel:
                         # reply in a just-deleted topic drew a peer's General cooldown notice).
                         logger.info("topic %s is gone; the rest of this post is dropped, "
                                     "not moved to General", thread_id)
+                        self._dead_topics.add(topic)
                         result = None
                         break
                     if not self.reroute_gone_topics:
@@ -10304,6 +10322,10 @@ class AgentChannel:
         self._note_general_message(destination, self.last_sent_message_id, thread_id,
                                    notice=notice)
         logger.info("Telegram accepted outbound message id=%s", self.last_sent_message_id)
+        if thread_id is not None:
+            # Its own posts count as activity too: a bot never receives them, and a topic only
+            # it has posted in for the last hour is not a finished one (/cleanup).
+            self.topics.touch(destination, thread_id)
         return self.last_sent_message_id if return_message_id else payload
 
     async def _send_with_retry(self, payload: str, reply_to_message_id: Optional[int],

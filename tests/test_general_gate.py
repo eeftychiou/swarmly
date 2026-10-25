@@ -132,3 +132,26 @@ class GeneralGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegistryRoutingMakesThemTransportOnlyTests(unittest.TestCase):
+    """Admin, 25 Oct: with registry routing nothing from token space is posted in General or
+    Swarm pulse -- live, bots took turns in both and a reply was moved into the pulse."""
+
+    def channel(self):
+        channel, adapter, opened = channel_for(general_turns="allow")
+        channel.state_link.routing_mode = "registry"
+        return channel, adapter, opened
+
+    def test_no_turn_in_general_or_the_pulse(self):
+        channel, adapter, _ = self.channel()
+        run(channel.handle_event(event("@HermesBot can you review #12?")))
+        run(channel.handle_event(event("@HermesBot can you review #12?", thread_id=PULSE)))
+        self.assertEqual(adapter.prompts, [])
+
+    def test_work_is_never_moved_into_the_pulse(self):
+        channel, _, _ = self.channel()
+        channel._learn_topic_refs(GROUP, PULSE, "talking about #300")
+        self.assertIsNone(channel.topic_for_text("progress on #300"))
+        channel._learn_topic_refs(GROUP, 9400, "work on #301")
+        self.assertEqual(channel.topic_for_text("progress on #301"), (GROUP, 9400))

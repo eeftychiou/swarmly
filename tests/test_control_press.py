@@ -1219,7 +1219,7 @@ class TestTheSwarmControls(unittest.TestCase):
     def test_a_cleanup_press_is_the_dry_run_and_deletes_nothing(self):
         channel = self.channel()
         text = run(channel.handle_control_press(press("ctl:swarm.cleanup")))
-        self.assertIn("dry run", text)
+        self.assertIn("would delete", text)
         self.assertIn("nothing is deleted", text)
 
     def test_both_are_offered_because_both_work(self):
