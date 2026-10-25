@@ -1314,5 +1314,86 @@ class TestTheReadViewsOnThePage(unittest.TestCase):
         self.assertNotIn("setInterval(memory, EVERY)", page)
         self.assertIn('location.hash === "#memory"', page)
 
+class TestTheControlCentre(unittest.TestCase):
+    """#345: every wired control on the page, with its confirm step and its off state."""
+
+    def channel(self, **web: Any) -> Any:
+        from tests.test_telegram_channel import make_channel, make_config
+        return make_channel(make_config(web=dict({"enabled": True, "port": 0}, **web)))
+
+    def rows(self) -> Dict[str, Any]:
+        view = self.channel().web_state()["controls"]
+        self.assertTrue(view["ready"])
+        return {row["action"]: row for row in view["controls"]}
+
+    def test_the_page_is_offered_a_button_per_control_this_build_carries_out(self):
+        from swarmly.telegram import control as ct
+        view = self.channel().web_state()["controls"]
+        self.assertEqual([row["action"] for row in view["controls"]], list(ct.page_actions()))
+        for row in view["controls"]:
+            self.assertTrue(row["label"], row)
+            # Where the button sits is the action's own prefix: on a bot's card, on the swarm,
+            # or on a round item -- the page never has to guess.
+            self.assertEqual(row["where"], row["action"].split(".", 1)[0], row["action"])
+
+    def test_the_confirm_step_is_the_tables_own(self):
+        from swarmly.telegram import control as ct
+        for action, row in self.rows().items():
+            self.assertEqual(row["confirm"], ct.control(action).confirm, action)
+            self.assertEqual(row["report"], ct.control(action).report, action)
+
+    def test_a_picker_carries_its_choices_and_a_typed_control_its_prompt(self):
+        rows = self.rows()
+        self.assertEqual([choice["value"] for choice in rows["bot.effort"]["choices"]],
+                         ["low", "medium", "high", "xhigh", "max"])
+        self.assertEqual(rows["bot.effort"]["typed"], "")
+        self.assertEqual(rows["swarm.admit"]["typed"], "a bot's @username")
+        # Reassigning a role is two picks in one press: which bot, then which role.
+        self.assertTrue(rows["swarm.role"]["choices"])
+        self.assertTrue(rows["swarm.role"]["then"])
+
+    def test_no_identifier_reaches_the_controls(self):
+        from tests.test_telegram_channel import GROUP
+        payload = json.dumps(self.channel().web_state()["controls"])
+        for secret in (str(GROUP), str(ADMIN_ID), "TEST"):
+            self.assertNotIn(secret, payload)
+
+    def test_the_page_has_no_control_it_can_press_without_the_admins_login(self):
+        page = webui.page_html()
+        # The page's own gate: no login, no enabled button -- and the reason, written down.
+        self.assertIn("const ADMIN = Boolean(INIT);", page)
+        self.assertIn('document.body.dataset.admin = ADMIN ? "1" : "0";', page)
+        self.assertIn("go.disabled = !ADMIN;", page)
+        self.assertIn("the controls are disabled", page)
+        self.assertIn('id="controls-reason"', page)
+        # And the write path is the one POST, with the minted code as its second body.
+        self.assertIn('const ACTION = "%s";' % webui.ACTION_PATH, page)
+        self.assertIn('verdict === "confirm"', page)
+        self.assertIn("post({code})", page)
+
+    def test_the_controls_sit_where_the_thing_they_change_is(self):
+        page = webui.page_html()
+        self.assertIn('controlsFor(state, "bot", bot.alias)', page)      # on the bot's card
+        self.assertIn("controlNode(nudge, item.item)", page)              # on its round item
+        self.assertIn('.where === "swarm"', page)                         # the rest in the panel
+
+    def test_a_page_that_collected_no_controls_draws_none(self):
+        self.assertIsNone(webui.controls_view(None))
+        self.assertIsNone(webui.watch_state(now=NOW)["controls"])
+        failed = webui.controls_view({"ready": False, "text": "the controls are not readable"})
+        self.assertEqual((failed["ready"], failed["controls"]), (False, []))
+        self.assertEqual(failed["text"], "the controls are not readable")
+
+    def test_the_controls_view_picks_its_fields_by_name(self):
+        view = webui.controls_view({"ready": True, "controls": [
+            {"action": "bot.pause", "label": "Pause", "where": "bot", "note": "",
+             "chat_id": CHAT, "token": "secret", "choices": [["low", "low"], "not a pair"]}]})
+        row = view["controls"][0]
+        self.assertEqual(sorted(row), ["action", "choices", "confirm", "label", "note",
+                                       "report", "typed", "where"])
+        self.assertEqual(row["choices"], [{"label": "low", "value": "low"}])
+        for secret in ("secret", str(CHAT)):
+            self.assertNotIn(secret, json.dumps(view))
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -17,6 +17,7 @@ from unittest import mock
 
 from swarmly.telegram import channel as channel_mod
 from swarmly.telegram import control as ct
+from swarmly.telegram.commands import MENU_COMMANDS
 from swarmly.telegram import control_press as cp
 from tests.test_control_center import FakeBot
 from tests.test_telegram_channel import (ADMIN_ID, event, make_channel, make_config,
@@ -285,7 +286,9 @@ class TestAnotherBotsControl(unittest.TestCase):
 
     def test_a_note_for_a_control_this_build_lacks_is_refused(self):
         channel = self.channel()
-        # `swarm.admit` was never wired (and has left the table), so this build lacks it.
+        # Every entry of the table is wired now (#345), so the build's own list is what says
+        # what it can carry out: one that lacks a control refuses that control's note.
+        channel.control_actions = lambda: ("bot.pause", "bot.resume")
         self.assertNotIn("swarm.admit", channel.control_actions())
         self.assertIn("not a control here",
                       apply(channel, self.note("swarm.admit", "Hermes")))
@@ -1118,6 +1121,9 @@ class TestARefusedBroadcastStaysOutOfTheChat(unittest.TestCase):
 
     def test_a_broadcast_trading_on_an_unknown_control_is_logged_and_not_posted(self):
         channel = self.channel()
+        # #345 wired every entry of the table, so what a build can carry out is its own list:
+        # a build without this control refuses the note, and nothing reaches the chat.
+        channel.control_actions = lambda: ("bot.pause",)
         self.assertIn("not a control here",
                       apply(channel, self.broadcast("swarm.admit"), sender="Claude"))
         self.assertEqual(channel._test_sender.sent, [])
@@ -1410,6 +1416,161 @@ class TestTheDashboardWritePath(unittest.TestCase):
         finally:
             channel.is_coordinator = lambda now=None: False
             channel._sync_web_dashboard()
+
+
+class TestEveryAdminCommandIsAControl(unittest.TestCase):
+    """#345: one table keeps the chat menu and the page's controls in step."""
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        return channel
+
+    def test_every_menu_entry_is_a_control_a_panel_or_a_written_reason(self):
+        self.assertEqual(ct.menu_gaps([name for name, _ in MENU_COMMANDS]), [])
+
+    def test_every_admin_command_is_a_control_or_says_in_words_why_not(self):
+        self.assertEqual(ct.admin_gaps(MENU_COMMANDS), [])
+        # The one exclusion left is the one this page cannot make: /topic is bound to the topic
+        # it is typed in, and a topic's thread id never reaches the wire.
+        topic = ct.coverage("topic")
+        self.assertEqual(topic.actions, ())
+        self.assertIn("thread id", topic.why)
+
+    def test_no_row_names_a_control_that_does_not_exist(self):
+        for row in ct.MENU_COVERAGE:
+            for action in row.actions:
+                self.assertIsNotNone(ct.control(action), f"{row.command}: {action}")
+
+    def test_no_row_survives_a_command_the_menu_dropped(self):
+        self.assertEqual(ct.stale_coverage([name for name, _ in MENU_COMMANDS]), [])
+
+    def test_the_page_offers_exactly_what_this_build_carries_out(self):
+        channel = self.channel()
+        self.assertEqual(set(ct.page_actions()), set(channel.control_actions()))
+        self.assertEqual([row["action"] for row in channel.web_controls()["controls"]],
+                         list(ct.page_actions()))
+
+
+class TestTheControlsThatChangeTheSwarm(unittest.TestCase):
+    """#345: the five controls added with the last slice, on the page's own write path."""
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        return channel
+
+    def ask(self, channel, **request):
+        return run(channel.dashboard_action(request))
+
+    def confirm(self, channel, **request):
+        """Press once (a code comes back), then press the code: the answer to the real run."""
+        asked = self.ask(channel, **request)
+        self.assertEqual(asked["verdict"], cp.CONFIRM, asked)
+        self.assertFalse(asked["ok"], asked)
+        code = asked.get("confirm")
+        self.assertTrue(code, asked)
+        return self.ask(channel, code=code)
+
+    def test_hold_and_release_are_the_state_the_typed_command_sets(self):
+        channel = self.channel()
+        self.assertTrue(self.confirm(channel, action="swarm.hold")["ok"])
+        self.assertTrue(channel.held())
+        self.assertTrue(self.confirm(channel, action="swarm.release")["ok"])
+        self.assertFalse(channel.held())
+        notes = [entry["text"] for entry in channel._test_sender.sent
+                 if "CONTROL swarm." in entry["text"]]
+        self.assertTrue(any("swarm.hold" in line and "via=dashboard" in line
+                            for line in notes), notes)
+        self.assertTrue(any("swarm.release" in line and "via=dashboard" in line
+                            for line in notes), notes)
+
+    def test_admit_adds_the_bot_that_already_said_hello(self):
+        channel = self.channel()
+        channel.roster.pending["newbot"] = ("Newbie", channel.roster._clock())
+        done = self.confirm(channel, action="swarm.admit", value="NewBot")
+        self.assertTrue(done["ok"], done)
+        self.assertIn("Newbie", done["text"])
+        self.assertEqual(channel.bot_handle("Newbie"), "NewBot")
+
+    def test_admit_refuses_a_bot_no_hello_came_from(self):
+        channel = self.channel()
+        done = self.confirm(channel, action="swarm.admit", value="GhostBot")
+        self.assertFalse(done["ok"])
+        self.assertEqual(done["refused"], cp.ACTION_REFUSED)
+        self.assertIn("HELLO", done["text"])
+
+    def test_remove_takes_the_bot_out_of_the_roster(self):
+        channel = self.channel()
+        channel.roster.joined["Codex"] = "CodexBot"
+        channel.roster.via["Codex"] = "admit"
+        done = self.confirm(channel, action="swarm.remove", target="Codex")
+        self.assertTrue(done["ok"], done)
+        self.assertNotIn("Codex", channel.roster.joined)
+        self.assertIn("codexbot", channel.roster.removed)
+
+    def test_remove_refuses_a_bot_this_roster_never_had(self):
+        channel = self.channel()
+        done = self.confirm(channel, action="swarm.remove", target="Nobody")
+        self.assertFalse(done["ok"])
+        self.assertEqual(done["refused"], cp.ACTION_REFUSED)
+
+    def test_memory_clear_is_this_bots_own_file(self):
+        channel = self.channel()
+        channel.lessons = mock.Mock()
+        channel.lessons.clear.return_value = "memory.md is empty"
+        done = self.confirm(channel, action="bot.memory", target="Hermes")
+        self.assertTrue(done["ok"], done)
+        self.assertTrue(channel.lessons.clear.called)
+
+    def test_memory_cannot_be_cleared_from_another_bots_card(self):
+        channel = self.channel()
+        channel.lessons = mock.Mock()
+        done = self.confirm(channel, action="bot.memory", target="Codex")
+        self.assertFalse(done["ok"])
+        self.assertIn("own file", done["text"])
+        self.assertFalse(channel.lessons.clear.called)
+
+
+class TestEveryConfirmingControlAsksTwice(unittest.TestCase):
+    """#345: the second tap is the only way anything that stops or changes something runs."""
+
+    def channel(self):
+        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
+        channel.control_round = lambda: None
+        return channel
+
+    def confirming(self):
+        """The controls that ask twice and are not pickers or reports: one button each."""
+        out = []
+        for action in ct.page_actions():
+            found = ct.control(action)
+            if found.confirm and not found.report and not ct.is_picker(action):
+                out.append(action)
+        return out
+
+    def test_every_one_answers_with_a_code_and_nothing_else_happens(self):
+        channel = self.channel()
+        self.assertTrue(self.confirming(), "the table stopped confirming anything")
+        before = len(channel._test_sender.sent)
+        for action in self.confirming():
+            asked = run(channel.dashboard_action({"action": action}))
+            self.assertEqual(asked["verdict"], cp.CONFIRM, action)
+            self.assertFalse(asked["ok"], action)
+            self.assertTrue(asked.get("confirm"), action)
+        # Nothing that stops or changes something ran, and no audit line was written for one.
+        notes = [entry["text"] for entry in channel._test_sender.sent[before:]
+                 if entry["text"].startswith("CONTROL ")]
+        self.assertEqual(notes, [])
+
+    def test_every_one_takes_its_own_code_back(self):
+        channel = self.channel()
+        for action in self.confirming():
+            code = run(channel.dashboard_action({"action": action}))["confirm"]
+            done = run(channel.dashboard_action({"code": code}))
+            self.assertNotEqual(done.get("refused"), cp.EXPIRED, action)
+            again = run(channel.dashboard_action({"code": code}))
+            self.assertEqual(again.get("refused"), cp.EXPIRED, action)   # one use only
 
 
 def round_state(items):

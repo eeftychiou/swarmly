@@ -3854,7 +3854,45 @@ class AgentChannel:
             coordinator=str(self.current_coordinator(now=moment) or ""), lease=lease,
             round_state=self.control_round(), owed=owed, registry=registry,
             peers=self.web_peers(), drift=self.web_drift(moment),
-            store=self.web_store())
+            store=self.web_store(), controls=self.web_controls())
+
+    # -- the page's controls (control centre 4/4, #345) --------------------------------
+    def web_controls(self) -> Dict[str, Any]:
+        """The controls the page may draw: the wired ones, their words, and their choices.
+
+        Read from the one table in :mod:`swarmly.telegram.control` and filtered by what this
+        build can actually carry out -- exactly as the pinned keyboard is -- so a button the
+        page shows is a button that works. The choices are read in code here, which is why
+        opening the panel costs no model turn.
+        """
+        try:
+            wired = set(self.control_actions())
+            rows: List[Dict[str, Any]] = []
+            for found in control_mod.CONTROLS:
+                if found.action not in wired:
+                    continue
+                row: Dict[str, Any] = {
+                    "action": found.action,
+                    "label": found.label,
+                    "confirm": bool(found.confirm),
+                    "report": bool(found.report),
+                    "note": found.note,
+                    "typed": control_mod.typed(found.action),
+                    "where": found.action.split(".", 1)[0],
+                    "choices": [[str(label), str(value)] for label, value
+                                in self.control_choices(found.action)],
+                }
+                if found.action == "swarm.role":
+                    # Two picks in one press: which bot, then which role. The page offers
+                    # both selects and sends them as one target and value (#345).
+                    row["then"] = [[str(label), str(value)] for label, value
+                                   in self.control_choices(found.action, "a-bot")]
+                rows.append(row)
+            return {"ready": True, "controls": rows}
+        except Exception:                      # noqa: BLE001 - a page without controls
+            logger.warning("web dashboard: the controls are not readable", exc_info=True)
+            return {"ready": False, "controls": [],
+                    "text": "the controls are not readable on this bot"}
 
     # -- the read commands' views (control centre 3/4, #344) ---------------------------
     def web_peers(self) -> List[Dict[str, Any]]:
@@ -4227,9 +4265,10 @@ class AgentChannel:
         it is wired; until then it is neither shown nor run.
         """
         return ("bot.pause", "bot.resume", "bot.restart", "bot.stop_turn",
-                "bot.model", "bot.effort", "bot.cli",
+                "bot.model", "bot.effort", "bot.cli", "bot.memory",
                 "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
                 "swarm.lease", "swarm.failback",
+                "swarm.hold", "swarm.release", "swarm.admit", "swarm.remove",
                 "item.nudge")
 
     #: The controls that only *report*, read off the one table in
@@ -4842,6 +4881,16 @@ class AgentChannel:
         Returns the words to answer the presser with when the control is one that *reports*
         (None otherwise, and the policy's own line is the answer).
         """
+        if action == "swarm.hold":
+            return self._hold_control("hold")
+        if action == "swarm.release":
+            return self._hold_control("release")
+        if action == "swarm.admit":
+            return await self._admit_control(value or target)
+        if action == "swarm.remove":
+            return await self._remove_control(target or value)
+        if action == "bot.memory":
+            return self._memory_control(target)
         if value:
             return await self._apply_pick(action, value, target, presser=presser, via=via)
         if action == "swarm.failback":
@@ -4896,6 +4945,89 @@ class AgentChannel:
         await self.send(f"@{handle} carry on with #{key} please — the dashboard has no "
                         "movement on it.", notice=True)
         logger.info("control: nudged %s about #%s", owner, key)
+
+    # -- the controls that change the swarm or this bot's own file (#345) ----------------
+    def _hold_control(self, command: str) -> str:
+        """``/hold`` and ``/release`` as a press: the state the typed command sets, in code.
+
+        The hold rides this bot's own pulse (#234), so a press is not a second kind of hold:
+        the peers adopt it on their next beat exactly as they adopt a typed ``/hold``.
+        """
+        was = self.held()
+        if command == "release":
+            self._set_hold(None)
+            logger.info("control: the swarm is released by a press")
+            return ("▶ the swarm is released: work goes on." if was
+                    else "▶ the swarm was not on hold.")
+        self._set_hold("")
+        logger.info("control: the swarm is held by a press")
+        return "⏸ the swarm is on hold: bots answer, but start nothing."
+
+    async def _admit_control(self, handle: str) -> str:
+        """``/admit @name`` as a press (#345): the same roster change, welcomed the same way.
+
+        A handle this bot never saw a HELLO from is refused in words rather than silently
+        added: the admin typed who it should be, and "nothing happened" is the answer that
+        would leave them guessing which of the two went wrong.
+        """
+        handle = str(handle or "").strip().lstrip("@")
+        if not handle:
+            raise ControlRefused("admit needs a bot: type its @username first")
+        added = self.roster.admit([handle])
+        if not added:
+            raise ControlRefused(f"@{handle}: nothing to admit — no HELLO from it has reached "
+                                 f"this bot yet")
+        for alias, username in added:
+            await self.send(format_message(
+                Envelope(type=MessageType.HELLO, to=alias, intent="WELCOME",
+                         ref=self._alias_ref(), rev=self._running_revision),
+                f"👋 @{username} {self.config.identity.alias} has added {alias} as a peer"),
+                silent=True, allow_when_frozen=True, notice=True)
+        logger.info("control: admitted %s", ", ".join(alias for alias, _ in added))
+        return "admitted " + ", ".join(alias for alias, _ in added)
+
+    async def _remove_control(self, alias: str) -> str:
+        """``/remove @name`` as a press (#345): the bot leaves this roster."""
+        who = str(alias or "").strip().lstrip("@")
+        if not who:
+            raise ControlRefused("remove needs a bot: pick one on its card")
+        handle = self.bot_handle(who)
+        if not handle:
+            raise ControlRefused(f"{who}: no @username is known for it here")
+        removed = self.roster.remove([handle])
+        if not removed:
+            raise ControlRefused(f"{who}: it is not a bot of this roster")
+        for name in removed:
+            self.membership.forget(name)
+        logger.info("control: removed %s", ", ".join(removed))
+        return "removed " + ", ".join(removed)
+
+    def bot_handle(self, name: str) -> str:
+        """The ``@username`` this swarm knows a bot by: the peer table's, else the roster's."""
+        wanted = str(name or "").strip().lstrip("@").lower()
+        if not wanted:
+            return ""
+        for alias, handle in (getattr(self.config, "peers", None) or {}).items():
+            if str(alias).strip().lower() == wanted:
+                return str(handle).strip().lstrip("@")
+        for alias, handle in (getattr(self.roster, "joined", None) or {}).items():
+            if str(alias).strip().lower() == wanted:
+                return str(handle).strip().lstrip("@")
+        return ""
+
+    def _memory_control(self, target: str) -> str:
+        """``/memory clear`` as a press: this bot's own file, and never a peer's (#345).
+
+        A memory is the bot's own; a page from another bot's card cannot empty it, because the
+        press would land *here* while the card named *there* -- so it is refused in words
+        rather than clearing the wrong bot's notes.
+        """
+        who = str(target or "").strip().lstrip("@")
+        mine = str(self.config.identity.alias).strip().lower()
+        if who and who.lower() not in ("", "self", mine):
+            raise ControlRefused(f"memory is {self.config.identity.alias}'s own file: its page "
+                                 f"clears it, not a card from here")
+        return self._memory_command(self._control_event("memory", "clear"))
 
     async def refresh_control_center(self, *, now: Optional[float] = None) -> Optional[Any]:
         """Edit the pinned dashboard for this beat. Never raises; ``None`` when there is none."""

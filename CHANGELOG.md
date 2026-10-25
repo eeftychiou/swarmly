@@ -173,6 +173,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- The dashboard **control centre** (`#345`, control centre 4/4): every admin command the bots take
+  in Telegram is now a control on the page, carried out by the same dispatch a Telegram button uses
+  (one table, one admin check, one second tap, one audit line). A `bot.` control sits on that bot's
+  card (Pause, Resume, Stop turn, Restart, Model, Effort, CLI, Memory), an `item.` control on its
+  round item (Nudge), a `swarm.` control in the Controls panel (Hold, Release, Pause all, Hand
+  lease, Fail back, Reassign role, Cleanup, Sync, Admit, Remove) — five of them new here, wired to
+  what the typed `/hold`, `/release`, `/admit`, `/remove` and `/memory clear` already do, and
+  `bot.memory` refusing a press aimed at another bot's card. A control that stops or changes
+  something asks twice: the first POST answers with the single-use code, a sheet says exactly what
+  the second tap will do, and only `{code}` runs it. Results answer in a toast with the policy's
+  own words and the card redraws at once. Without the admin's verified Mini App login every control
+  is drawn disabled with the reason shown. `control.MENU_COVERAGE` maps **every** entry of
+  `commands.MENU_COMMANDS` to its control(s) or panel, with one written exclusion — `/topic`, which
+  needs the topic's thread id and the page publishes none — and the suite fails on a gap, on a row
+  naming a control that does not exist, and on a row for a command the menu dropped.
+
 - A **view per read command** on the dashboard (`#344`, control centre 3/4): the roster behind
   `/status` and `/swarm` (role, state, model, effort, rev, and the peers this bot knows), the
   usage table behind `/usage all`, the round board, the settings section behind `/model`,

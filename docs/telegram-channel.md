@@ -1275,6 +1275,45 @@ admin's login is needed" when it is opened without the Mini App login, and it fe
 again when the section is opened), never on the three-second beat. The file's home never reaches
 the wire — only its words and their size.
 
+**The dashboard control centre (#345, slice 4/4).** The last slice turns the page into the
+control centre: every command an admin uses in the chat is a control on the page, and it is
+carried out by the same dispatch (`control.CONTROLS` through `control_press`, the write path
+above), so the two can never behave differently.
+
+Where a control sits is its own prefix: a `bot.` control is drawn **on that bot's card** (Pause,
+Resume, Stop turn, Restart, Model, Effort, CLI, Memory), an `item.` control **on the round item
+it acts on** (Nudge), and a `swarm.` control in the **Controls** panel (Hold, Release, Pause all,
+Hand lease, Fail back, Reassign role, Cleanup, Sync, Admit, Remove). A control that takes a value
+carries the one it can be picked from — a model, an effort level, a bot, a role, a round item's
+key — read in code by `control_choices`, so drawing the panel costs no model turn; a control whose
+value cannot be picked, like `/admit`'s `@username`, shows a text box instead.
+
+One table keeps the page and the commands in step: `control.MENU_COVERAGE` maps **every** entry of
+`commands.MENU_COMMANDS` to the control(s) it became, to the panel that answers it, or to the
+written reason it stays a chat command. The single exclusion is `/topic`, which binds items to the
+topic it is typed in — and a topic's thread id is exactly what the page never publishes (the
+no-leak rule above), so a press made from the page could not name the topic it would bind.
+`menu_gaps`, `admin_gaps` and `stale_coverage` name any hole, and the suite fails on one: an admin
+command with no control, a row naming a control that does not exist, or a row for a command the
+menu dropped. A control is only drawn when `control_actions()` can carry it out, so a button the
+page shows is a button that works.
+
+A press that stops or changes something asks twice. The first POST answers `verdict: "confirm"`
+with the single-use code, and the page shows a sheet saying exactly what the second tap will do
+(the control's own note, for Restart: "waits for the queue to empty and no reply to be unsent");
+only `{code}` runs it, and the sheet's Cancel — or a tap on the veil — runs nothing. A value that
+changes something (a picked model, an admitted handle) always asks twice, exactly as it does in
+the chat. What runs answers in a toast with the policy's own words, and the page redraws at once,
+so the card that changed is the card that is on screen. Each executed press writes the same
+`CONTROL … via=dashboard` line in the control topic that a Telegram button writes — who pressed
+what, and when, on the durable plane.
+
+While the page has no verified admin login — opened locally, or without the Mini App's
+`initData` — **every control is drawn disabled** and the panel says why, rather than offering a
+button that would answer `403`; the login is checked on the server for every write anyway, so the
+disabled state is a courtesy on top of the real door. The page's own gate (`ADMIN`) never decides
+anything: it only draws.
+
 The page follows the lease like the pin: the first heartbeat that finds this bot coordinating
 starts the server, and the first that finds another bot coordinating stops it — so a failover
 moves the page with the role instead of leaving a stale one answering on an old host. The
