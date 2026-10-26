@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-26
+
+### Highlights
+
+- **A first swarm on Telegram alone.** `swarmly --cli <claude|codex|agy|reasonix> ...` now writes
+  a config on the Telegram bus (`bus.transport: telegram`): the lease, the topic registry,
+  routing, the owed table and agent stats live in a state store in the group's 📡 Swarm pulse
+  topic. No git repository is needed; `/bus <git URL>` still moves an agent onto gitbus. New
+  [docs/QUICKSTART.md](docs/QUICKSTART.md) walks through a first swarm.
+- **The topic registry** (docs/design/topic-registry.md): every work topic has its links (issue,
+  PR, doc) with status, phase and assignees, and its agents with their sessions. The
+  coordinator takes a topic's messages; other agents when named or handed work. General and
+  Swarm pulse are transport-only, and a reply is always posted in its turn's topic.
+- **One session per topic for every runtime**, with a handover when a session is rotated (turn
+  limit, or a drift reset after repeated rule violations).
+- **The dashboard**: a Topics panel, a control centre, and a Telegram Mini App
+  (`web.public_host`, opened from the bot's Mini App link).
+- **Housekeeping**: `/cleanup` deletes finished topics in one command; each transport deletes its
+  own old posts in Swarm pulse; the pinned card is edited in place; no console windows on
+  Windows; the state folder is per bot (`state.dir`) and never depends on a bus checkout.
+
+
 ### Fixed
 
 - A parent issue still closes with its reason after an earlier close attempt failed (`#238`).

@@ -1168,3 +1168,41 @@ class TheSwarmCommandsAnswerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TelegramBusJoinTests(unittest.TestCase):
+    """A first swarm on the Telegram bus: no git repository, nothing to ask for."""
+
+    def telegram_config(self, folder):
+        data = {"agent": {"name": "HermesBot", "alias": "Hermes", "bot_token": "123456:TEST",
+                          "home_channel_id": GROUP, "admin_user_id": ADMIN_ID},
+                "adapter": {"type": "echo"},
+                "limits": {"min_seconds_between_messages": 0, "selftest_seconds": 0,
+                           "min_seconds_between_agent_turns": 0},
+                "bus": {"transport": "telegram"},
+                "state": {"backend": "telegram", "lease": "store", "routing": "registry",
+                          "owed": "store", "links": "registry"}}
+        return AgentConfig.from_dict(data, source_path=Path(folder) / "config.yaml")
+
+    def test_the_first_agent_coordinates_without_asking_for_a_bus(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = dynamic(make_channel(self.telegram_config(folder)))
+            m = channel.membership
+            run(m._await_swarm())
+            ask = channel._test_sender.last
+            self.assertIn("first one in this swarm", ask)
+            self.assertNotIn("/bus", ask)
+            self.assertEqual(m.state.role, "coordinator")
+            self.assertTrue(m.joined())
+
+    def test_the_launcher_writes_a_telegram_bus_config(self):
+        from swarmly.telegram.join import render_config
+        with tempfile.TemporaryDirectory() as folder:
+            text = render_config("claude_x_bot", "Claude", "claude", GROUP, ADMIN_ID,
+                                 Path(folder))
+            path = Path(folder) / "config.yaml"
+            path.write_text(text, encoding="utf-8")
+            cfg = AgentConfig.load(path)
+            self.assertEqual(cfg.bus.transport, "telegram")
+            self.assertEqual((cfg.state.backend, cfg.state.routing, cfg.state.owed),
+                             ("telegram", "registry", "store"))

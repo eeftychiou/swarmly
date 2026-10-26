@@ -498,6 +498,21 @@ class Membership:
     async def _await_swarm(self) -> None:
         """No answer to the JOIN: this is the first agent. No role after a while: ask."""
         await self.ch._sleep(JOIN_WAIT_SECONDS)
+        if self.cfg.bus.transport == "telegram":
+            # The Telegram store is the bus: there is nothing to ask for. The first agent
+            # coordinates; a later one waits for its role.
+            if not self._present_from and not self.state.role:
+                self.set_own_role("coordinator", by="default: the first agent")
+                self.state.self_appointed = True
+                self._save()
+                await self.ask_maintainer(
+                    f"🙋 {self.alias} here. No agent answered, so I am the first one in this "
+                    "swarm, and I will coordinate. The swarm runs on the Telegram bus; nothing "
+                    f"else to set up. Give me another role with /role "
+                    f"{self.cfg.identity.username} <role> if you want.")
+                return
+            await self._await_role()
+            return
         if not self.bus_location():
             first = not self._present_from
             await self.ask_maintainer(
