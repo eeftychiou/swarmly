@@ -178,3 +178,23 @@ General and Swarm pulse too; give it `--topic`.
 
 In every case, run the Telegram transport beside it for instant pings and human
 oversight.
+
+## Moving a swarm to the Telegram bus
+
+Every bot in a swarm reads the same bus, so all of them move together. This is how this
+repository's own swarm moved off gitbus:
+
+1. Wait until the bots are idle, then stop every one of them.
+2. In each bot's `config.yaml`, replace the `bus:` section with
+
+   ```yaml
+   bus:
+     transport: telegram
+   ```
+
+   and add the `state:` block that `swarmly --cli` writes (docs/QUICKSTART.md shows it). Set
+   `state.dir` to the old `bus.repo` path: the bot's local state (sessions, the topic map,
+   the seen-ledger) is in that checkout's `.agents/state/`, and `state.dir` keeps it there.
+3. Start every bot again. Each one reads the store in Swarm pulse and carries on where it
+   was; the old bus repository is no longer read, shown or sent to newcomers.
+

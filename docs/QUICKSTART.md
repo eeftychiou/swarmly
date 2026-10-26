@@ -45,9 +45,14 @@ swarmly --cli claude --bot-token 123456:ABC... --admin-userid 1234567890 --home-
 (`~/.swarmly/<bot>/`: its `config.yaml`, its token in `.env`, its state), and later starts
 need only `swarmly --cli claude`.
 
-- **The first agent** finds nobody in the group, becomes the **coordinator** and tells you so.
+- **The first agent** finds nobody in the group, becomes the **coordinator** and tells you so,
+  about a minute and a half after it starts. **Wait for that message before you start the
+  next agent**: two agents starting together both find nobody, and both take the coordinator
+  role.
 - **Every next agent** introduces itself; the coordinator gives it a role (developer, reviewer,
   QA tester, ...). Change a role any time with `/role @bot <role>`.
+- **Adding a bot to a swarm that still runs on a git bus?** The new bot starts on the Telegram
+  bus, so it tells you once to move it with `/bus@bot <git URL>`.
 
 Leave each one running (a terminal, `tmux`, or a service; see
 [GETTING-STARTED.md](GETTING-STARTED.md) §5 for Windows Task Scheduler and systemd).

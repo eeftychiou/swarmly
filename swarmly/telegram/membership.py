@@ -91,7 +91,8 @@ ROLE_LINES_PER_REPLY = 2
 #: ``ROLE: @handle role`` in a coordinator's reply.
 _ROLE_LINE = re.compile(r"(?im)^\W*ROLE:\s*@([A-Za-z0-9_]{5,32})\s+([a-z][a-z0-9_-]{0,39})\b")
 #: ``key: value`` lines of a JOIN or PRESENT body.
-_FIELD_LINE = re.compile(r"(?m)^\s*(cli|key|role|coordinator|bus|members):[ \t]*(.*?)\s*$")
+_FIELD_LINE = re.compile(
+    r"(?m)^\s*(cli|key|role|coordinator|bus|members|assigned):[ \t]*(.*?)\s*$")
 _TRAILING_HANDLES = re.compile(r"(?:\s+@[A-Za-z0-9_]{5,32})+$")
 #: One member of a coordinator's list: ``Alias=@username#user_id:role``.
 _MEMBER = re.compile(r"([A-Za-z0-9_-]{1,32})=@([A-Za-z0-9_]{5,32})#(\d{1,20})(?::([a-z][a-z0-9_-]{0,39}))?")
@@ -232,6 +233,7 @@ class Membership:
         #: Newcomers a role is being decided for: Telegram username (lower) -> alias.
         self._pending_roles: Dict[str, str] = {}
         self._onboarding = False                         # an onboarding turn is running
+        self._bus_mismatch_told = False                  # a git bus named to a Telegram bot
         #: Set by the ``swarmly --cli`` launcher. Only such an agent joins by itself (posts a
         #: JOIN, asks the maintainer for a bus, takes the first agent's coordinator role); an
         #: agent from a hand-written config only answers newcomers and records roles.
@@ -272,9 +274,13 @@ class Membership:
     def bus_location(self) -> Optional[str]:
         """The bus everyone shares: the agreed one, else the configured checkout's remote (or
         the configured folder)."""
+        bus = self.cfg.bus
+        if bus.transport == "telegram":
+            # The group itself, never told to a newcomer; first, so a git bus agreed before a
+            # move to the Telegram bus is neither shown nor sent on (review on #369).
+            return "telegram"
         if self.state.bus:
             return self.state.bus
-        bus = self.cfg.bus
         if bus.transport == "folder" and bus.folder:
             return bus.folder
         url = self._origin_url()
@@ -431,7 +437,8 @@ class Membership:
             if self.state.onboard_pending:
                 self._onboard()
             return
-        if self.state.bus and not self.state.bus_ready:
+        if self.cfg.bus.transport != "telegram" and self.state.bus \
+                and not self.state.bus_ready:
             # The swarm named a bus but its checkout did not finish (a crash, a stop): again.
             await self.adopt_bus(self.state.bus)
             return
@@ -625,6 +632,15 @@ class Membership:
         bus = self.advertised_bus()
         if bus:
             lines.append(f"bus: {bus}")
+        gap = None
+        if self.is_coordinator() and not self.cfg.peer_roles.get(alias) \
+                and self._no_turn_place():
+            # No topic can hold the role turn yet (a new swarm: General is transport-only), so
+            # the turn would be dropped and the newcomer would wait for the admin. The gap role
+            # rides in this answer instead, which the newcomer reads together with who the
+            # coordinator is: a separate ROLE could arrive first and be dropped.
+            gap = self.default_role_for(alias)
+            lines.append(f"assigned: {gap}")
         if self.is_coordinator():
             members = [f"{a}=@{str(u).lstrip('@')}#{self.state.peer_ids[a]}"
                        + (f":{self.cfg.peer_roles[a]}" if self.cfg.peer_roles.get(a) else "")
@@ -636,7 +652,11 @@ class Membership:
             Envelope(type=MessageType.HELLO, to=alias, intent="PRESENT",
                      ref=self.ch._alias_ref()), "\n".join(lines)),
             reply_to_message_id=event.message_id, silent=True, allow_when_frozen=True)
-        if self.is_coordinator() and not self.cfg.peer_roles.get(alias):
+        if gap is not None:
+            logger.info("membership: no work topic for a role turn; %s gets %s, the first "
+                        "role the team lacks", alias, gap)
+            await self.assign(username, gap, reason="the first role the team lacks")
+        elif self.is_coordinator() and not self.cfg.peer_roles.get(alias):
             self._decide_role(alias, username, fields.get("cli") or "unknown")
 
     async def _meet(self, alias: Optional[str], event: "ChannelEvent") -> Optional[str]:
@@ -728,8 +748,22 @@ class Membership:
                     continue
                 if await self._verified_admin(int(m_id), m_user):
                     self._add_peer(m_alias, m_user, int(m_id), m_role or None)
+        assigned = (fields.get("assigned") or "").lower()
+        if assigned and self.state.coordinator == alias and not self.state.role \
+                and assigned != "coordinator" and _ROLE_NAME(assigned):
+            self.set_own_role(assigned, by=alias)
         bus = fields.get("bus")
         self._save()
+        if bus and self.cfg.bus.transport == "telegram" and is_remote_bus(bus) \
+                and not self._bus_mismatch_told:
+            # A new bot on the Telegram bus joining a swarm that keeps its record in git: it
+            # would read none of the swarm's hand-offs. Said once, with the command that fixes
+            # it (/bus moves a bot onto gitbus).
+            self._bus_mismatch_told = True
+            await self.ask_maintainer(
+                f"⚠️ {self.alias} runs on the Telegram bus, but {alias} says this swarm's bus "
+                f"is a git repository. Reply /bus{self._at()} {safe_bus_location(bus)} to move "
+                f"{self.alias} onto it.")
         if bus and not self.state.bus and not self.bus_ready():
             if is_remote_bus(bus):
                 await self.adopt_bus(bus)
@@ -1058,6 +1092,17 @@ class Membership:
         self._pending_roles[username.lstrip("@").lower()] = alias
         self.ch._run_own_task(text, int(self.cfg.identity.home_channel_id or 0), None, None)
 
+    def _no_turn_place(self) -> bool:
+        """Whether a membership turn has nowhere to run: General is transport-only (registry
+        routing) and this bot has no work topic to take the turn instead."""
+        only = getattr(self.ch, "_transport_only_on", None)
+        place = getattr(self.ch, "_work_place", None)
+        try:
+            return bool(callable(only) and only() and callable(place) and place() is None)
+        except Exception:                            # noqa: BLE001 - run the turn as before
+            logger.warning("membership: cannot tell where a turn runs", exc_info=True)
+            return False
+
     def _onboard(self) -> None:
         """The role's first turn: its full instructions, and the ask for a first task."""
         from swarmly.telegram.roles import RoleError
@@ -1067,6 +1112,15 @@ class Membership:
             logger.warning("membership: cannot read the role %s: %s", self.state.role, exc)
             return
         if role is None or self._onboarding:
+            return
+        if self._no_turn_place():
+            # A new swarm: the general gate would drop this turn. The role's instructions ride
+            # in every turn anyway, and the maintainer was told to give the swarm work in a
+            # topic, so the first real turn carries the role.
+            logger.info("membership: no work topic for %s's first turn as %s; its next turn "
+                        "carries the role", self.alias, role.name)
+            self.state.onboard_pending = False
+            self._save()
             return
         self._onboarding = True       # onboard_pending clears when the turn has answered
         coordinator = self.coordinator_handle()
