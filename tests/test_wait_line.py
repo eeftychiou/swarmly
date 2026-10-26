@@ -196,9 +196,10 @@ class TestExtraction(unittest.TestCase):
             self.assertEqual((rows, reasons), ([], []), "an ack copied back is not a WAIT line")
 
     def test_the_bots_own_words_still_say_which_verdict(self):
-        row = wl.parse_line("WAIT review #337 head 03db9e3 from Reasonix on the panel",
-                            at=1000.0)
-        self.assertEqual(row.owes, "a review on the panel")
+        for words in ("on the panel", "On the panel"):          # review on #354: any case
+            row = wl.parse_line(f"WAIT review #337 head 03db9e3 from Reasonix {words}",
+                                at=1000.0)
+            self.assertEqual(row.owes, f"a review {words}")
 
 
 class TestARetiredWakeBecomesARow(unittest.TestCase):
@@ -286,6 +287,8 @@ class TestTheTransportRecordsIt(unittest.TestCase):
         self.assertEqual(channel._test_table[1].load(), [])
         self.assertIn("WAIT refused", said)
         self.assertIn("needs the head", said)
+        # The refusal copied back is not a WAIT line either (review on #354).
+        self.assertEqual(wl.extract_waits(said, at=1000.0)[1:], ([], []))
 
     def test_two_questions_to_the_admin_are_two_rows(self):
         channel = self.channel()

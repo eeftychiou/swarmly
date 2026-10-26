@@ -6111,7 +6111,8 @@ class AgentChannel:
                 notes.extend(said)
             except Exception as exc:               # noqa: BLE001 - said back, not swallowed
                 logger.warning("WAKE: the rows could not be recorded", exc_info=True)
-                notes.extend(f"WAKE not recorded: {exc}" for _row in rows)
+                # A note never opens with WAIT/WAKE: copied back, it would be refused (#353).
+                notes.extend(f"⚠️ WAKE not recorded: {exc}" for _row in rows)
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
 
@@ -6147,8 +6148,8 @@ class AgentChannel:
                 notes.extend(ack(row) for row in rows)
             except Exception as exc:               # noqa: BLE001 - said back, not swallowed
                 logger.warning("WAIT: the rows could not be recorded", exc_info=True)
-                notes.extend(f"WAIT not recorded: {exc}" for _row in rows)
-        notes.extend(f"WAIT refused: {reason}" for reason in reasons)
+                notes.extend(f"⚠️ WAIT not recorded: {exc}" for _row in rows)
+        notes.extend(f"⚠️ WAIT refused: {reason}" for reason in reasons)
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
 
