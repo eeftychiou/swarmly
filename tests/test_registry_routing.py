@@ -170,17 +170,21 @@ class ChannelRoutingTests(unittest.TestCase):
         run(channel.handle_event(admin("/model@CodexBot")))
         self.assertEqual(admin_links, [])
 
-    def test_a_linked_agent_a_peer_names_in_passing_is_not_refused_by_wording(self):
+    def test_a_peer_reporting_it_asked_a_linked_bot_is_not_a_refused_delegation(self):
         """Live, 25 Oct: "@Reasonix: thanks. I've asked @agy for QA" drew "a peer asks another
-        bot to hand this bot the work" from the linked QA bot. The registry decides here."""
+        bot to hand this bot the work" from the linked QA bot: "asked" read as a request."""
         text = "@AntigravityBot: thanks, verdict noted. I've asked @HermesBot for QA."
         channel, adapter, _ = channel_for(ME_LINKED)
         run(channel.handle_event(event(text, thread_id=TOPIC)))       # from Codex, a peer
         self.assertEqual(len(adapter.prompts), 1)
-        # Without a record the old guard still keeps a delegation away from this bot.
-        channel, adapter, _ = channel_for(None)
-        run(channel.handle_event(event(text, thread_id=TOPIC)))
-        self.assertEqual(adapter.prompts, [])
+
+    def test_a_delegation_still_goes_only_to_the_bot_it_addresses_under_the_registry(self):
+        """Review on #357: the registry has no notion of relaying, so the guard stays."""
+        for facts in (ME_LINKED, ME_COORD):
+            channel, adapter, _ = channel_for(facts)
+            run(channel.handle_event(event("@AntigravityBot please hand @HermesBot the task",
+                                           thread_id=TOPIC)))
+            self.assertEqual(adapter.prompts, [], facts)
 
     def test_without_registry_facts_the_mention_rules_decide(self):
         channel, adapter, _ = channel_for(None)
