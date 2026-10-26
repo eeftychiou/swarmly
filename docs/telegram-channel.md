@@ -1119,14 +1119,16 @@ the `usage.today` its latest heartbeat carried. The coordinator gets the same li
 turn's prompt (code, no tokens), so a cost report never needs anyone to look for ledger files.
 
 **The command centre — a pinned dashboard (issue #117).** The coordinator keeps one message
-pinned in a control topic (or the admin's DM) and edits it in place on every heartbeat, so the
-swarm's state is readable at a glance without asking anyone anything and without a model turn.
-Set where it lives in `config.yaml`; with no `control` section, nothing is pinned:
+pinned and edits it in place on every heartbeat, so the swarm's state is readable at a glance
+without asking anyone anything and without a model turn. **On the Telegram state store
+(`state.backend: telegram`) it lives in 📡 Swarm pulse by default**, whatever that topic's id, so
+there is nothing to configure and a reopened pulse topic needs no edit. A `control` section
+overrides it; without the store and without a section, nothing is pinned:
 
 ```yaml
 control:
   chat_id: -1001234567890     # optional: the admin's DM, or the group; defaults to the home channel
-  topic_id: 307               # optional: the forum topic; defaults to General
+  topic_id: pulse             # optional: "pulse" (the default on the store), a topic id, or omit for General
 ```
 
 The message is built in code from the records the transport already holds — the status
