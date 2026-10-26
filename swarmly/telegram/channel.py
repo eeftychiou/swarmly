@@ -2034,11 +2034,49 @@ class AgentChannel:
         a human's message is not ours to delete, and a model reply is the answer someone is
         reading.
         """
-        if thread_id is not None or message_id is None:
+        if message_id is None:
+            return
+        if thread_id is not None:
+            self.note_pulse_post(chat_id, message_id, thread_id)
             return
         self.ledger.note(int(chat_id), [int(message_id)])
         if notice:
             self.ledger.note_notice(int(chat_id), int(message_id))
+
+    def note_pulse_post(self, chat_id: int, message_id: Optional[int],
+                        thread_id: Optional[int]) -> None:
+        """A post of this transport's in Swarm pulse: pulses, STATE lines, snapshots, HELLOs.
+
+        All of it is machine traffic, delivered to the peers as live updates and never read
+        back from history, so the ephemeral sweep deletes it once it is old -- Swarm pulse had
+        thousands of such posts (admin, 26 Oct). The pinned card, the current snapshot and this
+        bot's live status message are kept by the sweep, whatever their age."""
+        pulse = self._pulse_topic()
+        if message_id is None or pulse is None or thread_id is None or \
+                int(thread_id) != int(pulse):
+            return
+        home = self.cleanup_home_chat()
+        if home is None or int(chat_id) != int(home):
+            return
+        self.ledger.note_notice(int(chat_id), int(message_id))
+
+    def _pulse_keep(self) -> Set[int]:
+        """Posts in Swarm pulse the sweep never deletes: the card, the pinned snapshot, and
+        this bot's status message."""
+        keep: Set[int] = set()
+        centre = getattr(self, "_control_center", None)
+        if centre is not None and getattr(centre, "message_id", None):
+            keep.add(int(centre.message_id))
+        store = getattr(self.state_link, "store", None)
+        if store is not None and getattr(store, "snapshot_message", None):
+            keep.add(int(store.snapshot_message))
+        try:
+            ref = self._pulse_message()
+        except Exception:                                  # noqa: BLE001 - keep nothing extra
+            ref = None
+        if ref:
+            keep.add(int(ref[2]))
+        return keep
 
     def cleanup_protected_topics(self) -> Set[int]:
         """Topics /cleanup never offers in bulk: the pulse topic the heartbeat posts to."""
@@ -2219,7 +2257,8 @@ class AgentChannel:
         home = self.cleanup_home_chat()
         if minutes <= 0 or home is None:
             return 0
-        due = self.ledger.notices_due(home, minutes, now)
+        keep = self._pulse_keep()
+        due = [mid for mid in self.ledger.notices_due(home, minutes, now) if mid not in keep]
         if not due:
             return 0
         deleted = 0
