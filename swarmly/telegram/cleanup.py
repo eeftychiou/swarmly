@@ -286,7 +286,8 @@ class Cleanup:
     # -- the command ---------------------------------------------------------------------
 
     async def handle_args(self, argv: Sequence[str], *, is_admin: bool,
-                          chat_id: Optional[int] = None) -> str:
+                          chat_id: Optional[int] = None, thread_id: Optional[int] = None,
+                          author_id: Optional[int] = None) -> str:
         """Answer ``/cleanup <argv>``."""
         if not is_admin:
             logger.warning("/cleanup ignored: only the admin tidies the group")
@@ -303,10 +304,18 @@ class Cleanup:
             return self.preview(self.host.cleanup_topics())
         if words == ["general"]:
             return await self._delete_messages(home, self.ledger.recent(home, self._clock()))
+        if words in (["keep"], ["unkeep"]):
+            setter = getattr(self.host, "cleanup_set_keep", None)
+            if setter is None:
+                return f"{self._me()}: keeping topics needs the topic registry (state store)."
+            said = await setter(home if chat_id is None else int(chat_id), thread_id, words == ["keep"],
+                                f"admin:{author_id}" if author_id is not None else "admin")
+            return f"{self._me()}: {said}."
         if len(words) == 2 and words[0] == "topic":
             return await self._delete_one(words[1], home)
         return (f"{self._me()}: /cleanup deletes every finished topic. Also: /cleanup preview, "
-                "/cleanup topic <id>, /cleanup general.")
+                "/cleanup topic <id>, /cleanup general, and in a topic /cleanup keep or "
+                "/cleanup unkeep.")
 
     # -- deciding ------------------------------------------------------------------------
 
