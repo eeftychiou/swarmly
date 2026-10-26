@@ -994,6 +994,9 @@ class ControlSettings:
     chat_id: Optional[int] = None
     #: The topic inside that chat. ``None`` means General.
     topic_id: Optional[int] = None
+    #: ``topic_id: pulse``: the swarm's own 📡 Swarm pulse topic, whatever its id -- so a pulse
+    #: topic the admin deleted and the coordinator reopened needs no config change.
+    follow_pulse: bool = False
 
 
 @dataclass
@@ -1420,9 +1423,12 @@ class AgentConfig:
         control_raw = data.get("control")
         control: Optional[ControlSettings] = None
         if isinstance(control_raw, dict):
+            follow = str(control_raw.get("topic_id") or "").strip().lower() == "pulse"
             control = ControlSettings(
                 chat_id=(_parse_int("control.chat_id", control_raw.get("chat_id"), 0) or None),
-                topic_id=(_parse_int("control.topic_id", control_raw.get("topic_id"), 0) or None),
+                topic_id=None if follow else (
+                    _parse_int("control.topic_id", control_raw.get("topic_id"), 0) or None),
+                follow_pulse=follow,
             )
         elif control_raw is not None:
             raise ConfigError("'control' must be a mapping")

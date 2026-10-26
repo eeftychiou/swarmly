@@ -82,10 +82,27 @@ class ChannelIO(TelegramIO):
                 await asyncio.sleep(float(wait) + 0.5)
         raise RuntimeError("unreachable")
 
-    async def post_line(self, text: str) -> Posted:
+    async def _pulse_place(self) -> Any:
+        """Where the store posts: Swarm pulse only. With no pulse topic known yet (deleted,
+        and not reopened) nothing is posted -- never General (live, 26 Oct)."""
         chat, topic = await self._place()
-        sent = await self._call(self.channel.bot.send_message, chat_id=chat,
-                                message_thread_id=topic, text=text,
+        if topic is None:
+            raise RuntimeError("no Swarm pulse topic yet; the coordinator opens one")
+        return chat, topic
+
+    async def _post(self, method: Any, chat: int, topic: int, **kwargs: Any) -> Any:
+        try:
+            return await self._call(method, chat_id=chat, message_thread_id=topic, **kwargs)
+        except Exception as exc:                       # noqa: BLE001 - re-raised
+            if "thread not found" in str(exc).lower():
+                gone = getattr(self.channel, "pulse_topic_gone", None)
+                if callable(gone):
+                    gone(chat, topic)
+            raise
+
+    async def post_line(self, text: str) -> Posted:
+        chat, topic = await self._pulse_place()
+        sent = await self._post(self.channel.bot.send_message, chat, topic, text=text,
                                 disable_notification=True, disable_web_page_preview=True,
                                 parse_mode=None)
         _note_pulse(self.channel, chat, int(sent.message_id), topic)
@@ -93,9 +110,8 @@ class ChannelIO(TelegramIO):
 
     async def post_file(self, name: str, data: bytes, caption: str) -> Posted:
         from aiogram.types import BufferedInputFile
-        chat, topic = await self._place()
-        sent = await self._call(self.channel.bot.send_document, chat_id=chat,
-                                message_thread_id=topic,
+        chat, topic = await self._pulse_place()
+        sent = await self._post(self.channel.bot.send_document, chat, topic,
                                 document=BufferedInputFile(data, name), caption=caption,
                                 disable_notification=True, parse_mode=None)
         # Kept while it is the pinned snapshot; swept once a newer one replaces it.

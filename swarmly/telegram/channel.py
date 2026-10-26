@@ -2066,6 +2066,21 @@ class AgentChannel:
             return
         self.ledger.note_notice(int(chat_id), int(message_id))
 
+    def pulse_topic_gone(self, chat_id: int, thread_id: Optional[int]) -> bool:
+        """The admin deleted 📡 Swarm pulse: forget it, so the coordinator opens a new one on
+        its next beat and the others learn it from there (live, 26 Oct: the bots kept posting
+        into the deleted topic, and the store's writes failed). True when it was the pulse."""
+        pulse = self._pulse_topic()
+        if pulse is None or thread_id is None or int(thread_id) != int(pulse):
+            return False
+        if int(getattr(self.config.limits, "heartbeat_topic_id", 0) or 0) > 0:
+            return False                         # a configured topic is the operator's to fix
+        logger.warning("heartbeat: the %s topic (%s) is gone; the coordinator opens a new one",
+                       PULSE_TOPIC_NAME, thread_id)
+        self.topics.forget(int(chat_id), int(thread_id))
+        self._pulse_topic_tried = 0.0
+        return True
+
     def _pulse_keep(self) -> Set[int]:
         """Posts in Swarm pulse the sweep never deletes: the card, the pinned snapshot, and
         this bot's status message."""
@@ -3703,15 +3718,17 @@ class AgentChannel:
         settings = getattr(self.config, "control", None)
         if settings is None:
             return None
+        thread = self._pulse_topic() if getattr(settings, "follow_pulse", False) \
+            else settings.topic_id
         existing = getattr(self, "_control_center", None)
-        if existing is not None:
+        if existing is not None and existing.thread_id == thread:
             return existing
         bot = getattr(self, "bot", None)
         if bot is None:                       # not started, and no test double injected
             return None
         chat_id = settings.chat_id or self.config.identity.home_channel_id
         store_on = getattr(self.state_link, "backend", "off") == "telegram"
-        centre = ControlCenter(bot, chat_id=chat_id, thread_id=settings.topic_id,
+        centre = ControlCenter(bot, chat_id=chat_id, thread_id=thread,
                                render=self.control_text,
                                markup=self.control_markup,
                                me_username=self.config.identity.name,
@@ -10994,6 +11011,7 @@ class AgentChannel:
                 self.state_link.topic_gone(thread_id, deleted=deleted)
                 if deleted:
                     self.close_owed_for_gone_topic(destination, thread_id)
+                    self.pulse_topic_gone(destination, thread_id)
             if (self._turn_slots is not None or not self.reroute_gone_topics
                     or self._drop_gone_topic_posts()):
                 raise
