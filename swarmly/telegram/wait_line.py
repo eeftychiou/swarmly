@@ -164,7 +164,7 @@ def parse_line(line: str, *, topic: str = "", place: str = "",
                    # "a review on <the bot's words>"; the default already says "a review
                    # verdict", so prefixing it again read "a review a review verdict" (25 Oct).
                    owes=f"a {kind} {owes}" if kind in ("review", "qa")
-                   and owes.startswith(("on ", "at ")) else owes,
+                   and owes.lower().startswith(("on ", "at ")) else owes,
                    head=head, topic=topic, key_extra=extra,
                    opened_by=f"WAIT line in {topic or 'a discussion'}",
                    created_at=moment, updated_at=moment)
