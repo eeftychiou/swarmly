@@ -1606,9 +1606,18 @@ class AgentChannel:
 
     def bus_turn_choices(self, text: str) -> Tuple[Optional[str], Optional[str]]:
         """The /model and /reasoning choices for a turn run from the bus: those of the topic
-        the text is about (an issue or PR it names), else General's. None = the adapter's."""
+        the text is about (an issue or PR it names), else those the controls are set in, else
+        General's. None = the adapter's.
+
+        The middle step is #374: a dashboard may sit in a topic of its own, so a model or an
+        effort the admin picked there is the one the next turn must use even when the turn's
+        own text names no topic -- otherwise the pick is a setting nothing reads.
+        """
         topic = self.topic_for_text(text or "")
-        key = (self.topics.context(topic[0], topic[1]) if topic else None) or "general"
+        picked = self._pick_topic()
+        own = (self.topics.context(topic[0], topic[1]) if topic else None)
+        key = own or (self.topics.context(self.config.identity.home_channel_id or 0, picked)
+                      if picked is not None else None) or "general"
         return self._models.get(key), self._efforts.get(key)
 
     def _effort_for(self, event: Optional[ChannelEvent]) -> Optional[str]:
@@ -4405,20 +4414,40 @@ class AgentChannel:
     #: (#342). A control that answers slower than this is one the page must not hang on.
     ACTION_TIMEOUT = 30.0
 
-    def _control_event(self, command: str, argument: str = "") -> ChannelEvent:
-        """A synthetic event for a report control: the admin, typing a bare command.
+    def _pick_topic(self) -> Optional[int]:
+        """The topic a control's setting is **stored** under: the configured one, never the
+        card's own (#374).
 
-        The report answers through the *same* functions the typed commands use (``/model``,
-        ``/reasoning``), so a button and a command can never drift apart. It
-        carries no arguments on purpose: a press says what the setting is and how to change
-        it, it never changes one -- a one-tap button that silently switched a bot's model
-        would be the wrong shape for a control that is not asked twice.
+        A model or an effort is a setting for this bot's turns, and ``bus_turn_choices``
+        looks for it on the topic a turn belongs to -- the configured ``control.topic_id``,
+        or General when the dashboard follows the pulse. Reading the *card's* topic instead
+        (the pulse topic, or whatever ``follow_pulse`` resolves to) stored the value where
+        nothing ever looks, and the answer still promised "from the next turn" (review of
+        #372, 6428033507). A DM has no topics at all, so a dashboard in one stores General's.
+        """
+        settings = self.control_settings()
+        if settings is None:
+            return None
+        chat_id = int(getattr(settings, "chat_id", None)
+                      or self.config.identity.home_channel_id or 0)
+        if chat_id > 0:
+            return None                        # a DM has no topics
+        return getattr(settings, "topic_id", None)
+
+    def _control_event(self, command: str, argument: str = "") -> ChannelEvent:
+        """A synthetic event for a control: the admin, typing a bare command.
+
+        The control answers through the *same* functions the typed commands use (``/model``,
+        ``/reasoning``), so a button and a command can never drift apart -- and it is stamped
+        with the topic the setting belongs to (``_pick_topic``), so a pick is read by the
+        next turn (#374). Where the *message* goes is another question: the card, the pickers
+        and the confirmations follow ``control_thread`` (see ``_control_chat``).
         """
         return ChannelEvent(text=f"/{command}" + (f" {argument}" if argument else ""),
                             chat_id=self.config.identity.home_channel_id or 0,
                             author_id=self.config.identity.admin_user_id,
                             author_username=self.config.identity.name,
-                            thread_id=self.control_thread())
+                            thread_id=self._pick_topic())
 
     def control_choices(self, action: str, target: str = "") -> List[Tuple[str, str]]:
         """The live choices a picker offers, read in code and costing no turn (#153).
@@ -4496,9 +4525,14 @@ class AgentChannel:
         (review, #153).
         """
         settings = self.control_settings()
-        chat_id = (getattr(settings, "chat_id", None)
-                   or self.config.identity.home_channel_id)
-        return int(chat_id or 0), self.control_thread()
+        chat_id = int((getattr(settings, "chat_id", None)
+                       or self.config.identity.home_channel_id) or 0)
+        if chat_id > 0:
+            # A private chat has no topics, and Telegram refuses a ``message_thread_id`` in
+            # one: a dashboard in the admin's DM posts its card, pickers and confirmations
+            # there without a thread (review of #372).
+            return chat_id, None
+        return chat_id, self.control_thread()
 
     @staticmethod
     def _control_post(chat_id: int, thread_id: Optional[int], **kwargs: Any) -> Dict[str, Any]:
