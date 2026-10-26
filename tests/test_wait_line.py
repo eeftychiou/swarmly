@@ -181,6 +181,25 @@ class TestExtraction(unittest.TestCase):
         self.assertIn("38f1977", said)
         self.assertIn("recorded", said)
 
+    def test_the_ack_says_what_is_owed_once_and_is_not_a_wait_line(self):
+        # Live, 25 Oct: "WAIT verdict #337 at 03db9e3 recorded: Reasonix owes a review a review
+        # verdict" -- the words doubled, and a bot that copied the line was refused ("verdict").
+        for line, owed in (("WAIT review #337 head 03db9e3 from Reasonix", "a review verdict"),
+                           ("WAIT qa #337 head 03db9e3 from Antigravity", "a QA verdict")):
+            row = wl.parse_line(line, at=1000.0)
+            said = wl.ack(row)
+            self.assertEqual(row.owes, owed)
+            self.assertEqual(said.count("verdict"), 1, said)
+            self.assertIn("#337", said)
+            self.assertIn("03db9e3", said)
+            body, rows, reasons = wl.extract_waits(said, at=1000.0)
+            self.assertEqual((rows, reasons), ([], []), "an ack copied back is not a WAIT line")
+
+    def test_the_bots_own_words_still_say_which_verdict(self):
+        row = wl.parse_line("WAIT review #337 head 03db9e3 from Reasonix on the panel",
+                            at=1000.0)
+        self.assertEqual(row.owes, "a review on the panel")
+
 
 class TestARetiredWakeBecomesARow(unittest.TestCase):
     """#165: the timer goes, the promise stays -- a ``WAKE`` line is the row that replaces it."""
