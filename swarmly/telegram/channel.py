@@ -928,9 +928,11 @@ class AgentChannel:
             return False
         if re.search(rf"(?im)^\s*(?:[-*•]|\d+[.)])?\s*@(?:{mine})\b", text):
             return False
+        # A request, not a report: "ask @me" or "asking @me", never "I've asked @me for QA"
+        # (live, 25 Oct: the past tense read as a delegation and the named QA bot refused).
         delegated = re.compile(
             r"(?i)\b(?:hand|ask|tell|have|get|assign|delegate|give|pass|forward|send|route|"
-            r"ping|nudge|let)\w*\s+(?:(?:it|this|that|the\s+\w+|a\s+\w+)\s+)?"
+            r"ping|nudge|let)(?:s|ing)?\s+(?:(?:it|this|that|the\s+\w+|a\s+\w+)\s+)?"
             rf"(?:(?:over\s+)?to\s+)?@(?:{mine})\b")
         mentions = re.findall(rf"(?i)@(?:{mine})\b", text)
         return len(delegated.findall(text)) >= len(mentions)
@@ -1171,11 +1173,7 @@ class AgentChannel:
             # hand-off, not a roster: every @handle in it counts as addressed. Only the
             # relay rule below still keeps a named bot from taking work meant for another,
             # and a drop there is reported to the sender (``_mention_drop_notice``).
-            # Under registry routing the topic's links decide who a peer's message reaches;
-            # this wording guess refused a linked QA bot that a peer named in passing ("I've
-            # asked @agy for QA", live 25 Oct). It still guards topics with no record.
-            if self._relayed_through_peer(event) and self.state_link.route_facts(
-                    event.chat_id, event.thread_id) is None:
+            if self._relayed_through_peer(event):
                 # ...unless the message asks several bots at once (#181): then it is one
                 # hand-off per bot, and the delegation rule does not apply to it. Only a
                 # message that asks *one* bot keeps the old refusal.
