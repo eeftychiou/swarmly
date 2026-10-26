@@ -1739,6 +1739,39 @@ class TestAPickForAnotherBot(unittest.TestCase):
         # And this bot's own pickers still read its own runtime.
         self.assertIn(("medium", "medium"), channel.control_choices("bot.effort"))
 
+    def test_a_forwarded_pick_lands_where_turns_read_it(self):
+        """Review #375: applied under the dashboard's own topic it was a setting nothing read."""
+        sender = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        hermes = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"}, adapter="claude")
+        live(sender, "Hermes")
+        self.forward(sender, action="bot.effort", target="Hermes", value="high")
+        line = [entry["text"] for entry in sender._test_sender.sent
+                if "CONTROL bot.effort" in entry["text"]][0].split("\n")[-1]
+        self.assertEqual(hermes.apply_control_note(line, sender="Claudebot"),
+                         "applied: bot.effort")
+        # A forwarded pick belongs to no discussion: it is General's, and that is exactly what
+        # a turn run from the bus reads.
+        self.assertEqual(hermes.bus_turn_choices(""), (None, "high"))
+        self.assertNotIn("tg-307", hermes._efforts)          # not the dashboard's topic
+
+    def test_a_peer_seen_under_its_handle_still_gets_its_picker(self):
+        """Review #375: a beat filed under @HermesBot left Hermes's card with no choices."""
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "HermesBot", models=("sonnet", "opus"), efforts=("low", "high"))
+        self.assertEqual(channel.control_choices("bot.model", "Hermes"),
+                         [("sonnet", "sonnet"), ("opus", "opus")])
+        rows = {row["action"]: row for row in channel.web_controls()["controls"]}
+        self.assertEqual([pick[1] for pick in rows["bot.effort"]["per_bot"]["Hermes"]],
+                         ["low", "high"])
+        self.assertNotIn("HermesBot", rows["bot.effort"]["per_bot"])   # one bot, one key
+
+    def test_a_handle_keeps_its_own_state_for_the_forward_gate_too(self):
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "HermesBot", state="frozen")
+        done = self.forward(channel, action="bot.effort", target="Hermes", value="high")
+        self.assertFalse(done["ok"])
+        self.assertIn("frozen", done["text"])
+
     def test_cli_and_memory_are_still_this_bots_own(self):
         channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
         live(channel, "Hermes")

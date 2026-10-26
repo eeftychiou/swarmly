@@ -4387,7 +4387,14 @@ class AgentChannel:
         if not value:
             return False
         command = "model" if action == "bot.model" else "reasoning"
-        event = self._control_event(command, value)
+        # No thread: a pick forwarded from a page belongs to no discussion, and the turns this
+        # bot runs from the bus read General's choices (``bus_turn_choices``). Stored under the
+        # dashboard's own topic it would be a setting nothing ever reads (review, #375).
+        event = ChannelEvent(text=f"/{command} {value}",
+                             chat_id=self.config.identity.home_channel_id or 0,
+                             author_id=self.config.identity.admin_user_id,
+                             author_username=self.config.identity.name,
+                             thread_id=None)
         if action == "bot.model":
             key = self._model_key(event)
             before = self._models.get(key)
@@ -4538,14 +4545,14 @@ class AgentChannel:
         An empty tuple when that bot has not said, or its runtime offers nothing: the picker
         then offers nothing, which is the truth, rather than this bot's own list.
         """
-        wanted = str(alias or "").strip().lstrip("@").lower()
+        wanted = self.canonical_peer(alias).strip().lstrip("@").lower()
         field = "models" if action == "bot.model" else "efforts"
         try:
             peers = self.presence().peers or {}
         except Exception:                      # noqa: BLE001 - no table, no choices
             return ()
         for name, peer in peers.items():
-            if str(name).strip().lower() != wanted:
+            if self.canonical_peer(name).strip().lstrip("@").lower() != wanted:
                 continue
             try:
                 row = snapshot_mod.Snapshot.from_dict(getattr(peer, "snapshot", None) or {})
@@ -4566,7 +4573,9 @@ class AgentChannel:
         except Exception:                      # noqa: BLE001 - no table, no choices
             peers = {}
         for name in peers:
-            alias = str(name).strip()
+            # Keyed by the bot's configured name, so a card drawn for "Codex" finds the list a
+            # beat filed under its handle reported -- one bot, one picker (#246, review #375).
+            alias = self.canonical_peer(name).strip()
             if not alias:
                 continue
             out[alias] = [(value, value) for value in self.peer_choices(action, alias)][:12]
@@ -4670,7 +4679,7 @@ class AgentChannel:
         (#124): a bot that stopped beating is ``down`` however it last described itself. Used
         to refuse a forward to a bot that cannot apply it (#373).
         """
-        wanted = str(alias or "").strip().lstrip("@").lower()
+        wanted = self.canonical_peer(alias).strip().lstrip("@").lower()
         if not wanted:
             return ""
         try:
@@ -4678,7 +4687,7 @@ class AgentChannel:
         except Exception:                      # noqa: BLE001 - no table, no answer
             return ""
         for name, peer in peers.items():
-            if str(name).strip().lower() != wanted:
+            if self.canonical_peer(name).strip().lstrip("@").lower() != wanted:
                 continue
             if bool(getattr(peer, "frozen", False)):
                 return snapshot_mod.FROZEN
