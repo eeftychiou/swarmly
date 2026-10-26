@@ -222,6 +222,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- The dashboard can set **model and reasoning effort for any bot**, not only the bot that serves
+  the page (`#373`). A pick on a peer's card is forwarded as exactly one `CONTROL` line naming that
+  bot and the value (`via=dashboard`, target, value, by), and nothing changes where the press
+  landed: only the named bot applies it, through its own `/model` or `/reasoning`, so its own
+  allowed list and per-topic scope decide — a value it will not take is refused by that bot and the
+  note is answered `failed`, never `applied`. The answer says *sent*, and the card shows the new
+  value only once that bot's own beat reports it. A paused, frozen or no-longer-beating target is
+  refused in words before anything goes out. Each snapshot now carries the `models` and `efforts`
+  its runtime offers, so a picker on a card is filled from *that* bot's list (and is drawn disabled
+  when it has reported none). `bot.cli` and `bot.memory` stay this bot's own.
+
 - The dashboard **control centre** (`#345`, control centre 4/4): every admin command the bots take
   in Telegram is now a control on the page, carried out by the same dispatch a Telegram button uses
   (one table, one admin check, one second tap, one audit line). A `bot.` control sits on that bot's

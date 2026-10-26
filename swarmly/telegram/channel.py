@@ -3522,12 +3522,22 @@ class AgentChannel:
             logger.debug("snapshot: no resolved model this beat", exc_info=True)
         if not effort and not (adapter.command or effort_problem(adapter.type, "high")):
             effort = "the model default"
+        # What this bot can be set to (#373): the model names its own CLI reported, and the
+        # effort levels its own adapter accepts. A peer publishes them so the page offers a
+        # picker filled from *that* bot's list, never one bot's list for another.
+        try:
+            models = tuple(cached_models(adapter.type) or ())
+        except Exception:                          # noqa: BLE001 - a beat without a list
+            models = ()
+        efforts = tuple(level for level in EFFORT_LEVELS
+                        if not effort_problem(adapter.type, level))
         return snapshot_mod.Snapshot(
             alias=self.config.identity.alias, state=state, since=since, at=moment,
             every=every, topic=str(topic), turn_elapsed=elapsed, turn_timeout=turn_timeout,
             silent=silent,
             queue=queue, wakes=(),                  # #215: no timers left to report
             model=str(model or ""), effort=str(effort or ""),
+            models=models, efforts=efforts,
             rev=str(self._running_revision or ""),
             uptime=max(0.0, self._clock() - self._booted_at), restarts=max(0, self._boots - 1),
             term=term, lease_ends=lease_ends)
@@ -4008,6 +4018,11 @@ class AgentChannel:
                     "choices": [[str(label), str(value)] for label, value
                                 in self.control_choices(found.action)],
                 }
+                if control_mod.remote_pick(found.action):
+                    # One pick per card (#373): the card's own bot decides what it can run.
+                    row["per_bot"] = {alias: [[label, value] for label, value in picks]
+                                      for alias, picks in
+                                      self.pick_choices_by_bot(found.action).items()}
                 if found.action == "swarm.role":
                     # Two picks in one press: which bot, then which role. The page offers
                     # both selects and sends them as one target and value (#345).
@@ -4241,16 +4256,18 @@ class AgentChannel:
             return f"refused: {note.by} is not the admin"
         if note.action not in self.control_actions():
             return f"refused: {note.action} is not a control here"
-        if note.action in self.CONTROL_REPORTS:
-            # A report answers the person who pressed it; a peer's note may not ask for one
-            # (there is nothing to apply, and nothing to send back).
+        if note.action in self.CONTROL_REPORTS and not note.value:
+            # A bare report answers the person who pressed it; a peer's note may not ask for
+            # one (there is nothing to apply, and nothing to send back). A *valued* one is a
+            # setting -- a model or an effort pressed for this bot (#373) -- and is applied
+            # below, under this bot's own rules.
             return f"refused: {note.action} is a report, not a control"
         try:
             # Synchronous on purpose: this runs inside the machine-note path, which must not
             # need an event loop of its own to hold a bot. A control that schedules its work
             # (a hand-over's claim is git work) answers with its own words instead of True,
             # so this path never reports "applied" for something still in flight (#154).
-            done = self._run_control_now(note.action)
+            done = self._run_control_now(note.action, note.value)
         except Exception:                      # noqa: BLE001 - a note must not break routing
             logger.warning("control note: %s failed", note.action, exc_info=True)
             return f"failed: {note.action}"
@@ -4316,7 +4333,7 @@ class AgentChannel:
         except (TypeError, ValueError):
             return False
 
-    def _run_control_now(self, action: str) -> Any:
+    def _run_control_now(self, action: str, value: str = "") -> Any:
         """The synchronous half of :meth:`_run_control`: the controls that only set state.
 
         Returns whether it actually carried the action out. That matters more than it looks:
@@ -4324,6 +4341,10 @@ class AgentChannel:
         that broadcast it, and the admin reading the log, would otherwise be told that a
         swarm-wide pause happened on a bot that never froze (review, #133).
         """
+        if value and control_mod.remote_pick(action):
+            # A pick a peer forwarded for this bot (#373): the typed command's own function
+            # decides, so this bot's allowed list and scope are the ones that apply.
+            return self._apply_remote_pick(action, value)
         if action == "bot.pause":
             # What /pause@bot does: a turn already running finishes and posts first, and the
             # FROZEN line its peers route by goes out once it holds.
@@ -4354,6 +4375,28 @@ class AgentChannel:
         else:
             return False
         return True
+
+    def _apply_remote_pick(self, action: str, value: str) -> bool:
+        """Apply a forwarded model or effort, through the typed command's own function (#373).
+
+        True only when the setting really changed: a model this bot cannot run, or an effort
+        it does not accept, is refused by ``/model``/``/reasoning`` themselves, and answering
+        the note with "applied" for that would tell the peer's page a lie (#133).
+        """
+        value = str(value or "").strip()
+        if not value:
+            return False
+        command = "model" if action == "bot.model" else "reasoning"
+        event = self._control_event(command, value)
+        if action == "bot.model":
+            key = self._model_key(event)
+            before = self._models.get(key)
+            self._model_command(event)
+            return self._models.get(key) != before
+        key = self._model_key(event)
+        before = self._efforts.get(key)
+        self._reasoning_command(event)
+        return self._efforts.get(key) != before
 
     def _notice_soon(self, text: str) -> None:
         """Post a machine line from synchronous code (a control note), once the loop runs."""
@@ -4457,6 +4500,11 @@ class AgentChannel:
         unreadable list is an empty one, and the press then says there is nothing to pick.
         """
         adapter = self.config.adapter
+        if action in ("bot.model", "bot.effort") and not self.own_target(target):
+            # A pick aimed at another bot offers *that* bot's list, as its own beat reported
+            # it (#373): one bot's models are never offered for another, and a bot whose
+            # runtime cannot say offers nothing rather than a guess.
+            return [(name, name) for name in self.peer_choices(action, target)][:12]
         if action == "bot.model":
             names = cached_models(adapter.type) or []
             return [(name, name) for name in names][:12]
@@ -4483,6 +4531,48 @@ class AgentChannel:
             names = sorted(known_roles(role_dirs(self.config.bus.repo)))
             return [(name, name) for name in names][:12]
         return []
+
+    def peer_choices(self, action: str, alias: str) -> Tuple[str, ...]:
+        """The models or efforts one bot reported it can run, from its own last beat (#373).
+
+        An empty tuple when that bot has not said, or its runtime offers nothing: the picker
+        then offers nothing, which is the truth, rather than this bot's own list.
+        """
+        wanted = str(alias or "").strip().lstrip("@").lower()
+        field = "models" if action == "bot.model" else "efforts"
+        try:
+            peers = self.presence().peers or {}
+        except Exception:                      # noqa: BLE001 - no table, no choices
+            return ()
+        for name, peer in peers.items():
+            if str(name).strip().lower() != wanted:
+                continue
+            try:
+                row = snapshot_mod.Snapshot.from_dict(getattr(peer, "snapshot", None) or {})
+            except (TypeError, ValueError):
+                return ()
+            return tuple(getattr(row, field) or ())
+        return ()
+
+    def pick_choices_by_bot(self, action: str) -> Dict[str, List[Tuple[str, str]]]:
+        """Every bot's own choices for one picker, this bot included (#373).
+
+        Read once per page render: each bot's from its snapshot, this bot's from its own
+        runtime. The page then offers the pick that belongs to the card it is pressed on.
+        """
+        out: Dict[str, List[Tuple[str, str]]] = {}
+        try:
+            peers = dict(self.presence().peers or {})
+        except Exception:                      # noqa: BLE001 - no table, no choices
+            peers = {}
+        for name in peers:
+            alias = str(name).strip()
+            if not alias:
+                continue
+            out[alias] = [(value, value) for value in self.peer_choices(action, alias)][:12]
+        own = str(self.config.identity.alias)
+        out[own] = list(self.control_choices(action))
+        return out
 
     async def _offer_picker(self, action: str, target: str = "") -> str:
         """Send the picker for *action*: a small message of its own, one button per value.
@@ -4572,6 +4662,56 @@ class AgentChannel:
         """Whether a press names this bot (or nobody): the only bot its own picks can change."""
         who = str(target or "").strip().lstrip("@").lower()
         return who in ("", "self", str(self.config.identity.alias).strip().lower())
+
+    def peer_state(self, alias: str) -> str:
+        """One known bot's state as its own beat last reported it, or ``""`` when unknown.
+
+        Read from its snapshot and judged by the same staleness rule the dashboard draws
+        (#124): a bot that stopped beating is ``down`` however it last described itself. Used
+        to refuse a forward to a bot that cannot apply it (#373).
+        """
+        wanted = str(alias or "").strip().lstrip("@").lower()
+        if not wanted:
+            return ""
+        try:
+            peers = self.presence().peers or {}
+        except Exception:                      # noqa: BLE001 - no table, no answer
+            return ""
+        for name, peer in peers.items():
+            if str(name).strip().lower() != wanted:
+                continue
+            if bool(getattr(peer, "frozen", False)):
+                return snapshot_mod.FROZEN
+            try:
+                row = snapshot_mod.Snapshot.from_dict(getattr(peer, "snapshot", None) or {})
+            except (TypeError, ValueError):
+                return ""
+            return snapshot_mod.DOWN if row.is_stale(self.presence_clock()) else row.state
+        return ""
+
+    def _forward_pick(self, action: str, target: str, value: str) -> str:
+        """Forward a model or effort pick to the bot it names (#373).
+
+        Nothing changes here. The press is already written as the one ``CONTROL`` line naming
+        that bot and the value -- ``handle_control_press`` posts the line the policy minted --
+        and only that bot applies it, through its own ``/model`` or ``/reasoning``, so its own
+        allowed list and its own per-topic scope decide. The answer therefore says *sent*: a
+        forward is not a setting, and the card shows the new value only once that bot's own
+        beat carries it.
+
+        A bot that cannot apply anything right now -- paused, frozen, or no longer beating --
+        is refused here, in words, before anything goes out.
+        """
+        alias = str(target or "").strip().lstrip("@")
+        found = control_mod.control(action)
+        label = str(found.label if found else action).lower()
+        state = self.peer_state(alias)
+        if state in (snapshot_mod.PAUSED, snapshot_mod.FROZEN, snapshot_mod.DOWN):
+            raise ControlRefused(
+                f"{alias} is {state}: nothing was sent -- {label} for it can be set once it is "
+                f"back, and guessing it as done would only mislead the page")
+        return (f"sent {label} {value} to {alias}: it applies that under its own rules, and its "
+                f"card shows the new value once its next beat reports it")
 
     def _refuse_peer_self_only(self, action: str, target: str) -> None:
         """Refuse a press on this bot's own runtime when it names another bot (#345 review).
@@ -5067,6 +5207,10 @@ class AgentChannel:
             return await self._remove_control(target or value)
         if action == "bot.memory":
             return self._memory_control(target)
+        if value and control_mod.remote_pick(action) and not self.own_target(target):
+            # A pick for *another* bot (#373): it is not set here, and never was -- the press
+            # is forwarded, and only the bot it names applies it.
+            return self._forward_pick(action, target, value)
         if value:
             return await self._apply_pick(action, value, target, presser=presser, via=via)
         if action == "swarm.failback":
