@@ -308,7 +308,7 @@ class Cleanup:
             setter = getattr(self.host, "cleanup_set_keep", None)
             if setter is None:
                 return f"{self._me()}: keeping topics needs the topic registry (state store)."
-            said = await setter(home, thread_id, words == ["keep"],
+            said = await setter(home if chat_id is None else int(chat_id), thread_id, words == ["keep"],
                                 f"admin:{author_id}" if author_id is not None else "admin")
             return f"{self._me()}: {said}."
         if len(words) == 2 and words[0] == "topic":

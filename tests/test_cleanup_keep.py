@@ -29,7 +29,7 @@ class KeepInTheRegistryTests(unittest.TestCase):
 
 class Host:
     def __init__(self, topics, kept):
-        self.topics, self.kept, self.calls = topics, kept, []
+        self.topics, self.kept, self.calls, self.chats = topics, kept, [], []
 
     def cleanup_home_chat(self):
         return -100
@@ -42,6 +42,7 @@ class Host:
 
     async def cleanup_set_keep(self, chat, thread, keep, by):
         self.calls.append((thread, keep, by))
+        self.chats.append(chat)
         return "kept" if keep else "no longer kept"
 
     async def cleanup_delete_topic(self, chat, thread):
@@ -59,6 +60,13 @@ class CommandTests(unittest.TestCase):
                                                thread_id=77, author_id=1))
         self.assertIn("kept", said)
         self.assertEqual(host.calls, [(77, True, "admin:1")])
+
+    def test_keep_names_the_chat_it_was_sent_in(self):
+        host = Host([], set())
+        cleanup = Cleanup(host, GeneralLedger(None), handle="Claude")
+        asyncio.run(cleanup.handle_args(["keep"], is_admin=True, chat_id=-200, thread_id=77,
+                                        author_id=1))
+        self.assertEqual(host.chats, [-200])
 
     def test_a_kept_topic_is_never_deleted(self):
         old = 1.0

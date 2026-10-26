@@ -2115,6 +2115,9 @@ class AgentChannel:
                                by: str) -> str:
         if thread_id is None:
             return "send /cleanup keep inside the topic to keep"
+        home = self.cleanup_home_chat()
+        if home is None or int(chat_id) != int(home):
+            return "send it in a topic of the home group; only its topics are in the registry"
         return await self.state_link.set_topic_keep(int(chat_id), int(thread_id), keep, by)
 
     def cleanup_home_chat(self) -> Optional[int]:
