@@ -3709,17 +3709,39 @@ class AgentChannel:
 
 
     # -- the control centre (issue #117) ------------------------------------------------
+    def control_settings(self) -> Optional[Any]:
+        """Where the pinned dashboard lives. A ``control`` section decides when there is one
+        (a DM, a fixed topic, or ``topic_id: pulse``); without one, a swarm on the Telegram
+        state store keeps its dashboard in 📡 Swarm pulse, whatever that topic's id -- nothing
+        to configure, and a reopened pulse topic needs no edit (admin, 26 Oct: "this should be
+        dynamic, not hard-coded in config.yaml"). Otherwise: no dashboard, as before."""
+        settings = getattr(self.config, "control", None)
+        if settings is not None:
+            return settings
+        if getattr(getattr(self.config, "state", None), "backend", "off") == "telegram":
+            from swarmly.telegram.config import ControlSettings
+            return ControlSettings(follow_pulse=True)
+        return None
+
+    def control_thread(self) -> Optional[int]:
+        """The topic the dashboard and its pickers post in (None: General)."""
+        settings = self.control_settings()
+        if settings is None:
+            return None
+        if getattr(settings, "follow_pulse", False):
+            return self._pulse_topic()
+        return getattr(settings, "topic_id", None)
+
     def control_center(self) -> Optional[Any]:
         """The pinned dashboard, when ``control`` names a chat. Built once, reused.
 
         No section, no dashboard: a bot that was not told where the message belongs keeps
         nothing pinned, which is what every config without ``control`` does today.
         """
-        settings = getattr(self.config, "control", None)
+        settings = self.control_settings()
         if settings is None:
             return None
-        thread = self._pulse_topic() if getattr(settings, "follow_pulse", False) \
-            else settings.topic_id
+        thread = self.control_thread()
         existing = getattr(self, "_control_center", None)
         if existing is not None and existing.thread_id == thread:
             return existing
@@ -4376,12 +4398,11 @@ class AgentChannel:
         it, it never changes one -- a one-tap button that silently switched a bot's model
         would be the wrong shape for a control that is not asked twice.
         """
-        settings = getattr(self.config, "control", None)
         return ChannelEvent(text=f"/{command}" + (f" {argument}" if argument else ""),
                             chat_id=self.config.identity.home_channel_id or 0,
                             author_id=self.config.identity.admin_user_id,
                             author_username=self.config.identity.name,
-                            thread_id=getattr(settings, "topic_id", None))
+                            thread_id=self.control_thread())
 
     def control_choices(self, action: str, target: str = "") -> List[Tuple[str, str]]:
         """The live choices a picker offers, read in code and costing no turn (#153).
@@ -4458,11 +4479,10 @@ class AgentChannel:
         control topic lands in the wrong conversation -- the presser is reading the other one
         (review, #153).
         """
-        settings = getattr(self.config, "control", None)
+        settings = self.control_settings()
         chat_id = (getattr(settings, "chat_id", None)
                    or self.config.identity.home_channel_id)
-        thread_id = getattr(settings, "topic_id", None)
-        return int(chat_id or 0), thread_id
+        return int(chat_id or 0), self.control_thread()
 
     @staticmethod
     def _control_post(chat_id: int, thread_id: Optional[int], **kwargs: Any) -> Dict[str, Any]:
@@ -5221,7 +5241,7 @@ class AgentChannel:
             logger.warning("owed: the stall ladder failed this beat", exc_info=True)
         # The pinned dashboard rides the beat, and only its holder edits it: every bot
         # refreshing one message would fight over it (#117).
-        if getattr(self.config, "control", None) is not None and self.is_coordinator(now=moment):
+        if self.control_settings() is not None and self.is_coordinator(now=moment):
             await self.refresh_control_center(now=moment)
         # Issue #240: the local web page follows the lease, like the pin -- served by the bot
         # that coordinates, stopped when another one does.

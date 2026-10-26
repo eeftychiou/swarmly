@@ -77,3 +77,25 @@ class ReopenWithoutALeaseTests(unittest.TestCase):
         channel.bot = SimpleNamespace(create_forum_topic=create_forum_topic)
         self.assertEqual(asyncio.run(channel._ensure_pulse_topic()), 777)
         self.assertEqual(opened, [PULSE_TOPIC_NAME])
+
+
+class DashboardFollowsThePulseTests(unittest.TestCase):
+    """Admin, 26 Oct: where the dashboard lives should be dynamic, not a number in config."""
+
+    def test_no_control_section_on_the_telegram_store_means_the_pulse_topic(self):
+        channel = make_channel(make_config(state={"backend": "telegram"}))
+        channel.bot = SimpleNamespace()
+        channel.topics.remember(GROUP, 812, PULSE_TOPIC_NAME)
+        self.assertEqual(channel.control_center().thread_id, 812)
+        self.assertEqual(channel._control_chat(), (GROUP, 812))
+
+    def test_without_the_store_and_without_a_section_there_is_no_dashboard(self):
+        channel = make_channel()
+        channel.bot = SimpleNamespace()
+        self.assertIsNone(channel.control_center())
+
+    def test_a_fixed_topic_still_wins(self):
+        channel = make_channel(make_config(state={"backend": "telegram"},
+                                           control={"topic_id": 55}))
+        channel.bot = SimpleNamespace()
+        self.assertEqual(channel.control_thread(), 55)
