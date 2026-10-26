@@ -480,3 +480,39 @@ class TestOneRowPerBotWhicheverNameItArrivesUnder(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestTheCardIsFoundByItsRecordedId(unittest.TestCase):
+    """Live, 26 Oct: the state snapshot is always the newest pin, so a card that looked for
+    itself there never found itself, and every restart pinned another (43 pins)."""
+
+    def make(self, bot, known):
+        recorded = []
+
+        async def record(mid):
+            recorded.append(mid)
+        centre = cc.ControlCenter(bot, chat_id=CHAT, thread_id=3418, render=lambda: TEXT,
+                                  cards=lambda: known, record=record, me_alias="claudebot")
+        return centre, recorded
+
+    def test_a_restart_edits_its_own_card_and_pins_nothing(self):
+        bot = FakeBot(shared_pin=True)
+        centre, recorded = self.make(bot, {"claudebot": 77})
+        result = run(centre.refresh())
+        self.assertEqual(result.message_id, 77)
+        self.assertEqual((bot.sent, bot.pins), ([], []))
+        self.assertEqual(recorded, [])
+
+    def test_a_new_coordinator_retires_the_old_card_and_records_its_own(self):
+        bot = FakeBot()
+        centre, recorded = self.make(bot, {"deepseek": 66})
+        result = run(centre.refresh())
+        self.assertEqual([u["message_id"] for u in bot.unpins], [66])
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(recorded, [result.message_id])
+
+    def test_no_store_read_yet_means_wait_not_pin(self):
+        bot = FakeBot()
+        centre, _ = self.make(bot, None)
+        run(centre.refresh())
+        self.assertEqual((bot.sent, bot.pins), ([], []))

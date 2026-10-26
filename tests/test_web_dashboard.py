@@ -726,7 +726,11 @@ class TestThePinnedCardsButton(unittest.TestCase):
         self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net/")
         first = channel.control_markup()[0][0]
         self.assertEqual(first["text"], "Open dashboard")
-        self.assertEqual(first["web_app"], {"url": "https://swarm.example.ts.net/"})
+        # A link to the bot's Mini App, not a web_app button: Telegram refuses those in a
+        # group, and the whole card then failed to refresh (live, 26 Oct).
+        self.assertNotIn("web_app", first)
+        handle = channel.config.identity.name.lstrip("@")
+        self.assertEqual(first["url"], f"https://t.me/{handle}?startapp=dashboard")
         # The controls are still there, below it.
         self.assertTrue(any("callback_data" in button
                             for row in channel.control_markup() for button in row))
