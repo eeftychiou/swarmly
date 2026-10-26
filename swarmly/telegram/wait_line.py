@@ -161,7 +161,10 @@ def parse_line(line: str, *, topic: str = "", place: str = "",
         extra = ""
     try:
         return Row(kind=row_kind, item=item, debtor=debtor or (CI if row_kind == "ci" else ADMIN),
-                   owes=f"a {kind} {owes}" if kind in ("review", "qa") else owes,
+                   # "a review on <the bot's words>"; the default already says "a review
+                   # verdict", so prefixing it again read "a review a review verdict" (25 Oct).
+                   owes=f"a {kind} {owes}" if kind in ("review", "qa")
+                   and owes.startswith(("on ", "at ")) else owes,
                    head=head, topic=topic, key_extra=extra,
                    opened_by=f"WAIT line in {topic or 'a discussion'}",
                    created_at=moment, updated_at=moment)
@@ -239,9 +242,17 @@ def extract_waits(text: str, *, topic: str = "", place: str = "",
 
 
 def ack(row: Row) -> str:
-    """What the bot is told its own line became: one short line, not a paragraph."""
-    head = f" at {row.head}" if row.head else ""
-    return f"WAIT {row.kind} {row.subject}{head} recorded: {row.debtor} owes {row.owes}"
+    """What the bot is told its own line became: one short line, not a paragraph.
+
+    It never starts with ``WAIT <kind>``: the row's kind (``verdict``) is not a word a ``WAIT``
+    line accepts, and a bot that copied the ack as its next line was refused (live, 25 Oct).
+    """
+    said = f"{row.debtor} owes {row.owes}"
+    if str(row.subject).lower() not in str(row.owes).lower():
+        said += f" for {row.subject}"
+    if row.head and row.head not in said:
+        said += f" at {row.head}"
+    return f"⏳ recorded: {said}"
 
 
 def line_for(rows: Iterable[Row]) -> List[str]:
