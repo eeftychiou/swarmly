@@ -3665,10 +3665,15 @@ class AgentChannel:
         if bot is None:                       # not started, and no test double injected
             return None
         chat_id = settings.chat_id or self.config.identity.home_channel_id
+        store_on = getattr(self.state_link, "backend", "off") == "telegram"
         centre = ControlCenter(bot, chat_id=chat_id, thread_id=settings.topic_id,
                                render=self.control_text,
                                markup=self.control_markup,
-                               me_username=self.config.identity.name)
+                               me_username=self.config.identity.name,
+                               cards=self.state_link.dashboard_cards if store_on else None,
+                               record=self.state_link.record_dashboard_card if store_on
+                               else None,
+                               me_alias=self.config.identity.alias)
         self._control_center = centre
         return centre
 
@@ -3769,9 +3774,13 @@ class AgentChannel:
         are unchanged.
         """
         rows: List[List[Dict[str, Any]]] = []
-        url = self.mini_app_url()
-        if url:
-            rows.append([{"text": "Open dashboard", "web_app": {"url": url}}])
+        link = self.mini_app_link()
+        if link:
+            # Telegram refuses a ``web_app`` button in a group (live, 26 Oct:
+            # BUTTON_TYPE_INVALID, and the whole card stopped refreshing). A link to the
+            # bot's Mini App opens it with the viewer's signed login, which is what the
+            # page's controls check (BotFather: Bot Settings -> Configure Mini App).
+            rows.append([{"text": "Open dashboard", "url": link}])
         return rows + control_mod.keyboard(self.control_actions())
 
     def control_roles(self) -> Dict[str, str]:
@@ -3815,6 +3824,13 @@ class AgentChannel:
         if not host:
             return ""
         return f"https://{host}/"
+
+    def mini_app_link(self) -> str:
+        """The ``t.me`` link that opens this bot's Mini App, or ``""`` (no public page)."""
+        if not self.mini_app_url():
+            return ""
+        handle = str(getattr(self.config.identity, "name", "") or "").lstrip("@").strip()
+        return f"https://t.me/{handle}?startapp=dashboard" if handle else ""
 
     def web_settings(self) -> Any:
         """``web`` from the config, or ``None``: no section means no page, and no port opened."""

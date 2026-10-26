@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from swarmly.telegram.control import MARKER
 
@@ -113,7 +113,10 @@ class ControlCenter:
     def __init__(self, bot: Any, *, chat_id: int, thread_id: Optional[int] = None,
                  render: Callable[[], str], markup: Optional[Callable[[], Any]] = None,
                  clock: Optional[Callable[[], float]] = None,
-                 me_username: str = ""):
+                 me_username: str = "",
+                 cards: Optional[Callable[[], Optional[Dict[str, int]]]] = None,
+                 record: Optional[Callable[[int], Awaitable[Any]]] = None,
+                 me_alias: str = ""):
         self.bot = bot
         #: This bot's own @username, so a pin it did not send is recognised as a failover's.
         self.me_username = str(me_username or "").lstrip("@").strip()
@@ -122,6 +125,13 @@ class ControlCenter:
         self._render = render
         self._markup = markup
         self._clock = clock
+        #: Every bot's dashboard message id as the state store records it (alias -> id), or
+        #: None when there is no store: then the chat's pin is asked, as before. The snapshot
+        #: is always the newest pin, so asking the pin never found the card again and every
+        #: restart pinned a new one (live, 26 Oct: 43 pins).
+        self._cards = cards
+        self._record = record
+        self.me_alias = str(me_alias or "").strip().lower()
         self.message_id: Optional[int] = None
         self.last_text: Optional[str] = None
         #: The last status a refresh returned, for /diag and for a test.
@@ -139,6 +149,19 @@ class ControlCenter:
             self.status = UNCHANGED
             return Refreshed(UNCHANGED, self.message_id)
         try:
+            if self.message_id is None and self._cards is not None:
+                known = self._cards()
+                if known is None:                      # the store is not read yet: wait
+                    self.status = UNCHANGED
+                    return Refreshed(UNCHANGED, None, "the state store is not ready")
+                for alias, mid in sorted(known.items()):
+                    if alias != self.me_alias and mid:
+                        await self._unpin(int(mid))    # a previous coordinator's card
+                mine = known.get(self.me_alias)
+                if mine:
+                    self.message_id = int(mine)
+                    return await self._edit(text, taken=True)
+                return await self._create(text)
             if self.message_id is None:
                 adopted = await self._adopt(text)
                 if adopted is not None:
@@ -215,6 +238,11 @@ class ControlCenter:
         self.message_id = message_id
         self.last_text = text
         await self._pin(message_id)
+        if self._record is not None and message_id is not None:
+            try:
+                await self._record(int(message_id))
+            except Exception:                          # noqa: BLE001 - kept in memory anyway
+                logger.warning("control center: the card's id was not recorded", exc_info=True)
         self.status = CREATED
         return Refreshed(CREATED, message_id)
 

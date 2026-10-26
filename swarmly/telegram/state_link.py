@@ -779,6 +779,28 @@ class StateLink:
             return f"Recorded: {said}"
         return "The store did not take the change; try again in a moment."
 
+    # -- the pinned dashboard card ------------------------------------------------------
+    def dashboard_cards(self) -> Optional[dict]:
+        """alias -> the dashboard message each bot last created (``agent/<a>/dashboard``),
+        or None while the store is not ready (the card waits rather than pin another)."""
+        store = self.store
+        if store is None or not store.ready:
+            return None
+        out = {}
+        for key in store.keys("agent/"):
+            if key.endswith("/dashboard"):
+                value = store.read(key)
+                mid = value.get("message_id") if isinstance(value, dict) else None
+                if isinstance(mid, int):
+                    out[key.split("/")[1]] = mid
+        return out
+
+    async def record_dashboard_card(self, message_id: int) -> None:
+        store = self.store
+        if store is None or not store.ready:
+            return
+        await store.write(K.agent(store.alias, "dashboard"), {"message_id": int(message_id)})
+
     # -- agent stats and drift (phase 8) -------------------------------------------------------
     def agent_stats(self) -> dict:
         """This bot's drift, as the store keeps it: score per live session, resets in the last
