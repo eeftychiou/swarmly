@@ -1371,7 +1371,7 @@ class TestTheControlCentre(unittest.TestCase):
         self.assertIn("ADMIN = Boolean(state.admin);", page)
         self.assertNotIn("Boolean(INIT)", page)
         self.assertIn('document.body.dataset.admin = ADMIN ? "1" : "0";', page)
-        self.assertIn("go.disabled = !ADMIN;", page)
+        self.assertIn("go.disabled = !ADMIN || empty;", page)
         self.assertIn("the controls are disabled", page)
         self.assertIn('id="controls-reason"', page)
         # And the write path is the one POST, with the minted code as its second body.
@@ -1406,14 +1406,43 @@ class TestTheControlCentre(unittest.TestCase):
         finally:
             server.stop()
 
-    def test_a_bots_own_controls_are_drawn_on_this_bots_card_only(self):
+    def test_the_own_only_controls_are_drawn_on_this_bots_card_only(self):
         view = self.channel().web_state()["controls"]
         self.assertEqual(view["self"], "Hermes")
         rows = {row["action"]: row for row in view["controls"]}
-        for action in ("bot.model", "bot.effort", "bot.cli", "bot.memory"):
+        # CLI and memory are this bot's own (#373 kept them here); model and effort travel to
+        # the bot they name, so they are drawn on every card.
+        for action in ("bot.cli", "bot.memory"):
             self.assertTrue(rows[action]["self_only"], action)
-        for action in ("bot.pause", "bot.stop_turn", "swarm.hold"):
+        for action in ("bot.model", "bot.effort", "bot.pause", "bot.stop_turn", "swarm.hold"):
             self.assertFalse(rows[action]["self_only"], action)
+
+    def test_each_card_gets_its_own_pick_list(self):
+        """#373: a model or effort offered for a bot is *that* bot's list, from its beat."""
+        from swarmly.telegram.presence import Pulse
+        from swarmly.telegram.snapshot import Snapshot
+        channel = self.channel()
+        now = channel.presence_clock()
+        channel.presence().note(Pulse(alias="Codex", at=now, status=Snapshot(
+            alias="Codex", state="idle", at=now, every=60.0, models=("gpt-x", "gpt-y"),
+            efforts=("low", "high")).to_dict()), seen_at=now)
+        rows = {row["action"]: row for row in channel.web_state()["controls"]["controls"]}
+        self.assertEqual([pick["value"] for pick in rows["bot.model"]["per_bot"]["Codex"]],
+                         ["gpt-x", "gpt-y"])
+        self.assertEqual([pick["value"] for pick in rows["bot.effort"]["per_bot"]["Codex"]],
+                         ["low", "high"])
+        self.assertIn("Hermes", rows["bot.effort"]["per_bot"])       # this bot's own too
+        self.assertEqual(rows["bot.effort"]["per_bot"]["Codex"],
+                         [{"label": "low", "value": "low"},
+                          {"label": "high", "value": "high"}])
+        # The page reads that map before the row's own list, and says so when it is empty.
+        page = webui.page_html()
+        self.assertIn("button.per_bot[target]", page)
+        self.assertIn("has not reported what it can run yet", page)
+        # And nothing in it is an identifier.
+        import json as _json
+        payload = _json.dumps(rows["bot.effort"]["per_bot"])
+        self.assertNotIn(str(CHAT), payload)
         # And the page asks the view which bot it is before drawing one on a card.
         page = webui.page_html()
         self.assertIn("const mine = !target || target === view.self;", page)

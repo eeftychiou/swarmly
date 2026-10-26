@@ -373,6 +373,11 @@ def controls_view(controls: Optional[Mapping[str, Any]] = None) -> Optional[Dict
         }
         if raw.get("then"):
             row["then"] = _picks(raw.get("then"))
+        if isinstance(raw.get("per_bot"), Mapping):
+            # One pick per card (#373): a model or an effort offered for a bot is that bot's
+            # own list, as its beat reported it -- never one bot's list shown for another.
+            row["per_bot"] = {str(alias): _picks(picks)
+                              for alias, picks in raw["per_bot"].items()}
         rows.append(row)
     return {"ready": True, "self": str(controls.get("self") or ""), "controls": rows}
 
@@ -1379,8 +1384,13 @@ function controlNode(button, target) {
   const box = el("span", "control");
   box.dataset.action = button.action;
   let pick = null, then = null, typed = null;
-  if ((button.choices || []).length) {
-    pick = picker(button.action + ":pick", button.choices,
+  // A pick for *this* card's bot uses that bot's own list (#373): the page never offers one
+  // bot's models or efforts for another, and a bot that has not reported any offers none.
+  const mine = button.per_bot && target ? (button.per_bot[target] || []) : null;
+  const choices = mine === null ? (button.choices || []) : mine;
+  const empty = mine !== null && !mine.length;
+  if (choices.length) {
+    pick = picker(button.action + ":pick", choices,
       button.then ? "which bot: pick one" : button.label + ": pick one");
     box.append(pick);
   }
@@ -1398,8 +1408,13 @@ function controlNode(button, target) {
   }
   const go = el("button", button.confirm ? "danger" : "", button.label);
   go.type = "button";
-  go.disabled = !ADMIN;
-  if (button.note) go.title = button.note;
+  go.disabled = !ADMIN || empty;
+  if (empty) {
+    // Nothing to pick from is said, not hidden: the card still says the control exists.
+    go.title = "it has not reported what it can run yet";
+  } else if (button.note) {
+    go.title = button.note;
+  }
   go.addEventListener("click", () => {
     let who = target || "";
     let value = "";
@@ -1458,7 +1473,9 @@ function controlsPanel(state) {
     .forEach((item) => row.append(controlNode(item, "")));
   if (row.children.length) box.append(row);
   else box.append(el("p", "note", "no swarm control is wired on this bot"));
-  where.textContent = "the per-bot controls sit on each card, and the nudge on its round item";
+  where.textContent = "the per-bot controls sit on each card -- a model or an effort " +
+    "offered there is that bot's own list, and the card shows the new value once its next " +
+    "beat reports it -- and the nudge on its round item";
 }
 
 function toast(text, cls) {

@@ -74,10 +74,14 @@ class Note:
     action: str
     target: str = ""
     by: str = ""
+    #: The value the press picked, when it picked one: a model, an effort level (#373). It is
+    #: what makes a note that names a peer *a setting* rather than a request to report one.
+    value: str = ""
 
 
 def parse_note(text: str) -> Optional[Note]:
-    """``CONTROL <action> target=<t> by=<id> at=<utc> state=done`` -> a :class:`Note`.
+    """``CONTROL <action> target=<t> [value=<v>] by=<id> at=<utc> state=done`` -> a
+    :class:`Note`.
 
     None for anything that is not one of these lines, so a peer's prose can never be read as
     a command: the shape is fixed, and a missing field means the note is not ours.
@@ -93,7 +97,8 @@ def parse_note(text: str) -> Optional[Note]:
         fields[key] = value
     if "by" not in fields or "target" not in fields:
         return None
-    return Note(action=words[1], target=fields["target"], by=fields["by"])
+    return Note(action=words[1], target=fields["target"], by=fields["by"],
+                value=fields.get("value", ""))
 
 
 #: Telegram's limit on one button's callback data, in bytes. A picker carries a value in that

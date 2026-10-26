@@ -1611,90 +1611,197 @@ class TestTheControlsThatChangeTheSwarm(unittest.TestCase):
         self.assertFalse(channel.lessons.clear.called)
 
 
-class TestABotsOwnRuntimeIsItsOwn(unittest.TestCase):
-    """Review #345: a pick pressed for a peer changed *this* bot, and the note named the peer.
+def named_bot(alias: str, *, peers: Any = None, adapter: str = "echo",
+              control: Any = None) -> Any:
+    """A transport for one bot of a small swarm, with its dashboard pinned in a control topic."""
+    agent = {"name": f"{alias}Bot", "alias": alias, "bot_token": "123456:TEST",
+             "home_channel_id": -1001234567890, "admin_user_id": ADMIN_ID}
+    channel = make_channel(make_config(agent=agent, adapter={"type": adapter},
+                                       peers=peers or {"Codex": "CodexBot"},
+                                       control=control
+                                       or {"chat_id": -1001234567890, "topic_id": 307}))
+    channel.control_round = lambda: None
+    return channel
 
-    The pick is applied by the bot the press lands on and a report describes the bot that
-    answers, so a press aimed at another bot is refused -- in words, before anything changes --
-    and the page draws these controls on this bot's own card only.
-    """
 
-    def channel(self):
-        channel = make_channel(make_config(control={"chat_id": -1001234567890, "topic_id": 307}))
-        channel.control_round = lambda: None
-        return channel
+def live(channel: Any, alias: str, *, state: str = "idle", age: float = 0.0,
+         models: Any = ("sonnet", "opus"), efforts: Any = ("low", "high")) -> None:
+    """Record *alias*'s last beat on *channel*'s presence table, aged by *age* seconds."""
+    from swarmly.telegram.presence import Pulse
+    from swarmly.telegram.snapshot import Snapshot
+    now = channel.presence_clock()
+    at = now - age
+    channel.presence().note(Pulse(
+        alias=alias, at=at, frozen=(state == "frozen"), status=Snapshot(
+            alias=alias, state=state, at=at, every=60.0, model="sonnet", effort="high",
+            models=tuple(models), efforts=tuple(efforts)).to_dict()), seen_at=at)
+
+
+class TestAPickForAnotherBot(unittest.TestCase):
+    """#373: a press on a peer's card is *forwarded*, and only that bot applies it."""
 
     def ask(self, channel, **request):
         return run(channel.dashboard_action(request))
 
-    def test_an_effort_pressed_for_a_peer_is_refused_and_changes_nothing(self):
-        channel = self.channel()
-        asked = self.ask(channel, action="bot.effort", target="Codex", value="high")
-        self.assertEqual(asked["verdict"], cp.CONFIRM)          # a value always asks twice
-        answer = self.ask(channel, code=asked["confirm"])
-        self.assertFalse(answer["ok"])
-        self.assertEqual(answer["refused"], cp.ACTION_REFUSED)
-        self.assertIn("own", answer["text"])
-        self.assertEqual(channel._efforts, {})                  # this bot's effort is untouched
+    def forward(self, channel, **request):
+        """The two taps of a pick: the code first, then the code itself."""
+        asked = self.ask(channel, **request)
+        self.assertEqual(asked["verdict"], cp.CONFIRM, asked)
+        return self.ask(channel, code=asked["confirm"])
+
+    def test_an_effort_for_a_peer_is_sent_not_set_here(self):
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"}, adapter="echo")
+        live(channel, "Hermes")
+        done = self.forward(channel, action="bot.effort", target="Hermes", value="high")
+        self.assertTrue(done["ok"], done)
+        self.assertIn("sent", done["text"])
+        self.assertIn("Hermes", done["text"])
+        self.assertIn("once its next beat reports it", done["text"])
+        self.assertEqual(channel._efforts, {})               # nothing was set here
+
+    def test_exactly_one_forwarded_control_names_the_target_and_the_value(self):
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "Hermes")
+        self.forward(channel, action="bot.model", target="Hermes", value="sonnet")
         notes = [entry["text"] for entry in channel._test_sender.sent
-                 if "CONTROL bot.effort" in entry["text"]]
-        self.assertEqual(notes, [])                             # and nothing claims it did
-
-    def test_a_model_pressed_for_a_peer_is_refused_too(self):
-        channel = self.channel()
-        asked = self.ask(channel, action="bot.model", target="Codex", value="some-model")
-        answer = self.ask(channel, code=asked["confirm"])
-        self.assertFalse(answer["ok"])
-        self.assertEqual(answer["refused"], cp.ACTION_REFUSED)
-        self.assertEqual(channel._models, {})
-
-    def test_a_report_pressed_for_a_peer_answers_this_bot_and_says_so(self):
-        channel = self.channel()
-        answer = self.ask(channel, action="bot.cli", target="Codex")
-        self.assertFalse(answer["ok"])
-        self.assertEqual(answer["refused"], cp.ACTION_REFUSED)
-        self.assertIn("own", answer["text"])
-
-    def test_the_same_press_for_this_bot_still_runs(self):
-        channel = self.channel()
-        asked = self.ask(channel, action="bot.effort", target="Hermes", value="high")
-        answer = self.ask(channel, code=asked["confirm"])
-        # It ran: the reasoning command's own words come back (the echo adapter has no effort
-        # setting, so those words are the refusal *about the setting*, not about the target).
-        self.assertTrue(answer["ok"], answer)
-        self.assertIn("Hermes", answer["text"])
-        self.assertNotIn("would change the bot that answers", answer["text"])
-        notes = [entry["text"] for entry in channel._test_sender.sent
-                 if "CONTROL bot.effort" in entry["text"]]
+                 if "CONTROL bot.model" in entry["text"]]
         self.assertEqual(len(notes), 1, notes)
-        self.assertIn("value=high", notes[0])
+        line = notes[0]
+        self.assertIn("target=Hermes", line)
+        self.assertIn("value=sonnet", line)
+        self.assertIn("by=%d" % ADMIN_ID, line)
+        self.assertIn("via=dashboard", line)
 
-    def test_a_bare_press_for_a_peer_is_refused_before_any_picker_opens(self):
-        """Review #345: the picker used to open first, so the refusal came one tap too late."""
-        channel = self.channel()
-        for action in ("bot.model", "bot.effort"):
-            answer = self.ask(channel, action=action, target="Codex")
-            self.assertEqual(answer["verdict"], cp.REFUSED, action)
-            self.assertEqual(answer["refused"], cp.ACTION_REFUSED, action)
-            self.assertNotIn("confirm", answer)              # not even a code was minted
-        self.assertEqual(channel._test_sender.sent, [])       # and no picker was posted
-        self.assertEqual(channel.control_policy().pending(), [])
+    def test_only_the_named_bot_applies_it_and_a_second_bot_ignores_it(self):
+        sender = named_bot("Claudebot", peers={"Hermes": "HermesBot", "Hunter": "HunterBot"})
+        hermes = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"},
+                           adapter="claude")     # an adapter that has an effort setting
+        hunter = named_bot("Hunter", peers={"Claudebot": "ClaudebotBot"}, adapter="claude")
+        live(sender, "Hermes")
+        self.forward(sender, action="bot.effort", target="Hermes", value="high")
+        line = [entry["text"] for entry in sender._test_sender.sent
+                if "CONTROL bot.effort" in entry["text"]][0].split("\n")[-1]
+        self.assertEqual(hermes.apply_control_note(line, sender="Claudebot"),
+                         "applied: bot.effort")
+        self.assertTrue(hermes._efforts)
+        self.assertEqual(hunter.apply_control_note(line, sender="Claudebot"),
+                         "for Hermes: not mine")
+        self.assertEqual(hunter._efforts, {})
 
-    def test_a_report_is_refused_from_a_peer_card_too(self):
-        channel = self.channel()
-        answer = self.ask(channel, action="bot.cli", target="Codex")
+    def test_the_peer_refuses_a_value_its_own_list_does_not_have(self):
+        hermes = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"}, adapter="claude")
+        line = (f"CONTROL bot.effort target=Hermes value=nonsense by={ADMIN_ID} "
+                "at=2026-10-26T21:00:00Z state=done")
+        self.assertEqual(hermes.apply_control_note(line, sender="Claudebot"),
+                         "failed: bot.effort is not carried out here")
+        self.assertEqual(hermes._efforts, {})
+
+    def test_a_frozen_target_is_refused_with_no_forward(self):
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "Hermes", state="frozen")
+        done = self.forward(channel, action="bot.effort", target="Hermes", value="high")
+        self.assertFalse(done["ok"])
+        self.assertEqual(done["refused"], cp.ACTION_REFUSED)
+        self.assertIn("frozen", done["text"])
+        self.assertEqual([entry for entry in channel._test_sender.sent
+                          if "CONTROL bot.effort" in entry["text"]], [])
+        self.assertEqual(channel._efforts, {})
+
+    def test_a_frozen_beat_refuses_even_before_its_snapshot_says_so(self):
+        """The freeze rides the pulse (#51); the snapshot it carried may still read idle."""
+        from swarmly.telegram.presence import Pulse
+        from swarmly.telegram.snapshot import Snapshot
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        now = channel.presence_clock()
+        channel.presence().note(Pulse(alias="Hermes", at=now, frozen=True, status=Snapshot(
+            alias="Hermes", state="idle", at=now, every=60.0).to_dict()), seen_at=now)
+        done = self.forward(channel, action="bot.effort", target="Hermes", value="high")
+        self.assertFalse(done["ok"])
+        self.assertIn("frozen", done["text"])
+        self.assertEqual(channel._efforts, {})
+
+    def test_a_bot_that_stopped_beating_is_refused_as_down(self):
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "Hermes", age=9000)                    # every=60: long past its renewals
+        done = self.forward(channel, action="bot.model", target="Hermes", value="sonnet")
+        self.assertFalse(done["ok"])
+        self.assertIn("down", done["text"])
+        self.assertEqual([entry for entry in channel._test_sender.sent
+                          if "CONTROL bot.model" in entry["text"]], [])
+
+    def test_the_pickers_offer_the_targets_own_list(self):
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "Hermes", models=("sonnet", "opus"), efforts=("low", "high"))
+        self.assertEqual(channel.control_choices("bot.model", "Hermes"),
+                         [("sonnet", "sonnet"), ("opus", "opus")])
+        self.assertEqual(channel.control_choices("bot.effort", "Hermes"),
+                         [("low", "low"), ("high", "high")])
+        # A bot that has reported nothing offers nothing: never this bot's list for another.
+        self.assertEqual(channel.control_choices("bot.effort", "Hunter"), [])
+        # And this bot's own pickers still read its own runtime.
+        self.assertIn(("medium", "medium"), channel.control_choices("bot.effort"))
+
+    def forwarded(self, peer_control, *, sender=None):
+        """Forward one effort pick and apply the note the sender posted, on *peer_control*'s bot."""
+        sender = sender or named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        peer = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"}, adapter="claude",
+                         control=peer_control)
+        live(sender, "Hermes")
+        self.forward(sender, action="bot.effort", target="Hermes", value="high")
+        line = [entry["text"] for entry in sender._test_sender.sent
+                if "CONTROL bot.effort" in entry["text"]][0].split("\n")[-1]
+        self.assertEqual(peer.apply_control_note(line, sender="Claudebot"),
+                         "applied: bot.effort")
+        return peer
+
+    def test_a_forwarded_pick_lands_where_turns_read_it(self):
+        """Review #375: applied under the dashboard's topic it was a setting nothing read.
+
+        Here the peer's dashboard follows the pulse, so its turns read General's choices and
+        that is where the pick must land -- not the pulse topic the card sits in.
+        """
+        peer = self.forwarded({"chat_id": -1001234567890, "topic_id": "pulse"})
+        self.assertEqual(peer._efforts, {"general": "high"})
+        self.assertEqual(peer.bus_turn_choices(""), (None, "high"))
+
+    def test_a_forwarded_pick_reaches_a_peer_with_a_configured_topic(self):
+        """#374 review: a General pick is invisible to a bot that reads a configured topic."""
+        peer = self.forwarded({"chat_id": -1001234567890, "topic_id": 307})
+        self.assertEqual(peer._efforts, {"tg-307": "high"})
+        self.assertEqual(peer.bus_turn_choices(""), (None, "high"))
+
+    def test_a_forwarded_pick_to_a_dm_dashboard_stores_generals(self):
+        peer = self.forwarded({"chat_id": ADMIN_ID})
+        self.assertEqual(peer._efforts, {"general": "high"})
+
+    def test_a_peer_seen_under_its_handle_still_gets_its_picker(self):
+        """Review #375: a beat filed under @HermesBot left Hermes's card with no choices."""
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "HermesBot", models=("sonnet", "opus"), efforts=("low", "high"))
+        self.assertEqual(channel.control_choices("bot.model", "Hermes"),
+                         [("sonnet", "sonnet"), ("opus", "opus")])
+        rows = {row["action"]: row for row in channel.web_controls()["controls"]}
+        self.assertEqual([pick[1] for pick in rows["bot.effort"]["per_bot"]["Hermes"]],
+                         ["low", "high"])
+        self.assertNotIn("HermesBot", rows["bot.effort"]["per_bot"])   # one bot, one key
+
+    def test_a_handle_keeps_its_own_state_for_the_forward_gate_too(self):
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "HermesBot", state="frozen")
+        done = self.forward(channel, action="bot.effort", target="Hermes", value="high")
+        self.assertFalse(done["ok"])
+        self.assertIn("frozen", done["text"])
+
+    def test_cli_and_memory_are_still_this_bots_own(self):
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "Hermes")
+        answer = self.ask(channel, action="bot.cli", target="Hermes")
         self.assertEqual(answer["refused"], cp.ACTION_REFUSED)
-        self.assertIn("own", answer["text"])
-
-    def test_the_page_draws_them_on_this_bots_card_only(self):
-        channel = self.channel()
-        view = channel.web_controls()
-        self.assertEqual(view["self"], "Hermes")
-        rows = {row["action"]: row for row in view["controls"]}
-        for action in ("bot.model", "bot.effort", "bot.cli", "bot.memory"):
-            self.assertTrue(rows[action]["self_only"], action)
-        for action in ("bot.pause", "bot.resume", "bot.stop_turn", "bot.restart"):
-            self.assertFalse(rows[action]["self_only"], action)
+        channel.lessons = mock.Mock()
+        asked = self.ask(channel, action="bot.memory", target="Hermes")
+        self.assertEqual(self.ask(channel, code=asked["confirm"])["refused"],
+                         cp.ACTION_REFUSED)
+        self.assertFalse(channel.lessons.clear.called)
 
 
 class TestEveryConfirmingControlAsksTwice(unittest.TestCase):

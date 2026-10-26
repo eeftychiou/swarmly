@@ -144,17 +144,33 @@ def typed(action: str) -> str:
     return str(found.typed) if found else ""
 
 
-#: The controls that read or change **this bot's own** runtime -- its model, its effort, its
-#: CLI allowlist, its memory file. A press for another bot would either change the wrong bot
-#: (the pick is applied by the bot the press lands on) or answer about the wrong one (a report
-#: describes the bot that answers), so the page draws them on this bot's own card only, and the
-#: transport refuses the press however it arrives (review, #345).
-SELF_ONLY: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.cli", "bot.memory")
+#: The controls that can only ever be answered by **this bot** -- its CLI allowlist and its
+#: memory file. A press for another bot would answer about the wrong one (a report describes
+#: the bot that answers) or empty the wrong file, so the page draws them on this bot's own card
+#: only, and the transport refuses the press however it arrives (review, #345).
+#:
+#: Model and effort were here too until #373: a pick for a peer is now *forwarded* to that bot,
+#: which applies it under its own rules -- see :data:`REMOTE_PICKS`.
+SELF_ONLY: Tuple[str, ...] = ("bot.cli", "bot.memory")
 
 
 def self_only(action: str) -> bool:
     """Whether *action* only makes sense on the bot it lands on, never addressed to a peer."""
     return str(action) in SELF_ONLY
+
+
+#: The controls the page may aim at **another bot**: its model and its reasoning effort (#373).
+#: The press does not change anything where it lands -- it travels as one ``CONTROL`` note
+#: naming that bot and the value, and only that bot applies it, through its own ``/model`` and
+#: ``/reasoning`` rules (its adapter's allowed list, its own per-topic scope). So the answer
+#: says *sent*, and the bot's card shows the new value only once its own beat reports it: a
+#: forward is not a setting, and a page that claimed otherwise would be guessing.
+REMOTE_PICKS: Tuple[str, ...] = ("bot.model", "bot.effort")
+
+
+def remote_pick(action: str) -> bool:
+    """Whether *action* may be forwarded to the bot it names (#373)."""
+    return str(action) in REMOTE_PICKS
 
 
 def page_actions() -> Tuple[str, ...]:

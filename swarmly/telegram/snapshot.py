@@ -70,6 +70,12 @@ class Snapshot:
     wakes: Tuple[Tuple[str, float], ...] = ()
     model: str = ""
     effort: str = ""
+    #: What this bot's runtime offers (#373): the model names its CLI last reported and the
+    #: effort levels it accepts. A peer reads them so a pick offered for *this* bot is one
+    #: this bot can actually take, and never one bot's list shown for another. Empty means
+    #: this bot cannot say -- the picker then offers nothing rather than guessing.
+    models: Tuple[str, ...] = ()
+    efforts: Tuple[str, ...] = ()
     #: The revision this bot is running, for /diag's "which build is that?".
     rev: str = ""
     uptime: float = 0.0
@@ -87,6 +93,7 @@ class Snapshot:
             "silent": self.silent,
             "queue": int(self.queue), "wakes": [[str(i), float(at)] for i, at in self.wakes],
             "model": self.model, "effort": self.effort, "rev": self.rev,
+            "models": list(self.models), "efforts": list(self.efforts),
             "uptime": self.uptime, "restarts": int(self.restarts),
             "term": int(self.term), "lease_ends": self.lease_ends,
         }
@@ -117,6 +124,7 @@ class Snapshot:
             turn_timeout=_num(data.get("turn_timeout")), silent=_num(data.get("silent")),
             queue=int(_num(data.get("queue"))), wakes=tuple(wakes),
             model=str(data.get("model") or ""), effort=str(data.get("effort") or ""),
+            models=_names(data.get("models")), efforts=_names(data.get("efforts")),
             rev=str(data.get("rev") or ""), uptime=_num(data.get("uptime")),
             restarts=int(_num(data.get("restarts"))), term=int(_num(data.get("term"))),
             lease_ends=_num(data.get("lease_ends")),
@@ -159,6 +167,20 @@ class Snapshot:
         age = self.age(moment)
         parts.append(f"{'stale ' if self.is_stale(moment) else ''}age={_duration(age)}")
         return " ".join(parts)
+
+
+def _names(value: Any) -> Tuple[str, ...]:
+    """A list of names from a record, short and clean: an unreadable one is an empty one.
+
+    A peer's list is another bot's word, so one malformed entry is dropped rather than
+    carried: the picker then offers the names that parsed, never a blank button.
+    """
+    out: List[str] = []
+    for raw in value or ():
+        name = str(raw or "").strip()
+        if name and len(name) <= 64 and name not in out:
+            out.append(name)
+    return tuple(out[:24])
 
 
 def _num(value: Any) -> float:

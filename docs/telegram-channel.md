@@ -1289,16 +1289,33 @@ Resume, Stop turn, Restart, Model, Effort, CLI, Memory), an `item.` control **on
 it acts on** (Nudge), and a `swarm.` control in the **Controls** panel (Hold, Release, Pause all,
 Hand lease, Fail back, Reassign role, Cleanup, Sync, Admit, Remove).
 
-Four of the per-bot controls — Model, Effort, CLI and Memory — are **this bot's own**: a pick is
-applied by the bot the press lands on, and a report describes the bot that answers, so asking for
-a peer's model from its card would change this bot's and then say the peer's name. They are drawn
-on the bot's own card only, and the transport refuses such a press however it arrives — the page,
-or a typed `ctl:bot.effort:Codex:high` — in words: `Effort is Hermes's own: a press for Codex
-would change the bot that answers, not that one`. Pause, Resume, Stop turn and Restart are not in
-that list: those travel as a `CONTROL` note that names the peer, and the peer applies them. A control that takes a value
-carries the one it can be picked from — a model, an effort level, a bot, a role, a round item's
-key — read in code by `control_choices`, so drawing the panel costs no model turn; a control whose
-value cannot be picked, like `/admit`'s `@username`, shows a text box instead.
+A control that takes a value carries the one it can be picked from — a model, an effort level, a
+bot, a role, a round item's key — read in code by `control_choices`, so drawing the panel costs no
+model turn; a control whose value cannot be picked, like `/admit`'s `@username`, shows a text box
+instead.
+
+**Model and effort can be set for any bot** (#373). A press on a bot's card is *forwarded*: the
+line the policy writes — `CONTROL bot.effort target=Codex value=high by=… via=dashboard` — is the
+whole of it, exactly one note, and nothing changes where the press landed. Only the bot it names
+applies it, through its own `/model` or `/reasoning`, so its own adapter's allowed list and its own
+per-topic scope are the ones that decide; a value its runtime will not take is refused by *that*
+bot, and the note is answered `failed` rather than `applied`. The pickers come from each bot's own
+beat: a snapshot now carries the model names its CLI reported (`models`) and the effort levels its
+adapter accepts (`efforts`), so the page offers Codex's list on Codex's card and Hermes's on
+Hermes's — a bot that has reported none offers none, rather than one bot's list for another.
+
+The answer is honest about what happened. `sent effort high to Codex: it applies that under its own
+rules, and its card shows the new value once its next beat reports it` means exactly that: the
+forward went out, and the card changes when Codex's own heartbeat says so — never before. A bot
+that cannot apply anything right now is refused *before* anything goes out, in words: a paused,
+frozen or no-longer-beating target (`Codex is frozen: nothing was sent — effort for it can be set
+once it is back…`).
+
+**CLI and Memory stay this bot's own**: a report describes the bot that answers, and a memory file
+belongs to one bot, so those two are drawn on the bot's own card only and the transport refuses a
+press that names a peer however it arrives — the page, or a typed `ctl:bot.memory:Codex` — in
+words. Pause, Resume and Stop turn are not in that list either: they travel as the same kind of
+note that names the peer, and the peer applies them.
 
 One table keeps the page and the commands in step: `control.MENU_COVERAGE` maps **every** entry of
 `commands.MENU_COMMANDS` to the control(s) it became, to the panel that answers it, or to the
