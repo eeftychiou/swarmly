@@ -99,11 +99,13 @@ same things with lines in its replies: `LINK: …`, `ASSIGN: @bot <ref|L1> as <r
 
 ## Dashboard buttons
 
-With `control:` set, the coordinator keeps a pinned dashboard in the chat it names. Its buttons
-are admin only, and some ask for a second tap. The per-bot buttons act on the coordinator, the
-bot that holds the dashboard; a typed `ctl:bot.pause:Codex` sends one to another bot. A typed
-`ctl:` code reaches every bot, so the others answer that the coordinator has the dashboard:
-pressing the button is quieter.
+With `control:` set, the coordinator keeps a pinned dashboard in the chat it names (or in
+📡 Swarm pulse). Its buttons are admin only, and some ask for a second tap. A per-bot button
+names its bot: Pause, Resume, Stop turn and Restart travel as the `CONTROL` note that bot applies
+to itself, and Model and Effort are forwarded to it as well — it applies them under its own rules,
+and its card shows the new value once its own beat reports it. CLI and Memory act on the
+coordinator only. A typed `ctl:` code reaches every bot, so the others answer that the
+coordinator has the dashboard: pressing the button is quieter.
 
 | Button | What it does |
 |---|---|

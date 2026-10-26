@@ -10,6 +10,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A Model or Effort picked from the dashboard card or the page is stored where the turns read
+  it again (`#374`). `#372` stamped the pick with the topic the *card* sits in — the 📡 Swarm
+  pulse topic, or whatever `follow_pulse` resolves to — so it saved `{'tg-812': 'high'}` while
+  `bus_turn_choices` read `(None, None)`, and the reply still promised "from the next turn".
+  `_control_event` is back on the configured `control.topic_id` (General when there is none, and
+  never a DM's thread), `bus_turn_choices` falls back to that topic before General, and a
+  dashboard in the admin's DM no longer posts a `message_thread_id` into a chat that has no
+  topics. `docs/telegram/COMMANDS.md` says what the buttons actually do now.
+
 - A newcomer to a new swarm on the Telegram bus gets its role at once (`#369`). The
   coordinator's role turn and each role's greeting turn ran in General, which is
   transport-only on that bus, so with no work topic yet both were dropped, and the newcomer

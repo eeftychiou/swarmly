@@ -1265,6 +1265,84 @@ class TestTheSwarmControls(unittest.TestCase):
         self.assertIn("swarm.cleanup", channel.control_actions())
 
 
+class TestAPickIsStoredWhereTurnsReadIt(unittest.TestCase):
+    """#374: a pick from the card or the page landed on the card's topic, which turns never read.
+
+    The setting a pick makes is for this bot's *turns*, and ``bus_turn_choices`` looks for it
+    on the topic a turn belongs to. A dashboard that follows the pulse stores General's; one
+    with a configured topic stores that topic's, and a bus turn falls back to it.
+    """
+
+    def channel(self, **control):
+        from tests.test_telegram_channel import GROUP
+        return make_channel(make_config(
+            adapter={"type": "claude"},          # an adapter that has an effort setting
+            control=dict({"chat_id": GROUP}, **control)))
+
+    def card_pick(self, channel, value="high"):
+        """A pick pressed on the pinned card: the same two taps its keyboard sends."""
+        asked = run(channel.handle_control_press(press(f"ctl:bot.effort::{value}")))
+        code = channel.control_policy().pending()[-1].code
+        self.assertIn(code, asked)
+        return run(channel.handle_control_press(press(cp.confirm_data(code))))
+
+    def page_pick(self, channel, value="high"):
+        """The same pick through the page's write path (POST /api/action)."""
+        asked = run(channel.dashboard_action({"action": "bot.effort", "value": value}))
+        self.assertEqual(asked["verdict"], cp.CONFIRM)
+        return run(channel.dashboard_action({"code": asked["confirm"]}))
+
+    def test_a_card_pick_is_read_by_the_next_turn_with_a_pulse_dashboard(self):
+        channel = self.channel(follow_pulse=True)
+        done = self.card_pick(channel)
+        self.assertIn("high", done)
+        self.assertEqual(channel.bus_turn_choices(""), (None, "high"))
+
+    def test_a_card_pick_is_read_with_a_configured_topic(self):
+        channel = self.channel(topic_id=307)
+        asked = run(channel.handle_control_press(press("ctl:bot.effort::high")))
+        code = channel.control_policy().pending()[-1].code
+        self.assertIn(code, asked)
+        done = run(channel.handle_control_press(press(cp.confirm_data(code))))
+        self.assertIn("high", done)
+        # Stored on the configured topic, and a bus turn falls back to it (#374).
+        self.assertEqual(channel._efforts, {"tg-307": "high"})
+        self.assertEqual(channel.bus_turn_choices(""), (None, "high"))
+
+    def test_a_page_pick_is_read_with_a_pulse_dashboard(self):
+        channel = self.channel(follow_pulse=True)
+        done = self.page_pick(channel)
+        self.assertTrue(done["ok"], done)
+        self.assertEqual(channel.bus_turn_choices(""), (None, "high"))
+
+    def test_a_page_pick_is_read_with_a_configured_topic(self):
+        channel = self.channel(topic_id=307)
+        done = self.page_pick(channel)
+        self.assertTrue(done["ok"], done)
+        self.assertEqual(channel.bus_turn_choices(""), (None, "high"))
+
+    def test_the_setting_never_follows_the_topic_the_card_sits_in(self):
+        """#372's regression: the pick was stamped with the card's topic, not the setting's."""
+        from tests.test_telegram_channel import GROUP
+        channel = make_channel(make_config(
+            adapter={"type": "claude"},
+            limits={"heartbeat_topic_id": 812},          # the card really sits in topic 812
+            control={"chat_id": GROUP, "topic_id": "pulse"}))
+        self.page_pick(channel)
+        self.assertNotIn("tg-812", channel._efforts)         # the card's topic
+        self.assertEqual(sorted(channel._efforts), ["general"])
+
+    def test_a_dashboard_in_a_dm_posts_no_thread_id(self):
+        """A private chat has no topics, and Telegram refuses a thread id in one (#372)."""
+        channel = make_channel(make_config(limits={"heartbeat_topic_id": 812},
+                                           control={"chat_id": ADMIN_ID,
+                                                    "topic_id": "pulse"}))
+        chat_id, thread_id = channel._control_chat()
+        self.assertEqual(chat_id, ADMIN_ID)
+        self.assertIsNone(thread_id)
+        self.assertIsNone(channel._pick_topic())             # and General's setting is used
+
+
 class TestTheDashboardWritePath(unittest.TestCase):
     """#342: the page's write path runs the same press, with its code and its audit line."""
 
