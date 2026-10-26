@@ -5327,7 +5327,11 @@ class AgentChannel:
             return found
         home = int(self.config.identity.home_channel_id or 0)
         create = getattr(self.bot, "create_forum_topic", None) if self.bot is not None else None
-        if not home or create is None or not self.is_coordinator():
+        # The lease holder -- or, when no lease can be read, the named coordinator: renewing
+        # the lease is a store write, and the store writes to this very topic, so with the
+        # topic gone the lease lapses and nobody would ever open a new one (live, 26 Oct).
+        if not home or create is None or not (self.is_coordinator()
+                                               or self.is_named_coordinator()):
             return None
         now = time.time()
         if now - float(self.__dict__.get("_pulse_topic_tried") or 0.0) < PULSE_TOPIC_RETRY_SECONDS:

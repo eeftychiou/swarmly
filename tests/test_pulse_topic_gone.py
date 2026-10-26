@@ -60,3 +60,20 @@ class PulseTopicGoneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReopenWithoutALeaseTests(unittest.TestCase):
+    def test_the_named_coordinator_opens_it_when_the_lease_has_lapsed(self):
+        """The lease renews through the store, which writes to the pulse topic: with the topic
+        gone, the lease lapses, and only the named coordinator can break the circle."""
+        config = make_config(agent={"role": "coordinator"})
+        channel = make_channel(config)
+        channel.is_coordinator = lambda now=None: False
+        opened = []
+
+        async def create_forum_topic(chat_id, name):
+            opened.append(name)
+            return SimpleNamespace(message_thread_id=777)
+        channel.bot = SimpleNamespace(create_forum_topic=create_forum_topic)
+        self.assertEqual(asyncio.run(channel._ensure_pulse_topic()), 777)
+        self.assertEqual(opened, [PULSE_TOPIC_NAME])
