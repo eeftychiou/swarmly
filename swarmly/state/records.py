@@ -210,6 +210,9 @@ class Topic(Record):
     links: List[Link] = field(default_factory=list)
     agents: Dict[str, Binding] = field(default_factory=dict)
     history: List[Change] = field(default_factory=list)
+    #: ``/cleanup keep`` in the topic: /cleanup never deletes it (admin, 26 Oct: kept topics
+    #: are decided in the group, not as ids in config.yaml).
+    keep: bool = False
 
     NESTED: ClassVar[Dict[str, Any]] = {"links": (Link, "list"), "agents": (Binding, "map"),
               "history": (Change, "list")}

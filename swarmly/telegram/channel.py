@@ -1858,7 +1858,8 @@ class AgentChannel:
             return None
         return await self.cleanup.handle_args(
             command_args(event.text or ""),
-            is_admin=self.config.is_admin(event.author_id), chat_id=event.chat_id)
+            is_admin=self.config.is_admin(event.author_id), chat_id=event.chat_id,
+            thread_id=event.thread_id, author_id=event.author_id)
 
     def _answers_for_swarm(self) -> bool:
         """A bare swarm-wide command (``/cleanup``) is answered by one bot: the store's
@@ -2100,9 +2101,21 @@ class AgentChannel:
         return keep
 
     def cleanup_protected_topics(self) -> Set[int]:
-        """Topics /cleanup never offers in bulk: the pulse topic the heartbeat posts to."""
+        """Topics /cleanup never deletes: the pulse topic the heartbeat posts to, and every
+        topic marked with ``/cleanup keep`` (in the registry, not in config.yaml)."""
         pulse = self._pulse_topic()
-        return {int(pulse)} if pulse else set()
+        kept = {int(pulse)} if pulse else set()
+        try:
+            kept |= self.state_link.kept_topics()
+        except Exception:                                  # noqa: BLE001 - keep what we know
+            logger.warning("cleanup: the kept topics could not be read", exc_info=True)
+        return kept
+
+    async def cleanup_set_keep(self, chat_id: int, thread_id: Optional[int], keep: bool,
+                               by: str) -> str:
+        if thread_id is None:
+            return "send /cleanup keep inside the topic to keep"
+        return await self.state_link.set_topic_keep(int(chat_id), int(thread_id), keep, by)
 
     def cleanup_home_chat(self) -> Optional[int]:
         home = self.config.identity.home_channel_id

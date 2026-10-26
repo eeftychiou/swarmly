@@ -805,6 +805,37 @@ class StateLink:
             return f"Recorded: {said}"
         return "The store did not take the change; try again in a moment."
 
+    # -- topics /cleanup keeps ----------------------------------------------------------
+    def kept_topics(self) -> Set[int]:
+        """The topics marked ``keep`` in the registry (``/cleanup keep``)."""
+        out: Set[int] = set()
+        for topic_id, record in self._topic_records():
+            if isinstance(record, dict) and record.get("keep"):
+                out.add(int(topic_id))
+        return out
+
+    async def set_topic_keep(self, chat_id: int, thread_id: int, keep: bool, by: str) -> str:
+        """Mark (or unmark) a topic as one /cleanup never deletes. The lease holder writes."""
+        store = self.store
+        if store is None or not store.ready:
+            return "the state store is not running here, so nothing can be kept"
+        if not store.holds_lease():
+            return "only the coordinator (the lease holder) writes topic records"
+        async with self.topic_lock:
+            ops = self._ops()
+            await store.refresh()
+            topic = ops.topic(thread_id, self.channel.topics.name(chat_id, thread_id) or "")
+            if bool(topic.keep) == bool(keep):
+                return "already kept" if keep else "was not kept"
+            # No history entry: an older bot validates history fields and would read the
+            # whole record as broken. The log line keeps who did it.
+            topic.keep = bool(keep)
+            logger.info("registry: topic %s keep=%s by %s", thread_id, keep, by)
+            if not await ops.save(thread_id, topic):
+                return "the store did not take the change; try again in a moment"
+        return "kept: /cleanup never deletes this topic" if keep else \
+            "no longer kept: /cleanup may delete it once it is finished"
+
     # -- the pinned dashboard card ------------------------------------------------------
     def dashboard_cards(self) -> Optional[dict]:
         """alias -> the dashboard message each bot last created (``agent/<a>/dashboard``),
