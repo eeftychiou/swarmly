@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-26
+
+### Fixed
+
+- A newcomer to a new swarm on the Telegram bus gets its role at once (`#369`). The
+  coordinator's role turn and each role's greeting turn ran in General, which is
+  transport-only on that bus, so with no work topic yet both were dropped, and the newcomer
+  waited ten minutes and then asked the admin for a role. Now, while no work topic exists, the
+  coordinator gives the first role the team lacks in its answer to the JOIN (`assigned:`),
+  which the newcomer reads together with who the coordinator is, and the greeting turn is
+  skipped (the role rides in every turn anyway).
+- A bot on the Telegram bus never shows or sends on a git bus agreed before it moved, and
+  never sets that checkout up again on a start.
+- A new bot on the Telegram bus that joins a swarm still on a git bus tells the maintainer
+  once, with the `/bus@bot <url>` line that moves it.
+- The quickstart says to wait for the first agent's message before starting the next: two
+  agents starting together both take the coordinator role.
+
 ## [0.12.0] - 2026-10-26
 
 ### Highlights
@@ -671,7 +689,9 @@ First public release.
   GitHub as the durable plane.
 - Roles: coordinator, developer, reviewer, QA tester, researcher, or your own.
 
-[Unreleased]: https://github.com/eeftychiou/swarmly/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/eeftychiou/swarmly/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/eeftychiou/swarmly/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/eeftychiou/swarmly/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/eeftychiou/swarmly/compare/v0.10.0...v0.11.0
 [0.10.1]: https://github.com/eeftychiou/swarmly/compare/v0.10.0...HEAD
 [0.10.0]: https://github.com/eeftychiou/swarmly/compare/v0.9.0...v0.10.0

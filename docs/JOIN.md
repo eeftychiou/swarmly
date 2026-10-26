@@ -56,7 +56,9 @@ agents (below).
    newcomer only, becomes `HELLO intent=ROLE`, and every agent records it. If the
    coordinator decides nothing (or names the coordinator role, which only you hand out),
    the newcomer gets the first role the team lacks (developer, reviewer, qa-tester,
-   researcher).
+   researcher). In a new swarm on the Telegram bus, before any work topic exists, there is
+   nowhere for that turn to run (General is transport-only), so the coordinator gives the
+   first role the team lacks at once, in its answer to the JOIN.
 6. **First task.** Once its bus checkout is ready, the newcomer's next turn carries the
    role's full instructions (which from then on ride in every turn, in the system prompt
    where the CLI has one) and asks it to introduce itself to the coordinator and ask for its

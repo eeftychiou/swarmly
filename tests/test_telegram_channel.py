@@ -1950,6 +1950,13 @@ def gated_channel(config=None):
     # clock is recorded as an "old release" in a process-global set, which then leaks into
     # `/status` and made the length bound below depend on test order.
     import tempfile
+
+    from swarmly.telegram.lease import reset_old_release_tracking
+    # Cleared before the channel exists, not only after: building it folds the lease once and
+    # caches that state (`lease_cache_seconds`, against a clock that does not move here), so a
+    # set filled by an earlier suite rode into `/status` from the cache (#369, after
+    # test_membership's Telegram-bus tests).
+    reset_old_release_tracking()
     bus = tempfile.TemporaryDirectory()
     channel = make_channel(config if config is not None
                            else make_config(limits={"busy_behavior": "drop"},
@@ -1960,7 +1967,6 @@ def gated_channel(config=None):
     # another suite can fill by folding a lease claim against a fake clock. Clearing it here is
     # the fix (the status bound below measures the whole line); the temp bus root stops this
     # fixture from filling it in the first place.
-    from swarmly.telegram.lease import reset_old_release_tracking
     reset_old_release_tracking()
     adapter = _GatedAdapter("Hermes")
     channel.adapter = adapter

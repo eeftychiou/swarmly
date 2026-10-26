@@ -1166,9 +1166,6 @@ class TheSwarmCommandsAnswerTests(unittest.TestCase):
         quiet.is_coordinator = lambda **_: False
         self.assertNotIn("only the admin", self.say(quiet, "/sync", author_id=77))
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TelegramBusJoinTests(unittest.TestCase):
     """A first swarm on the Telegram bus: no git repository, nothing to ask for."""
@@ -1206,3 +1203,95 @@ class TelegramBusJoinTests(unittest.TestCase):
             self.assertEqual(cfg.bus.transport, "telegram")
             self.assertEqual((cfg.state.backend, cfg.state.routing, cfg.state.owed),
                              ("telegram", "registry", "store"))
+
+    def test_the_first_agents_greeting_turn_is_not_tried_where_it_would_be_dropped(self):
+        """A new group has no work topic and General is transport-only: the general gate
+        drops an own brief there, so the role's greeting turn is skipped, not left pending."""
+        with tempfile.TemporaryDirectory() as folder:
+            channel = dynamic(make_channel(self.telegram_config(folder)))
+            m = channel.membership
+            run(m._await_swarm())
+            run(drain(channel))
+            self.assertEqual(m.state.role, "coordinator")
+            self.assertFalse(m.state.onboard_pending)
+            self.assertFalse([r for r in channel._test_sender.sent if "received:" in r["text"]])
+
+    def test_a_newcomer_gets_the_gap_role_in_the_coordinators_answer(self):
+        """Live-shaped, review on #369: with no work topic the coordinator's role turn was
+        dropped by the general gate, and the newcomer waited ten minutes for the admin."""
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(make_channel(self.telegram_config(folder)), codex_x_bot=402)
+            m = joined(channel, bus=None).membership
+            channel.is_coordinator = lambda now=None: True
+            run(channel.handle_event(hello("JOIN", "Codex", "🙋 Codex wants to join the swarm."
+                                           f"\ncli: codex\nkey: {PUB}", "codex_x_bot", 402)))
+            run(drain(channel))
+            self.assertEqual(channel.config.peer_roles.get("Codex"), "developer")
+            self.assertFalse(m._pending_roles)               # no role turn was started
+            present = [r["text"] for r in channel._test_sender.sent
+                       if "intent=PRESENT" in r["text"]]
+            self.assertIn("assigned: developer", present[-1])
+            self.assertTrue(any("intent=ROLE" in r["text"] for r in channel._test_sender.sent))
+
+    def test_a_newcomer_takes_the_role_only_from_the_coordinators_answer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(dynamic(make_channel(self.telegram_config(folder))),
+                                  claude_x_bot=401, codex_x_bot=402)
+            m = channel.membership
+            run(channel.handle_event(hello(
+                "PRESENT", "Codex", "@HermesBot 👋 Codex here.\nrole: reviewer\n"
+                "coordinator: Claude\nassigned: researcher", "codex_x_bot", 402, to="Hermes")))
+            self.assertIsNone(m.state.role)                  # a member, not the coordinator
+            run(channel.handle_event(hello(
+                "PRESENT", "Claude", "@HermesBot 👋 Claude here.\nrole: coordinator\n"
+                "coordinator: Claude\nassigned: coordinator", "claude_x_bot", 401,
+                to="Hermes", message_id=8)))
+            self.assertIsNone(m.state.role)                  # never the coordinator role
+            run(channel.handle_event(hello(
+                "PRESENT", "Claude", "@HermesBot 👋 Claude here.\nrole: coordinator\n"
+                "coordinator: Claude\nassigned: developer", "claude_x_bot", 401,
+                to="Hermes", message_id=9)))
+            self.assertEqual(m.state.role, "developer")
+            self.assertTrue(m.joined())
+
+    def test_a_newcomer_told_of_a_git_bus_says_how_to_move_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = with_admins(dynamic(make_channel(self.telegram_config(folder))),
+                                  claude_x_bot=401)
+            m = channel.membership
+            got = []
+
+            async def on_bus(location):
+                got.append(location)
+            m.on_bus = on_bus
+            for message_id in (7, 8):
+                run(channel.handle_event(hello(
+                    "PRESENT", "Claude", "@HermesBot 👋 Claude here.\nrole: coordinator\n"
+                    "coordinator: Claude\nbus: https://github.com/me/swarm-bus.git",
+                    "claude_x_bot", 401, to="Hermes", message_id=message_id)))
+            self.assertEqual(got, [])                        # the admin decides
+            told = [r["text"] for r in channel._test_sender.sent if "git repository" in r["text"]]
+            self.assertEqual(len(told), 1, told)
+            self.assertIn("/bus@HermesBot https://github.com/me/swarm-bus.git", told[0])
+
+    def test_a_bot_moved_to_the_telegram_bus_forgets_its_old_git_bus(self):
+        """Review on #369: a launcher bot moved by hand kept its agreed git URL, showed it in
+        /swarm, sent it to newcomers, and could set the checkout up again on a start."""
+        with tempfile.TemporaryDirectory() as folder:
+            channel = dynamic(make_channel(self.telegram_config(folder)))
+            m = channel.membership
+            m.state.bus, m.state.bus_ready = "https://github.com/me/old-bus.git", False
+            self.assertEqual(m.bus_location(), "telegram")
+            self.assertIsNone(m.advertised_bus())
+            moved = []
+
+            async def on_bus(location):
+                moved.append(location)
+            m.on_bus = on_bus
+            run(m.on_start())
+            m.cancel()
+            self.assertEqual(moved, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
