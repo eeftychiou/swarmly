@@ -1167,7 +1167,11 @@ class AgentChannel:
             # hand-off, not a roster: every @handle in it counts as addressed. Only the
             # relay rule below still keeps a named bot from taking work meant for another,
             # and a drop there is reported to the sender (``_mention_drop_notice``).
-            if self._relayed_through_peer(event):
+            # Under registry routing the topic's links decide who a peer's message reaches;
+            # this wording guess refused a linked QA bot that a peer named in passing ("I've
+            # asked @agy for QA", live 25 Oct). It still guards topics with no record.
+            if self._relayed_through_peer(event) and self.state_link.route_facts(
+                    event.chat_id, event.thread_id) is None:
                 # ...unless the message asks several bots at once (#181): then it is one
                 # hand-off per bot, and the delegation rule does not apply to it. Only a
                 # message that asks *one* bot keeps the old refusal.
