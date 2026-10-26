@@ -4387,14 +4387,16 @@ class AgentChannel:
         if not value:
             return False
         command = "model" if action == "bot.model" else "reasoning"
-        # No thread: a pick forwarded from a page belongs to no discussion, and the turns this
-        # bot runs from the bus read General's choices (``bus_turn_choices``). Stored under the
-        # dashboard's own topic it would be a setting nothing ever reads (review, #375).
+        # The pick is stamped with the topic *this* bot's turns read a setting from
+        # (``_pick_topic``, #374), not with the topic its dashboard sits in: General for a
+        # dashboard that follows the pulse, the configured ``control.topic_id`` otherwise, and
+        # nothing at all in a DM. Any other key would be a setting nothing ever reads
+        # (review, #375).
         event = ChannelEvent(text=f"/{command} {value}",
                              chat_id=self.config.identity.home_channel_id or 0,
                              author_id=self.config.identity.admin_user_id,
                              author_username=self.config.identity.name,
-                             thread_id=None)
+                             thread_id=self._pick_topic())
         if action == "bot.model":
             key = self._model_key(event)
             before = self._models.get(key)

@@ -1611,13 +1611,15 @@ class TestTheControlsThatChangeTheSwarm(unittest.TestCase):
         self.assertFalse(channel.lessons.clear.called)
 
 
-def named_bot(alias: str, *, peers: Any = None, adapter: str = "echo") -> Any:
+def named_bot(alias: str, *, peers: Any = None, adapter: str = "echo",
+              control: Any = None) -> Any:
     """A transport for one bot of a small swarm, with its dashboard pinned in a control topic."""
     agent = {"name": f"{alias}Bot", "alias": alias, "bot_token": "123456:TEST",
              "home_channel_id": -1001234567890, "admin_user_id": ADMIN_ID}
     channel = make_channel(make_config(agent=agent, adapter={"type": adapter},
                                        peers=peers or {"Codex": "CodexBot"},
-                                       control={"chat_id": -1001234567890, "topic_id": 307}))
+                                       control=control
+                                       or {"chat_id": -1001234567890, "topic_id": 307}))
     channel.control_round = lambda: None
     return channel
 
@@ -1739,20 +1741,38 @@ class TestAPickForAnotherBot(unittest.TestCase):
         # And this bot's own pickers still read its own runtime.
         self.assertIn(("medium", "medium"), channel.control_choices("bot.effort"))
 
-    def test_a_forwarded_pick_lands_where_turns_read_it(self):
-        """Review #375: applied under the dashboard's own topic it was a setting nothing read."""
-        sender = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
-        hermes = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"}, adapter="claude")
+    def forwarded(self, peer_control, *, sender=None):
+        """Forward one effort pick and apply the note the sender posted, on *peer_control*'s bot."""
+        sender = sender or named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        peer = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"}, adapter="claude",
+                         control=peer_control)
         live(sender, "Hermes")
         self.forward(sender, action="bot.effort", target="Hermes", value="high")
         line = [entry["text"] for entry in sender._test_sender.sent
                 if "CONTROL bot.effort" in entry["text"]][0].split("\n")[-1]
-        self.assertEqual(hermes.apply_control_note(line, sender="Claudebot"),
+        self.assertEqual(peer.apply_control_note(line, sender="Claudebot"),
                          "applied: bot.effort")
-        # A forwarded pick belongs to no discussion: it is General's, and that is exactly what
-        # a turn run from the bus reads.
-        self.assertEqual(hermes.bus_turn_choices(""), (None, "high"))
-        self.assertNotIn("tg-307", hermes._efforts)          # not the dashboard's topic
+        return peer
+
+    def test_a_forwarded_pick_lands_where_turns_read_it(self):
+        """Review #375: applied under the dashboard's topic it was a setting nothing read.
+
+        Here the peer's dashboard follows the pulse, so its turns read General's choices and
+        that is where the pick must land -- not the pulse topic the card sits in.
+        """
+        peer = self.forwarded({"chat_id": -1001234567890, "topic_id": "pulse"})
+        self.assertEqual(peer._efforts, {"general": "high"})
+        self.assertEqual(peer.bus_turn_choices(""), (None, "high"))
+
+    def test_a_forwarded_pick_reaches_a_peer_with_a_configured_topic(self):
+        """#374 review: a General pick is invisible to a bot that reads a configured topic."""
+        peer = self.forwarded({"chat_id": -1001234567890, "topic_id": 307})
+        self.assertEqual(peer._efforts, {"tg-307": "high"})
+        self.assertEqual(peer.bus_turn_choices(""), (None, "high"))
+
+    def test_a_forwarded_pick_to_a_dm_dashboard_stores_generals(self):
+        peer = self.forwarded({"chat_id": ADMIN_ID})
+        self.assertEqual(peer._efforts, {"general": "high"})
 
     def test_a_peer_seen_under_its_handle_still_gets_its_picker(self):
         """Review #375: a beat filed under @HermesBot left Hermes's card with no choices."""
