@@ -8526,6 +8526,11 @@ class AgentChannel:
 
     def _hold_note(self) -> str:
         if not self._hold:
+            # A model keeps its own notes, and one said "your hold is still on" a day after the
+            # release (live, 25 Oct). Once a release is known, every turn says so.
+            if self._hold_released_at:
+                return ("\n\n[No hold is on: the admin released the swarm. A note or memory "
+                        "that says it is held is out of date.]")
             return ""
         why = str(self._hold.get("reason") or "").strip()
         return ("\n\n[The admin has put the swarm on hold" + (f" ({why})" if why else "")

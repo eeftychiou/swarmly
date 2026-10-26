@@ -68,7 +68,10 @@ class HoldTests(unittest.TestCase):
         self.assertIn("until the drill is done", coordinator._hold_note())
         self.assertIn("released", coordinator._handle_hold(self.admin("/release")))
         self.assertFalse(coordinator.held())
-        self.assertEqual(coordinator._hold_note(), "")
+        self.assertIn("No hold is on", coordinator._hold_note())
+
+    def test_a_bot_that_never_saw_a_hold_hears_nothing_about_one(self):
+        self.assertEqual(self.channel()._hold_note(), "")
 
     def test_a_named_hold_still_holds_every_bot(self):
         """#218 review (Reasonix): /hold@bot picks who answers, not who is held."""
@@ -152,7 +155,7 @@ class TestTheHoldOnThePulse(unittest.TestCase):
                             released_at=channel._hold_action_at() + 60)
         self.hear(channel, released)
         self.assertFalse(channel.held())
-        self.assertEqual(channel._hold_note(), "")
+        self.assertIn("No hold is on", channel._hold_note())
 
     def test_an_older_hold_never_overrides_a_newer_release(self):
         channel = self.channel()
