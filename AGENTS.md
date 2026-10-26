@@ -16,7 +16,10 @@ Before the maintainer finishes their own review:
    tests, docs, risks.
 3. **Then the maintainer's own review.** Read the diff, verify claims against the PR head
    (run the suite locally, check the CI run), reconcile the subagent and swarm findings,
-   and decide.
+   and decide. Run the suite with the checkout's own virtual environment
+   (`.venv\Scripts\python -m pytest -n auto tests` on Windows, `.venv/bin/python` elsewhere):
+   a plain `python` without the `telegram` extra fails every test that needs aiogram, and a
+   run that matches that baseline is not a passing suite.
 
 Only then merge — `--no-ff` merge commits authored by the reviewing maintainer, keeping
 every contributor's authorship intact — or reject with a written reason.

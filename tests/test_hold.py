@@ -68,7 +68,23 @@ class HoldTests(unittest.TestCase):
         self.assertIn("until the drill is done", coordinator._hold_note())
         self.assertIn("released", coordinator._handle_hold(self.admin("/release")))
         self.assertFalse(coordinator.held())
-        self.assertEqual(coordinator._hold_note(), "")
+        self.assertIn("No hold is on", coordinator._hold_note())
+
+    def test_a_bot_that_never_saw_a_hold_hears_nothing_about_one(self):
+        self.assertEqual(self.channel()._hold_note(), "")
+
+    def test_the_released_line_lasts_a_day_not_forever(self):
+        """Review on #359: the release time is kept and spreads by pulse, so an unbounded
+        note would sit in every turn of every bot from the first release on."""
+        from swarmly.telegram.channel import HOLD_RELEASE_NOTE_SECONDS
+        channel = self.channel()
+        clock = {"t": NOW}
+        channel._wall = lambda: clock["t"]
+        channel._handle_hold(self.admin("/hold drill"))
+        channel._handle_hold(self.admin("/release"))
+        self.assertIn("No hold is on", channel._hold_note())
+        clock["t"] = NOW + HOLD_RELEASE_NOTE_SECONDS + 1
+        self.assertEqual(channel._hold_note(), "")
 
     def test_a_named_hold_still_holds_every_bot(self):
         """#218 review (Reasonix): /hold@bot picks who answers, not who is held."""
@@ -152,7 +168,7 @@ class TestTheHoldOnThePulse(unittest.TestCase):
                             released_at=channel._hold_action_at() + 60)
         self.hear(channel, released)
         self.assertFalse(channel.held())
-        self.assertEqual(channel._hold_note(), "")
+        self.assertIn("No hold is on", channel._hold_note())
 
     def test_an_older_hold_never_overrides_a_newer_release(self):
         channel = self.channel()

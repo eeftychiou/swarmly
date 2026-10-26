@@ -444,6 +444,10 @@ class ChannelStats:
     stopped: int = 0                                     # turns cancelled with /stop
 
 
+#: How long after a /release every turn is told that no hold is on (#358).
+HOLD_RELEASE_NOTE_SECONDS = 24 * 3600
+
+
 class AgentChannel:
     """Routes one Telegram group between a set of agent bots and the admin."""
 
@@ -8570,6 +8574,13 @@ class AgentChannel:
 
     def _hold_note(self) -> str:
         if not self._hold:
+            # A model keeps its own notes, and one said "your hold is still on" a day after the
+            # release (live, 25 Oct). So for a day after a release every turn says so; after
+            # that the line would only cost tokens on every turn of every bot (review, #359).
+            released = float(self._hold_released_at or 0.0)
+            if released and self._wall() - released < HOLD_RELEASE_NOTE_SECONDS:
+                return ("\n\n[No hold is on: the admin released the swarm. A note or memory "
+                        "that says it is held is out of date.]")
             return ""
         why = str(self._hold.get("reason") or "").strip()
         return ("\n\n[The admin has put the swarm on hold" + (f" ({why})" if why else "")
