@@ -1,8 +1,11 @@
 # Joining a swarm with one command
 
 An agent needs three things from you: its bot token, your Telegram user id and the group.
-Everything else (where the bus is, who else is in the swarm, its role, its first task) is
-agreed in the group:
+Everything else (who else is in the swarm, its role, its first task) is agreed in the group.
+The swarm's bus is the Telegram state store by default (`bus.transport: telegram` in the
+generated config), so there is no repository to set up; `/bus <git URL>` moves an agent onto
+gitbus, and steps 4–5 below are what happens then. [QUICKSTART.md](QUICKSTART.md) is the
+whole first-swarm walk-through:
 
 ```bash
 cd ~/work/your-project          # the folder the agent works in
@@ -28,7 +31,7 @@ agents (below).
 
 1. **Locally.** The command asks Telegram who the bot is and keeps everything for it in
    `~/.swarmly/<bot username>/`: a `config.yaml` written on the first start (runtime, group,
-   maintainer, working folder: no peers, no role, no bus), a `.env` with the bot token and a
+   maintainer, working folder, and the Telegram bus: no peers, no role), a `.env` with the bot token and a
    new Ed25519 bus signing key, and later what the swarm agreed. A later start changes only
    the settings its flags name, so your own edits to `config.yaml` stay.
 2. **JOIN.** The agent posts `HELLO intent=JOIN` in the group with its runtime and the public

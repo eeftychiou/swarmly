@@ -26,8 +26,8 @@ An optional TCP gateway (the "fast plane") is included for agents on the same ne
 > **Roles:** give each agent a role (coordinator, developer, reviewer, QA tester, researcher, or
 > your own) and its turns follow that role's workflow. See [docs/ROLES.md](https://github.com/eeftychiou/swarmly/blob/main/docs/ROLES.md).
 
-> **New here?** [Getting started](https://github.com/eeftychiou/swarmly/blob/main/docs/GETTING-STARTED.md) brings a node up in about fifteen
-> minutes. Then see the [envelope cheat-sheet](https://github.com/eeftychiou/swarmly/blob/main/docs/ENVELOPES.md),
+> **New here?** The [quickstart](https://github.com/eeftychiou/swarmly/blob/main/docs/QUICKSTART.md) brings up a first swarm on
+> Telegram alone in about fifteen minutes; [Getting started](https://github.com/eeftychiou/swarmly/blob/main/docs/GETTING-STARTED.md) is the manual setup. Then see the [envelope cheat-sheet](https://github.com/eeftychiou/swarmly/blob/main/docs/ENVELOPES.md),
 > [adopting Swarmly in your project](https://github.com/eeftychiou/swarmly/blob/main/docs/ADOPT.md) and the [runnable demo](https://github.com/eeftychiou/swarmly/blob/main/examples/README.md).
 
 ---
@@ -72,7 +72,7 @@ pipx install swarmly          # or: uv tool install swarmly, or pip install swar
 swarmly-telegram --help
 ```
 
-Python 3.10 or newer and git are the only prerequisites. One install gives you the three
+Python 3.10 or newer is the only prerequisite (git too, if you use gitbus). One install gives you the three
 commands: `swarmly-telegram` (the Telegram transport and bus poller), `swarmly-keygen` (signing
 keys) and `swarmly` (the swarm kernel). Google Drive as a bus needs `pipx install
 "swarmly[gdrive]"`. To work on Swarmly itself, install from a clone instead:
@@ -90,8 +90,32 @@ keys) and `swarmly` (the swarm kernel). Google Drive as a bus needs `pipx instal
 
 ## Quickstart
 
-**1. Try the bus with no tokens at all.** From a clone, two agents exchange a signed message
-through a throwaway git repository, or through a plain shared folder:
+A first swarm needs only Telegram: no server, no open port, and no git repository for the
+swarm itself. The full walk-through is [docs/QUICKSTART.md](https://github.com/eeftychiou/swarmly/blob/main/docs/QUICKSTART.md); in short:
+
+1. **Install** Swarmly and the agent CLIs you want (logged in): `pipx install swarmly`.
+2. **In Telegram**, create a private group with **Topics** on. Create one bot per agent in
+   @BotFather (`/newbot`; *Group Privacy* off, *Bot-to-Bot Communication* on) and make each bot
+   an admin of the group.
+3. **Start each agent** on its machine, in the project folder:
+
+   ```bash
+   cd ~/projects/your-project
+   swarmly --cli claude --bot-token 123456:ABC... --admin-userid 1234567890 --home-channel -1001234567890
+   ```
+
+   `--cli` is `claude`, `codex`, `agy` or `reasonix`. The first agent becomes the coordinator;
+   the others join and get a role. Later starts need only `swarmly --cli claude`.
+4. **Give it work:** open a topic in the group and write the task. The coordinator plans it and
+   hands it out; each agent keeps one session per topic.
+5. **Watch it** on the pinned card in 📡 Swarm pulse, or on the live dashboard.
+
+The bus is the Telegram state store (`bus.transport: telegram`); `/bus <git URL>` moves an agent
+onto gitbus instead. [docs/JOIN.md](https://github.com/eeftychiou/swarmly/blob/main/docs/JOIN.md)
+explains the join handshake and the maintainer's commands (`/bus`, `/role`, `/swarm`).
+
+**Try the envelope bus with no tokens at all.** From a clone, two agents exchange a signed
+message through a throwaway git repository, or through a plain shared folder:
 
 ```bash
 git clone https://github.com/eeftychiou/swarmly.git && cd swarmly
@@ -99,22 +123,7 @@ examples/minimal-bus-demo.sh        # gitbus
 examples/folder-bus-demo.sh         # folder bus (what Drive or Dropbox would sync)
 ```
 
-**2. Start an agent with one command.** Give each agent its own Telegram bot (from
-@BotFather; Bot-to-Bot mode on, privacy off, admin in your group), then on its machine:
-
-```bash
-cd ~/projects/your-project
-swarmly --cli claude --bot-token 123456:ABC... --admin-userid 1234567890 --home-channel -1001234567890
-```
-
-`--cli` is `claude`, `codex`, `agy` or `reasonix`. The agent joins the swarm in the group: the
-other agents tell it where the bus is, the coordinator gives it a role, and it asks for its
-first task. The first agent asks you for the bus (`/bus <git URL>`) and coordinates. Nothing
-lists peers or roles in a file; agents join and drop out at any time.
-[docs/JOIN.md](https://github.com/eeftychiou/swarmly/blob/main/docs/JOIN.md) explains the
-handshake and the maintainer's commands (`/bus`, `/role`, `/swarm`).
-
-**Or set up an agent by hand.** Each agent gets its own Telegram bot (from @BotFather) and its own
+**Or set up an agent by hand, on gitbus.** Each agent gets its own Telegram bot (from @BotFather) and its own
 `config.yaml`. Run this in the project repository your agents will share; its
 `.agents/inbox/` becomes the durable bus:
 
@@ -137,7 +146,7 @@ checkout, so the host needs a git identity (`git config user.name` and `user.ema
 `custom`. `swarmly-keygen` writes the private key to the env file (owner-only) and only the
 public key to the registry; every peer verifies against that committed registry.
 
-**3. Check it, then run it.**
+**Check it, then run it.**
 
 ```bash
 swarmly-telegram check      # validates the config and says what is still missing

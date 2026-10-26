@@ -112,8 +112,10 @@ def _yaml_scalar(value: str) -> str:
 def render_config(username: str, alias: str, adapter: str, home_channel: int, admin: int,
                   workdir: Path, permissions: Optional[str] = None,
                   model: Optional[str] = None) -> str:
-    """The generated config: who the bot is and what it runs. No peers, no role, no bus:
-    the swarm agrees those in the group."""
+    """The generated config: who the bot is and what it runs, on the Telegram bus. No peers
+    and no role: the swarm agrees those in the group. The swarm's shared state -- the lease,
+    the topic registry, routing, the owed table -- lives in the Telegram state store, so a
+    first swarm needs no git repository at all (``/bus`` still moves it onto gitbus)."""
     lines = [
         "# Written by `swarmly --cli`. Peers, roles and the bus are agreed in the Telegram",
         "# group (docs/JOIN.md): they live in config.roster.json and config.swarm.json beside",
@@ -133,6 +135,18 @@ def render_config(username: str, alias: str, adapter: str, home_channel: int, ad
         lines.append(f"  permissions: {permissions}")
     if model:
         lines.append(f"  model: {_yaml_scalar(model)}")
+    lines += [
+        "",
+        "# The swarm's bus is the Telegram state store (docs/TRANSPORTS.md).",
+        "bus:",
+        "  transport: telegram",
+        "state:",
+        "  backend: telegram",
+        "  lease: store",
+        "  routing: registry",
+        "  owed: store",
+        "  links: registry",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -332,6 +346,8 @@ def setup_bus(config_path: Path, location: str, alias: str,
             lines = [line for line in lines if not line.startswith(PUSH_ONCE)]
         lines.append(committed)
     config = config_path.read_text(encoding="utf-8")
+    # /bus moves this agent onto gitbus: the transport says so, beside the checkout.
+    config = _set_key(config, "bus", "transport", "git")
     config = _set_key(config, "bus", "repo", _yaml_scalar(str(bus_repo)))
     if ref:
         config = _set_key(config, "bus", "ref", _yaml_scalar(ref))
