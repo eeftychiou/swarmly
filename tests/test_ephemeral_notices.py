@@ -209,3 +209,29 @@ class TickTests(Case):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SwarmPulseTests(Case):
+    """Admin, 26 Oct: thousands of machine posts in Swarm pulse. Every post of this transport
+    there is swept once it is old, except the card, the pinned snapshot and its status message."""
+
+    PULSE = 3418
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.channel._pulse_topic = lambda: self.PULSE
+
+    def test_pulse_posts_are_swept_and_the_keepers_stay(self):
+        from types import SimpleNamespace
+        for mid in (10, 11, 12, 13):
+            self.ledger.note_notice(GROUP, mid, now=NOW - 2 * 60 * MINUTE)
+        self.channel._control_center = SimpleNamespace(message_id=11)
+        self.channel.state_link.store = SimpleNamespace(snapshot_message=12, ready=True)
+        self.channel._pulse_message = lambda: (GROUP, self.PULSE, 13)
+        self.assertEqual(self.sweep(NOW), 1)
+        self.assertEqual(self.bot.messages, [(GROUP, [10])])
+
+    def test_a_post_in_the_pulse_topic_is_recorded(self):
+        self.channel.note_pulse_post(GROUP, 900, self.PULSE)
+        self.channel.note_pulse_post(GROUP, 901, 9400)             # a work topic: not ours to sweep
+        self.assertEqual(self.ledger.notices(GROUP), [900])

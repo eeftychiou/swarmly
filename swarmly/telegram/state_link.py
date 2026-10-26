@@ -51,6 +51,13 @@ def _date(message: Any) -> float:
         return time.time()
 
 
+def _note_pulse(channel: Any, chat: int, message_id: int, topic: Any) -> None:
+    """Hand a Swarm pulse post to the channel's sweep (a channel double may not have one)."""
+    note = getattr(channel, "note_pulse_post", None)
+    if callable(note):
+        note(chat, message_id, topic)
+
+
 class ChannelIO(TelegramIO):
     """Swarm pulse, reached through the transport's bot. Store lines are sent directly, not
     through the paced reply path: they are small, rare, and their message date is needed."""
@@ -81,6 +88,7 @@ class ChannelIO(TelegramIO):
                                 message_thread_id=topic, text=text,
                                 disable_notification=True, disable_web_page_preview=True,
                                 parse_mode=None)
+        _note_pulse(self.channel, chat, int(sent.message_id), topic)
         return Posted(int(sent.message_id), _date(sent))
 
     async def post_file(self, name: str, data: bytes, caption: str) -> Posted:
@@ -90,6 +98,8 @@ class ChannelIO(TelegramIO):
                                 message_thread_id=topic,
                                 document=BufferedInputFile(data, name), caption=caption,
                                 disable_notification=True, parse_mode=None)
+        # Kept while it is the pinned snapshot; swept once a newer one replaces it.
+        _note_pulse(self.channel, chat, int(sent.message_id), topic)
         return Posted(int(sent.message_id), _date(sent))
 
     async def pin(self, message_id: int) -> None:
