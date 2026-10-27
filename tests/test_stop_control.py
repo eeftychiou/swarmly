@@ -29,7 +29,7 @@ class Store:
 
     def __init__(self, term=15, holder="Hermes", fail=False):
         self.term, self.holder, self.fail = term, holder, fail
-        self.yielded = []
+        self.yielded, self.claimed = [], []
 
     def state(self, *, now=None):
         from swarmly.telegram.lease import LeaseState
@@ -40,6 +40,15 @@ class Store:
             raise RuntimeError("the bus refused the push")
         self.yielded.append((reason, term))
         self.holder = ""
+
+    def refresh(self, *, force=False):
+        return True
+
+    def claim(self, *, term=None, now=None, promoted=False):
+        from swarmly.telegram.lease import LeaseClaim
+        self.claimed.append((term, promoted))
+        self.term, self.holder = int(term or self.term), "Hermes"
+        return LeaseClaim(term=self.term, alias="Hermes", expires_at=1e12)
 
 
 class Dispatcher:
@@ -106,6 +115,20 @@ class TestStopping(unittest.TestCase):
         self.assertFalse(channel.stop_requested)
         self.assertEqual(lines(channel, "Hermes offline"), [])
 
+    def test_a_lease_tick_after_the_stop_claims_nothing_back(self):
+        """The yield leaves no live lease, so the next tick read as "expired, I am next".
+
+        Reproduced in review: `holder: Hermes term 16` — a bot that is exiting taking the
+        role with it, while the docstring promises a peer claims it at once.
+        """
+        channel = self.channel()
+        run(channel.go_offline())
+        self.assertTrue(channel._going_offline)
+
+        self.assertIsNone(run(channel.check_lease()))
+        self.assertEqual(channel.store.claimed, [], "an exiting bot claims no term")
+        self.assertEqual(channel.store.holder, "")
+
     def test_the_exit_is_polling_stopped_and_not_a_restart(self):
         channel = self.channel()
         channel.dispatcher = Dispatcher()
@@ -152,11 +175,24 @@ class TestAPeersPress(unittest.TestCase):
     def note(self, action="bot.offline"):
         return cp.PressPolicy.log_line(action, "Hermes", str(ADMIN_ID), NOW, done=True)
 
-    def test_the_note_path_answers_and_asks_for_the_exit(self):
+    def test_the_note_path_answers_and_gives_the_lease_up_too(self):
         channel = self.channel()
         said = channel.apply_control_note(self.note(), sender="Codex")
         self.assertIn("accepted: bot.offline", said)
+        self.assertIn("in flight", said, "accepted, never applied: the yield has not landed")
+        self.assertEqual(channel.store.yielded, [("offline (dashboard Stop)", 15)])
+        self.assertEqual(len(lines(channel, "Hermes offline")), 1)
         self.assertTrue(channel.stop_requested)
+
+    def test_a_refused_peer_stop_is_said_in_the_chat_not_lost_in_a_task(self):
+        channel = self.channel()
+        channel.store = Store(fail=True)
+        channel.lease_store = lambda: channel.store
+        said = channel.apply_control_note(self.note(), sender="Codex")
+        self.assertIn("accepted", said)                    # the note path does not wait
+        self.assertFalse(channel.stop_requested)           # and the bot stays up
+        self.assertFalse(channel._going_offline, "a refused stop must not silence the ticks")
+        self.assertEqual(len(lines(channel, "could not give the lease away")), 1)
 
     def test_a_note_from_a_bot_without_the_dashboard_is_refused(self):
         """Only the lease holder's notes are obeyed, so a Stop cannot arrive from a stranger."""

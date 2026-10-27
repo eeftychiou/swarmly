@@ -836,6 +836,7 @@ class AgentChannel:
         self.dispatcher: Any = None
         self.restart_requested = False           # request_restart(): the launcher starts again
         self.stop_requested = False              # request_stop(): the bot goes offline (#437)
+        self._going_offline = False              # go_offline() is yielding: claim nothing back
         self._offline_announced = False           # go_offline() posted it; stop() must not again
         self.replies = None
         self._reply_task: Optional[asyncio.Task] = None
@@ -4741,10 +4742,11 @@ class AgentChannel:
                 pending["restart"] = True
         elif action == "bot.offline":
             # A peer's Stop, applied here: the lease yield is a push, so it is scheduled and
-            # the note path answers at once (#437).
-            if not self._go_offline_soon():
-                return False
-            return (f"accepted: {action} -- {self.config.identity.alias} is going offline")
+            # the note path answers at once -- "accepted", never "applied", because the yield
+            # has not landed when this returns (#437 review).
+            self._go_offline_soon()
+            return (f"accepted: {action} -- {self.config.identity.alias} is stopping; the "
+                    f"lease yield is in flight")
         elif action == "bot.stop_turn":
             self._stop_every_turn()
         elif action == "swarm.lease":
@@ -8320,6 +8322,12 @@ class AgentChannel:
                 and not self.store_lease_on():
             return None
         if self._frozen or self._pause_pending:
+            return None
+        if self._going_offline:
+            # The yield is written and the fold is no longer live, so this tick would read as
+            # "expired, and I am next in succession" and claim term+1 right back -- a bot that
+            # is exiting taking the role with it (#437 review; the same class as #154's
+            # deferred hand-over). Nothing to renew and nothing to take: it is leaving.
             return None
 
         moment = self._lease_clock() if now is None else now
@@ -12331,6 +12339,9 @@ class AgentChannel:
         me = str(self.config.identity.alias)
         if self._has_lease_bus():
             term = 0
+            # Set before the yield, not after: the tick that runs between the yield and the
+            # exit would otherwise claim the term back (see check_lease).
+            self._going_offline = True
             try:
                 state = self.lease_state()
                 if str(getattr(state, "holder", "") or "").strip().lower() == me.lower():
@@ -12341,8 +12352,15 @@ class AgentChannel:
                                                reason="offline (dashboard Stop)",
                                                term=term or None)
                     self._forget_lease_cache()
-                    logger.warning("stop: %s yielded the lease at term %d", me, term)
+                    still = await asyncio.to_thread(store.state, now=self._lease_clock())
+                    if str(getattr(still, "holder", "") or "").strip().lower() == me.lower():
+                        # The store lease returns instead of raising when someone else has
+                        # already moved on; say what is true, not what was asked (#437 review).
+                        logger.warning("stop: %s still shows the lease after the yield", me)
+                    else:
+                        logger.warning("stop: %s yielded the lease at term %d", me, term)
             except Exception as exc:                   # noqa: BLE001 - refused, in words
+                self._going_offline = False            # it stays up, so it keeps its role
                 logger.warning("stop: %s could not yield the lease", me, exc_info=True)
                 raise ControlRefused(
                     f"stop: {me} could not give the lease away, so it stays up -- "
@@ -12364,19 +12382,32 @@ class AgentChannel:
                 f"transport is exiting. Start it again on the host -- a unit with "
                 f"Restart=always brings it back on its own, Restart=on-failure leaves it down.")
 
-    def _go_offline_soon(self) -> bool:
+    def _go_offline_soon(self) -> None:
         """Run :meth:`go_offline` from the synchronous note path (a peer's press, #437).
 
-        The note path cannot wait: the yield is a push. With no running loop -- a test applying
-        a note directly -- the work runs inline, where there is nothing else to block.
+        The note path cannot wait -- the yield is a push -- so on a loop the work is scheduled,
+        and a refusal is said in the chat instead of dying in an unretrieved task. With no
+        running loop (a test applying a note directly) it runs inline, where there is nothing
+        else to block: the same yield, the same OFFLINE line, the same stop.
         """
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            self.request_stop()
-            return True
-        self._spawn_lease_task(self.go_offline())
-        return True
+            asyncio.run(self._stop_safely())
+            return
+        self._spawn_lease_task(self._stop_safely())
+
+    async def _stop_safely(self) -> None:
+        """`go_offline`, with a refusal posted rather than lost in a task (#437 review)."""
+        try:
+            await self.go_offline()
+        except ControlRefused as exc:
+            logger.warning("stop: a peer's Stop was refused -- %s", exc)
+            try:
+                await self.send(f"⚠️ {exc}", silent=True, notice=True,
+                                allow_when_frozen=True)
+            except Exception:                          # noqa: BLE001 - the log has it
+                logger.warning("stop: could not post the refusal", exc_info=True)
 
     def request_restart(self) -> None:
         """Stop polling so the ``swarmly --cli`` launcher starts the transport again with
