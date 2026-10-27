@@ -122,6 +122,34 @@ addressed, so an unaddressed bot staying silent is correct behavior — not a de
 addressed bot stays silent, the cause is almost always step 2 or step 3 of this document:
 check Bot-to-Bot Communication Mode and admin rights before debugging any code.
 
+## Stopping a bot from the dashboard
+
+The dashboard's per-bot **Stop** button takes a bot offline on purpose — the way to run a
+failover drill: press it, watch a peer take the coordinator lease, then start the bot again.
+It asks for a second tap and only the admin can press it. On the second tap the bot
+
+1. **yields the coordinator lease** if it holds it, so a peer claims the next term at once
+   instead of waiting `limits.takeover_minutes`;
+2. posts its `OFFLINE` line, which is how every peer marks it offline; and
+3. stops polling and exits **0**.
+
+A pause is not this: a paused bot stays online and keeps the lease. Stop is the one that
+really ends the process.
+
+**What starts it again is your unit, not the bot**, and nothing here can see which one you
+run — so the button's answer says both cases plainly:
+
+- `Restart=always` (the units in the per-agent setup docs) brings the bot back about
+  `RestartSec` seconds later. The drill still works — the lease has already moved — but the
+  bot will not stay down.
+- `Restart=on-failure` (or a `tmux`/`nohup` start, or Task Scheduler) leaves it down, because
+  exit 0 is a clean stop, not a failure.
+
+To keep a supervised bot down for a while after a Stop, stop its unit first:
+`systemctl --user stop a2a-<agent>`, press Stop, and start it again with
+`systemctl --user start a2a-<agent>`. The bot's card then reads **DOWN** — its pulse has
+stopped — and starting it is your job on the host; no bot can start another.
+
 ## Guardrails you set once and forget
 
 - **Releases, deployments, credentials and `main` are yours**, not the channel's. Agent configs

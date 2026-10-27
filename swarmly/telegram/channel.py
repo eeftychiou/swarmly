@@ -835,6 +835,8 @@ class AgentChannel:
         self.bot: Any = None
         self.dispatcher: Any = None
         self.restart_requested = False           # request_restart(): the launcher starts again
+        self.stop_requested = False              # request_stop(): the bot goes offline (#437)
+        self._offline_announced = False           # go_offline() posted it; stop() must not again
         self.replies = None
         self._reply_task: Optional[asyncio.Task] = None
         if config.adapter.type == "codex_thread" and (config.source_path or config.adapter.reply_state_path):
@@ -4737,6 +4739,12 @@ class AgentChannel:
                 self.request_restart()
             else:
                 pending["restart"] = True
+        elif action == "bot.offline":
+            # A peer's Stop, applied here: the lease yield is a push, so it is scheduled and
+            # the note path answers at once (#437).
+            if not self._go_offline_soon():
+                return False
+            return (f"accepted: {action} -- {self.config.identity.alias} is going offline")
         elif action == "bot.stop_turn":
             self._stop_every_turn()
         elif action == "swarm.lease":
@@ -4822,7 +4830,7 @@ class AgentChannel:
         A control added to the table in :mod:`swarmly.telegram.control` joins this tuple once
         it is wired; until then it is neither shown nor run.
         """
-        return ("bot.pause", "bot.resume", "bot.restart", "bot.stop_turn",
+        return ("bot.pause", "bot.resume", "bot.restart", "bot.offline", "bot.stop_turn",
                 "bot.model", "bot.effort", "bot.cli", "bot.memory",
                 "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
                 "swarm.lease", "swarm.failback",
@@ -5665,6 +5673,10 @@ class AgentChannel:
             # Another bot's control travels as the CONTROL note the press already posts; that
             # bot applies it to itself (#117). Nothing to do here, and nothing to double-apply.
             return
+        if action == "bot.offline":
+            # The admin's Stop (#437): this bot is the one being stopped -- a press that
+            # named another bot returned above, and travels to it as the CONTROL note.
+            return await self.go_offline(presser=presser, via=via)
         # The launcher starts the transport again on a restart; nothing is left running when
         # it does, which is why that control asks for a second tap (#117).
         self._run_control_now(action, pending=pending)
@@ -12294,6 +12306,78 @@ class AgentChannel:
             logger.warning("could not clear a webhook before polling: %s", exc)
         await self.dispatcher.start_polling(self.bot)
 
+    def request_stop(self) -> None:
+        """Stop the transport for good: the dashboard's Stop (#437).
+
+        Unlike :meth:`request_restart`, nothing starts the transport again: polling ends and
+        the process exits **0**. A unit whose ``Restart=`` is ``on-failure`` then leaves the
+        bot down -- which is what the failover drill needs -- while a ``Restart=always`` unit
+        brings it back after ``RestartSec`` (`docs/telegram/SETUP-ADMIN.md`).
+        """
+        self.stop_requested = True
+        if self.dispatcher is not None:
+            asyncio.ensure_future(self.dispatcher.stop_polling())
+
+    async def go_offline(self, *, presser: str = "", via: str = "") -> str:
+        """The dashboard's Stop: give the lease away, say OFFLINE, then exit (#437).
+
+        A pause keeps the bot online and holding the lease, so the failover drill could not be
+        run from the page. Here the lease is **yielded**, not left to lapse, so a peer takes
+        over at once instead of after ``limits.takeover_minutes``; the OFFLINE line goes out
+        (the same envelope ``membership.on_stop`` posts); and the transport stops. A yield
+        that does not land refuses the stop in words: a bot that goes offline while its lease
+        still names it leaves the swarm waiting for a term that nobody holds.
+        """
+        me = str(self.config.identity.alias)
+        if self._has_lease_bus():
+            term = 0
+            try:
+                state = self.lease_state()
+                if str(getattr(state, "holder", "") or "").strip().lower() == me.lower():
+                    term = int(getattr(state, "term", 0) or 0)
+                    store = self.lease_store()
+                    async with self._lease_lock():
+                        await asyncio.to_thread(store.yield_lease,
+                                               reason="offline (dashboard Stop)",
+                                               term=term or None)
+                    self._forget_lease_cache()
+                    logger.warning("stop: %s yielded the lease at term %d", me, term)
+            except Exception as exc:                   # noqa: BLE001 - refused, in words
+                logger.warning("stop: %s could not yield the lease", me, exc_info=True)
+                raise ControlRefused(
+                    f"stop: {me} could not give the lease away, so it stays up -- "
+                    f"{str(exc)[:160]}")
+        try:
+            await self.send(format_message(
+                Envelope(type=MessageType.BYE, to="*", intent="OFFLINE",
+                         ref=self._alias_ref()),
+                f"🔴 {me} offline"), silent=True, allow_when_frozen=True, notice=True)
+            self._offline_announced = True
+        except Exception:                              # noqa: BLE001 - stopping goes on
+            logger.warning("stop: could not post the offline line", exc_info=True)
+        self.request_stop()
+        logger.warning("control: %s is stopping (dashboard Stop, by=%s via=%s)",
+                       me, presser or "admin", via or "chat")
+        # Nothing here can know what starts this process again, so the answer says what is
+        # true of both units the setup documents rather than guessing which one is in force.
+        return (f"⏹ {me} is offline: the lease is given up, the OFFLINE line is out, and the "
+                f"transport is exiting. Start it again on the host -- a unit with "
+                f"Restart=always brings it back on its own, Restart=on-failure leaves it down.")
+
+    def _go_offline_soon(self) -> bool:
+        """Run :meth:`go_offline` from the synchronous note path (a peer's press, #437).
+
+        The note path cannot wait: the yield is a push. With no running loop -- a test applying
+        a note directly -- the work runs inline, where there is nothing else to block.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self.request_stop()
+            return True
+        self._spawn_lease_task(self.go_offline())
+        return True
+
     def request_restart(self) -> None:
         """Stop polling so the ``swarmly --cli`` launcher starts the transport again with
         the config it just rewrote (a new bus moves the transport's state and lock)."""
@@ -12336,7 +12420,7 @@ class AgentChannel:
             server.stop()
             self._web_server = None
         if self.bot is not None and getattr(self, "_started_wall", None) is not None \
-                and not self.restart_requested:
+                and not self.restart_requested and not self._offline_announced:
             try:                                  # peers mark this agent offline
                 await asyncio.wait_for(self.membership.on_stop(), timeout=5.0)
             except Exception as exc:              # noqa: BLE001 - stopping goes on
