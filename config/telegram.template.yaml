@@ -164,6 +164,11 @@ limits:
   allow_shared_cwd: false              # parallel topics share adapter.cwd; must be true when max_parallel_turns > 1
   max_peer_turns_per_topic: 8          # peer-started turns in a row per forum topic without progress (a new issue/PR/commit, a merge) until a human posts (0 = no cap)
   work_in_topics: true                 # General is for setup: bots' work there (and long answers) moves to its own topic
+  # general_turns: allow               # "never" makes General and Swarm pulse transport-only: no model turn runs
+  #                                    # there at all. An own brief goes to the last work topic, a person's
+  #                                    # request gets a topic of its own, and anything else is dropped (a peer
+  #                                    # whose hand-off it drops is told so, #327). Supersedes work_in_topics;
+  #                                    # commands are still answered, and work topics are untouched.
   handoff_nudge_minutes: 10            # a hand-off with no answer: remind its bot, then the admin at twice this; 0 = off
   memory_every_turns: 10               # every this many turns, ask the bot to update its memory.md (its own lessons, read into every turn)
   memory_max_bytes: 2048               # cap on that file, in UTF-8 bytes: a bigger block is refused (the old memory stays), never cut

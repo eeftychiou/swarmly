@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A hand-off dropped by the General gate is said back, and the switch is documented**
+  (`#327`). With `limits.general_turns: never`, General and Swarm pulse are transport-only: a
+  peer's message that passed `should_respond` was then dropped by the gate with only a local
+  log line, so from the sender's side a lost hand-off looked exactly like a taken one — the
+  noise the §5 ACK and the `#27` drop notice exist to prevent. The gate now sends the same
+  `⚠️ … took no turn` notice any other dropped mention gets, naming the handle and the reason,
+  once per window; a peer's notice, command answer or sign-off is machine traffic and still
+  hears nothing. `limits.general_turns` is also documented where operators look —
+  `config/telegram.template.yaml` beside the other limits, and `docs/telegram-channel.md` —
+  which it was not: it superseded `work_in_topics` with a single passing mention.
+
 - A delete that could not be asked about is never counted as refused, whatever shape the
   answer takes (`#400`). `delete_message_ids` read a host's `0` as "Telegram refused these",
   so a host with no bot attached, a network error or a `429` that surfaced as an error (rather
