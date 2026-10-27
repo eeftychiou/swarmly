@@ -1507,9 +1507,49 @@ function control(state, action) {
   return (view.controls || []).find((row) => row.action === action) || null;
 }
 
-function picker(forAction, choices, first) {
+// A half-done press belongs to its control, not to the drawing (#449). The page redraws every
+// few seconds, so a value chosen but not yet sent would be wiped before Set could be pressed.
+// It is kept here instead -- keyed by the card's target and the control's `data-for`, so two
+// cards' picks never mix -- and put back by picker() and the typed input on the next render.
+// It goes when it is pressed, when it is cleared, or when the choice stops being offered.
+const PENDING = {};
+//: The control that had the keyboard, so a re-render does not take it away mid-typing.
+let FOCUS = "";
+
+function pendingKey(target, forAction) {
+  return (target || "") + "|" + forAction;
+}
+
+function pendingGet(key) {
+  return Object.prototype.hasOwnProperty.call(PENDING, key) ? PENDING[key] : null;
+}
+
+function pendingSet(key, value) {
+  if (value) PENDING[key] = value;
+  else delete PENDING[key];
+}
+
+// The one control the keyboard was in, remembered by its own key rather than by node: the
+// node it was in does not survive the redraw.
+function rememberFocus(key) {
+  FOCUS = key || "";
+}
+
+function restoreFocus() {
+  if (!FOCUS) return;
+  const nodes = document.querySelectorAll("[data-pending]");
+  for (let at = 0; at < nodes.length; at += 1) {
+    if (nodes[at].dataset.pending !== FOCUS) continue;
+    try { nodes[at].focus(); } catch (err) { /* a disabled control cannot take it back */ }
+    return;
+  }
+  FOCUS = "";                        // the control is gone: nothing to give the keyboard to
+}
+
+function picker(forAction, choices, first, key) {
   const select = el("select", "");
   select.dataset.for = forAction;
+  select.dataset.pending = key;
   select.disabled = !ADMIN;
   const blank = el("option", "", first);
   blank.value = "";
@@ -1519,6 +1559,18 @@ function picker(forAction, choices, first) {
     option.value = choice.value;
     select.append(option);
   });
+  // A kept pick is put back only while it is still one of the choices: a bot that stopped
+  // offering an effort does not get it pressed with a stale value.
+  const kept = pendingGet(key);
+  if (kept !== null) {
+    if ((choices || []).some((choice) => choice.value === kept)) select.value = kept;
+    else pendingSet(key, "");
+  }
+  select.addEventListener("change", () => {
+    pendingSet(key, select.value);
+    rememberFocus(key);
+  });
+  select.addEventListener("focus", () => rememberFocus(key));
   return select;
 }
 
@@ -1534,11 +1586,13 @@ function controlNode(button, target) {
   const empty = mine !== null && !mine.length;
   if (choices.length) {
     pick = picker(button.action + ":pick", choices,
-      button.then ? "which bot: pick one" : button.label + ": pick one");
+      button.then ? "which bot: pick one" : button.label + ": pick one",
+      pendingKey(target, button.action + ":pick"));
     box.append(pick);
   }
   if ((button.then || []).length) {
-    then = picker(button.action + ":then", button.then, "which role: pick one");
+    then = picker(button.action + ":then", button.then, "which role: pick one",
+      pendingKey(target, button.action + ":then"));
     box.append(then);
   }
   if (button.typed) {
@@ -1546,7 +1600,14 @@ function controlNode(button, target) {
     typed.type = "text";
     typed.placeholder = button.typed;
     typed.setAttribute("aria-label", button.label + ": " + button.typed);
+    typed.dataset.pending = pendingKey(target, button.action + ":typed");
     typed.disabled = !ADMIN;
+    typed.value = pendingGet(typed.dataset.pending) || "";
+    typed.addEventListener("input", () => {
+      pendingSet(typed.dataset.pending, typed.value.trim());
+      rememberFocus(typed.dataset.pending);
+    });
+    typed.addEventListener("focus", () => rememberFocus(typed.dataset.pending));
     box.append(typed);
   }
   const go = el("button", button.confirm ? "danger" : "", button.label);
@@ -1570,6 +1631,13 @@ function controlNode(button, target) {
     }
     if (then && !then.value) { toast("a role is needed first", "bad"); return; }
     if (typed && !value) { toast(button.typed + " is needed first", "bad"); return; }
+    // The value is in this press now, so the control goes back to blank (#449): a kept pick
+    // that has been sent must not be pressed a second time by the next redraw.
+    [pick, then, typed].forEach((node) => {
+      if (!node) return;
+      pendingSet(node.dataset.pending, "");
+      node.value = "";
+    });
     press(button.action, who, value);
   });
   box.append(go);
@@ -1713,7 +1781,17 @@ function render(state) {
   drift(state);
   storeState(state);
   controlsPanel(state);
+  // Last, once the controls are all drawn: give the keyboard back to the control that had it,
+  // so a redraw in the middle of a pick does not take the focus away (#449).
+  restoreFocus();
 }
+
+// A tap anywhere that is not a control is the page's own: the keyboard went there on purpose,
+// and the next redraw must not pull it back.
+document.addEventListener("pointerdown", (event) => {
+  const target = event.target;
+  if (!target || !target.closest || !target.closest("[data-pending]")) FOCUS = "";
+});
 
 // Opened as a Telegram Mini App, the page arrives with initData in its URL hash. It is sent
 // back on every poll so the server can check it; opened locally there is none, and none is
