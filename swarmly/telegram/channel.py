@@ -2526,29 +2526,111 @@ class AgentChannel:
                                   context: Optional[str] = None) -> int:
         """A deleted topic answers its hand-offs: nobody can reply there any more, so its open
         hand-off rows close (live, 25 Oct: deleting finished topics left orphan debts, and
-        their reminders fired for hours). Returns how many closed."""
+        their reminders fired for hours). Returns how many closed.
+
+        A close that could not read the whole table closes nothing it can only guess at, and
+        the topic is remembered instead (#331): with the table on the state store, a deletion
+        during a restart read only this bot's own rows, so every hand-off the other bots
+        published stayed open and kept reminding. The memory survives a restart, and
+        :meth:`retry_gone_topic_closes` tries again on every beat until it succeeds.
+        """
         if thread_id is None:
             return 0
         token = context or self._topic_token(chat_id, thread_id)
         if not token:
             return 0
         try:
-            store = self.owed_store()
-            done = []
-            for row in store.load():
-                if row.is_open and row.kind == "handoff" and token in (row.topic, row.key_extra):
-                    row.state = "closed"
-                    row.closed_by = "topic deleted"
-                    done.append(row)
-            if done:
-                store.save_all(done)
-                logger.info("owed: topic %s is gone; closed %d hand-off row(s)", thread_id,
-                            len(done))
-            return len(done)
+            closed = self._close_gone_topic_rows(token, thread_id)
         except Exception:                                  # noqa: BLE001 - book-keeping only
             logger.warning("owed: could not close the hand-offs of gone topic %s", thread_id,
                            exc_info=True)
+            closed = None
+        if closed is None:
+            self._remember_gone_topic_close(token, thread_id)
             return 0
+        self._forget_gone_topic_close(token)
+        return closed
+
+    def _close_gone_topic_rows(self, token: str, thread_id: int) -> Optional[int]:
+        """Close the open hand-off rows of gone topic *token*; ``None`` when the store could
+        not be read, so the caller knows to try again rather than to call it done."""
+        store = self.owed_store()
+        rows = store.load()
+        if _store_unreadable(store):
+            # Missing is not empty (#86): a table that could not be read is never "nothing is
+            # owed here", so a close on it would be a guess (#331).
+            logger.info("owed: gone topic %s: the table is not readable yet; will retry",
+                        thread_id)
+            return None
+        done = []
+        for row in rows:
+            if row.is_open and row.kind == "handoff" and token in (row.topic, row.key_extra):
+                row.state = "closed"
+                row.closed_by = "topic deleted"
+                done.append(row)
+        if done:
+            store.save_all(done)
+            logger.info("owed: topic %s is gone; closed %d hand-off row(s)", thread_id, len(done))
+        return len(done)
+
+    def _pending_gone_closes(self) -> Dict[str, int]:
+        """Gone topics whose close has to be tried again: ``{token: thread_id}`` (#331).
+
+        Kept beside the transport's other state, so a restart between the deletion and a
+        readable store does not lose the topic -- the next beat reads it back and retries.
+        """
+        pending = getattr(self, "_gone_topic_closes", None)
+        if pending is None:
+            pending = {}
+            saved = load_state(_state_file(self.config, "gone-topic-closes"),
+                               "gone topic closes").get("tokens") or {}
+            for token, thread_id in saved.items():
+                if isinstance(thread_id, int):
+                    pending[str(token)] = int(thread_id)
+            self._gone_topic_closes = pending
+        return pending
+
+    def _remember_gone_topic_close(self, token: str, thread_id: int) -> None:
+        """Keep a gone topic for the next beat: its close could not read the whole table."""
+        pending = self._pending_gone_closes()
+        if pending.get(token) == int(thread_id):
+            return
+        pending[token] = int(thread_id)
+        save_state(_state_file(self.config, "gone-topic-closes"), {"tokens": pending},
+                   "gone topic closes")
+
+    def _forget_gone_topic_close(self, token: str) -> None:
+        """A close that read the table is done: a remembered topic is not retried (#331)."""
+        pending = self._pending_gone_closes()
+        if pending.pop(str(token), None) is None:
+            return
+        save_state(_state_file(self.config, "gone-topic-closes"), {"tokens": pending},
+                   "gone topic closes")
+
+    def retry_gone_topic_closes(self, *, now: Optional[float] = None) -> List[str]:
+        """Try the closes a deletion could not finish, once per beat, until they work (#331).
+
+        Each is forgotten the moment its close read the whole table; one that still cannot be
+        read stays remembered and costs the next beat one read.
+        """
+        pending = self._pending_gone_closes()
+        if not pending:
+            return []
+        said: List[str] = []
+        for token, thread_id in list(pending.items()):
+            try:
+                closed = self._close_gone_topic_rows(token, thread_id)
+            except Exception:                          # noqa: BLE001 - the next beat tries
+                logger.warning("owed: could not close the hand-offs of gone topic %s",
+                               thread_id, exc_info=True)
+                continue
+            if closed is None:
+                continue                               # still unreadable: kept for later
+            self._forget_gone_topic_close(token)
+            said.append(f"gone topic {thread_id}: closed {closed} hand-off row(s)")
+        if said:
+            logger.info("owed: %s", "; ".join(said))
+        return said
 
     def forget_topic_state(self, chat_id: int, thread_id: Optional[int]) -> None:
         """Forget everything this transport kept about a topic that is gone (issue #63).
@@ -5601,6 +5683,12 @@ class AgentChannel:
             await self.owed_settle_from_github(now=moment)
         except Exception:                          # noqa: BLE001 - a beat must not fail on it
             logger.warning("owed: the GitHub check failed this beat", exc_info=True)
+        # #331: a topic deleted while the table could not be read left the peers' hand-offs
+        # open; the close is tried again here, before the sweep, until it works.
+        try:
+            self.retry_gone_topic_closes(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("owed: the gone-topic retry failed this beat", exc_info=True)
         # Live, 27 Oct: and a hand-off in a topic whose work has all finished is moot.
         try:
             self.owed_settle_topics_done(now=moment)
@@ -12124,6 +12212,15 @@ def _is_topic_deleted(exc: Optional[BaseException]) -> bool:
 def _topics_path(config: AgentConfig) -> Optional[Path]:
     """``topics.json`` beside the transport's other state; None when it has no home."""
     return _state_file(config, "topics")
+
+
+def _store_unreadable(store: Any) -> bool:
+    """Whether the last ``load()`` could not read the shared state store (#331).
+
+    The rows it did read are this bot's own directory, so a table called unreadable is missing
+    every row another bot published -- missing, never empty.
+    """
+    return "state store" in list(getattr(store, "unreadable", None) or [])
 
 
 def _state_file(config: AgentConfig, stem: str, suffix: Optional[str] = None) -> Optional[Path]:

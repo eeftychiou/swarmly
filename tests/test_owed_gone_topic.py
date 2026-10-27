@@ -67,3 +67,87 @@ class OwnBusClosuresTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def not_ready():
+    raise RuntimeError("the state store is not ready")
+
+
+class GoneTopicWhileTheStoreIsNotReadyTests(unittest.TestCase):
+    """#331: a deletion during a restart closes what it can and is retried until it can."""
+
+    def channel(self, tmp, flags, rows):
+        channel = make_channel()
+        state = Path(tmp) / "state"
+        channel.owed_store = lambda: OwedStore(
+            "Hermes", state_dir=state,
+            shared=lambda: list(rows) if flags["ready"] else not_ready())
+        return channel
+
+    def states(self, channel):
+        return {row.topic: row.state for row in channel.owed_store().load()}
+
+    def test_the_next_beat_closes_a_peer_handoff_the_deletion_could_not_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            flags, peer = {"ready": False}, handoff("tg-77", debtor="Codex", writer="Codex")
+            channel = self.channel(tmp, flags, [peer])
+            # The deletion lands while the store cannot be read: nothing is closed (the row is
+            # not in this bot's own directory at all) and nothing is called done either.
+            self.assertEqual(channel.close_owed_for_gone_topic(GROUP, 77, "tg-77"), 0)
+            self.assertEqual(channel._pending_gone_closes(), {"tg-77": 77})
+            self.assertEqual(channel.retry_gone_topic_closes(), [])   # still not ready
+            self.assertEqual(channel._pending_gone_closes(), {"tg-77": 77})
+            # The store comes back: the next beat closes the row and forgets the topic.
+            flags["ready"] = True
+            said = channel.retry_gone_topic_closes()
+            self.assertEqual(len(said), 1, said)
+            self.assertIn("77", said[0])
+            self.assertEqual(channel._pending_gone_closes(), {})
+            self.assertEqual(self.states(channel)["tg-77"], "closed")
+            self.assertEqual(channel.retry_gone_topic_closes(), [])   # nothing left to retry
+
+    def test_a_close_that_read_the_store_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            flags = {"ready": True}
+            channel = self.channel(tmp, flags, [handoff("tg-77")])
+            self.assertEqual(channel.close_owed_for_gone_topic(GROUP, 77, "tg-77"), 1)
+            self.assertEqual(channel._pending_gone_closes(), {})
+            self.assertEqual(channel.retry_gone_topic_closes(), [])
+            self.assertEqual(self.states(channel), {"tg-77": "closed"})
+
+    def test_the_memory_survives_a_restart(self):
+        """A restart between the deletion and a readable store still retries: the state file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            flags, peer = {"ready": False}, handoff("tg-77", debtor="Codex", writer="Codex")
+
+            def config():
+                from tests.test_telegram_channel import make_config
+                made = make_config(state={"dir": tmp})
+                made.source_path = Path(tmp) / "config.yaml"     # so its state is kept
+                return made
+
+            first = self.channel(tmp, flags, [peer])
+            first.config = config()
+            self.assertEqual(first.close_owed_for_gone_topic(GROUP, 77, "tg-77"), 0)
+            self.assertEqual(first._pending_gone_closes(), {"tg-77": 77})
+            kept = list(Path(tmp).rglob("gone-topic-closes-*.json"))   # on disk, not in memory
+            self.assertEqual(len(kept), 1, kept)
+            # A new process: nothing in memory, and the topic is still remembered.
+            flags["ready"] = True
+            second = self.channel(tmp, flags, [peer])
+            second.config = config()
+            self.assertEqual(second._pending_gone_closes(), {"tg-77": 77})
+            self.assertEqual(len(second.retry_gone_topic_closes()), 1)
+            self.assertEqual(self.states(second)["tg-77"], "closed")
+
+    def test_the_heartbeat_is_what_retries_the_close(self):
+        """The retry rides the beat, so nothing has to remember to call it."""
+        from tests.test_telegram_channel import run
+        with tempfile.TemporaryDirectory() as tmp:
+            flags, peer = {"ready": False}, handoff("tg-77", debtor="Codex", writer="Codex")
+            channel = self.channel(tmp, flags, [peer])
+            self.assertEqual(channel.close_owed_for_gone_topic(GROUP, 77, "tg-77"), 0)
+            flags["ready"] = True
+            run(channel._heartbeat_tick())
+            self.assertEqual(channel._pending_gone_closes(), {})
+            self.assertEqual(self.states(channel)["tg-77"], "closed")
