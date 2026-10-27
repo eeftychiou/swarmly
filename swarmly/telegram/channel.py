@@ -9048,6 +9048,9 @@ class AgentChannel:
             reply_chars=((project_settings.reply_chars if project_settings is not None else None)
                          or self.config.limits.reply_chars),
             general_is_for_setup=self._work_moves_to_topics(event),
+            # #425: the admin's private chat: no peer sees a reply there, so its hand-offs
+            # are placed by the transport (see _private_chat_handoffs).
+            private_chat=is_admin_dm,
             role_brief=self._role_brief(),
             fresh_text=self._fresh_text(event, text[len(recap):]),
             reassembled=event.reassembled,
@@ -10054,8 +10057,12 @@ class AgentChannel:
                                chat_id=event.chat_id, thread_id=event.thread_id, token=True)
         self._log_topic(event.chat_id, event.thread_id, self.config.identity.alias, shown,
                         self.last_first_message_id)
-        self._mirror_handoffs(body, event.chat_id, event.thread_id, self.last_first_message_id,
-                              asker=self._asker(event))
+        # #425: in the admin's private chat a hand-off is placed by the transport -- in the
+        # item's linked topic, or not at all -- never mirrored out of the private chat.
+        handed = await self._private_chat_handoffs(event, body)
+        if not handed:
+            self._mirror_handoffs(body, event.chat_id, event.thread_id,
+                                  self.last_first_message_id, asker=self._asker(event))
         if report is not None and origin is not None:
             self._topics_reported.add((event.chat_id, event.thread_id))
             link = topic_link(event.chat_id, event.thread_id) if event.thread_id else ""
@@ -10598,6 +10605,59 @@ class AgentChannel:
         lowered = {h.lower() for h in lead}
         return [alias for alias, target in self.config.peers.items()
                 if str(target).lstrip("@").lower() in lowered or alias.lower() in lowered]
+
+    async def _private_chat_handoffs(self, event: ChannelEvent, body: str) -> bool:
+        """A hand-off written in the admin's private chat goes to the item's linked topic and
+        nowhere else (#425): peers never see the private chat, so a hand-off left there was
+        lost (live, 27 Oct: "@DeepSeek_dd_bot please take #424" was answered where DeepSeek
+        could not read it), and a private chat must never open a topic of its own. Returns
+        whether this reply's hand-offs were dealt with here, so the caller does not mirror
+        them a second time from the private chat."""
+        if not self._direct_chat(event):
+            return False
+        from swarmly.telegram.handoff_split import handoff_lines
+        who = (self._asker(event) or "").lstrip("@").lower()
+        peers = [p for p in self.assigned_peers(body)
+                 if p.lower() != who
+                 and str(self.config.peers.get(p, "")).lstrip("@").lower() != who]
+        if not peers:
+            return False
+        handoff = handoff_lines(body)
+        if not handoff:
+            # Assigned peers and a hand-off line disagreed: fail closed rather than post a
+            # whole private reply where a peer can read it (#427 nit 3).
+            logger.info("a private-chat reply hands work to %s but has no hand-off line: "
+                        "not placed", ", ".join(peers))
+            return False
+        # The hand-off's own refs decide, and they decide alone: the item being handed over is
+        # the one that must get the topic, not whatever item the admin's message happened to
+        # name (#427 review: "go ahead on #260" plus "@CodexBot please take #424" went to
+        # #260's topic). The admin's text is a fallback only when the hand-off names no item
+        # at all -- not when the item it names has no linked topic, which is a refusal.
+        if issue_refs(handoff):
+            topic = self._linked_topic(handoff)
+        else:
+            topic = self._linked_topic(f"{event.text or ''}\n{body}")
+        if topic is None:
+            logger.info("a hand-off from the private chat names %s but no item it names has a "
+                        "linked topic: not delivered", ", ".join(peers))
+            await self.send(
+                "⚠️ that hand-off did not reach " + ", ".join(
+                    "@" + str(self.config.peers.get(p, p)).lstrip("@") for p in peers)
+                + ": peers cannot see this chat, and I only hand work over in the work item's "
+                "own topic. Take it to the topic linked to the item (a LINK in the registry) "
+                "and hand it over there.",
+                chat_id=event.chat_id, thread_id=event.thread_id, notice=True)
+            return True
+        chat_id, thread_id = topic
+        await self.send(handoff, chat_id=chat_id, thread_id=thread_id, token=True)
+        self._log_topic(chat_id, thread_id, self.config.identity.alias, handoff,
+                        self.last_first_message_id)
+        self._mirror_handoffs(handoff, chat_id, thread_id, self.last_first_message_id,
+                              asker=self._asker(event))
+        await self.send(f"↪ handed that over in {topic_link(chat_id, thread_id)}",
+                        chat_id=event.chat_id, thread_id=event.thread_id, notice=True)
+        return True
 
     def _mirror_handoffs(self, body: str, chat_id: int, thread_id: Optional[int],
                          message_id: Optional[int], asker: Optional[str] = None) -> None:

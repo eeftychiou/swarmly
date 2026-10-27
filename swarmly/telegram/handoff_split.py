@@ -123,9 +123,45 @@ def requests(text: str, handles: Iterable[str]) -> List[str]:
     return asked
 
 
+#: A line that opens with a peer's handle, with or without a bullet: a hand-off line (#425).
+_OPENING_HANDLE = re.compile(r"^\s*(?:[-*•]|\d+[.)])?\s*@\w+[:,]?(?=\s|$)")
+#: A line that is only a handle (":", then nothing): its ask follows on the lines below.
+_HANDLE_ALONE = re.compile(r"^\s*(?:[-*•]|\d+[.)])?\s*@\w+[:,]?\s*$")
+
+
 def is_multi_recipient(text: str, handles: Iterable[str]) -> bool:
     """Two or more bots each asked something: the case that must never be refused."""
     return len(requests(text, handles)) >= 2
+
+
+def handoff_lines(text: str) -> str:
+    """The lines of a reply that hand work to a peer, as one block.
+
+    A line (bullet or not) that opens with an ``@handle`` is what
+    :meth:`AgentChannel.assigned_peers` reads as an assignment, and a line that is *only* a
+    handle is a heading: its ask is the next paragraph, blank lines and all (review of #425
+    on #427: ``"@CodexBot:\\n\\nPlease review #424."`` is how a model naturally writes it, and
+    keeping only the bare handle dropped the instruction). Those lines are carried out of a
+    place no peer can see -- the admin's private chat (#425) -- into the work item's own
+    topic; the rest of the reply stays where it was written. "" when nothing is handed over.
+    """
+    lines = str(text or "").splitlines()
+    out: List[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        if _HANDLE_ALONE.match(line):
+            out.append(line)
+            while index < len(lines) and not lines[index].strip():
+                index += 1              # the ask is the next paragraph, after any blank line
+            while index < len(lines) and lines[index].strip():
+                out.append(lines[index])
+                index += 1
+        elif _OPENING_HANDLE.match(line):
+            # The ask is on this line: the rest of the reply is not part of the hand-off.
+            out.append(line)
+    return "\n".join(out).strip()
 
 
 def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
