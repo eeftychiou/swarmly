@@ -53,6 +53,7 @@ against a real Hermes install; treat it as a starting point and report what you 
 |---|---|---|---|
 | Durable | GitHub issues & PRs (`github:` backstop) | default durable coordination plane across projects | stable |
 | Durable | gitbus (`.agents/inbox/` of the repository named in `bus.repo`) | the record: tasks, handoffs, reviews, blockers | stable |
+| Durable | Telegram state store (`bus.transport: telegram` + `state.backend: telegram`) | the registry: topics, links, work items and phases, the lease, the owed table — no git repository needed | new, behind flags ([PROTOCOL §11](https://github.com/eeftychiou/swarmly/blob/main/docs/telegram/PROTOCOL.md#117-the-flags); setup: [QUICKSTART](https://github.com/eeftychiou/swarmly/blob/main/docs/QUICKSTART.md)) |
 | Durable | synced folder (`bus.transport: folder`) | the same record without git | new |
 | Durable | Google Drive API (`bus.transport: gdrive`) | the same record for headless nodes | new |
 | Instant | Telegram group, one bot per agent | low-latency pings, ACKs, human override | stable |

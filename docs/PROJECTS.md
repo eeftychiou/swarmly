@@ -41,6 +41,31 @@ When a message arrives in a topic:
 - The turn prompt is framed with project context: `Project: <key> (github.com/<owner>/<repo>)`.
 - Unbound topics and the General topic (`thread_id is None`) continue to use the default `adapter.cwd`.
 
+### The durable record without gitbus (topic registry, phases 3–8)
+
+gitbus is **optional**. The transport's own registry — one record per topic, holding its links,
+its work items with phases and assignees, the lease and the owed table — can live in the
+**Telegram state store** instead, so a swarm needs no bus repository at all. None of these flags
+is switched on by default today; the flags, their values and what each switches are in
+[`telegram/PROTOCOL.md` §11](telegram/PROTOCOL.md#117-the-flags), and a setup that needs no git
+at all is in [QUICKSTART.md](QUICKSTART.md).
+
+What replaces `bus.repo`:
+
+| You used to set | Set instead | What it does |
+|---|---|---|
+| `bus.repo` (the checkout whose `.agents/inbox/` is read) | nothing — leave it unset | Nothing is polled on git; with `bus.transport: telegram` no bus repository is needed. |
+| — | `bus.transport: telegram` | The store is the durable plane; it needs `state.backend: telegram`. |
+| — | `state.backend: telegram` | The op log in 📡 Swarm pulse and the pinned snapshot: topics, links, lease, owed rows. |
+| — | `state.lease: store`, `state.owed: store` | The lease and the owed / `WAIT` table live in the store instead of on gitbus. |
+| — | `state.dir` | Where this bot keeps its own copy (cache, sessions, topic map); unset means beside `config.yaml`. |
+
+`bus.repo` still decides where a **project's** role files and this bot's state files were looked
+up when a bus exists. With no bus, roles come from the built-ins unless `agent.role` names a path,
+and the state files (the store's cache, sessions, the topic map) sit under `state.dir` — unset, in
+the folder that holds `config.yaml`. Topic-to-project routing (`projects:`) and the GitHub
+backstop work the same either way: they need no gitbus, only the repository name and a token.
+
 ### Git worktrees vs shared working copy
 
 For projects mapped to multiple active topics, concurrent agent turns on the same checkout risk stepping on each other's unstaged edits or checking out conflicting branches:
