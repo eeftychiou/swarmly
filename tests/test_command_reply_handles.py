@@ -122,6 +122,11 @@ class TestRegistryAnswersAreMachineTraffic(unittest.TestCase):
                      "[Claudebot] Topic registry:\n• a gone one (8) closed"
                      "\n+1 closed (listed above)",
                      "[Claudebot] Topic registry: no open topics.\n+2 closed (listed above)",
+                     # #438: nothing matched the filters asked for -- an answer, not a
+                     # hand-off, so a peer does not move it into a topic.
+                     "[Claudebot] Topic registry: no topic matches stage=review.",
+                     "[Claudebot] Topic registry: no topic matches stage=review.\n"
+                     "unknown filter: stage=reveiw",
                      "[Claudebot] SWARM bus: unknown\ncoordinator: Codex"):
             self.assertTrue(is_command_reply(text), text)
 

@@ -66,6 +66,7 @@ from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig
                                      MODEL_NAME, MODEL_TYPES, effort_problem,
                                      model_problem)
 from swarmly.telegram import native as native_cli
+from swarmly.telegram import topic_filter
 from swarmly.telegram.poll import bus_poll_once
 from swarmly.telegram.presence import Presence, Pulse, hold_action
 
@@ -1966,10 +1967,13 @@ class AgentChannel:
         if command == "state":
             return self.state_link.describe()
         if command == "topics":
+            # #438: the same filters the dashboard's Topics panel reads, so `/topics
+            # stage=review` and the panel's own chips answer the same question.
+            words = command_args(event.text or "")
             return self.state_link.registry.describe(
                 self.state_link.store,
-                show_all=any(word.lower() == "all"
-                             for word in command_args(event.text or "")))
+                show_all=any(word.lower() == "all" for word in words),
+                filters=topic_filter.parse(words))
         return self._command_reply(command, event)
 
     def _storetest_command(self, event: ChannelEvent) -> str:
@@ -4351,7 +4355,8 @@ class AgentChannel:
         """``web`` from the config, or ``None``: no section means no page, and no port opened."""
         return getattr(self.config, "web", None)
 
-    def web_state(self, now: Optional[float] = None) -> Dict[str, Any]:
+    def web_state(self, now: Optional[float] = None,
+                  filters: Optional[Any] = None) -> Dict[str, Any]:
         """The page's JSON: the same records the pinned card is built from, nothing more.
 
         Read per request, so the page is as fresh as the transport's own state and costs no
@@ -4359,6 +4364,10 @@ class AgentChannel:
         a chat id, a token or a path cannot reach the wire. A table that cannot be read
         leaves its section empty and says so in the log -- the page is a view, not the
         authority ``/owed`` is, and a page that raises is worse than one that is thin.
+
+        *filters* are the page's own topic filters (#438), read from its URL query: the same
+        :mod:`swarmly.telegram.topic_filter` rules ``/topics`` applies, so a chip and a typed
+        argument narrow the registry the same way.
         """
         from swarmly.telegram import webui
         moment = self.presence_clock() if now is None else float(now)
@@ -4375,7 +4384,8 @@ class AgentChannel:
         try:
             registry = webui.registry_panel(now=moment, store=self.registry_store(),
                                             drift=self.registry_drift(),
-                                            stall_seconds=self.registry_stall_seconds())
+                                            stall_seconds=self.registry_stall_seconds(),
+                                            filters=filters)
         except Exception:                          # noqa: BLE001 - a page without topics
             logger.warning("web dashboard: the registry is not readable", exc_info=True)
             registry = {"ready": False, "topics": []}

@@ -36,6 +36,7 @@ from __future__ import annotations
 import calendar
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import threading
@@ -45,6 +46,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import parse_qsl, urlsplit
 
 from swarmly.state import keys as K
+from swarmly.telegram import topic_filter
 from swarmly.state.records import Profile, RecordError, Topic, as_dict
 from swarmly.telegram.drift import RESET_AT as DRIFT_RESET_AT
 from swarmly.telegram.snapshot import (BUSY, DOWN, FROZEN, IDLE, PAUSED, STUCK, Snapshot)
@@ -558,6 +560,9 @@ def link_cards(links: Sequence[Any] = (), *, now: float,
             # A local link's ref is a path: it stays out of the JSON, and the title speaks.
             "ref": (ref or None) if provider in PUBLIC_PROVIDERS else None,
             "name": name or None,
+            # What kind of thing it is (issue, pr, other, none), from the shared filter
+            # (#438): the panel's chips filter on this exact value, so it is published once.
+            "type": topic_filter.item_type(data),
         }
         if card["role"] == "work":
             phase = str(data.get("phase") or "").strip() or None
@@ -652,18 +657,25 @@ def topic_cards(*, now: float, topics: Sequence[Any] = (),
                 sessions: Optional[Mapping[Any, Mapping[str, Any]]] = None,
                 profiles: Optional[Mapping[str, Mapping[str, Any]]] = None,
                 drift: Optional[Mapping[Any, Mapping[str, Any]]] = None,
-                stall_seconds: float = STALL_SECONDS) -> List[Dict[str, Any]]:
-    """One card per **open** topic, most recently active first.
+                stall_seconds: float = STALL_SECONDS,
+                filters: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """One card per topic the filters keep, most recently active first (#332, #438).
+
+    The default view is the admin's: open topics that still have something to do. A closed
+    record is only read when ``state=closed`` (or ``all``) asks for it -- it carries no live
+    work -- and then the card says ``closed``.
 
     The topic's own identity (its thread id, its chat id) is used to reach its session
     records and goes no further: what reaches the wire is the topic's name, its links' refs
     and the agents' aliases.
     """
     moment = float(now)
+    chosen = topic_filter.DEFAULT if filters is None else filters
     cards: List[Dict[str, Any]] = []
     for raw in topics:
         data = as_dict(raw)
-        if str(data.get("status") or "open").strip().lower() != "open":
+        status = str(data.get("status") or "open").strip().lower()
+        if status not in chosen.topic_states:
             continue                                    # closed topics carry no live work
         thread = data.get("topic_id")
         links = link_cards(data.get("links") or (), now=moment, stall_seconds=stall_seconds)
@@ -671,7 +683,7 @@ def topic_cards(*, now: float, topics: Sequence[Any] = (),
                                  profiles=profiles, drift=drift, now=moment)
         cards.append({
             "topic": str(data.get("title") or "").strip() or None,
-            "status": "open",
+            "status": status,
             "updated": _since(data.get("last_activity"), moment),
             "stalled": any(link.get("stalled") for link in links),
             "links": links,
@@ -680,12 +692,13 @@ def topic_cards(*, now: float, topics: Sequence[Any] = (),
     # Most recently active first; a topic that never said goes last, and never becomes a zero.
     cards.sort(key=lambda card: card["updated"] if card["updated"] is not None
                else float("inf"))
-    return cards
+    return list(topic_filter.select_cards(cards, chosen))
 
 
 def registry_panel(*, now: float, store: Any = None,
                    drift: Optional[Mapping[Any, Mapping[str, Any]]] = None,
-                   stall_seconds: float = STALL_SECONDS) -> Dict[str, Any]:
+                   stall_seconds: float = STALL_SECONDS,
+                   filters: Optional[Any] = None) -> Dict[str, Any]:
     """The Topics panel from the store's registry -- the same records ``/topics`` reads.
 
     A store that is not started, or not yet ``ready``, is reported as such: an empty panel
@@ -720,10 +733,39 @@ def registry_panel(*, now: float, store: Any = None,
                 profiles[K.norm(parts[1])] = Profile.from_dict(store.read(key) or {}).to_dict()
             except RecordError:
                 logger.warning("web dashboard: %s is unreadable; no limits from it", key)
+    chosen = topic_filter.DEFAULT if filters is None else filters
+    cards = topic_cards(now=now, topics=topics, sessions=sessions, profiles=profiles,
+                        drift=drift, stall_seconds=stall_seconds, filters=chosen)
     return {"ready": True,
-            "topics": topic_cards(now=now, topics=topics, sessions=sessions,
-                                  profiles=profiles, drift=drift,
-                                  stall_seconds=stall_seconds)}
+            "topics": cards,
+            # What the filters did, so the panel can say "3 hidden" rather than look empty
+            # (#438). Counted the way `/topics` counts it: a record the *filters* left out,
+            # not every closed record the view never asked for (#438 review).
+            "hidden": sum(
+                1 for raw in topics
+                if str(as_dict(raw).get("status") or "open").strip().lower()
+                in chosen.topic_states
+                and not chosen.topic_ok(
+                    str(as_dict(raw).get("status") or "open").strip().lower(),
+                    list(as_dict(raw).get("links") or ()))),
+            "filters": filters_view(chosen)}
+
+
+def filters_view(filters: Any = None) -> Dict[str, Any]:
+    """The filters as the page reads them: what is selected, what it may select (#438).
+
+    The choices come from :mod:`swarmly.telegram.topic_filter`, the one place that knows them,
+    so the page cannot offer a filter the transport does not understand.
+    """
+    chosen = topic_filter.DEFAULT if filters is None else filters
+    return {
+        "selected": chosen.as_query(),
+        "words": chosen.describe(),
+        "asked": chosen.asked,
+        "unknown": list(chosen.unknown),
+        "choices": {"type": list(topic_filter.TYPES), "state": list(topic_filter.STATES),
+                    "stage": list(topic_filter.STAGES)},
+    }
 
 
 def _enrich_drift(drift: Dict[str, Any], *, snapshots: Sequence[Snapshot] = (),
@@ -782,7 +824,10 @@ def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
         # panel rather than claiming a registry nobody read.
         "registry": (None if registry is None else
                      {"ready": bool(registry.get("ready")),
-                      "topics": list(registry.get("topics") or ())}),
+                      "topics": list(registry.get("topics") or ()),
+                      # #438: what the filters left out, and which ones the page drew with.
+                      "hidden": int(registry.get("hidden") or 0),
+                      "filters": dict(registry.get("filters") or filters_view())}),
         # The read commands' own views (#344). Each is ``None`` when the caller did not collect
         # it -- a view nobody read is not an empty one.
         "roster": roster_view(cards=cards, peers=peers or (), coordinator=holder),
@@ -981,6 +1026,12 @@ section.panel { background: var(--card); border: 1px solid var(--line); border-r
 h2 { font: var(--font-head); text-transform: uppercase; letter-spacing: .05em; color: var(--dim);
   margin: 0 0 var(--space-2); }
 .note { font: var(--font-small); color: var(--dim); margin: 0; }
+/* The Topics panel's filters (#438): chips that toggle, and one "reset" that clears them.
+   A selected chip is the accent, so a filtered view is never mistaken for the whole registry. */
+.filters { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.chip { font: var(--font-small); color: var(--dim); background: transparent; cursor: pointer;
+  border: 1px solid var(--line); border-radius: var(--pill); padding: 2px 10px; }
+.chip.on { color: var(--accent); border-color: var(--accent); font-weight: 600; }
 .card { border: 1px solid var(--line); border-radius: var(--radius); padding: var(--space-2)
   var(--space-3); margin-bottom: var(--space-2); }
 .card:last-child { margin-bottom: 0; }
@@ -1095,6 +1146,7 @@ body[data-admin="0"] .controls input { opacity: .55; cursor: not-allowed; }
 
   <section class="panel" id="topics">
     <h2>Topics</h2>
+    <div class="filters" id="topic-filters"></div>
     <div id="topic-cards"></div>
   </section>
 
@@ -1245,8 +1297,11 @@ function topicCard(topic) {
   const box = el("article", "card");
   const top = el("div", "top");
   top.append(el("span", "alias", topic.topic || "?"));
-  top.append(el("span", "badge " + (topic.stalled ? "stuck" : "idle"),
-    topic.stalled ? "stalled" : "open"));
+  // A closed record is only on the page when `state=closed` (or `all`) asked for it, and it
+  // must not draw as open (#438 review): the badge says what the record is.
+  const closed = topic.status === "closed";
+  top.append(el("span", "badge " + (closed ? "paused" : (topic.stalled ? "stuck" : "idle")),
+    closed ? "closed" : (topic.stalled ? "stalled" : "open")));
   if (topic.updated !== null && topic.updated !== undefined)
     top.append(el("span", "sub", "active " + ago(topic.updated) + " ago"));
   box.append(top);
@@ -1783,10 +1838,14 @@ function render(state) {
   } else if (!state.registry.ready) {
     cards.append(el("p", "note", "registry not ready"));
   } else if (!(state.registry.topics || []).length) {
-    cards.append(el("p", "note", "no open topics yet"));
+    const hidden = (state.registry.hidden || 0);
+    cards.append(el("p", "note", hidden
+      ? "nothing matches these filters (" + hidden + " hidden)"
+      : "no open topics yet"));
   } else {
     state.registry.topics.forEach((topic) => cards.append(topicCard(topic)));
   }
+  filterBar(state.registry || {});
 
   usage(state);
   settings(state);
@@ -1867,10 +1926,68 @@ document.documentElement.dataset.theme = SCHEME;
   if (THEME_PARAMS[key]) document.documentElement.style.setProperty(token, THEME_PARAMS[key]);
 });
 
+// -- the Topics filters (#438) -------------------------------------------------------
+// The page keeps them in its own URL query (`?type=issue&state=open&stage=review`), so a
+// view can be bookmarked, reloaded and shared, and the server reads the same words the
+// transport's `/topics` arguments parse -- one filter function, two readers.
+function filterQuery() {
+  const query = location.search.replace(/^[?]/, "");
+  return query ? "?" + query : "";
+}
+
+function filterSet(key, value) {
+  const params = new URLSearchParams(location.search);
+  const now = (params.get(key) || "").split(",").filter(Boolean);
+  const next = now.includes(value) ? now.filter((word) => word !== value)
+                                   : now.concat([value]);
+  if (next.length) params.set(key, next.join(",")); else params.delete(key);
+  const text = params.toString();
+  history.replaceState(null, "", text ? "?" + text : location.pathname);
+  tick();
+}
+
+function filterAll() {
+  const params = new URLSearchParams(location.search);
+  if (params.get("all")) params.delete("all"); else params.set("all", "1");
+  const text = params.toString();
+  history.replaceState(null, "", text ? "?" + text : location.pathname);
+  tick();
+}
+
+function filterChip(label, active, press) {
+  const chip = el("button", "chip" + (active ? " on" : ""), label);
+  chip.type = "button";
+  chip.addEventListener("click", press);
+  return chip;
+}
+
+function filterBar(registry) {
+  const bar = document.getElementById("topic-filters");
+  bar.replaceChildren();
+  const view = registry.filters;
+  if (!view || !view.choices) return;
+  const selected = (key) => (view.selected || {})[key] || "";
+  const chosen = (key, word) => selected(key).split(",").filter(Boolean).includes(word);
+  (view.choices.type || []).forEach((word) =>
+    bar.append(filterChip(word, chosen("type", word), () => filterSet("type", word))));
+  (view.choices.state || []).forEach((word) =>
+    bar.append(filterChip(word, chosen("state", word), () => filterSet("state", word))));
+  (view.choices.stage || []).forEach((word) =>
+    bar.append(filterChip(word, chosen("stage", word), () => filterSet("stage", word))));
+  bar.append(filterChip("all", Boolean(selected("all")), filterAll));
+  if (view.asked || Object.keys(view.selected || {}).length)
+    bar.append(filterChip("reset", false, () => {
+      history.replaceState(null, "", location.pathname);
+      tick();
+    }));
+  if ((view.unknown || []).length)
+    bar.append(el("span", "note", "unknown filter: " + view.unknown.join(" ")));
+}
+
 async function tick() {
   try {
     const headers = INIT ? {"X-Telegram-Init-Data": INIT} : {};
-    const response = await fetch(STATE, {cache: "no-store", headers});
+    const response = await fetch(STATE + filterQuery(), {cache: "no-store", headers});
     if (!response.ok) throw new Error("status " + response.status);
     render(await response.json());
   } catch (err) {
@@ -1932,6 +2049,17 @@ def action_answer(raw: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _takes_filters(provider: Any) -> bool:
+    """Whether *provider* accepts a ``filters`` keyword -- the page's topic filters (#438)."""
+    try:
+        params = inspect.signature(provider).parameters
+    except (TypeError, ValueError):                 # a builtin or a C callable: no signature
+        return False
+    if "filters" in params:
+        return True
+    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+
+
 class DashboardServer:
     """A read-only HTTP server for the page, on the loopback, for as long as it is started.
 
@@ -1951,6 +2079,10 @@ class DashboardServer:
                  action: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None,
                  memory: Optional[Callable[[], Optional[str]]] = None) -> None:
         self.provider = provider
+        #: Whether the provider takes this request's topic filters (#438). A provider that
+        #: does is called with them; one that does not (a test's ``lambda: {...}``) is called
+        #: as it is, so adding filters never broke a page that has none.
+        self.filters_ok = _takes_filters(provider)
         self.host = host
         self.requested_port = int(port)
         self.title = title
@@ -2010,8 +2142,15 @@ class DashboardServer:
     def url(self) -> str:
         return f"http://{self.host}:{self.port}{PAGE_PATH}"
 
-    def state(self) -> Dict[str, Any]:
-        """The provider's answer, as a plain dict: what the JSON endpoint serves."""
+    def state(self, *, filters: Any = None) -> Dict[str, Any]:
+        """The provider's answer, as a plain dict: what the JSON endpoint serves.
+
+        *filters* is the request's own topic filter (#438), passed through when the provider
+        takes one; a provider that does not is called as it is, so a page without filters is
+        answered exactly as before.
+        """
+        if filters is not None and self.filters_ok:
+            return dict(self.provider(filters=filters) or {})
         return dict(self.provider() or {})
 
     # -- running it ------------------------------------------------------------------
@@ -2190,7 +2329,10 @@ class DashboardServer:
                         self._send(403, b'{"error":"not the admin"}', "application/json")
                         return
                     try:
-                        payload = dict(server.state())
+                        chosen = topic_filter.from_query(dict(parse_qsl(
+                            query, keep_blank_values=True)))
+                        payload = dict(server.state(filters=chosen))
+                        payload.setdefault("filters", filters_view(chosen))
                         # Whether this very request carries the admin's verified login: the
                         # page draws its controls enabled from *this*, never from the mere
                         # presence of some initData in its URL -- a member's login is valid
