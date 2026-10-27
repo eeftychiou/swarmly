@@ -65,10 +65,6 @@ class OwnBusClosuresTests(unittest.TestCase):
                 store._mark_undelivered([])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def not_ready():
     raise RuntimeError("the state store is not ready")
 
@@ -151,3 +147,7 @@ class GoneTopicWhileTheStoreIsNotReadyTests(unittest.TestCase):
             run(channel._heartbeat_tick())
             self.assertEqual(channel._pending_gone_closes(), {})
             self.assertEqual(self.states(channel)["tg-77"], "closed")
+
+
+if __name__ == "__main__":
+    unittest.main()
