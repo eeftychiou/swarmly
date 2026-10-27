@@ -226,7 +226,8 @@ class PressPolicy:
     available: Tuple[str, ...] = ()
     #: This bot's own alias, so a press naming a *peer* can be refused while the press is
     #: still being decided -- before a confirm code is minted for something that cannot run
-    #: (#351). Empty when the caller names nobody, and then no target counts as a peer's.
+    #: (#351). An empty alias matches no target, so every *named* target reads as a peer's and
+    #: is refused: a policy that does not know whose it is fails closed, never open.
     alias: str = ""
     _pending: Dict[str, _Pending] = field(default_factory=dict)
 
