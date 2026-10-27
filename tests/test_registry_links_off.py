@@ -26,6 +26,10 @@ class TestWhatIsNotARef(unittest.TestCase):
         self.assertEqual(issue_refs("CI green for #421 (#42\u2026"), ["#421"])
         self.assertEqual(issue_refs("#421 (#42..."), ["#421"])
         self.assertEqual(issue_refs("a title cut here (#12\u2026)"), [])
+        # Prose is not a truncation: a real ref followed by three dots stays a ref, and the
+        # bracketed three-dot form is the same cut as the one above (#457 review).
+        self.assertEqual(issue_refs("see #123..."), ["#123"])
+        self.assertEqual(issue_refs("(#42..."), [])
 
     def test_a_topic_id_is_not_an_issue_number(self):
         """`#13221` was a forum thread id, learned as a ref."""
@@ -72,6 +76,67 @@ class TestLearningUnderTheFlag(unittest.TestCase):
         channel._learn_topic_refs(channel.config.identity.home_channel_id, 28784,
                                   "see #13221 and #77")
         self.assertEqual(sorted(channel._ref_topics), ["#77"])
+
+
+class FakeLink:
+    """A state link whose registry says `#12` lives in topic 55."""
+
+    links_mode = "registry"
+
+    def __init__(self, topic=(HOME, 55)):
+        self.topic = topic
+
+    def topic_for_refs(self, refs, repo=None):
+        return self.topic if "#12" in list(refs or ()) else None
+
+
+class TestTheExplicitLinkStillMoves(unittest.TestCase):
+    """The flag turns off the *guess*; the item's explicit link still decides (#457 review).
+
+    Phase 5 lands before phase 6, so `state.links: registry` with `state.routing: legacy`
+    is a real configuration -- and there the learned map is empty, so every reader that
+    looked only at it lost the link the admin had made.
+    """
+
+    def channel(self, links="registry"):
+        config = make_config()
+        config.limits.work_in_topics = True
+        channel = make_channel(config)
+        channel.state_link = FakeLink()
+        channel.state_link.links_mode = links
+        return channel
+
+    def test_the_text_helper_finds_the_explicit_link(self):
+        channel = self.channel("registry")
+        self.assertEqual(channel.topic_for_text("please look at #12"),
+                         (HOME, 55))
+
+    def test_legacy_mode_ignores_the_explicit_link_and_guesses(self):
+        channel = self.channel("legacy")
+        channel._learn_topic_refs(HOME, 55, "#12")
+        self.assertEqual(channel.topic_for_text("please look at #12"), (HOME, 55))
+
+    def test_the_explicit_link_moves_a_reply_and_the_guess_does_not(self):
+        channel = self.channel("registry")
+        moved = channel._topic_elsewhere(self.reply_in(28784, "answer here"), "about #12")
+        self.assertEqual(moved, (HOME, 55))
+        nothing = channel._topic_elsewhere(self.reply_in(28784, "answer here"), "about #999")
+        self.assertIsNone(nothing, "a number nobody linked moves nothing")
+
+    def test_a_brief_and_a_general_reply_ask_the_helper(self):
+        """`_open_topic` and the General move used `_topic_for_refs`, which is now empty under
+        the flag: they ask `topic_for_text`, so the explicit link still wins."""
+        import inspect
+        from swarmly.telegram import channel as channel_mod
+        self.assertIn("self.topic_for_text(about)",
+                      inspect.getsource(channel_mod.AgentChannel._open_topic))
+        self.assertIn("self.topic_for_text(f\"{event.text or ''}",
+                      inspect.getsource(channel_mod.AgentChannel._run_turn))
+
+    def reply_in(self, thread, text):
+        from swarmly.telegram.channel import ChannelEvent
+        return ChannelEvent(text=text, chat_id=HOME, thread_id=thread,
+                            author_id=999, author_username="deepseek", author_is_bot=True)
 
 
 class TestTheRegistrysLinks(unittest.TestCase):

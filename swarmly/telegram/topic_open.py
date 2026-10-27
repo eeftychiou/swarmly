@@ -69,8 +69,9 @@ def strip_report_marker(body: str) -> str:
 _REF = re.compile(r"(?:(?<![\w/])#|/(?:pull|issues)/|\bPR ?#?)(\d{1,7})\b")
 
 #: What a cut number looks like: a title the transport truncated ("(#42…"), so the digits are
-#: the start of a longer number, not a ref (#457: the live phantom `#42` for #421).
-_TRUNCATED = ("\u2026", "...")
+#: the start of a longer number, not a ref (#457: the live phantom `#42` for #421). One
+#: ellipsis character always is one; three dots only right after an opening bracket, because
+#: "see #123..." is a real ref with prose after it (#457 review).
 
 
 def issue_refs(text: str, topic_ids=()) -> list:
@@ -90,7 +91,9 @@ def issue_refs(text: str, topic_ids=()) -> list:
             continue
     found = []
     for match in _REF.finditer(body):
-        if body[match.end():match.end() + 3].startswith(_TRUNCATED):
+        tail = body[match.end():match.end() + 3]
+        bracketed = match.start() > 0 and body[match.start() - 1] == "("
+        if tail.startswith("\u2026") or (bracketed and tail.startswith("...")):
             continue                                # a title cut mid-number, not a ref
         try:
             number = int(match.group(1))
