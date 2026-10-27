@@ -158,6 +158,20 @@ class GeneralGateTests(unittest.TestCase):
         self.assertIn("work topic", texts[0])
         self.assertNotIn("Address one of those handles alone", texts[0])
 
+    def test_an_ordinary_dropped_mention_keeps_the_handle_advice(self):
+        """The gate passes its own advice; every other drop keeps the handle rule (#418 nit).
+
+        Here the relay guard drops a peer's "ask @HermesBot ..." made of another bot, with the
+        gate off -- so this is the default tail, on the default path.
+        """
+        channel, adapter, _ = channel_for(general_turns="allow")
+        run(channel.handle_event(event("@AntigravityBot: asking @HermesBot to review #12")))
+        texts = [m["text"] for m in channel._test_sender.sent]
+        self.assertEqual(adapter.prompts, [])
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("Address one of those handles alone", texts[0])
+        self.assertNotIn("work topic", texts[0])
+
     def test_an_own_brief_in_swarm_pulse_goes_to_the_work_topic(self):
         channel, adapter, _ = channel_for()
         channel._last_turn_place = (GROUP, 9400)
