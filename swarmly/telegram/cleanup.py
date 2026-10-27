@@ -52,6 +52,43 @@ FINISHED_IDLE_SECONDS = 3600.0
 LEDGER_MAX_PER_CHAT = 2000
 
 
+async def delete_message_ids(host: Any, chat_id: int,
+                             ids: Sequence[int]) -> Tuple[List[int], List[int]]:
+    """Delete ``ids`` in Telegram's 100-per-call batches: (deleted, refused).
+
+    ``deleteMessages`` is all-or-nothing: one id the bot cannot touch -- a peer's post in
+    Swarm pulse, a message already gone -- refuses the whole call (#395, live 27 Oct: one
+    such id in each batch meant the batch was dropped and the pulse kept growing). So a batch
+    that does not fully go is asked again one id at a time, and only the ids Telegram really
+    refused come back as refused: they are the ones to stop offering.
+    """
+    deleted: List[int] = []
+    refused: List[int] = []
+    for start in range(0, len(ids), DELETE_BATCH):
+        batch = [int(i) for i in ids[start:start + DELETE_BATCH]]
+        if not batch:
+            continue
+        try:
+            got = int(await host.cleanup_delete_messages(chat_id, batch) or 0)
+        except Exception:                                  # noqa: BLE001 - ask per id below
+            logger.exception("could not delete %d message(s)", len(batch))
+            got = 0
+        if got >= len(batch):
+            deleted.extend(batch)
+            continue
+        if got > 0:                                        # a host that reports a prefix
+            deleted.extend(batch[:got])
+            batch = batch[got:]
+        for message_id in batch:
+            try:
+                ok = int(await host.cleanup_delete_messages(chat_id, [message_id]) or 0) > 0
+            except Exception:                              # noqa: BLE001 - report, go on
+                logger.exception("could not delete message %s", message_id)
+                ok = False
+            (deleted if ok else refused).append(message_id)
+    return deleted, refused
+
+
 @dataclass
 class TopicInfo:
     """One forum topic, as /cleanup decides about it."""
@@ -401,23 +438,17 @@ class Cleanup:
         if not ids:
             return (f"{self._me()}: no General message this bot can still delete (it reaches "
                     "only its last 48h).")
-        deleted = 0
-        try:
-            for start in range(0, len(ids), DELETE_BATCH):
-                batch = ids[start:start + DELETE_BATCH]
-                got = await self.host.cleanup_delete_messages(chat_id, batch)
-                got = int(got or 0)
-                deleted += max(0, got)
-                if got:
-                    self.ledger.drop(chat_id, batch[:got])
-                if got < len(batch):
-                    break                      # the rest are gone or no longer deletable
-        except Exception as exc:                             # noqa: BLE001 - report it
-            logger.exception("could not delete General messages")
-            return (f"{self._me()}: deleted {deleted} General message(s), then Telegram "
-                    f"refused the rest: {exc}")
-        return (f"{self._me()}: deleted {deleted} General message(s). Messages older than "
-                "48h stay yours to remove by hand.")
+        deleted, refused = await delete_message_ids(self.host, chat_id, ids)
+        # Both are settled: what went is gone, what Telegram refused can never be this bot's
+        # to delete, so neither is offered again (#395).
+        self.ledger.drop(chat_id, deleted + refused)
+        said = (f"{self._me()}: deleted {len(deleted)} General message(s). Messages older "
+                "than 48h stay yours to remove by hand.")
+        if refused:
+            said += (f" {len(refused)} the bot cannot delete (not its own, or already gone): "
+                     + ", ".join(str(i) for i in refused[:10])
+                     + ("…" if len(refused) > 10 else ""))
+        return said
 
     # -- helpers -------------------------------------------------------------------------
 

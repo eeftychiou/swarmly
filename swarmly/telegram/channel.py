@@ -50,7 +50,8 @@ from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapt
 from swarmly.telegram.adapters.base import (AdapterReply, drop_stray_silence, is_silent_reply,
                                             load_state, save_state, topic_mode)
 from swarmly.telegram.children import reap_orphans
-from swarmly.telegram.cleanup import DELETE_BATCH, Cleanup, GeneralLedger, TopicInfo
+from swarmly.telegram.cleanup import (DELETE_BATCH, Cleanup, GeneralLedger, TopicInfo,
+                                     delete_message_ids)
 from swarmly.telegram.commands import (
     DIAG_COMMANDS,
     command_args,
@@ -2090,21 +2091,28 @@ class AgentChannel:
     # -- what /cleanup needs from the channel -------------------------------------------
 
     def _note_general_message(self, chat_id: int, message_id: Optional[int],
-                              thread_id: Optional[int], notice: bool = False) -> None:
+                              thread_id: Optional[int], notice: bool = False,
+                              own: bool = True) -> None:
         """Record a General message id, the only kind /cleanup could still delete (#63).
 
         ``notice`` marks the message as a machine notice this transport posted itself, which
         is what the ephemeral sweep may delete on a timer (#64). Nothing else is ever marked:
         a human's message is not ours to delete, and a model reply is the answer someone is
         reading.
+
+        ``own`` says the message is this transport's own post. A message it merely *saw* is
+        never marked as a notice, whatever its topic: in Swarm pulse every peer's post was
+        recorded as this bot's own, and Telegram refuses a delete of a message another bot
+        sent (#395, live 27 Oct).
         """
         if message_id is None:
             return
         if thread_id is not None:
-            self.note_pulse_post(chat_id, message_id, thread_id)
+            if own:
+                self.note_pulse_post(chat_id, message_id, thread_id)
             return
         self.ledger.note(int(chat_id), [int(message_id)])
-        if notice:
+        if notice and own:
             self.ledger.note_notice(int(chat_id), int(message_id))
 
     def note_pulse_post(self, chat_id: int, message_id: Optional[int],
@@ -2355,25 +2363,14 @@ class AgentChannel:
         due = [mid for mid in self.ledger.notices_due(home, minutes, now) if mid not in keep]
         if not due:
             return 0
-        deleted = 0
-        for start in range(0, len(due), DELETE_BATCH):
-            batch = due[start:start + DELETE_BATCH]
-            try:
-                got = int(await self.cleanup_delete_messages(home, batch) or 0)
-            except Exception:                              # noqa: BLE001 - the tick goes on
-                logger.exception("could not delete %d expired notice(s)", len(batch))
-                break
-            if got > 0:
-                self.ledger.drop(home, batch[:got])
-                deleted += got
-            if got < len(batch):
-                # Telegram refused the rest (already gone, or out of reach): stop offering
-                # them, or every tick retries the same dead ids.
-                self.ledger.drop(home, batch[got:])
-                break
+        # One refused id must not cost the batch beside it (#395): the helper asks again one
+        # at a time, so the good deletes still go and only the refused ids are forgotten.
+        deleted, refused = await delete_message_ids(self, home, due)
+        if deleted or refused:
+            self.ledger.drop(home, deleted + refused)
         if deleted:
-            logger.info("deleted %d expired notice(s) in chat %s", deleted, home)
-        return deleted
+            logger.info("deleted %d expired notice(s) in chat %s", len(deleted), home)
+        return len(deleted)
 
     async def _ephemeral_tick(self) -> None:
         """Sweep on a timer; the interval is short enough that a notice never lingers long."""
@@ -8377,7 +8374,8 @@ class AgentChannel:
         # with registry routing the coordinator takes every person's message in a work topic,
         # and it answered "your message reached me with no text".
         # A General message id is still recorded first, so /cleanup can delete a sticker or pin.
-        self._note_general_message(event.chat_id, event.message_id, event.thread_id)
+        self._note_general_message(event.chat_id, event.message_id, event.thread_id,
+                                   own=False)
         if not (event.text or "").strip() and not event.attachments and not event.self_task:
             self.stats.ignored += 1
             logger.info("message %s in topic %s has no text and nothing attached; no turn",

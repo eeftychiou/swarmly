@@ -36,11 +36,13 @@ class FakeHost:
     """The channel side of /cleanup, recorded instead of called."""
 
     def __init__(self, topics=(), chat_id=GROUP, delete_ok=True,
-                 message_batches=None, protected=()) -> None:
+                 message_batches=None, protected=(), refuse_messages=()) -> None:
         self.topics = list(topics)
         self.chat_id = chat_id
         self.delete_ok = delete_ok
         self.message_batches = message_batches      # None: every id goes; else per-batch count
+        #: Ids Telegram will not delete: a whole batch holding one is refused (#395).
+        self.refuse_messages = {int(i) for i in refuse_messages}
         self.protected = set(protected)
         self.deleted_topics = []
         self.deleted_messages = []
@@ -60,10 +62,13 @@ class FakeHost:
         return self.delete_ok and int(thread_id) not in getattr(self, "refuse", set())
 
     async def cleanup_delete_messages(self, chat_id, ids):
-        self.deleted_messages.append([int(i) for i in ids])
+        batch = [int(i) for i in ids]
+        self.deleted_messages.append(batch)
         if self.message_batches is not None:
             return self.message_batches.pop(0) if self.message_batches else 0
-        return len(ids)
+        if any(mid in self.refuse_messages for mid in batch):
+            return 0                    # all-or-nothing, exactly as Telegram does it
+        return len(batch)
 
     async def cleanup_forget_topic(self, chat_id, thread_id):
         self.forgotten.append(int(thread_id))
@@ -181,7 +186,19 @@ class OtherFormTests(CleanupCase):
         self.ledger.note(GROUP, list(range(1, DELETE_BATCH + 11)), now=NOW - HOUR)
         host = FakeHost(message_batches=[40])
         self.ask(self.cleanup(host), "general")
-        self.assertEqual(len(host.deleted_messages), 1)
+        self.assertEqual(len(host.deleted_messages), 72)   # the 100 asked, then one by one
+
+    def test_one_undelatable_id_does_not_cost_the_others(self):
+        # #395, live 27 Oct: the pulse recorded peers' posts as its own notices, and one id
+        # Telegram refused dropped the whole batch of 100 -- so nothing was ever deleted.
+        self.ledger.note(GROUP, [5, 6, 7, 8], now=NOW - HOUR)
+        host = FakeHost(refuse_messages={6})
+        reply = self.ask(self.cleanup(host), "general")
+        self.assertEqual(host.deleted_messages[0], [5, 6, 7, 8])   # the batch first
+        self.assertIn("deleted 3 General message(s)", reply)
+        self.assertIn("1 the bot cannot delete", reply)
+        # What went and what Telegram refused are both settled: neither is offered again.
+        self.assertEqual(self.ledger.recent(GROUP, NOW), [])
 
     def test_a_non_admin_gets_a_refusal_and_nothing_else(self):
         host = FakeHost([topic(10)])
