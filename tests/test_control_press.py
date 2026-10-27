@@ -267,6 +267,14 @@ class TestAnotherBotsControl(unittest.TestCase):
                          "applied: bot.pause")
         self.assertTrue(channel._frozen)
 
+    def test_a_restart_note_addressed_to_this_bot_still_stops_polling(self):
+        """#432: the press path carries the restart out late; the note path must not lose it."""
+        channel = self.channel()
+        self.assertEqual(apply(channel, self.note("bot.restart", "Hermes")),
+                         "applied: bot.restart")
+        self.assertTrue(channel.restart_requested)
+        self.assertFalse(channel._restart_pending)
+
     def test_a_note_for_another_bot_is_ignored(self):
         channel = self.channel()
         self.assertIn("not mine", apply(channel, self.note("bot.pause", "Codex")))
@@ -1372,6 +1380,31 @@ class TestTheDashboardWritePath(unittest.TestCase):
         self.assertTrue(code, "a confirm answer must carry the code the second post sends")
         done = self.ask(channel, action="bot.restart", code=code)
         self.assertTrue(done["ok"])
+        self.assertTrue(channel.restart_requested)
+
+    def test_the_note_goes_out_before_the_restart_stops_polling(self):
+        """#432: stopping polling first closed the connection the note rides, so the note
+        failed and a restart that went through was answered "the press failed"."""
+        channel = self.channel()
+        order = []
+        real_note, real_restart = channel._post_control_note, channel.request_restart
+
+        async def note(line: str) -> None:
+            order.append("note")
+            await real_note(line)
+
+        def restart() -> None:
+            order.append("restart")
+            real_restart()
+
+        channel._post_control_note = note
+        channel.request_restart = restart
+        code = self.ask(channel, action="bot.restart")["confirm"]
+        self.assertEqual(order, [])                          # the first post only mints a code
+        done = self.ask(channel, action="bot.restart", code=code)
+        self.assertTrue(done["ok"], done)
+        self.assertNotIn("the press failed", done["text"])
+        self.assertEqual(order, ["note", "restart"])         # the note is out before the stop
         self.assertTrue(channel.restart_requested)
 
     def test_a_code_is_single_use(self):

@@ -835,6 +835,8 @@ class AgentChannel:
         self.bot: Any = None
         self.dispatcher: Any = None
         self.restart_requested = False           # request_restart(): the launcher starts again
+        #: A restart a press asked for and the press path has not carried out yet (#432).
+        self._restart_pending = False
         self.replies = None
         self._reply_task: Optional[asyncio.Task] = None
         if config.adapter.type == "codex_thread" and (config.source_path or config.adapter.reply_state_path):
@@ -4582,6 +4584,9 @@ class AgentChannel:
                            note.action)
             return f"failed: {note.action} is not carried out here"
         logger.info("control: %s applied from a peer note (by=%s)", note.action, note.by)
+        # A peer's restart reaches this bot by note, not by a press: there is no note or answer
+        # of this bot's own left to send, so it is carried out here (#432).
+        self.carry_out_pending_restart()
         return f"applied: {note.action}"
 
     def _note_sender_may_command(self, sender: str, action: str = "") -> bool:
@@ -4654,7 +4659,11 @@ class AgentChannel:
                     type=MessageType.STATUS, to="*", intent="RESUMED", ref="pause",
                     rev=self._running_revision), f"▶ {self.config.identity.alias} resumed."))
         elif action == "bot.restart":
-            self.request_restart()
+            # Asked for, not carried out: the shutdown takes this bot's own connection with
+            # it, so a press that restarted here could not send its CONTROL note or answer
+            # afterwards -- the send failed and the presser was told "the press failed" while
+            # the restart went through (#432). The caller carries it out once it is done.
+            self._restart_pending = True
         elif action == "bot.stop_turn":
             self._stop_every_turn()
         elif action == "swarm.lease":
@@ -5191,6 +5200,9 @@ class AgentChannel:
             if decision.log and decision.action not in self.CONTROL_BROADCASTS:
                 await self._post_control_note(self._with_via(decision.log, via))
             self._control_answer = decision.text
+            # The note is out and the answer is this press's own: only now may polling stop
+            # (#432 -- it used to stop before the note, which then failed).
+            self.carry_out_pending_restart()
             return decision.text
         except ControlRefused as exc:
             record(press_mod.REFUSED, reason=press_mod.ACTION_REFUSED)
@@ -12178,6 +12190,21 @@ class AgentChannel:
         self.restart_requested = True
         if self.dispatcher is not None:
             asyncio.ensure_future(self.dispatcher.stop_polling())
+
+    def carry_out_pending_restart(self) -> None:
+        """Run a restart a press asked for, once that press has posted and answered (#432).
+
+        ``request_restart`` stops polling, and the shutdown takes the bot's connection with it.
+        A press that restarted before it had sent its CONTROL note left the note failing and
+        told the presser "the press failed" while the restart went through -- what the admin
+        saw live. So ``_run_control_now`` only asks for the restart, and the path that carries
+        the action out calls this at the end: the note is on the bus and the answer is in
+        ``_control_answer`` before polling stops.
+        """
+        if not self._restart_pending:
+            return
+        self._restart_pending = False
+        self.request_restart()
 
     async def _group_member(self, user_id: int) -> Optional[Tuple[str, str, bool]]:
         """``(status, username, is_bot)`` of a user in the home group (getChatMember)."""
