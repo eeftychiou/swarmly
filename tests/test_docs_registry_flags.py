@@ -135,6 +135,30 @@ def wrong_defaults(text: str = None) -> dict:
     return wrong
 
 
+#: Statements that were true while every flag was off by default, and are false since #424.
+#: The review of #426 found three of them still in the pages: a page that says legacy is the
+#: default reads as a lie next to the dagger footnote.
+STALE = (
+    "the legacy path is still the default today",
+    "No flag is on by default yet",
+    "new, behind flags",
+    "(the default once the store is on)",
+)
+
+#: The pages that carry one of them, by name.
+STALE_PAGES = {
+    "docs/telegram/PROTOCOL.md": PAGE,
+    "AGENTS.md": ROOT / "AGENTS.md",
+    "README.md": ROOT / "README.md",
+    "swarmly/telegram/store_lease.py": ROOT / "swarmly" / "telegram" / "store_lease.py",
+}
+
+
+def stale_statements(text: str) -> list:
+    """The superseded statements a page still makes (#424)."""
+    return [line for line in STALE if line in text]
+
+
 class TheFlagsTableTests(unittest.TestCase):
     def test_the_table_lists_every_flag_of_the_registry(self):
         rows = table_rows()
@@ -177,6 +201,33 @@ class TheFlagsTableTests(unittest.TestCase):
         text = PAGE.read_text(encoding="utf-8") + \
             "\n### 11.8 Later\n\n| `state.made_up` | `on` | x | 9 | no |\n"
         self.assertNotIn("state.made_up", table_rows(text))
+
+
+class ThePagesThatStatedTheOldDefaultTests(unittest.TestCase):
+    """#424: a page that still calls ``legacy`` *the* default is not updated documentation."""
+
+    def test_no_page_still_calls_legacy_the_default(self):
+        for name, page in STALE_PAGES.items():
+            with self.subTest(page=name):
+                self.assertEqual(stale_statements(page.read_text(encoding="utf-8")), [])
+
+    def test_a_page_that_puts_one_back_is_caught(self):
+        """DISCRIMINATING: the same check, over a copy of AGENTS.md that still says it."""
+        text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        mutated = text.replace("On that store the registry side is the default",
+                               "No flag is on by default yet; On that store the registry side "
+                               "is the default", 1)
+        self.assertNotEqual(text, mutated, "the sentence this test mutates is gone")
+        self.assertEqual(stale_statements(mutated), ["No flag is on by default yet"])
+
+    def test_the_section_intro_names_where_the_default_flips(self):
+        """The replacement sentence says which backend the registry default belongs to."""
+        intro = PAGE.read_text(encoding="utf-8").split("### 11.1", 1)[0]
+        paragraph = intro.split("**Most of what is below ships behind its flag.**", 1)[1]
+        paragraph = paragraph.split("### ", 1)[0]
+        for needle in ("With the store off", "`state.backend: telegram`", "#424", "§11.7"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, paragraph)
 
 
 class GitbusIsOptionalTests(unittest.TestCase):

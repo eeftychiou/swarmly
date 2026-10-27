@@ -552,11 +552,14 @@ routes from that record instead of from mention heuristics. The design is
 [`docs/design/topic-registry.md`](../design/topic-registry.md) §1–4; this section is what a
 conforming transport does, and the flag each part is switched by.
 
-**Most of what is below ships behind its flag, and the legacy path is still the default today.**
-A config that sets none of the flags behaves exactly as it did before §11 existed. Phase 9 (§6
-of the design) makes the `on` values the defaults and removes the legacy code. Two parts are
-already live with no flag at all: the per-topic session every adapter keeps (§11.5) and the
-session-scoped drift score (§11.6).
+**Most of what is below ships behind its flag.** With the store off — no `state:` section at
+all — the legacy path is still the default, and a config that sets none of the flags behaves
+exactly as it did before §11 existed. With `state.backend: telegram` the four registry flags
+default to the registry side instead (phase 9b, `#424`: the daggered rows in §11.7), so from
+there the registry paths are what runs unless a flag says otherwise. What is left for phase 9
+(§6 of the design) is removing the legacy code — and `bus.transport` keeps its default until 9c.
+Two parts are already live with no flag at all: the per-topic session every adapter keeps
+(§11.5) and the session-scoped drift score (§11.6).
 
 ### 11.1 The shared state store
 
