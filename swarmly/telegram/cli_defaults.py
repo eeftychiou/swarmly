@@ -86,6 +86,43 @@ def _read_toml(path: Path) -> Dict[str, Any]:
 _TOML_STRING = re.compile(r'^\s*([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"')
 
 
+def _toml_header(line: str) -> List[str]:
+    """The dotted parts of a ``[table]`` / ``[[array]]`` header, comment and quotes removed.
+
+    ``"gemini-3.8-flash"`` is one model name, not two keys: a dot inside a quoted part does
+    not split it, and a ``#`` inside one does not start the comment (#407). Escapes in a
+    basic string are read only so that a ``\\"`` does not end the part.
+    """
+    parts: List[str] = []
+    current = ""
+    quote = ""
+    escaped = False
+    for char in line:
+        if quote:
+            if escaped:
+                current += char
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = ""
+            else:
+                current += char
+        elif char in "\"'":
+            quote = char
+        elif char == "#":
+            break                                     # the comment ends the header
+        elif char == ".":
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += char
+    parts.append(current.strip())
+    parts[0] = parts[0].lstrip("[").strip()           # the brackets belong to no key, nor do
+    parts[-1] = parts[-1].rstrip("]").strip()         # the spaces inside them: `[[ providers ]]`
+    return [part for part in parts if part]           # ``[[providers]]`` is one part, not two
+
+
 def _top_level_toml(text: str) -> Dict[str, Any]:
     """``key = "value"`` lines, each ``[[providers]]`` table, and their nested tables.
 
@@ -103,10 +140,13 @@ def _top_level_toml(text: str) -> Dict[str, Any]:
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("["):
-            header = stripped.strip("[]").replace(" ", "").replace("\t", "")
-            parts = header.split(".")
+            # `[[providers]]  # the DeepSeek providers` and [providers.model_overrides."x"]
+            # are both ordinary TOML: the comment ends the header, and a key may be quoted.
+            parts = _toml_header(stripped)
             current = None
-            if header.lower() == "providers" and stripped.startswith("[["):
+            if not parts:                             # ``[]`` is not a table: read nothing
+                continue
+            if [p.lower() for p in parts] == ["providers"] and stripped.startswith("[["):
                 current = {}
                 providers.append(current)
             elif parts[0].lower() == "providers" and len(parts) == 3 \

@@ -21,7 +21,7 @@ from tempfile import TemporaryDirectory
 
 from swarmly.telegram.channel import AgentChannel
 from swarmly.telegram.cleanup import (LEDGER_TTL_SECONDS, GeneralLedger,
-                                        delete_message_ids)
+                                      delete_message_ids)
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.adapters import EchoAdapter
 from tests.aio import run

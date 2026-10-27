@@ -237,12 +237,55 @@ class TestTheBackgroundLookup(unittest.TestCase):
                 names = reasonix_provider_names(tmp, env={}, home=Path(tmp))
         self.assertEqual(names, ["deepseek-flash", "deepseek-pro"])
 
-    def test_a_python_without_tomllib_reads_a_models_effort_too(self):
-        """#397: the fallback also has to see ``[providers.model_overrides.<model>]``, which is
-        where ``_reasonix`` finds the effort -- it read as "the model default" on 3.10."""
+    def test_a_python_without_tomllib_reads_a_header_with_a_comment(self):
+        """#407: a comment ends a table header, so 3.10 has to drop it before it splits the
+        key -- otherwise the ``[[providers]]`` table was skipped, and the model's effort with
+        it (it read as "the model default")."""
+        text = ('default_model = "deepseek-pro"\n\n'
+                '[[providers]]  # the DeepSeek providers\nname = "deepseek-pro"\n\n'
+                '[providers.model_overrides.deepseek-pro]\ndefault_effort = "high"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                without = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+            whole = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+        self.assertEqual(without.effort, "high")
+        self.assertEqual(whole.effort, without.effort)      # the real parser agrees
+
+    def test_a_python_without_tomllib_reads_a_quoted_key(self):
+        """#407: a TOML key may be quoted, so ``"deepseek-flash"`` names that model and the
+        quotes are not part of it -- the effort read as "the model default" on 3.10."""
         text = ('default_model = "deepseek-flash"\n\n'
-                '[[providers]]\nname = "deepseek-pro"\n\n'
-                '[providers.model_overrides.deepseek-flash]\ndefault_effort = "high"\n')
+                '[[providers]]\nname = "deepseek-flash"\n\n'
+                '[providers.model_overrides."deepseek-flash"]\ndefault_effort = "high"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                without = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+            whole = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+        self.assertEqual(without.effort, "high")
+        self.assertEqual(whole.effort, without.effort)      # the real parser agrees
+
+    def test_a_python_without_tomllib_keeps_a_dot_inside_a_quoted_key(self):
+        """#407: a dot inside a quoted key is part of the name, so ``"gemini-3.8-flash"`` is
+        one model -- split on it and the override was dropped, the effort read as the default."""
+        text = ('default_model = "gemini-3.8-flash"\n\n'
+                '[[providers]]\nname = "gemini-3.8-flash"\n\n'
+                '[providers.model_overrides."gemini-3.8-flash"]\ndefault_effort = "high"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                without = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+            whole = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+        self.assertEqual(without.effort, "high")
+        self.assertEqual(whole.effort, without.effort)      # the real parser agrees
+
+    def test_a_python_without_tomllib_reads_brackets_with_spaces_inside(self):
+        """#407: `[[ providers ]]` is the same table as `[[providers]]` -- the spaces just
+        inside the brackets are not part of the key, so the provider table was dropped."""
+        text = ('default_model = "gemini-3.8-flash"\n\n'
+                '[[ providers ]]\n\n'
+                '[providers.model_overrides."gemini-3.8-flash"]\ndefault_effort = "high"\n')
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
             with mock.patch.dict(sys.modules, {"tomllib": None}):
@@ -307,6 +350,9 @@ class TestTheBackgroundLookup(unittest.TestCase):
 
             async def send_message(self, **kwargs):
                 return types.SimpleNamespace(message_id=1)
+
+            async def delete_webhook(self, **kwargs):
+                return True          # the real Bot has it, so start() takes no warning path
 
             async def close(self):
                 return None
