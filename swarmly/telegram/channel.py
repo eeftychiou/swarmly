@@ -4439,6 +4439,10 @@ class AgentChannel:
                     row["per_bot"] = {alias: [[label, value] for label, value in picks]
                                       for alias, picks in
                                       self.pick_choices_by_bot(found.action).items()}
+                if found.action == "bot.settings":
+                    # One form per card (#451): each bot's own dropdowns, prefilled with what
+                    # its beat says it runs. A card with nothing reported draws empty selects.
+                    row["settings"] = self.settings_by_bot()
                 if found.action == "swarm.role":
                     # Two picks in one press: which bot, then which role. The page offers
                     # both selects and sends them as one target and value (#345).
@@ -4762,6 +4766,10 @@ class AgentChannel:
         recorded **there**, not in channel state, so two presses at once cannot cancel each
         other's restart (#442).
         """
+        if value and action == "bot.settings":
+            # A form a peer forwarded for this bot (#451): each field goes through the typed
+            # command, so this bot's own list and scope decide.
+            return self._apply_remote_settings(value)
         if value and control_mod.remote_pick(action):
             # A pick a peer forwarded for this bot (#373): the typed command's own function
             # decides, so this bot's allowed list and scope are the ones that apply.
@@ -4858,6 +4866,34 @@ class AgentChannel:
                     f"{label} {value}; nothing changed")
         return False
 
+    def _apply_remote_settings(self, value: str) -> Any:
+        """Apply a forwarded form (#451): each field through the typed command, as a pick is.
+
+        True when at least one field really changed; a form whose every field was already at
+        the value it sends answers in words instead, so a peer's note never reports "applied"
+        for a press that changed nothing.
+        """
+        pairs = control_mod.parse_settings(value)
+        if not pairs:
+            return False
+        changed: List[str] = []
+        already: List[str] = []
+        for key, wanted in pairs:
+            action = control_mod.setting_action(key)
+            if not action:
+                return False
+            result = self._apply_remote_pick(action, wanted)
+            if result is True:
+                changed.append(f"{key} → {wanted}")
+            elif isinstance(result, str) and "already" in result:
+                already.append(f"{key} was already {wanted}")
+        if changed:
+            return True
+        if already:
+            return (f"accepted: bot.settings -- {self.config.identity.alias} was already at "
+                    + ", ".join(already))
+        return False
+
     def _notice_soon(self, text: str) -> None:
         """Post a machine line from synchronous code (a control note), once the loop runs."""
         try:
@@ -4891,10 +4927,11 @@ class AgentChannel:
         """The controls this build can actually carry out, so no button is offered in vain.
 
         A control added to the table in :mod:`swarmly.telegram.control` joins this tuple once
-        it is wired; until then it is neither shown nor run.
+        it is wired; until then it is neither shown nor run. ``bot.settings`` is page-only
+        (#451): the chat keyboard leaves it out, the dashboard draws it as one form.
         """
         return ("bot.pause", "bot.resume", "bot.restart", "bot.offline", "bot.stop_turn",
-                "bot.model", "bot.effort", "bot.cli", "bot.memory",
+                "bot.model", "bot.effort", "bot.settings", "bot.cli", "bot.memory",
                 "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
                 "swarm.lease", "swarm.failback",
                 "swarm.hold", "swarm.release", "swarm.admit", "swarm.remove",
@@ -5268,6 +5305,144 @@ class AgentChannel:
                 f"changed")
         return (f"sent {label} {value} to {alias}: it applies that under its own rules, and its "
                 f"card shows the new value once its next beat reports it")
+
+    def settings_fields(self, target: str = "") -> List[Dict[str, Any]]:
+        """One bot's per-turn settings, prefilled: what the page's one form shows (#451).
+
+        *target* is the card's bot: this one when it names nobody or itself, a peer otherwise.
+        A peer's list and its current value come from its own beat (#373, #450), so a peer's
+        form offers that bot's runtime, never this one's -- and a bot that has not reported
+        its list offers none, rather than a guess.
+
+        This bot's own prefill is the value the *card* shows (`running_model_and_effort`, #450),
+        not just what `/model` stored: a bot running its adapter's model has a value even
+        though nothing was picked, and a form that prefilled empty would leave the first
+        choice in the dropdown and look like a change the admin never made (review, #451).
+        """
+        alias = str(target or "").strip().lstrip("@")
+        mine = not alias or alias.lower() == str(self.config.identity.alias).strip().lower()
+        out: List[Dict[str, Any]] = []
+        mine_model, mine_effort = ("", "")
+        if mine:
+            try:
+                model, effort = self.running_model_and_effort()
+                mine_model, mine_effort = str(model or ""), str(effort or "")
+            except Exception:                  # noqa: BLE001 - a form without a guess
+                logger.debug("dashboard: this bot's own model is not resolvable", exc_info=True)
+        for key, action in control_mod.SETTING_ACTIONS:
+            if mine:
+                value = mine_model if key == "model" else mine_effort
+                choices = self.control_choices(action)
+            else:
+                value = self.peer_pick_value(alias, action)
+                # That bot's own list, as its beat reported it (#373): the values it offers
+                # are the labels too, since a peer publishes names and not pairs.
+                choices = [(name, name) for name in self.peer_choices(action, alias)]
+            out.append({"key": key, "label": key.capitalize(), "value": str(value),
+                        "choices": [[str(label), str(val)] for label, val in choices]})
+        return out
+
+    def settings_by_bot(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Every card's form: this bot's, and each peer's as its own beat reported it (#451)."""
+        out: Dict[str, List[Dict[str, Any]]] = {str(self.config.identity.alias):
+                                                self.settings_fields()}
+        try:
+            peers = self.presence().peers or {}
+        except Exception:                      # noqa: BLE001 - a page without peers
+            return out
+        for name in peers:
+            alias = self.canonical_peer(name) or name
+            if alias.strip().lower() in {key.strip().lower() for key in out}:
+                continue
+            try:
+                out[alias] = self.settings_fields(alias)
+            except Exception:                  # noqa: BLE001 - one card, not the page
+                logger.debug("dashboard: no settings for %s", alias, exc_info=True)
+        return out
+
+    def settings_report(self, target: str = "") -> str:
+        """What one bot's settings are now, in words: the answer a bare Apply gets (#451)."""
+        alias = str(target or "").strip().lstrip("@") or str(self.config.identity.alias)
+        fields = self.settings_fields(alias)
+        said = ", ".join(f"{row['key']} {row['value'] or '(not set)'}" for row in fields)
+        return f"{alias}: {said}"
+
+    async def _apply_settings(self, target: str, value: str, *, presser: str = "",
+                              via: str = "", pending: Optional[Dict[str, Any]] = None) -> str:
+        """One form, one press: apply only the fields it sends, and say what each one did (#451).
+
+        *value* is ``model=opus;effort=high``: only the fields the admin changed. Each field
+        goes through the *same* function the typed command runs, so a value this bot cannot
+        use is refused in that command's own words -- and the answer names every field that
+        changed and every field that was refused, never just the last one.
+        """
+        pairs = control_mod.parse_settings(value)
+        if not pairs:
+            raise ControlRefused("the settings form sent nothing to apply")
+        alias = str(target or "").strip().lstrip("@")
+        if not self.own_target(target):
+            return self._forward_settings(alias, pairs)
+        changed: List[str] = []
+        refused: List[str] = []
+        unchanged: List[str] = []
+        for key, wanted in pairs:
+            action = control_mod.setting_action(key)
+            if not action:
+                refused.append(f"{key} (not a setting this dashboard has)")
+                continue
+            store = self._models if key == "model" else self._efforts
+            before = store.get(self._pick_key())
+            # No *pending* here: a field that was already set is this form's business, not the
+            # press's. Letting the per-field path mark the press "unchanged" silenced the
+            # CONTROL line for a form where another field really did change (review, #451).
+            said = self._pick_through("model" if key == "model" else "reasoning", wanted, store,
+                                      key, None)
+            after = store.get(self._pick_key())
+            if after != before:
+                changed.append(f"{key} → {after}")
+            elif str(after or "").strip().lower() == wanted.strip().lower():
+                unchanged.append(f"{key} was already {wanted}")
+            else:
+                # The command refused it: its own words say why, and this press says so too.
+                refused.append(f"{key}: {said}")
+        me = str(self.config.identity.alias)
+        parts: List[str] = []
+        if changed:
+            parts.append(f"{me}: " + ", ".join(changed))
+        if unchanged:
+            parts.append(", ".join(unchanged))
+        if refused:
+            parts.append("refused -- " + "; ".join(refused))
+        if not changed:
+            # Nothing to record: the CONTROL line for this press is the one the caller would
+            # otherwise post saying something changed (#450, #451).
+            if pending is not None:
+                pending["unchanged"] = True
+        return ". ".join(parts) or f"{me}: nothing changed"
+
+    def _forward_settings(self, alias: str, pairs: List[Tuple[str, str]]) -> str:
+        """Send one form's changed fields to the bot it is about (#451, #373).
+
+        Nothing is set here: the CONTROL line the press already posts names that bot and the
+        fields, and only that bot applies them, under its own runtime's rules.
+        """
+        if not alias:
+            raise ControlRefused("a settings form needs a bot")
+        state = self.peer_state(alias)
+        if state in (snapshot_mod.PAUSED, snapshot_mod.FROZEN, snapshot_mod.DOWN):
+            raise ControlRefused(
+                f"{alias} is {state}: nothing was sent -- its settings can be set once it is "
+                f"back, and guessing them as done would only mislead the page")
+        same = [key for key, wanted in pairs
+                if self.peer_pick_value(alias, control_mod.setting_action(key) or "").strip()
+                .lower() == wanted.strip().lower()]
+        if same and len(same) == len(pairs):
+            raise ControlRefused(
+                f"{alias} already runs " + ", ".join(f"{key} {wanted}" for key, wanted in pairs)
+                + ": nothing was sent, and nothing changed")
+        names = ", ".join(f"{key} {wanted}" for key, wanted in pairs)
+        return (f"sent {names} to {alias}: it applies them under its own rules, and its card "
+                f"shows the new values once its next beat reports them")
 
     def _refuse_peer_self_only(self, action: str, target: str) -> None:
         """Refuse a press on this bot's own runtime when it names another bot (#345 review).
@@ -5829,6 +6004,13 @@ class AgentChannel:
             return await self._remove_control(target or value)
         if action == "bot.memory":
             return self._memory_control(target)
+        if action == "bot.settings":
+            # One form, one press (#451). A bare press (a typed ctl: code) answers what the
+            # settings are; a valued one applies -- or forwards -- the fields it carries.
+            if not value:
+                return self.settings_report(target)
+            return await self._apply_settings(target, value, presser=presser, via=via,
+                                              pending=pending)
         if value and control_mod.remote_pick(action) and not self.own_target(target):
             # A pick for *another* bot (#373): it is not set here, and never was -- the press
             # is forwarded, and only the bot it names applies it.

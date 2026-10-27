@@ -115,6 +115,7 @@ coordinator has the dashboard: pressing the button is quieter.
 | Restart | Restarts the coordinator now; a turn it cuts off is replayed when it starts again. The `swarmly --cli` launcher starts it again; `swarmly-telegram run` just exits. |
 | Stop | Stops the bot for good, after a second tap: it yields the coordinator lease (so a peer takes over at once, not after `limits.takeover_minutes`), posts its OFFLINE line, and exits **0**. A pause is not this — a paused bot stays online and keeps the lease. Starting it again is the admin's job on the host: a unit with `Restart=always` brings it back after `RestartSec`, one with `Restart=on-failure` leaves it down ([`SETUP-ADMIN.md`](SETUP-ADMIN.md#stopping-a-bot-from-the-dashboard)). Its card then goes DOWN, because the bot's pulse has stopped. |
 | Model, Effort | Picks the coordinator's model or effort, for the dashboard's own topic only. |
+| Apply | The live page's one settings form (#451): a dropdown per setting, prefilled with what the card's bot runs now, and one **Apply** for all of them. Only the fields you changed are sent, so one Apply is one `CONTROL` line and no second tap. Not on the chat keyboard, because a keypad cannot carry a form. |
 | CLI | Lists the `/cli` commands the coordinator may run; it runs nothing. |
 | Memory | `clear`: empties the coordinator's own `memory.md`, after a second tap. It is that bot's own file, so a press aimed at another bot's card is refused. |
 | Pause all | Pauses every bot, the way a bare `/pause` does, after a second tap. |
@@ -129,3 +130,28 @@ coordinator has the dashboard: pressing the button is quieter.
 The live page (#345) draws the same controls from the same table — a `bot.` button on that bot's
 card, an `item.` button on its round item, the `swarm.` ones in its Controls panel — and each press
 takes the same route and leaves the same `via=dashboard` line.
+
+### The settings form, and what each adapter exposes (#451)
+
+One form per card: a dropdown per setting, prefilled with what that bot's own beat says it
+runs, and one **Apply**. Only the fields that differ from the reported value are sent, as
+`model=opus;effort=high`, and the bot's own `/model` and `/reasoning` decide each one — so a
+value its runtime refuses is answered in that command's words, and the answer names every
+field that changed, every field already at that value, and every field that was refused. A
+form for a peer is forwarded to that peer (`sent ... to Codex`); nothing is set on the bot the
+page is served by.
+
+A setting is offered when the adapter maps it to a flag for a **turn**:
+
+| Adapter | Model | Effort | Why nothing else |
+|---|---|---|---|
+| `claude`, `claude_thread` | yes (`--model`) | yes (`--effort low…max`) | `cwd`, `command`, `permissions` and `timeout` are read when the CLI is launched, so a dropdown for them would take effect on the next restart, not the next turn. |
+| `codex` | yes (`-m`) | yes (`-c model_reasoning_effort=…`), not `max` | Same: the rest of `adapter` is launch-time. Codex has no `max`, and the command says so rather than the form hiding it. |
+| `antigravity` | yes, an engine name as `agy models` prints it | yes (`--effort`) | Same. An engine name carries its tier (`Gemini 3.1 Pro (High)`), so the model also sets the effort. |
+| `reasonix` | yes (`--model`) | yes (`--effort`) | Same. |
+| `echo` and the other test adapters | no list | no list | It reports no runtime settings, so the form offers none: an empty dropdown, not a guess. |
+
+What is *not* on the form, and why: `adapter.command`, `adapter.cwd`, `adapter.permissions`,
+`adapter.timeout_seconds` and `limits.*` are launch-time or transport-wide, not per turn. And
+a topic may carry its own `/model` and `/reasoning` (#374): the form shows the value the
+pick's own key holds, which is what that bot's next turn reads (#450).

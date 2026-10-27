@@ -258,6 +258,15 @@ class PressPolicy:
             # rule still cannot carry it out -- but the page is never handed a dead code.
             return Decision(REFUSED, command=command, reason=ACTION_REFUSED,
                             action=command.action, target=command.target, text=said)
+        if command.value and found.one_tap:
+            # A settings form (#451): #153's second tap is for a press that *changes* what
+            # runs -- and the admin's complaint was that setting a model took two presses.
+            # This one starts nothing and stops nothing, so it is one tap and one line.
+            return Decision(RUN, command=command, action=command.action,
+                            target=command.target, value=command.value,
+                            log=self.log_line(command.action, command.target, actor, moment,
+                                              done=True, value=command.value),
+                            text=f"{found.label}: sent.")
         if command.value:
             # A picked value *changes* something (a model, an effort, a role), so it always
             # asks for the second tap, whatever the bare control's own rule is (#153).

@@ -88,6 +88,15 @@ class Control:
     #: does not have yet (an ``/admit`` handle): the prompt the page shows beside its button,
     #: and empty for every control that either needs no value or picks one (#345).
     typed: str = ""
+    #: A control the *dashboard page* offers and the chat keyboard does not (#451): one form
+    #: of dropdowns and one Apply cannot be a keypad, and a chat button for it would carry no
+    #: value and answer nothing. It is still wired, so a typed ``ctl:`` code runs it.
+    page_only: bool = False
+    #: A valued press that runs without a second tap (#451). #153's rule is that a picked
+    #: value asks twice because it *changes* something -- and the admin's complaint was that
+    #: setting a model took two presses. A settings form starts nothing and stops nothing, so
+    #: it is one tap, with the same durable CONTROL line.
+    one_tap: bool = False
 
 
 CONTROLS: Tuple[Control, ...] = (
@@ -105,6 +114,11 @@ CONTROLS: Tuple[Control, ...] = (
                  "brings it back, so start it on the host"),
     Control("bot.model", "Model", report=True),
     Control("bot.effort", "Effort", report=True),
+    # #451: the whole settings form as one press. Only the fields that changed are in the
+    # value, so one Apply is one line -- and no second tap: setting a model or an effort
+    # starts nothing, and the admin's complaint was that it took two presses.
+    Control("bot.settings", "Apply", page_only=True, one_tap=True, report=True,
+            note="only the fields you changed are sent"),
     Control("bot.cli", "CLI", note="read-only commands only", report=True),
     Control("bot.memory", "Memory", confirm=True,
             note="empties this bot's memory.md for good"),
@@ -150,6 +164,52 @@ def typed(action: str) -> str:
     return str(found.typed) if found else ""
 
 
+#: The per-turn settings the dashboard's one form carries (#451), in the order it draws them:
+#: the key a setting is stored under and the command that sets it. These are the adapter
+#: knobs a *turn* takes a flag for (``config.EFFORT_FLAGS`` and ``config.MODEL_TYPES``);
+#: everything else in ``adapter`` (cwd, command, permissions, timeout) is read when the CLI
+#: is launched, not per turn, so a dashboard that offered it would be lying about when it
+#: takes effect -- see docs/telegram/COMMANDS.md.
+SETTING_ACTIONS: Tuple[Tuple[str, str], ...] = (("model", "bot.model"),
+                                                ("effort", "bot.effort"))
+
+SETTING_KEYS: Tuple[str, ...] = tuple(key for key, _ in SETTING_ACTIONS)
+
+#: What separates two ``key=value`` pairs in one press's value (#451): ``model=opus;effort=high``.
+SETTINGS_SEPARATOR = ";"
+
+
+def setting_action(key: str) -> str:
+    """The control one setting is set through, or ``""`` for a key this build has not."""
+    for name, action in SETTING_ACTIONS:
+        if name == str(key):
+            return action
+    return ""
+
+
+def settings_value(pairs: Iterable[Tuple[str, str]]) -> str:
+    """``[("model", "opus")]`` -> ``model=opus``: the value one Apply carries."""
+    return SETTINGS_SEPARATOR.join(f"{str(key)}={str(value)}" for key, value in pairs
+                                  if str(value))
+
+
+def parse_settings(value: str) -> List[Tuple[str, str]]:
+    """``model=opus;effort=high`` -> ``[("model", "opus"), ("effort", "high")]`` (#451).
+
+    Only what a form sent: a pair with no ``=`` or with nothing after it is not a setting and
+    is dropped rather than guessed at. A key this build does not know is kept, so the answer
+    can name it back instead of pretending the field was never sent.
+    """
+    out: List[Tuple[str, str]] = []
+    for part in str(value or "").split(SETTINGS_SEPARATOR):
+        key, sep, wanted = part.partition("=")
+        key, wanted = key.strip(), wanted.strip()
+        if not sep or not key or not wanted:
+            continue
+        out.append((key, wanted))
+    return out
+
+
 #: The controls that can only ever be answered by **this bot** -- its CLI allowlist and its
 #: memory file. A press for another bot would answer about the wrong one (a report describes
 #: the bot that answers) or empty the wrong file, so the page draws them on this bot's own card
@@ -193,7 +253,7 @@ def peer_self_only(action: str, target: str, alias: str) -> str:
 #: ``/reasoning`` rules (its adapter's allowed list, its own per-topic scope). So the answer
 #: says *sent*, and the bot's card shows the new value only once its own beat reports it: a
 #: forward is not a setting, and a page that claimed otherwise would be guessing.
-REMOTE_PICKS: Tuple[str, ...] = ("bot.model", "bot.effort")
+REMOTE_PICKS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.settings")
 
 
 def remote_pick(action: str) -> bool:
@@ -334,8 +394,8 @@ def keyboard(actions: Iterable[str]) -> List[List[Dict[str, str]]]:
     buttons = []
     for action in actions:
         found = control(action)
-        if found is None:
-            continue
+        if found is None or found.page_only:
+            continue                          # a form, not a keypad: the page draws it (#451)
         buttons.append({"text": found.label, "callback_data": callback_data(action)})
     return [buttons[index:index + PER_ROW] for index in range(0, len(buttons), PER_ROW)]
 

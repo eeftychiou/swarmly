@@ -475,6 +475,11 @@ def controls_view(controls: Optional[Mapping[str, Any]] = None) -> Optional[Dict
         }
         if raw.get("then"):
             row["then"] = _picks(raw.get("then"))
+        if isinstance(raw.get("settings"), Mapping):
+            # One form per card (#451): each bot's dropdowns, prefilled with what it runs.
+            # Fields and their choices are read by name; nothing else reaches the page.
+            row["settings"] = {str(alias): _fields(fields)
+                               for alias, fields in raw["settings"].items()}
         if isinstance(raw.get("per_bot"), Mapping):
             # One pick per card (#373): a model or an effort offered for a bot is that bot's
             # own list, as its beat reported it -- never one bot's list shown for another.
@@ -490,6 +495,25 @@ def _picks(raw: Any) -> List[Dict[str, str]]:
     for pair in raw or ():
         if isinstance(pair, (list, tuple)) and len(pair) == 2:
             out.append({"label": str(pair[0]), "value": str(pair[1])})
+    return out
+
+
+def _fields(raw: Any) -> List[Dict[str, Any]]:
+    """One card's settings form, read by name (#451): key, label, current value, choices.
+
+    A field with no key, or with choices that are not pairs, is dropped: the page draws what
+    it is given and nothing it has to guess at.
+    """
+    out: List[Dict[str, Any]] = []
+    for field in raw or ():
+        if not isinstance(field, Mapping):
+            continue
+        key = str(field.get("key") or "")
+        if not key:
+            continue
+        out.append({"key": key, "label": str(field.get("label") or key),
+                    "value": str(field.get("value") or ""),
+                    "choices": _picks(field.get("choices"))})
     return out
 
 
@@ -1568,6 +1592,9 @@ function control(state, action) {
 // cards' picks never mix -- and put back by picker() and the typed input on the next render.
 // It goes when it is pressed, when it is cleared, or when the choice stops being offered.
 const PENDING = {};
+//: Where the caret was in each typed control, by its key: the value is kept across a redraw
+//: (#449), and so is the place in it, so editing in the middle does not jump to the end.
+const CARET = {};
 //: The control that had the keyboard, so a re-render does not take it away mid-typing.
 let FOCUS = "";
 
@@ -1606,6 +1633,12 @@ function restoreFocus() {
   for (let at = 0; at < nodes.length; at += 1) {
     if (nodes[at].dataset.pending !== FOCUS) continue;
     try { nodes[at].focus(); } catch (err) { /* a disabled control cannot take it back */ }
+    // And where the caret was, when it takes one: a redraw that keeps the text and moves the
+    // caret to the end still edits the wrong place (review, #451).
+    const caret = CARET[FOCUS];
+    if (caret !== undefined && typeof nodes[at].setSelectionRange === "function") {
+      try { nodes[at].setSelectionRange(caret, caret); } catch (err) { /* not a text field */ }
+    }
     return;
   }
   FOCUS = "";                        // the control is gone: nothing to give the keyboard to
@@ -1640,9 +1673,72 @@ function picker(forAction, choices, first, key) {
 }
 
 // One control, drawn where the thing it changes is: what it needs to know, then its button.
+// One bot's settings as one press (#451): a dropdown per setting, prefilled with what that bot
+// runs right now, and one Apply. Only the fields the admin changed are sent -- re-sending a
+// value that is already set is the press that used to answer "done" and change nothing (#450).
+// A kept pick (#449) survives the 3 s redraw here too, and goes once the bot reports it.
+function settingsForm(button, target, fields, box) {
+  const reads = fields.map((field) => {
+    const key = pendingKey(target, button.action + ":" + field.key);
+    const select = el("select", "");
+    select.dataset.for = button.action + ":" + field.key;
+    select.dataset.pending = key;
+    select.setAttribute("aria-label", field.label + " for " + (target || "this bot"));
+    select.disabled = !ADMIN;
+    // The bot's own value stands first, and it is not a choice: a dropdown that opened on the
+    // first available model looked like a pick nobody made -- and Apply on an untouched form
+    // then sent it (review, #451). The blank carries what the bot runs now.
+    const now = el("option", "", field.value || "not set");
+    now.value = "";
+    select.append(now);
+    (field.choices || []).forEach((choice) => {
+      const option = el("option", "", choice.label);
+      option.value = choice.value;
+      select.append(option);
+    });
+    let kept = pendingGet(key);
+    if (kept !== null && kept === field.value) kept = null;
+    if (kept !== null) pendingSet(key, kept);
+    else pendingSet(key, "");            // the bot runs it now: nothing left to send
+    if (kept !== null) select.value = kept;
+    select.addEventListener("change", () => {
+      pendingSet(key, select.value);
+      rememberFocus(key);
+    });
+    select.addEventListener("focus", () => rememberFocus(key));
+    box.append(el("span", "sub", field.label));
+    box.append(select);
+    return {field, key, select};
+  });
+  const go = el("button", "", button.label || "Apply");
+  go.type = "button";
+  go.disabled = !ADMIN;
+  if (button.note) go.title = button.note;
+  go.addEventListener("click", () => {
+    // Only a field the admin actually picked a new value for is sent: what the dropdown shows
+    // untouched is the bot's own value, not a choice (#451).
+    const changed = [];
+    reads.forEach((read) => {
+      const kept = pendingGet(read.key);
+      if (kept && kept !== read.field.value) changed.push(read.field.key + "=" + kept);
+    });
+    if (!changed.length) {
+      toast("nothing changed: pick a new value first", "bad");
+      return;
+    }
+    press(button.action, target || "", changed.join(";"));
+  });
+  box.append(go);
+  return box;
+}
+
 function controlNode(button, target) {
   const box = el("span", "control");
   box.dataset.action = button.action;
+  // One form for one bot's settings (#451): its own dropdowns, prefilled with what that bot
+  // says it runs, and one Apply. Drawn instead of a picker, never beside one.
+  const fields = (button.settings || {})[target || ""];
+  if (fields && fields.length) return settingsForm(button, target, fields, box);
   let pick = null, then = null, typed = null;
   // A pick for *this* card's bot uses that bot's own list (#373): the page never offers one
   // bot's models or efforts for another, and a bot that has not reported any offers none.
@@ -1672,6 +1768,7 @@ function controlNode(button, target) {
       // Kept raw, trimmed only when the press reads it: a trailing space eaten every 3 s, or a
       // caret that jumps to the end mid-edit, is the redraw showing through (review, #449).
       pendingSet(typed.dataset.pending, typed.value);
+      CARET[typed.dataset.pending] = typed.selectionStart;
       rememberFocus(typed.dataset.pending);
     });
     typed.addEventListener("focus", () => rememberFocus(typed.dataset.pending));
@@ -1718,10 +1815,16 @@ function controlsFor(state, where, target) {
   const view = state.controls;
   if (view && view.ready) {
     const mine = !target || target === view.self;
+    // What the card's one form already carries is not drawn beside it (#451): a Model picker
+    // next to a Model dropdown is the two-step the admin asked to be rid of.
+    const form = (view.controls || []).find((row) => row.settings);
+    const carried = form ? (form.settings[target || ""] || []).map((field) => "bot." + field.key)
+      : [];
     (view.controls || [])
       // Model, effort, CLI and memory are this bot's own: drawn on its card, never on a
       // peer's, because a pick is applied by the bot the press lands on (review, #345).
       .filter((row) => row.where === where && (mine || !row.self_only))
+      .filter((row) => !carried.includes(row.action))
       .forEach((row) => box.append(controlNode(row, target)));
   }
   return box;
