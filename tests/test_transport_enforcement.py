@@ -190,6 +190,16 @@ class ChannelEnforcementTests(unittest.TestCase):
         self.assertIn("@ReasonixBot", posted)                       # the stand-in is
         self.assertEqual([r.kind for r in channel.drift.live()], ["addressed_frozen_peer"])
 
+    def test_a_handle_quoted_in_code_is_not_addressed(self):
+        """Live, 27 Oct: three bots were reset for quoting `/owed close @Codex` to the admin."""
+        channel, _ = self.channel("Use `/owed close @AntigravityBot` in the topic.")
+        run(channel.handle_event(event("@HermesBot how do I close it?", thread_id=9400,
+                                       message_id=41)))
+        posted = channel._test_sender.sent[-1]["text"]
+        self.assertNotIn("Not delivered", posted)
+        self.assertIn("@AntigravityBot", posted)                    # quoted as written
+        self.assertEqual(channel.drift.live(), [])
+
     def test_the_sender_is_told_in_its_own_token_space_once(self):
         """Admin, 24 Oct: the refusal reaches the sender as a turn, and it takes corrective
         action -- but a sender that repeats itself is not woken in a loop."""
