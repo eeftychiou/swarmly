@@ -13,7 +13,7 @@ import asyncio
 import json
 import time
 import unittest
-from typing import Any
+from typing import Any, Dict
 from unittest import mock
 
 from swarmly.telegram import channel as channel_mod

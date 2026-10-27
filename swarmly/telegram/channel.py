@@ -42,8 +42,8 @@ import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Set,
-                    Tuple, Union)
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, MutableMapping,
+                    NamedTuple, Optional, Set, Tuple, Union)
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -12299,15 +12299,15 @@ class AgentChannel:
         if self.dispatcher is not None:
             asyncio.ensure_future(self.dispatcher.stop_polling())
 
-    def carry_out_restart(self, pending: Mapping[str, Any]) -> None:
+    def carry_out_restart(self, pending: MutableMapping[str, Any]) -> None:
         """Run a restart **this** press asked for, once its answer has been delivered (#432).
 
         ``request_restart`` stops polling, and the shutdown takes the bot's connection with it.
         A press that restarted first left its CONTROL note failing and told the presser "the
-        press failed" while the restart went through -- what the admin saw live. So
-        So the press only asks -- ``_run_control_now`` writes the request into the value the
-        press was given -- and the caller that delivers its answer calls this after sending
-        it: the page's response, the chat answer or the note is out before polling stops.
+        press failed" while the restart went through -- what the admin saw live. So the press
+        only asks -- ``_run_control_now`` writes the request into the value it was given -- and
+        the caller that delivers its answer calls this after sending it: the page's response,
+        the chat answer or the note is out before polling stops.
 
         The value belongs to the press, never to the channel (#442): two presses at once each
         carry out their own restart, and neither can cancel the other's.
