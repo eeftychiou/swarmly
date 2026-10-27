@@ -71,7 +71,6 @@ async def delete_message_ids(host: Any, chat_id: int, ids: Sequence[int], *,
                              limit: Optional[int] = None
                              ) -> Tuple[List[int], List[int], List[int]]:
     """Delete ``ids`` in Telegram's 100-per-call batches: (deleted, refused, unasked).
-
     ``deleteMessages`` is all-or-nothing: one id the bot cannot touch -- a peer's post in
     Swarm pulse, a message already gone -- refuses the whole call (#395, live 27 Oct: one
     such id in each batch meant the batch was dropped and the pulse kept growing). So a batch
@@ -81,8 +80,9 @@ async def delete_message_ids(host: Any, chat_id: int, ids: Sequence[int], *,
     The fallback is one Bot API call per id, so it is paced (``pause``, default
     :data:`SINGLE_DELETE_PAUSE`) and capped (``limit``, default :data:`SINGLE_DELETE_MAX`);
     what it did not get to comes back as ``unasked`` and waits for the next sweep. A host
-    that raises :class:`DeleteUnavailable` was not answered by Telegram at all: that id and
-    everything after it are ``unasked`` too, never ``refused`` (#398).
+    that raises :class:`DeleteUnavailable`, raises anything else, or answers ``None`` was not
+    answered by Telegram at all: that id and everything after it are ``unasked`` too, never
+    ``refused`` (#398, #400) -- only a call that came back with a count settles an id.
     """
     sleep = asyncio.sleep if sleep is None else sleep
     pause = SINGLE_DELETE_PAUSE if pause is None else max(0.0, float(pause))
@@ -97,15 +97,28 @@ async def delete_message_ids(host: Any, chat_id: int, ids: Sequence[int], *,
         if not batch:
             continue
         try:
-            got = int(await host.cleanup_delete_messages(chat_id, batch) or 0)
+            answer = await host.cleanup_delete_messages(chat_id, batch)
         except DeleteUnavailable as exc:
             logger.warning("could not ask Telegram to delete %d message(s) (%s); keeping them "
                            "for the next sweep", len(ids) - start, exc)
             unasked.extend(ids[start:])
             return deleted, refused, unasked
-        except Exception:                                  # noqa: BLE001 - ask per id below
-            logger.exception("could not delete %d message(s)", len(batch))
-            got = 0
+        except Exception:                                  # noqa: BLE001 - not a refusal
+            # An unexpected error is Telegram not answering, not Telegram saying no: keeping
+            # the ids is safe (they are still ours to delete) while dropping them as refused
+            # would lose notices an outage was never about (#400).
+            logger.exception("could not ask Telegram to delete %d message(s); keeping them "
+                             "for the next sweep", len(batch))
+            unasked.extend(ids[start:])
+            return deleted, refused, unasked
+        if answer is None:
+            # The host's own "could not ask" (issue #400): 0 means Telegram refused, None means
+            # nobody answered, so only the first settles the ids.
+            logger.warning("no answer for %d message(s); keeping them for the next sweep",
+                           len(batch))
+            unasked.extend(ids[start:])
+            return deleted, refused, unasked
+        got = int(answer or 0)
         if got >= len(batch):
             deleted.extend(batch)
             continue
@@ -124,16 +137,26 @@ async def delete_message_ids(host: Any, chat_id: int, ids: Sequence[int], *,
                     await waited
             singles += 1
             try:
-                ok = int(await host.cleanup_delete_messages(chat_id, [message_id]) or 0) > 0
+                one = await host.cleanup_delete_messages(chat_id, [message_id])
             except DeleteUnavailable as exc:
                 logger.warning("could not ask Telegram to delete message %s (%s); keeping it "
                                "and the rest for the next sweep", message_id, exc)
                 unasked.extend(batch[position:])
                 unasked.extend(ids[start + DELETE_BATCH:])
                 return deleted, refused, unasked
-            except Exception:                              # noqa: BLE001 - report, go on
-                logger.exception("could not delete message %s", message_id)
-                ok = False
+            except Exception:                          # noqa: BLE001 - not a refusal either
+                # Same rule one id down (#400): an error is "could not ask", so this id and
+                # the rest stay offered; only a call that came back with 0 was refused.
+                logger.exception("could not ask Telegram about message %s; keeping it and the "
+                                 "rest for the next sweep", message_id)
+                unasked.extend(batch[position:])
+                unasked.extend(ids[start + DELETE_BATCH:])
+                return deleted, refused, unasked
+            if one is None:
+                unasked.extend(batch[position:])
+                unasked.extend(ids[start + DELETE_BATCH:])
+                return deleted, refused, unasked
+            ok = int(one) > 0
             (deleted if ok else refused).append(message_id)
     return deleted, refused, unasked
 
@@ -355,7 +378,10 @@ class Cleanup:
       ``open_reason`` set when it has open work
     * ``cleanup_home_chat() -> Optional[int]`` -- the home group's chat id
     * ``cleanup_delete_topic(chat_id, thread_id) -> bool`` (awaited)
-    * ``cleanup_delete_messages(chat_id, ids) -> int`` (awaited): how many went
+    * ``cleanup_delete_messages(chat_id, ids) -> Optional[int]`` (awaited): how many went, or
+      ``None`` when Telegram could not be asked -- that is not a refusal, so the ids stay
+      offered. An exception means the same; raise
+      :class:`~swarmly.telegram.cleanup.DeleteUnavailable` for the ordinary cases.
     * ``cleanup_forget_topic(chat_id, thread_id)`` (awaited): forget it, and tell the peers
     """
 

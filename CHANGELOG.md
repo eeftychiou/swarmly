@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A delete that could not be asked about is never counted as refused, whatever shape the
+  answer takes (`#400`). `delete_message_ids` read a host's `0` as "Telegram refused these",
+  so a host with no bot attached, a network error or a `429` that surfaced as an error (rather
+  than as `DeleteUnavailable`) marked every id refused, and both callers then dropped them from
+  the ledger — one outage lost every notice that was due. The wrapper now signals "not asked"
+  separately: an exception, or `None` from `cleanup_delete_messages` (the host protocol now
+  says `Optional[int]`), keeps that id and every id after it for the next sweep, and only a
+  call that came back with a count settles an id as deleted or refused.
+
 - A sweep that can delete nothing waits instead of asking every minute (`#400`). A bot that
   lost `can_delete_messages` — or a chat that answers "no" for any other reason — was re-asked
   once a minute for the whole 48-hour delete window, where `#398`'s fix turned the old
