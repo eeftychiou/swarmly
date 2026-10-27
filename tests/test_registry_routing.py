@@ -186,6 +186,17 @@ class ChannelRoutingTests(unittest.TestCase):
                                            thread_id=TOPIC)))
             self.assertEqual(adapter.prompts, [], facts)
 
+    def test_a_delegation_written_getting_or_letting_is_recognised_too(self):
+        """#363: the guard's verb group ended in ``(?:s|ing)?``, so "getting" and "letting"
+        were not read as a hand-off and the named bot took the work meant for the other one."""
+        for text in ("@AntigravityBot: getting @HermesBot to take the QA",
+                     "@AntigravityBot: letting @HermesBot handle the QA",
+                     "@AntigravityBot: giving @HermesBot the QA work"):
+            with self.subTest(text=text):
+                channel, adapter, _ = channel_for(ME_LINKED)
+                run(channel.handle_event(event(text, thread_id=TOPIC)))
+                self.assertEqual(adapter.prompts, [])
+
     def test_without_registry_facts_the_mention_rules_decide(self):
         channel, adapter, _ = channel_for(None)
         run(channel.handle_event(event("@HermesBot please review #12", thread_id=TOPIC)))
