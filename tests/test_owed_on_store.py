@@ -362,7 +362,8 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(store.shared, channel.state_link.shared_owed_rows)
 
     def test_shadow_mode_keeps_gitbus(self):
-        channel = make_channel(make_config(state={"backend": "telegram"}))
+        # #424: on the store the default is `store`, so shadow is asked for explicitly.
+        channel = make_channel(make_config(state={"backend": "telegram", "owed": "shadow"}))
         self.assertIsNone(channel.owed_store().shared)
 
 

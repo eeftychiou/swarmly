@@ -151,6 +151,25 @@ bus:
   # senders: [codex, claude]             # optional: deliver only these senders
   # allow_unsigned: false                # true turns off signature checks: local demos only
 
+# The topic registry's shared state store (docs/telegram/PROTOCOL.md §11). Off unless turned on:
+# with no `state:` section everything below stays off and the swarm runs on gitbus as before.
+# state:
+#   backend: telegram                  # off (default) or telegram: the op log and the pinned
+#                                      # snapshot in 📡 Swarm pulse, the lease and the owed table
+#   mode: shadow                       # shadow is the only mode for now
+#   heartbeat_minutes: 10              # each bot's heartbeat key, and the registry sync cadence
+#   # The four registry flags. Omitted, they take the registry side on the store and the legacy
+#   # one off it (#424): `store`/`store`, `registry`/`registry` with `backend: telegram`, and
+#   # `shadow`/`shadow`, `legacy`/`legacy` with `backend: off`. Set any of them explicitly to
+#   # downgrade a single path; each value is validated as before.
+#   lease: store                       # store: the store's lease is the coordinator lease
+#   owed: store                        # store: the owed / WAIT table lives in the store
+#   links: registry                    # registry: a notification's topic follows the item's links
+#   routing: registry                  # registry: the transport routes each topic's messages
+#   dir: /path/to/state                # where this bot keeps its own state files (unset: beside
+#                                      # config.yaml); never a folder shared with other bots
+# `bus.transport` keeps its own default (git): turning gitbus off by default is a later phase.
+
 limits:
   max_message_chars: 4096              # Telegram's hard limit for text messages
   max_reply_parts: 4                   # a longer reply is split into up to this many messages

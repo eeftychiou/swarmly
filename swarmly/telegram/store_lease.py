@@ -13,8 +13,9 @@ lease-holder write by term. Times cross the boundary converted: the fold keeps s
 the transport compares against its own clock, so ``state()`` reports ``expires_at`` in the
 bot's own clock (server expiry minus the offset the store measures).
 
-``state.lease: shadow`` (the default once the store is on) keeps gitbus authoritative and only
-compares the two leases; ``/state`` says whether they agree.
+``state.lease: shadow`` (the default with the store off, and still honoured on it) keeps gitbus
+authoritative and only compares the two leases; ``/state`` says whether they agree. On the store
+an omitted flag is ``store`` (phase 9b, ``#424``): the fold's lease is the coordinator lease.
 """
 
 from __future__ import annotations

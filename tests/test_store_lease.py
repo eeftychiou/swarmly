@@ -186,10 +186,11 @@ class ChannelUsesTheStoreLeaseTests(unittest.TestCase):
                 return await channel.check_lease()
         self.assertIsNone(asyncio.run(go()))
 
-    def test_the_default_keeps_the_gitbus_lease(self):
+    def test_a_shadow_lease_keeps_the_gitbus_lease(self):
         from swarmly.telegram.lease import LeaseStore
         from tests.test_telegram_channel import make_channel, make_config
-        channel = make_channel(make_config(state={"backend": "telegram"}))
+        # #424: on the store the lease defaults to `store`; the gitbus lease is the explicit ask.
+        channel = make_channel(make_config(state={"backend": "telegram", "lease": "shadow"}))
         self.assertEqual(channel.state_link.lease_mode, "shadow")
         self.assertIsInstance(channel.lease_store(), LeaseStore)
 

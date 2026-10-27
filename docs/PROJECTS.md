@@ -45,10 +45,13 @@ When a message arrives in a topic:
 
 gitbus is **optional**. The transport's own registry — one record per topic, holding its links,
 its work items with phases and assignees, the lease and the owed table — can live in the
-**Telegram state store** instead, so a swarm needs no bus repository at all. None of these flags
-is switched on by default today; the flags, their values and what each switches are in
-[`telegram/PROTOCOL.md` §11](telegram/PROTOCOL.md#117-the-flags), and a setup that needs no git
-at all is in [QUICKSTART.md](QUICKSTART.md).
+**Telegram state store** instead, so a swarm needs no bus repository at all. On that store the
+registry side is the default (`#424`): with `state.backend: telegram` the lease and the owed
+table are `store` and `links`/`routing` are `registry` unless a config says otherwise. With the
+store off, every default is the legacy path, so no existing config changes. `bus.transport` is
+not one of them — gitbus off by default is a later phase. The flags, their values and what each
+switches are in [`telegram/PROTOCOL.md` §11](telegram/PROTOCOL.md#117-the-flags), and a setup
+that needs no git at all is in [QUICKSTART.md](QUICKSTART.md).
 
 What replaces `bus.repo`:
 

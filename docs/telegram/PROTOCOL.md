@@ -552,11 +552,14 @@ routes from that record instead of from mention heuristics. The design is
 [`docs/design/topic-registry.md`](../design/topic-registry.md) §1–4; this section is what a
 conforming transport does, and the flag each part is switched by.
 
-**Most of what is below ships behind its flag, and the legacy path is still the default today.**
-A config that sets none of the flags behaves exactly as it did before §11 existed. Phase 9 (§6
-of the design) makes the `on` values the defaults and removes the legacy code. Two parts are
-already live with no flag at all: the per-topic session every adapter keeps (§11.5) and the
-session-scoped drift score (§11.6).
+**Most of what is below ships behind its flag.** With the store off — no `state:` section at
+all — the legacy path is still the default, and a config that sets none of the flags behaves
+exactly as it did before §11 existed. With `state.backend: telegram` the four registry flags
+default to the registry side instead (phase 9b, `#424`: the daggered rows in §11.7), so from
+there the registry paths are what runs unless a flag says otherwise. What is left for phase 9
+(§6 of the design) is removing the legacy code — and `bus.transport` keeps its default until 9c.
+Two parts are already live with no flag at all: the per-topic session every adapter keeps
+(§11.5) and the session-scoped drift score (§11.6).
 
 ### 11.1 The shared state store
 
@@ -590,8 +593,8 @@ plane is then the store, and it needs `state.backend: telegram`.
 
 ### 11.2 Routing from the registry
 
-With `state.routing: registry` (default `legacy`) the transport, not each bot's mention rules,
-decides who takes a message in a work topic: the **coordinator** (the lease holder) takes every
+With `state.routing: registry` (default `legacy`, `registry` once the store is on) the transport,
+not each bot's mention rules, decides who takes a message in a work topic: the **coordinator** (the lease holder) takes every
 message that is not addressed only to other agents; another **linked** agent takes one only when
 it names it, replies to it, or hands it work (an `ASSIGN:` line); a mention of an **unlinked**
 agent links it when the author is the coordinator or the admin, and is refused with a transport
@@ -676,15 +679,23 @@ that drifts from the code fails the suite.
 | `state.mode` | `shadow` | `shadow` | 1 | The store runs beside today's logic and nothing acts on it. |
 | `state.heartbeat_minutes` | `10` | minutes > 0 | 1 | How often each bot writes its heartbeat key, and the registry sync every bot runs at that cadence. |
 | `state.dir` | `unset` | a path | 1 | Where this bot keeps its own state files (the store's cache, sessions, the topic map). |
-| `state.lease` | `shadow` | `shadow`, `store` | 3 | `store`: the store's lease is the coordinator lease (`bus.transport: telegram` made it possible). |
-| `state.owed` | `shadow` | `shadow`, `store` | 3 | `store`: the owed / `WAIT` table lives in the store, and nothing goes to gitbus. |
+| `state.lease` | `shadow` † | `shadow`, `store` | 3 | `store`: the store's lease is the coordinator lease (`bus.transport: telegram` made it possible). |
+| `state.owed` | `shadow` † | `shadow`, `store` | 3 | `store`: the owed / `WAIT` table lives in the store, and nothing goes to gitbus. |
 | `bus.transport` | `git` | `git`, `folder`, `gdrive`, `telegram` | 3 | `telegram`: gitbus is off; the store is the durable plane (needs `state.backend: telegram`). |
 | `limits.general_turns` | `allow` | `allow`, `never` | 4 | `never`: no model turn in General or Swarm pulse; work typed there gets its own topic. |
-| `state.links` | `legacy` | `legacy`, `registry` | 5 | `registry`: a notification's topic comes from the item's links, not from ref-learning. |
-| `state.routing` | `legacy` | `legacy`, `registry` | 6 | `registry`: the transport routes from the registry (§11.2), not each bot's mention rules. |
+| `state.links` | `legacy` † | `legacy`, `registry` | 5 | `registry`: a notification's topic comes from the item's links, not from ref-learning. |
+| `state.routing` | `legacy` † | `legacy`, `registry` | 6 | `registry`: the transport routes from the registry (§11.2), not each bot's mention rules. |
 | `adapter.type` | `echo` | any adapter, `claude_thread` for Claude | 7 | `claude_thread`: one resumable session per topic, like the other adapters. |
 | `adapter.session_turn_limit` | `unset` | turns > 0 | 7 | Turns a topic's session may run before the adapter hands over to a new one. |
 | `adapter.session_token_limit` | `unset` | tokens > 0 | 7 | Input tokens a resumed session may reach before the next turn starts a new one. |
+
+† **On the store these four default to the registry side** (`#424`, phase 9b of `#260`): with
+`state.backend: telegram` an omitted `state.lease`/`state.owed` is `store` and an omitted
+`state.links`/`state.routing` is `registry`. The value in the column is the default with the
+store off — with no `state:` section at all as well — so an existing config loads unchanged and
+raises no new error. An explicit `shadow`/`legacy` is honoured on either backend: downgrading is
+one config line per flag. `bus.transport` keeps its default, and turning gitbus off by default
+is 9c's.
 
 The snapshot's own cadence (900 s, or 25 ops) is a constant in the code, not a setting.
 

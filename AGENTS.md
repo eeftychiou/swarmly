@@ -65,8 +65,11 @@ instead, so a swarm needs no bus repository. That takes `state.backend: telegram
 the pinned snapshot in 📡 Swarm pulse) plus `bus.transport: telegram`; `state.lease: store` and
 `state.owed: store` move the lease and the owed / `WAIT` table there, and `state.dir` names the
 folder where each bot keeps its own copy (unset: beside `config.yaml`). `bus.repo` is then unset
-and nothing is polled on git. No flag is on by default yet; the list, with each default today,
-is [`docs/telegram/PROTOCOL.md` §11](docs/telegram/PROTOCOL.md#117-the-flags).
+and nothing is polled on git. On that store the registry side is the default (`#424`):
+`state.lease`/`state.owed` are `store` and `state.links`/`state.routing` are `registry` unless a
+config says otherwise, while with the store off every default is the legacy path and no existing
+config changes. The list, with both defaults, is
+[`docs/telegram/PROTOCOL.md` §11](docs/telegram/PROTOCOL.md#117-the-flags).
 
 **Topic-to-project routing.** Agents configure `projects:` in `config.yaml` to bind
 Telegram forum topics (by numeric topic id) to project repositories and checkouts (with

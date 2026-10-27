@@ -298,6 +298,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- The topic registry's flags are **on by default on the store** (`#424`, phase 9b of `#260`).
+  With `state.backend: telegram`, an omitted flag now defaults to the registry side:
+  `state.lease: store`, `state.owed: store`, `state.links: registry`, `state.routing: registry`.
+  With `state.backend: off` — or no `state:` section at all — every default stays exactly as it
+  was (`shadow` for the lease and the owed table, `legacy` for links and routing), so existing
+  configs load unchanged and raise no new `ConfigError`. An explicit `shadow`/`legacy` is still
+  honoured on the store too: downgrading is one config line per flag, and each value is still
+  validated as before. `bus.transport` keeps its default (gitbus off by default is 9c).
+  Nothing changes for a running bot until it is restarted on a build that includes this;
+  §11.7 of `docs/telegram/PROTOCOL.md`, `docs/PROJECTS.md` and the config template state both
+  defaults now.
+
 - The pinned dashboard is **one clear row per bot** (`#241`). The card opened with alerts and
   then a dense line per bot; it now opens with a header line (the round, the swarm's spend
   today — turns, tokens, cost — and the time of the last refresh), then one row per bot in a
