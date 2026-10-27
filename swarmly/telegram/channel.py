@@ -2047,8 +2047,18 @@ class AgentChannel:
         if event.thread_id is None:
             return ("❌ /rotate works inside a topic: the session it retires is that topic's. "
                     "Send it in the topic you want rotated.")
-        if not self.topics.context(event.chat_id, event.thread_id):
+        context_id = self.topics.context(event.chat_id, event.thread_id)
+        if not context_id:
             return "❌ This topic has no session yet: there is nothing to rotate."
+        # A rotation already waiting for its first turn has one already: rotating again would
+        # either be a no-op (Claude refuses a second handover) or spend a second handover turn
+        # (Reasonix), so say what is true instead of "no handover came" (review, #436).
+        adapter = self._adapter_for(event.chat_id, event.thread_id)
+        pending = getattr(getattr(adapter, "_handovers", None), "pending", None)
+        if callable(pending) and pending(context_id):
+            return (f"♻️ {self.config.identity.alias} is already rotated here: this topic's "
+                    "next turn starts the new session, and it is still waiting for its first "
+                    "turn.")
         rotated = await self._rotate_topic_session(
             event.chat_id, event.thread_id,
             lead="[The admin rotated your session for this topic. Read your rulebook again "
