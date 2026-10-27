@@ -194,7 +194,8 @@ def stall_text(row: Row, step: str, *, minutes: float, unable: str = "",
         return (f"{row.debtor} still owes {row.owes} on {row.subject} and {waited}. "
                 f"Coordinator: reassign it or escalate it; the table says nobody else can.")
     return (f"{row.debtor} owes {row.owes} on {row.subject}, {waited}, and two rungs of "
-            f"reminders have not moved it. The admin should decide.")
+            f"reminders have not moved it. The admin should decide: if it no longer applies, "
+            f"/owed close in that discussion clears it.")
 
 
 def moment_of(row: Row) -> float:

@@ -1802,6 +1802,9 @@ class AgentChannel:
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
                 return None
+        elif command == "owed" and command_args(event.text or "")[:1] == ["close"]:
+            if not self.is_coordinator():
+                return None                         # one bot answers a bare /owed close
         elif not (self.mentions_me(event.text or "") or event.replies_to_bot
                   or self._direct_chat(event)):
             return None
@@ -5428,6 +5431,11 @@ class AgentChannel:
             await self.owed_settle_from_github(now=moment)
         except Exception:                          # noqa: BLE001 - a beat must not fail on it
             logger.warning("owed: the GitHub check failed this beat", exc_info=True)
+        # Live, 27 Oct: and a hand-off in a topic whose work has all finished is moot.
+        try:
+            self.owed_settle_topics_done(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("owed: the finished-topic check failed this beat", exc_info=True)
         # Round 5.5 (#162): the round state's own facts open and close rows each beat.
         try:
             self.owed_sweep(now=moment)
@@ -6495,13 +6503,115 @@ class AgentChannel:
     def _owed_command(self, event: Optional[ChannelEvent]) -> str:
         """``/owed[@bot]``: the rows this bot holds open -- facts, not a model's word (#162).
 
-        Read-only, like ``/round``: it reports, it changes nothing, and it costs no turn.
+        Read-only, like ``/round``: it reports, it changes nothing, and it costs no turn --
+        except ``/owed close [alias]``, the admin's answer to the stall ladder's last rung.
         """
+        args = [word.lower() for word in command_args(event.text or "")] if event else []
+        if args[:1] == ["close"]:
+            return self._owed_close_command(event, args[1:])
         try:
             return self.owed_store().summary()
         except Exception:                          # noqa: BLE001 - the command must answer
             logger.warning("owed: the table could not be read", exc_info=True)
             return "owed: cannot read the table (the log has the reason); this is not 'nothing is owed'"
+
+    def _owed_close_command(self, event: Any, args: List[str]) -> str:
+        """``/owed close [alias]``, from the admin in a discussion: close the rows owed there.
+
+        The table closes rows on facts and never on a bot's word, so a debt nobody can answer
+        any more -- a hand-off about work that ended elsewhere -- climbed to "the admin should
+        decide" with nothing the admin could do (live, 27 Oct). The admin's word is that fact.
+        Only rows placed in this discussion close, and only the named debtor's when one is
+        given; a debt on an item, not a place, is closed by GitHub and the round.
+        """
+        from swarmly.telegram.owed import Fact, settle
+        if event.author_is_bot or not self.config.is_admin(event.author_id):
+            return "⛔ only the admin can close owed rows"
+        who = args[0].lstrip("@") if args else ""
+        if who:
+            who = self.config.peer_alias_for(who) or who
+        try:
+            store = self.owed_store()
+            closed = settle(store.load(), Fact(kind="dismiss",
+                                               item=self._place_key(event.chat_id,
+                                                                    event.thread_id),
+                                               who=who))
+            if closed:
+                store.save_all(closed)
+        except Exception:                          # noqa: BLE001 - the command must answer
+            logger.warning("owed: /owed close failed", exc_info=True)
+            return "owed: could not close the rows here (the log has the reason)"
+        if not closed:
+            return f"Nothing{' ' + who if who else ''} owes anything here."
+        lines = [f"- {row.debtor} owed {row.owes}" for row in closed[:10]]
+        more = f"\n- and {len(closed) - 10} more" if len(closed) > 10 else ""
+        return f"Closed {len(closed)} owed row(s) here:\n" + "\n".join(lines) + more
+
+    def owed_settle_topics_done(self, *, now: Optional[float] = None) -> List[str]:
+        """Close the hand-offs made in a topic whose work has all finished since (live, 27 Oct).
+
+        A hand-off is answered by the peer's reply where it was made. When the work the topic
+        links (the registry's work items) has all merged or closed after the hand-off, the
+        question is moot and the peer may never speak there again, so the row only climbed the
+        stall ladder. A topic with no work links, or one still open, closes nothing, and a
+        hand-off made after the work finished is new work and stays.
+        """
+        import calendar
+        from swarmly.state import keys as K
+        from swarmly.telegram.owed import Fact, closes
+        registry = self.state_link.store
+        if registry is None or not getattr(registry, "ready", False) or self.held():
+            return []
+        moment = time.time() if now is None else float(now)
+        me = str(self.config.identity.alias or "").strip().lower()
+        store = self.owed_store()
+        coordinating: Optional[bool] = None
+        finished_at: Dict[str, float] = {}
+        closed: List[Any] = []
+        for row in store.open_rows(now=moment):
+            if row.kind != "handoff" or not row.topic:
+                continue
+            if str(row.debtor).strip().lower() != me:
+                if coordinating is None:
+                    coordinating = bool(self.is_coordinator(now=moment))
+                if not coordinating:
+                    continue
+            if row.topic not in finished_at:
+                at = 0.0
+                target = self._place_target(row.topic)
+                record = registry.read(K.topic(target[1])) \
+                    if target is not None and target[1] is not None else None
+                work = [link for link in ((record or {}).get("links") or [])
+                        if isinstance(link, dict) and link.get("role") == "work"]
+                if work and all(link.get("status") in ("closed", "abandoned")
+                                or link.get("phase") == "done" for link in work):
+                    for link in work:
+                        stamp = str(link.get("updated_at") or link.get("phase_at") or "")
+                        try:
+                            at = max(at, float(calendar.timegm(
+                                time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))))
+                        except ValueError:
+                            continue
+                finished_at[row.topic] = at
+            at = finished_at[row.topic]
+            if not at:
+                continue
+            reason = closes(row, Fact(kind="finished", item=row.topic, at=at))
+            if reason is None:
+                continue
+            row.state, row.closed_by, row.updated_at = "closed", reason, moment
+            closed.append(row)
+        if not closed:
+            return []
+        try:
+            store.save_all(closed)
+        except Exception:                          # noqa: BLE001 - the next beat tries again
+            logger.warning("owed: could not close the hand-offs of finished topics",
+                           exc_info=True)
+            return []
+        done = [f"closed {row.id} ({row.closed_by})" for row in closed]
+        logger.info("owed: %s", "; ".join(done[:8]))
+        return done
 
     def owed_store(self) -> Any:
         """This bot's expectations table: rows in its state, documents on the bus (#162).

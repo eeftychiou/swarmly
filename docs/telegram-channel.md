@@ -1585,7 +1585,12 @@ row), never a value another source wrote.
 What this transport infers and records **today**: the hand-off, and the facts the round
 state already carries. A reply that addresses a peer opens one row per peer addressed (the
 multi-recipient case that missed DeepSeek on 22 Oct), in the discussion it was made in; that
-peer's reply **in that discussion** closes it, and a reply anywhere else does not. A sweep on
+peer's reply **in that discussion** closes it, and a reply anywhere else does not. So does the
+end of the work it was about: when every work item the topic registry links to that topic has
+merged or closed **after** the hand-off, the hand-off closes as moot (one made after that is new
+work and stays). And the admin's `/owed close [alias]` in a discussion closes the rows placed
+there, or only the named debtor's: it is the decision the stall ladder's last rung asks for. A
+sweep on
 the heartbeat tick reads the round's items and opens the rest, each bound to the fact that
 opened it: a new head (CI owes a result, the reviewer and QA owe verdicts on **that** head), a
 fix-first or QA fail (the developer owes a new head), CI green with a merge verdict and a QA

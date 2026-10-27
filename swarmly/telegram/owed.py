@@ -489,10 +489,13 @@ def admin_row(*, question: str, item: str = "", topic: str = "", asked_by: str =
 class Fact:
     """Something that happened, which may answer one or more rows. Never prose.
 
-    ``kind`` is one of ``ci``, ``merge``, ``head``, ``verdict``, ``reply``, ``close``; a fact
-    about an item carries its ``item``, and the facts bound to one carry the ``head`` they are
-    about. A row is closed by the fact that answers *it* -- which is why the same fact closes
-    a CI row and leaves a progress row alone.
+    ``kind`` is one of ``ci``, ``merge``, ``head``, ``verdict``, ``reply``, ``close``,
+    ``finished``, ``dismiss``; a fact about an item carries its ``item``, and the facts bound to
+    one carry the ``head`` they are about. ``finished`` and ``dismiss`` are about a discussion:
+    their ``item`` is its place (the topic token, or the digest of an untokened one), and a
+    ``finished`` carries ``at``, when the discussion's work finished. A row is closed by the fact
+    that answers *it* -- which is why the same fact closes a CI row and leaves a progress row
+    alone.
     """
 
     kind: str
@@ -501,9 +504,11 @@ class Fact:
     who: str = ""
     verdict: str = ""             # for a verdict fact: "merge", "pass", "fix-first", ...
     note: str = ""
+    at: float = 0.0               # for a finished fact: when the discussion's work finished
 
     def __post_init__(self) -> None:
-        if self.kind not in ("ci", "merge", "head", "verdict", "reply", "close"):
+        if self.kind not in ("ci", "merge", "head", "verdict", "reply", "close",
+                             "finished", "dismiss"):
             raise OwedError(f"unknown fact {self.kind!r}")
 
 
@@ -571,6 +576,23 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
     if fact.kind == "close":
         if same_item and row.kind in ("progress", "verdict"):
             return f"{item} closed"
+        return None
+    here = (item or "").lower()
+    in_place = bool(here) and here in (str(row.topic or "").lower(),
+                                       str(row.key_extra or "").lower())
+    if fact.kind == "finished":
+        # Every work item a discussion links finished (merged, closed): a hand-off made there
+        # before that is moot -- the work it asked about is over, and the debtor may never
+        # speak there again (live, 27 Oct: "Codex owes an answer" on a QA of a PR merged the
+        # night before, and nothing could close it). One made after it is new work.
+        if in_place and row.kind == "handoff" and fact.at and row.created_at < fact.at:
+            return "the topic's work is done"
+        return None
+    if fact.kind == "dismiss":
+        # The admin's word: the decision the stall ladder's last rung asks for. Any open row
+        # placed in the discussion it was given in, or only the named debtor's.
+        if in_place and (not who or who.lower() == row.debtor.lower()):
+            return "dismissed by the admin"
         return None
     return None
 
