@@ -20,7 +20,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from swarmly.telegram.channel import AgentChannel
-from swarmly.telegram.cleanup import LEDGER_TTL_SECONDS, GeneralLedger
+from swarmly.telegram.cleanup import (LEDGER_TTL_SECONDS, GeneralLedger,
+                                        delete_message_ids)
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.adapters import EchoAdapter
 from tests.aio import run
@@ -279,6 +280,23 @@ class SweepTests(Case):
         self.assertEqual(self.bot.messages[0], (GROUP, [1, 2, 3]))
         self.assertEqual([call[1] for call in self.bot.messages[1:]], [[1], [2], [3]])
         self.assertEqual(self.ledger.notices(GROUP), [])     # the refused one is not retried
+
+    def test_no_bot_attached_keeps_the_ids_unasked(self):
+        """#403: the wrapper raises DeleteUnavailable when no bot is attached.
+
+        Turning that back into ``return 0`` would read as "Telegram refused them all" and
+        drop every due id from the ledger -- one transport without a bot would lose the
+        notices it still has to delete.
+        """
+        for mid in (1, 2):
+            self.ledger.note_notice(GROUP, mid, now=NOW - 2 * 60 * MINUTE)
+        self.channel.bot = None
+        deleted, refused, unasked = run(delete_message_ids(self.channel, GROUP, [1, 2]))
+        self.assertEqual((deleted, refused, unasked), ([], [], [1, 2]))
+        self.assertEqual(self.sweep(NOW), 0)
+        self.assertEqual(self.ledger.notices(GROUP, NOW), [1, 2])     # still offered
+        self.channel.bot = self.bot
+        self.assertEqual(self.sweep(NOW + 121), 2)                    # after the #400 backoff
 
     def test_a_throttled_delete_keeps_the_notices_for_the_next_sweep(self):
         # #398: a 429 is not a refusal. The ids must not be forgotten -- they are still
