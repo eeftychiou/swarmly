@@ -17,8 +17,10 @@ All notable changes to this project are documented here. The format follows
   issue comments and review comments. The needles are the ones the config already redacts, plus
   two backstops (a `-100…` chat id, an absolute path under a home directory) that need no
   config entry. It exits `0` clean, `1` on a hit and `2` when something could not be scanned
-  (never silently clean), redacts every excerpt before printing it, and reuses a clone given
-  with `--clone`. `docs/telegram-channel.md` documents it.
+  (never silently clean — an unreadable `gh` answer or a 404 is a problem, not a pass), redacts
+  every excerpt before printing it (an empty `public_redactions` replacement labels its needle
+  `<redacted>`, never the value), and reuses a clone given with `--clone`. Pull-request reviews
+  are scanned as well as inline review comments. `docs/telegram-channel.md` documents it.
 
 ### Fixed
 

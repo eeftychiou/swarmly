@@ -27,7 +27,8 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence,
+                    Tuple)
 
 from swarmly.telegram.redact import CHAT, PATH, USER, Redactor
 
@@ -120,12 +121,23 @@ class Report:
 # ------------------------------------------------------------------------------------
 
 
+#: What a needle is called when the config gives its replacement as empty. A
+#: ``public_redactions`` entry with an empty value is legal (only an empty *key* is refused) and
+#: means "delete it", so the placeholder cannot come from the config: a report that labelled the
+#: value with itself would print the very string it found (#1 review, blocker).
+REDACTED = "<redacted>"
+
+
 def needles_from(config: Any) -> List[Needle]:
     """The strings a config says must not be public, plus the two backstops (#1).
 
     The same set the redactor replaces on the way out -- the maintainer's handle,
     ``public_redactions``, chat ids, long user ids, absolute local paths -- so what the audit
     looks for and what the transport would scrub cannot drift apart.
+
+    A needle's label is the config's replacement, so a report says ``<maintainer>`` rather than
+    the handle. An empty replacement (a legal "just delete it" entry) falls back to
+    :data:`REDACTED`: the label is printed, so it must never be the value itself.
     """
     redactor = Redactor.from_config(config)
     found: Dict[Tuple[str, str], Needle] = {}
@@ -137,7 +149,7 @@ def needles_from(config: Any) -> List[Needle]:
         found.setdefault((label, text), Needle(label, text))
 
     for literal, replacement in (redactor.literals or {}).items():
-        add(str(replacement or literal), literal)
+        add(str(replacement or "").strip() or REDACTED, literal)
     for chat in redactor.chat_ids:
         add(CHAT, chat)
         add(CHAT, str(abs(int(chat))))
@@ -302,13 +314,14 @@ def scan_commits(root: Path, needles: Sequence[Needle],
         for label, excerpt in scan_text(message, needles, redactor):
             hits.append(Hit(where=f"commit {sha.strip()[:12]} message", needle=label,
                             excerpt=excerpt))
-    tags = _git(root, "for-each-ref", "--format=%(contents)%x00%(refname)", "refs/tags")
-    for chunk in tags.split("\x00"):
-        said = chunk.strip()
+    # One call per tag, asking for its message only: a `contents%x00refname` format would put
+    # the refname into the text scanned and report a tag *name* as a tag message (#1 nit).
+    for tag in _git(root, "for-each-ref", "--format=%(refname)", "refs/tags").split():
+        said = _git(root, "for-each-ref", "--format=%(contents)", tag).strip()
         if not said:
-            continue
+            continue                          # a lightweight tag has no message
         for label, excerpt in scan_text(said, needles, redactor):
-            hits.append(Hit(where="a tag message", needle=label, excerpt=excerpt))
+            hits.append(Hit(where=f"{tag} message", needle=label, excerpt=excerpt))
     return count, hits
 
 
@@ -362,14 +375,19 @@ def _gh_pages(path: str) -> List[Dict[str, Any]]:
             continue
         try:
             value = json.loads(line)
-        except ValueError:                       # an endpoint that answers one document
-            value = None
-        if isinstance(value, dict):
-            items.append(value)
+        except ValueError:
+            # `--jq .[]` promises one JSON object per line. Anything else means this source was
+            # not read: an empty list here would be reported as "nothing found" (#1 review).
+            raise AuditError(f"gh api {path}: could not read its answer "
+                             f"({len(line)} characters that are not JSON)")
+        if not isinstance(value, dict):
+            raise AuditError(f"gh api {path}: answered {type(value).__name__}, not an object")
+        items.append(value)
     return items
 
 
-#: The three places issue/PR text lives, and what to call each in a report.
+#: The places issue/PR text lives, and what to call each in a report. The first is also how a
+#: pull request's number is found, which is what `pulls/{n}/reviews` needs (below).
 GH_SOURCES: Tuple[Tuple[str, str], ...] = (
     ("issues?state=all", "issue"),
     ("issues/comments", "comment"),
@@ -378,9 +396,14 @@ GH_SOURCES: Tuple[Tuple[str, str], ...] = (
 
 
 def scan_github(repo: str, needles: Sequence[Needle], redactor: Optional[Redactor] = None,
-                fetch: Optional[Callable[[str], List[Dict[str, Any]]]] = None
+                fetch: Optional[Callable[[str], List[Dict[str, Any]]]] = None,
                 ) -> Tuple[int, List[Hit], List[str]]:
-    """``(items, hits, problems)`` for issue/PR bodies, comments and review comments.
+    """``(items, hits, problems)`` for issue/PR bodies, comments and every kind of review text.
+
+    The sources are :data:`GH_SOURCES` -- issue and pull-request bodies, issue comments,
+    inline review comments -- plus each pull request's reviews (`pulls/{n}/reviews`), whose
+    summary `body` is public text too but has no bulk endpoint: that costs one call per pull
+    request, which is the reason the docstring says so rather than the caller discovering it.
 
     *fetch* is how the pages are got -- :func:`_gh_pages` by default -- so a test can hand over
     fake records instead of calling GitHub (this repository is public: the tests use fake
@@ -390,6 +413,7 @@ def scan_github(repo: str, needles: Sequence[Needle], redactor: Optional[Redacto
     hits: List[Hit] = []
     problems: List[str] = []
     items = 0
+    pulls: List[int] = []
     for suffix, what in GH_SOURCES:
         path = f"repos/{repo}/{suffix}"
         try:
@@ -399,16 +423,41 @@ def scan_github(repo: str, needles: Sequence[Needle], redactor: Optional[Redacto
             continue
         for record in records or []:
             items += 1
-            for field_name in ("title", "body", "diff_hunk"):
-                text = record.get(field_name)
-                if not isinstance(text, str) or not text:
-                    continue
-                number = record.get("number") or record.get("id") or "?"
-                where = f"{what} #{number}" + ("" if field_name == "body"
-                                               else f" ({field_name})")
-                for label, excerpt in scan_text(text, needles, redactor):
-                    hits.append(Hit(where=where, needle=label, excerpt=excerpt))
+            if isinstance(record.get("pull_request"), dict):
+                number = record.get("number")
+                if isinstance(number, int) and number not in pulls:
+                    pulls.append(number)
+            for where, needle, excerpt in _fields(record, what, needles, redactor):
+                hits.append(Hit(where=where, needle=needle, excerpt=excerpt))
+    for number in sorted(pulls):
+        path = f"repos/{repo}/pulls/{number}/reviews"
+        try:
+            records = get(path)
+        except AuditError as exc:
+            problems.append(str(exc))
+            continue
+        for record in records or []:
+            items += 1
+            for where, needle, excerpt in _fields(record, "review", needles, redactor,
+                                                  number=number):
+                hits.append(Hit(where=where, needle=needle, excerpt=excerpt))
     return items, hits, problems
+
+
+def _fields(record: Mapping[str, Any], what: str, needles: Sequence[Needle],
+            redactor: Optional[Redactor], *, number: Any = None
+            ) -> List[Tuple[str, str, str]]:
+    """``[(where, needle, excerpt)]`` for the text fields of one issue/comment/review record."""
+    found: List[Tuple[str, str, str]] = []
+    for field_name in ("title", "body", "diff_hunk"):
+        text = record.get(field_name)
+        if not isinstance(text, str) or not text:
+            continue
+        at = number if number is not None else (record.get("number") or record.get("id") or "?")
+        where = f"{what} #{at}" + ("" if field_name == "body" else f" ({field_name})")
+        for label, excerpt in scan_text(text, needles, redactor):
+            found.append((where, label, excerpt))
+    return found
 
 
 # ------------------------------------------------------------------------------------
@@ -431,10 +480,11 @@ def audit(repo: str, needles: Sequence[Needle], *, clone: Optional[Path] = None,
     try:
         try:
             if clone is None:
+                # A folder of our own, and the clone as its child: cloning into the folder we
+                # were handed was a race with anything that got there first (#1 nit).
                 scratch = Path(tempfile.mkdtemp(prefix="audit-"))
-                scratch.rmdir()                  # `git clone` wants to make the folder itself
             root = mirror_clone(url or f"https://github.com/{repo}.git",
-                                clone or scratch, fetch=fetch)
+                                clone or (scratch / "repo" if scratch else None), fetch=fetch)
         except AuditError as exc:
             report.problems.append(str(exc))
             return report
@@ -456,10 +506,9 @@ def audit(repo: str, needles: Sequence[Needle], *, clone: Optional[Path] = None,
             shutil.rmtree(scratch, ignore_errors=True)
 
 
-def render(report: Report, *, verbose: bool = True) -> List[str]:
+def render(report: Report) -> List[str]:
     """The report as lines: one per hit (most useful first), then what could not be scanned."""
-    lines = [str(hit) for hit in report.hits] if verbose else \
-        [f"{hit.needle} in {hit.where}" for hit in report.hits]
+    lines = [str(hit) for hit in report.hits]
     lines.extend(f"not scanned: {said}" for said in report.problems)
     lines.append(report.summary())
     return lines

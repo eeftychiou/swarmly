@@ -175,12 +175,19 @@ paths (`adapter.cwd`, every project's `cwd`, your home) -- plus two backstops (a
   pull-request head is as public as `main`, and fixing `main` does not remove it. The files
   reachable from every ref are scanned, and so are commit messages and tag messages.
 - **The issue/PR side**, through `gh`: issue and pull-request bodies (`issues?state=all`, which
-  includes PRs), issue comments and review comments.
+  includes PRs), issue comments, inline review comments, and each pull request's reviews —
+  a review's summary body is public text too, and GitHub has no bulk endpoint for it, so that
+  part costs one call per pull request.
 - **Exit status**: `0` nothing found, `1` at least one hit (do not publish until it is purged
   and the command is re-run), `2` something could not be scanned -- a missing `gh`, a failed
   clone -- which is never a clean result. `--json` gives the same report machine-readably.
 - **An excerpt is redacted before it is printed**, so running the audit cannot copy the value
-  it just found into a terminal, a log or a PR.
+  it just found into a terminal, a log or a PR. A `public_redactions` entry whose replacement is
+  empty ("just delete it") labels its needle `<redacted>`: the label is printed, so it is never
+  the value.
+- **A source that could not be read is a problem, not a pass**: a `gh` that is not logged in, an
+  answer that is not the expected JSON, a review that 404s — each is reported and the exit
+  status is `2`, so an incomplete scan never reads as clean.
 - `--clone PATH` reuses (and fetches) a mirror clone instead of making a temporary one;
   `--no-fetch` audits it exactly as it stands, `--no-github` skips the issue/PR side, and
   `--keep` leaves a temporary clone for looking a hit up by hand.

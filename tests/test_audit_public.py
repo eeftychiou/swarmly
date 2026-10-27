@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 from swarmly.telegram import audit as au
 from swarmly.telegram.cli import _audit_public
@@ -159,6 +160,15 @@ class RefTests(SecretSandbox):
         self.assertIn("commit ", report.hits[0].where)
         self.assertIn("message", report.hits[0].where)
 
+    def test_a_tag_message_is_scanned_and_its_refname_is_not(self):
+        """#1 nit: `contents%00refname` scanned a tag's *name* as if it were a message."""
+        self.repo.commit("first", {"README.md": "# example"})
+        git(self.repo.root, "tag", "-a", "v1", "-m", f"ping {HANDLE_TEXT}")
+        git(self.repo.root, "tag", "v2")                 # lightweight: no message at all
+        report = self.audit()
+        self.assertEqual([hit.where for hit in report.hits], ["refs/tags/v1 message"])
+        self.assertEqual([hit.needle for hit in report.hits], ["<bot>"])
+
     def test_the_report_says_how_much_was_read(self):
         self.repo.commit("first", {"README.md": "# example\n"})
         report = self.audit()
@@ -205,6 +215,105 @@ class GithubTests(SecretSandbox):
         self.assertEqual(len(problems), 3)                 # one per source, not one total
         report = au.Report(repo="example-org/example", problems=problems)
         self.assertEqual(report.status, au.EXIT_BROKEN)
+
+
+class EmptyReplacementTests(SecretSandbox):
+    """#1 review, blocker: a needle's label is printed, so it must never be the value."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Repo(tmp.name)
+
+    def test_an_empty_replacement_labels_the_needle_and_never_the_value(self):
+        made = config(public_redactions={HANDLE_TEXT: ""})     # legal: "just delete it"
+        needles = au.needles_from(made)
+        self.assertIn(HANDLE_TEXT, [needle.value for needle in needles])   # still searched
+        self.assertNotIn(HANDLE_TEXT, [needle.label for needle in needles])
+        self.assertIn(au.REDACTED, [needle.label for needle in needles])
+        self.repo.commit("first", {"notes.md": f"ask {HANDLE_TEXT}"})
+        mirror = self.repo.publish()
+        report = au.audit("example-org/example", needles, clone=mirror, github=False,
+                          redactor=Redactor.from_config(made))
+        self.assertEqual([hit.needle for hit in report.hits], [au.REDACTED])
+        rendered = chr(10).join(au.render(report))
+        self.assertNotIn(HANDLE_TEXT, rendered)
+        self.assertIn(au.REDACTED, rendered)
+
+    def test_the_command_prints_no_raw_value_either(self):
+        import contextlib
+        import io as _io
+        self.repo.commit("first", {"notes.md": f"ask {HANDLE_TEXT}"})
+        made = config(public_redactions={HANDLE_TEXT: ""})
+        mirror = self.repo.publish()
+        for as_json in (False, True):
+            args = Namespace(repo="example-org/example", clone=mirror,
+                             no_github=True, no_fetch=True, keep=False, json=as_json)
+            buffer = _io.StringIO()
+            with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+                self.assertEqual(_audit_public(made, args), 1)
+            self.assertNotIn(HANDLE_TEXT, buffer.getvalue())
+
+
+class ReviewBodyTests(SecretSandbox):
+    """#1 review, should-fix: a review's summary body is public text too."""
+
+    def pages(self, reviews):
+        return {
+            "repos/example-org/example/issues?state=all": [
+                {"number": 7, "title": "a pr", "body": "nothing",
+                 "pull_request": {"url": "…/pulls/7"}}],
+            "repos/example-org/example/issues/comments": [],
+            "repos/example-org/example/pulls/comments": [],
+            "repos/example-org/example/pulls/7/reviews": reviews,
+        }
+
+    def scan(self, pages):
+        made = cfg()
+        return au.scan_github("example-org/example", au.needles_from(made),
+                              Redactor.from_config(made), fetch=pages.__getitem__)
+
+    def test_a_reviews_summary_body_is_scanned(self):
+        items, hits, problems = self.scan(self.pages([{"id": 5, "body": f"from {HANDLE_TEXT}"}]))
+        self.assertEqual(problems, [])
+        self.assertEqual(items, 2)                       # the pull request, and its review
+        self.assertEqual([hit.where for hit in hits], ["review #7"])
+        self.assertEqual([hit.needle for hit in hits], ["<bot>"])
+
+    def test_a_review_that_cannot_be_read_is_a_problem(self):
+        def broken(path):
+            if path.endswith("/reviews"):
+                raise au.AuditError(f"gh api {path} failed: 404")
+            return self.pages([])[path]
+        _, _, problems = au.scan_github("example-org/example", au.needles_from(cfg()), None,
+                                       fetch=broken)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("reviews", problems[0])
+
+
+class UnreadableGithubOutputTests(SecretSandbox):
+    """#1 review, should-fix: an unreadable `gh` answer is never "nothing found"."""
+
+    def reply(self, stdout, code=0):
+        from subprocess import CompletedProcess
+        return CompletedProcess(["gh"], code, stdout.encode(), b"")
+
+    def test_a_line_that_is_not_json_is_a_problem(self):
+        with mock.patch("swarmly.telegram.audit.subprocess.run",
+                        return_value=self.reply("not json at all")):
+            with self.assertRaises(au.AuditError):
+                au._gh_pages("repos/example-org/example/issues/comments")
+
+    def test_a_document_that_is_not_an_object_is_a_problem(self):
+        with mock.patch("swarmly.telegram.audit.subprocess.run",
+                        return_value=self.reply('["a list"]')):
+            with self.assertRaises(au.AuditError):
+                au._gh_pages("repos/example-org/example/issues?state=all")
+
+    def test_good_objects_still_parse(self):
+        with mock.patch("swarmly.telegram.audit.subprocess.run",
+                        return_value=self.reply(chr(10).join(['{"a": 1}', '{"b": 2}']) + chr(10))):
+            self.assertEqual(au._gh_pages("x"), [{"a": 1}, {"b": 2}])
 
 
 class CommandTests(SecretSandbox):
