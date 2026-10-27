@@ -29,10 +29,14 @@ This document describes the component relationships, data flow, and architectura
 - **Human-in-the-Loop & Override**:
   - A human operator has visibility and control over all agent turns and can intervene in Telegram at any time.
 - **Status Snapshots, Pulse & Usage Accounting (#166)**:
-  - `status_snapshot` captures real-time bot state, active topic, queues, and resolved model/effort without invoking model turns.
+  - `status_snapshot` captures real-time bot state, active topic, queues, resolved model/effort, and safe drift metrics without invoking model turns.
+  - Heartbeat status snapshots report per-bot drift metrics (`drift_score`, `drift_hard`, `drift_resets_today`, `drift_standing`, newest violation kind and age) without exposing sensitive evidence strings or session identifiers (#452).
   - Snapshot and pulse align with `online_notice` resolution: adapters supporting reasoning effort (Antigravity, Reasonix, Codex, Claude) default to `"the model default"` when effort is unspecified, or infer effort from tiered model names (e.g., `Gemini 3.1 Pro (High)` -> `high`).
   - Antigravity runs in plain-text print mode (`agy -p`) without token counters in its SQLite metadata (`gen_metadata`); its usage remains unknown in turn ledgers and pulse by design.
   - Token parsing in `usage_tokens()` defensively normalizes nested and top-level snake_case and camelCase token payloads across model providers.
+- **Web Dashboard & Multi-Bot Drift Table (#452)**:
+  - Dashboard panels (`usage`, `settings`, `drift`, `state`, `memory`) use unique section element IDs distinct from their inner containers (`usage-rows`, `settings-rows`, `drift-table`, `state-rows`, `memory-rows`), preserving section headings across periodic client redraws.
+  - The Drift view presents a swarm-wide table with one row per bot: alias, score, hard count, resets today, standing, and newest violation kind and age (or "not reported" for peers that have not yet reported drift metrics).
 
 ---
 

@@ -190,6 +190,36 @@ class TestOnTheChannel(unittest.TestCase):
         self.assertEqual(snap.uptime, 7200.0)
         self.assertGreaterEqual(snap.restarts, 0)
 
+    def test_status_snapshot_reports_drift_and_round_trips_safely(self):
+        """#452: status_snapshot reports drift score, standing, and kind without evidence/keys."""
+        channel = live_channel()
+        channel.record_violation("merge_gate_refused",
+                                 r"secret path C:\Users\eftyc\secret\notes and chat -100123456789",
+                                 chat_id=-100123456789, thread_id=19286)
+        snap = channel.status_snapshot(NOW)
+        self.assertEqual(snap.drift_score, 3)
+        self.assertEqual(snap.drift_standing, "a reminder rides the next turn")
+        self.assertEqual(snap.drift_kind, "merge_gate_refused")
+        self.assertIsNotNone(snap.drift_age)
+
+        # Round-trip through dict
+        data = snap.to_dict()
+        again = sn.Snapshot.from_dict(data)
+        self.assertEqual(again.drift_score, snap.drift_score)
+        self.assertEqual(again.drift_hard, snap.drift_hard)
+        self.assertEqual(again.drift_resets_today, snap.drift_resets_today)
+        self.assertEqual(again.drift_standing, snap.drift_standing)
+        self.assertEqual(again.drift_kind, snap.drift_kind)
+        self.assertEqual(again.drift_age, snap.drift_age)
+        self.assertEqual(again, snap)
+
+        # Safety: neither evidence nor session keys leak (#349)
+        payload = json.dumps(data)
+        self.assertNotIn("Users", payload)
+        self.assertNotIn("notes", payload)
+        self.assertNotIn("100123456789", payload)
+        self.assertNotIn("19286", payload)
+
 
 class TestWhenTheStateBegan(unittest.TestCase):
     """#124 review: `since` is when the state began, and it holds across beats.
