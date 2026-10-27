@@ -332,13 +332,21 @@ _NO_DROP_NOTICE_REASONS = frozenset({
     "built-in command reply from peer bot (machine traffic)",
     "terminal acknowledgment/sign-off from peer bot (no reply needed)",
 })
+#: The verbs that turn "another bot's handle, then mine" into a hand-off rather than a report,
+#: in the forms a request uses. Each form is spelled out: a bare ``(?:s|ing)?`` suffix missed
+#: the doubled-consonant and dropped-``e`` ones ("getting", "letting", "giving", "routing"),
+#: so a delegation written that way reached the named bot (#363).
+_DELEGATION_VERBS = (r"hands?|handing|asks?|asking|tells?|telling|has|have|having|"
+                     r"gets?|getting|assigns?|assigning|delegates?|delegating|"
+                     r"gives?|giving|passes?|passing|forwards?|forwarding|"
+                     r"sends?|sending|routes?|routing|pings?|pinging|"
+                     r"nudges?|nudging|lets?|letting")
 #: Why a peer's message in General or Swarm pulse got no turn when the place is transport-only
 #: (#327). It reads as the middle of the drop notice's sentence, and it is deliberately *not* in
 #: `_NO_DROP_NOTICE_REASONS`: a hand-off dropped by the gate is exactly the silence that reads
 #: as a taken job, so the sender hears it like any other dropped mention (#27).
 GENERAL_GATE_REASON = ("this bot takes no turns in General or Swarm pulse on this host "
                        "(limits.general_turns: never)")
-
 #: One drop notice per reason per topic per window: a peer that keeps naming this bot in the
 #: same dropped shape hears it once, not once per message.
 DROP_NOTICE_SECONDS = 600.0
@@ -992,8 +1000,8 @@ class AgentChannel:
         # A request, not a report: "ask @me" or "asking @me", never "I've asked @me for QA"
         # (live, 25 Oct: the past tense read as a delegation and the named QA bot refused).
         delegated = re.compile(
-            r"(?i)\b(?:hand|ask|tell|have|get|assign|delegate|give|pass|forward|send|route|"
-            r"ping|nudge|let)(?:s|ing)?\s+(?:(?:it|this|that|the\s+\w+|a\s+\w+)\s+)?"
+            rf"(?i)\b(?:{_DELEGATION_VERBS})\s+"
+            r"(?:(?:it|this|that|the\s+\w+|a\s+\w+)\s+)?"
             rf"(?:(?:over\s+)?to\s+)?@(?:{mine})\b")
         mentions = re.findall(rf"(?i)@(?:{mine})\b", text)
         return len(delegated.findall(text)) >= len(mentions)
