@@ -630,6 +630,15 @@ addresses that bot; `@all` reaches linked agents only. Each recipient's turn run
 agent's session for this topic**, queued when busy (§8). Swarm pulse and closed topics are never
 routed from the registry, and a mention alone never opens a topic record.
 
+Two consequences are worth knowing before a message is sent. **Every `@handle` in a message is an
+address**, so a pasted transcript carries its own addresses: the bots it names take the turn, and
+the coordinator stays out of a message addressed to agents that will take it. And **until phase 9
+an agent that has already had turns in a topic counts as linked there**, so a peer's mention of it
+in that topic is delivered rather than refused (`/unlink` takes it off again).
+
+> **Tip:** to reach the coordinator with a pasted transcript, start the message with its handle, or
+> leave the `@handles` out of the paste.
+
 ### 11.3 Work items, links and phases
 
 A **link** is a pointer to wherever the work lives — GitHub, GitLab, Google Drive or another
