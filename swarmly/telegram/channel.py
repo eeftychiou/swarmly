@@ -240,7 +240,9 @@ _REF_STATE_CACHE_SECONDS = 300.0
 _OWED_ITEM = re.compile(r"#?\d{1,9}")
 #: The repo a retired WAKE line's row names (wait_line.from_wake: "checked `gh ...` in o/r").
 _OWED_WAKE_REPO = re.compile(r"`\s+in\s+([\w.-]+/[\w.-]+)")
-_OWED_ITEM_KINDS = ("ci", "verdict", "fix", "merge", "progress")
+#: Kinds whose ``item`` is a ``#N`` GitHub can answer for. ``handoff`` is in it since #428: a
+#: hand-off names the item it is about, and that item landing answers it.
+_OWED_ITEM_KINDS = ("ci", "verdict", "fix", "merge", "progress", "handoff")
 #: How often one owed item is asked about on GitHub, and how many items one beat asks about:
 #: an item still open is asked again later, and a backlog of stale rows clears over a few beats.
 OWED_GITHUB_RECHECK_SECONDS = 900.0
@@ -5726,6 +5728,12 @@ class AgentChannel:
             self.retry_gone_topic_closes(now=moment)
         except Exception:                          # noqa: BLE001 - a beat must not fail on it
             logger.warning("owed: the gone-topic retry failed this beat", exc_info=True)
+        # #428: a hand-off kept against the admin's private chat can never be answered, and
+        # every reminder would land where the peer cannot read it. Closed here, every beat.
+        try:
+            self.owed_settle_private_chat(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("owed: the private-chat check failed this beat", exc_info=True)
         # Live, 27 Oct: and a hand-off in a topic whose work has all finished is moot.
         try:
             self.owed_settle_topics_done(now=moment)
@@ -7911,12 +7919,17 @@ class AgentChannel:
         return [row for row in rows if row.id not in gone]
 
     def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
-                            thread_id: Optional[int]) -> None:
+                            thread_id: Optional[int], item: str = "") -> None:
         """Record a durable row per peer just handed work (#162, the wiring).
 
         The in-memory ``_pending_handoffs`` is the same debt in a second book and is lost on a
         restart; these rows are the copy the swarm and a successor coordinator can read. A
         book-keeping failure is logged and never fails the hand-off itself.
+
+        ``item`` is the ``#N`` the hand-off names (#428): the row is settled when that item
+        merges or closes, which is the only way some hand-offs ever end. Nothing is recorded
+        for the admin's private chat: no peer can post there, so the row could never be
+        answered and every reminder would land where the peer cannot read it.
         """
         from swarmly.telegram.owed import handoff_rows
         # A peer that cannot act gets no row: the hand-off was refused and bounced (#237).
@@ -7925,15 +7938,130 @@ class AgentChannel:
             return
         topic = self._topic_token(chat_id, thread_id)
         place = self._place_key(chat_id, thread_id)
+        if place and place == self._private_chat_place():
+            logger.info("hand-off to %s in the admin's private chat: no row kept (#428)",
+                        ", ".join(asked))
+            return
         try:
             store = self.owed_store()
             rows = store.observe(handoff_rows(asked=asked, asker=self.config.identity.alias,
-                                              topic=topic, place=place,
+                                              item=item, topic=topic, place=place,
                                               opened_by=f"hand-off in {topic or 'a topic'}"))
             store.save_all(rows)               # one push for the whole reply, not one per peer
         except Exception:                          # noqa: BLE001 - reported, not swallowed
             logger.warning("owed: could not record the hand-off to %s",
                            ", ".join(asked), exc_info=True)
+
+    def _private_chat_place(self) -> str:
+        """The place key of the admin's private chat with this bot ("" without an admin).
+
+        A hand-off kept against that place can never be answered -- a peer cannot post in the
+        admin's private chat -- so the row would climb the stall ladder for ever and every
+        reminder would land where the peer cannot read it (live, 27 Oct - 18 Nov: the #424
+        reminders, long after #424 merged). Nothing is kept there, and the rows already written
+        before #427 are closed on load (#428).
+        """
+        admin = getattr(self.config.identity, "admin_user_id", None)
+        if admin is None:
+            return ""
+        try:
+            return str(self._place_key(int(admin), None) or "")
+        except Exception:                          # noqa: BLE001 - book-keeping, not a turn
+            return ""
+
+    @staticmethod
+    def _handoff_item(text: str) -> str:
+        """The item a reply hands work about: the first ``#N`` in its hand-off lines (#428).
+
+        The lines decide, not the whole reply: a reply that discusses #260 and hands over #424
+        is a hand-off about #424, and that is the item whose merge settles it.
+        """
+        from swarmly.telegram.handoff_split import handoff_lines
+        refs = issue_refs(handoff_lines(text) or str(text or ""))
+        return refs[0] if refs else ""
+
+    def _registry_item_done(self, item: str) -> bool:
+        """Whether the registry shows the work item ``#N`` finished (local read only)."""
+        from swarmly.state import keys as K
+        store = self.state_link.store
+        if store is None or not getattr(store, "ready", False):
+            return False
+        wanted = str(item or "").strip().lstrip("#")
+        if not wanted:
+            return False
+        for key in store.keys("topic/"):
+            if K.topic_of(key) is None:
+                continue
+            record = store.read(key) or {}
+            for link in record.get("links") or []:
+                if not isinstance(link, dict) or link.get("role") != "work":
+                    continue
+                found = re.search(r"/(?:issues|pull)/(\d+)(?:[/?#].*)?$",
+                                  str(link.get("ref") or ""))
+                if found is None or found.group(1) != wanted:
+                    continue
+                status = str(link.get("status") or "").strip().lower()
+                phase = str(link.get("phase") or "").strip().lower()
+                if status in ("closed", "abandoned") or phase == "done":
+                    return True
+        return False
+
+    def _handoff_item_done(self, item: str) -> bool:
+        """Whether the item a hand-off names is already done, from facts held here (#428).
+
+        A merge GitHub has shown this bot (``_owed_merged_keys``, kept on disk) or a registry
+        work item closed or past ``done``. Local reads only: a reminder is not worth a GitHub
+        call on every beat, and ``owed_settle_from_github`` is what learns new merges.
+        """
+        ref = str(item or "").strip()
+        if not ref:
+            return False
+        label = "#" + ref.lstrip("#")
+        try:
+            if any(known == label for _repo, known in self._owed_merged_keys()):
+                return True
+        except Exception:                          # noqa: BLE001 - unknown is not done
+            logger.debug("owed: could not read the merged PRs", exc_info=True)
+        return self._registry_item_done(ref)
+
+    def owed_settle_private_chat(self, *, now: Optional[float] = None) -> List[str]:
+        """Close the hand-offs kept against the admin's private chat (#428).
+
+        Rows written before #427 were placed there, and no peer can ever answer in that chat,
+        so each one would climb the ladder to the admin for ever. They are closed here, once
+        on load and on every beat after, with a log line naming them.
+        """
+        place = self._private_chat_place()
+        if not place or self.held():
+            return []
+        moment = time.time() if now is None else float(now)
+        try:
+            store = self.owed_store()
+            rows = store.open_rows(now=moment)
+        except Exception:                          # noqa: BLE001 - a beat must not fail on it
+            logger.warning("owed: could not read the table to clear private-chat rows",
+                           exc_info=True)
+            return []
+        closed: List[Any] = []
+        for row in rows:
+            if row.kind != "handoff":
+                continue
+            here = str(row.key_extra or "").strip().lower(), str(row.topic or "").strip().lower()
+            if place.strip().lower() not in here:
+                continue
+            row.state, row.updated_at = "closed", moment
+            row.closed_by = "a private chat cannot be answered: no hand-off is kept there"
+            closed.append(row)
+        if not closed:
+            return []
+        try:
+            store.save_all(closed)
+        except Exception:                          # noqa: BLE001 - the next beat tries again
+            logger.warning("owed: could not write the private-chat closes", exc_info=True)
+            return []
+        done = [f"closed {row.id} ({row.closed_by})" for row in closed]
+        logger.info("owed: %s", "; ".join(done[:8]))
+        return done
 
     def _close_owed_handoff(self, peer: str, chat_id: int, thread_id: Optional[int]) -> None:
         """A peer's reply in a discussion answers the hand-off recorded **there**, not others.
@@ -10686,22 +10814,26 @@ class AgentChannel:
         leads = {name.strip().lower() for name in
                  (self.membership.state.coordinator, self.current_coordinator())
                  if isinstance(name, str) and name.strip()}
+        # #428: the item the hand-off is about travels with the debt. A hand-off whose item
+        # merges or closes is answered, which is the only way some of them ever end.
+        item = self._handoff_item(body)
         owed_to_leads: List[str] = []
         for peer in named:
             if peer not in peers and peer.strip().lower() in leads                     and peer.strip().lower() != self.config.identity.alias.strip().lower():
                 self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
-                    "at": self._clock(), "message_id": message_id, "nudged": False}
+                    "at": self._clock(), "message_id": message_id, "nudged": False,
+                    "item": item}
                 owed_to_leads.append(peer)          # waited on, so it is owed a row (#173)
         if owed_to_leads:
             # Recorded before the early return: a reply that hands work only to the coordinator
             # has no mirror copy, and used to open no row at all (#173 review).
-            self._note_owed_handoffs(owed_to_leads, chat_id, thread_id)
+            self._note_owed_handoffs(owed_to_leads, chat_id, thread_id, item=item)
         if not peers:
             return
         for peer in peers:
             self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
-                "at": self._clock(), "message_id": message_id, "nudged": False}
-        self._note_owed_handoffs(peers, chat_id, thread_id)
+                "at": self._clock(), "message_id": message_id, "nudged": False, "item": item}
+        self._note_owed_handoffs(peers, chat_id, thread_id, item=item)
         if not (self.config.bus.repo and getattr(self.config.bus, "mirror_handoffs", True)):
             return
         # Issue #22: the bus carries a topic token, never the chat id. The token resolves
@@ -10862,10 +10994,23 @@ class AgentChannel:
         # swarm waited all night, because only the coordinator sends reminders).
         leads = {name.strip().lower() for name in (coordinator, self.current_coordinator())
                  if isinstance(name, str) and name.strip()}
+        private_place = self._private_chat_place()
         for key, entry in list(self._pending_handoffs.items()):
             chat_id, thread_id, alias = key
             handle = str(self.config.peers.get(alias, alias)).lstrip("@")
             age = now - float(entry["at"])
+            if private_place and self._place_key(chat_id, thread_id) == private_place:
+                # #428: nobody the reminder is for can read the admin's private chat.
+                self._pending_handoffs.pop(key, None)
+                logger.info("hand-off to %s in a private chat: no reminder there (#428)",
+                            alias)
+                continue
+            if self._handoff_item_done(str(entry.get("item") or "")):
+                # The work the hand-off was about has landed: there is nothing to chase.
+                self._pending_handoffs.pop(key, None)
+                logger.info("hand-off to %s in %s: %s is done; no reminder",
+                            alias, thread_id or "General", entry.get("item"))
+                continue
             nudges = may_nudge or alias.strip().lower() in leads
             if alias in frozen:
                 # A frozen peer cannot answer: no reminder, no "may be stopped" notice; the
@@ -11963,6 +12108,12 @@ class AgentChannel:
         self.selftest.start(getattr(me, "can_read_all_group_messages", None))
         self.membership.lookup = self._group_member
         await self.membership.on_start()
+        # #428: rows written against the admin's private chat before #427 are cleared on load,
+        # not left to the first beat, so a restart does not answer with stale reminders.
+        try:
+            self.owed_settle_private_chat()
+        except Exception:                          # noqa: BLE001 - a load must not fail on it
+            logger.warning("owed: could not clear the private-chat rows on load", exc_info=True)
         await self._restore_freeze_state()
         if self.replies is not None:
             self.replies.recover()
