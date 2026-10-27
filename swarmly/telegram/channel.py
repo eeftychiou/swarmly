@@ -5223,7 +5223,9 @@ class AgentChannel:
         recorded there and **not** carried out here, so the caller that delivers the answer
         can restart once it is out (#432) -- and two presses at once each keep their own,
         neither cancelling the other's (#442). A caller that passes nothing is delivering its
-        own answer, so the restart goes out at the end of the press.
+        own answer, so the restart is carried out *here*, before this returns -- the CONTROL
+        note is out by then, and the answer the caller is about to send may not be. Every
+        production caller passes *pending*; the no-value path is for a direct press in a test.
         """
         def record(verdict: str, *, action: str = "", target: str = "", code: str = "",
                    reason: str = "") -> None:
