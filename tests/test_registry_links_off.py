@@ -148,6 +148,20 @@ class TestTheExplicitLinkStillMoves(unittest.TestCase):
         self.assertEqual(channel._topic_for_general_work(event, "reviewed #12"), (HOME, 55))
         self.assertIsNone(channel._topic_for_general_work(event, "reviewed #999"))
 
+    def test_a_general_handoff_moves_by_the_item_it_names(self):
+        """The other half of `_topic_for_general_work`: the ref is in the hand-off, not the answer.
+
+        The docstring says the message and the answer are read together, and only the answer
+        side was pinned: replacing the body with `topic_for_text(body)` left every test green
+        (#462 nit).
+        """
+        channel = self.channel("registry")
+        handoff = self.reply_in(None, "handing #12 over, please take it")
+        self.assertEqual(channel._topic_for_general_work(handoff, "taking it"), (HOME, 55))
+        unknown = self.reply_in(None, "handing #999 over, please take it")
+        self.assertIsNone(channel._topic_for_general_work(unknown, "taking it"),
+                          "a hand-off naming an item nobody linked stays in General")
+
     def test_transport_only_moves_a_brief_on_a_link_never_on_a_guess(self):
         """With General and pulse transport-only only a link moves a brief (admin, 25 Oct)."""
         linked = self.channel("registry")
