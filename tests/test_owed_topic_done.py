@@ -172,6 +172,24 @@ class TestTheAdminClosesARow(unittest.TestCase):
         channel.is_coordinator = lambda now=None: True
         self.assertIn("Closed 1", channel._handle_command(self.admin("/owed close")))
 
+    def test_a_bare_owed_close_is_the_named_coordinators_while_no_lease_is_live(self):
+        """Bug #385: ``should_respond`` routes a bare ``/owed close`` to the coordinator the
+        admin named, but the command itself still demanded a live lease, so a coordinator
+        whose swarm was paused (no lease renewed) was routed the command and then dropped it:
+        the admin's close got no reply and the row stayed open."""
+        channel, store = channel_with([handoff()], {}, coordinating=False)
+        channel.current_coordinator = lambda now=None: None       # no live lease anywhere
+        channel.is_named_coordinator = lambda: True               # but the admin named this bot
+        self.assertIn("Closed 1", channel._handle_command(self.admin("/owed close")))
+        self.assertEqual(open_ids(store), [])
+
+    def test_a_bot_the_admin_did_not_name_leaves_a_bare_owed_close_alone(self):
+        channel, store = channel_with([handoff()], {}, coordinating=False)
+        channel.current_coordinator = lambda now=None: None
+        channel.is_named_coordinator = lambda: False
+        self.assertIsNone(channel._handle_command(self.admin("/owed close")))
+        self.assertEqual(len(open_ids(store)), 1)
+
     def test_only_the_admin_closes(self):
         channel, store = channel_with([handoff()], {})
         reply = channel._handle_command(event("/owed@HermesBot close", thread_id=307))

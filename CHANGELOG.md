@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A bare `/owed close` is answered by the coordinator the admin named, even while no lease is
+  live (`#385`). `should_respond` routes a bare `/owed close` to that coordinator (`#381`), but
+  the command itself still demanded a live bus lease, so a paused swarm — which renews no
+  lease — had the message routed to its coordinator and then dropped: the admin's close got no
+  reply and the row stayed open. `_handle_command` now asks `_answers_for_swarm()`, the same
+  reader the routing uses, so the bot that is handed the command is the bot that answers it; a
+  bot the admin did not name is still refused.
+
 - `/owed close @Codex` closes that bot's rows in the topic again, not every row in it (`#382`).
   `command_args` drops every `@word` — the peers a message *names* — and in this one command an
   `@name` is the argument, so the name came out empty and the close fell through to "every row
