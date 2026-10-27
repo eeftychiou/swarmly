@@ -69,6 +69,7 @@ Any member may use these.
 | `/model@bot` (admin to set) | Show the model this bot runs in this topic; `/model@bot <name>` switches it from the next turn (`default` goes back). |
 | `/reasoning@bot` (admin to set) | The same for reasoning effort (`low` … `max`, `default`). `/effort@bot` is the same command. |
 | `/role@bot` | Show a bot's role and the team's. The admin sets one with `/role@bot <role>` (or `/role @bot <role>`); every bot applies it, and the bot named (or, for `/role @bot`, the coordinator) confirms it. `/role @bot coordinator` names a new coordinator, which announces itself, and the old one becomes a developer. |
+| `/rotate@bot` (admin) | Retires this topic's CLI session now: the old one writes its handover, and the next turn starts a **new** session from the rulebook, the registry's facts and that handover — the retired id is never resumed, and `/topics` shows the new one. Answered by the transport, no model turn. |
 
 ## Topics and work items (the topic registry)
 

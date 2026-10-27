@@ -27,7 +27,7 @@ class TheCommandsPageTests(unittest.TestCase):
         text = PAGE.read_text(encoding="utf-8")
         written = set(re.findall(r"`/([a-z_]+)", text))
         hidden = {"diag", "effort", "bus", "where", "storetest", "link", "unlink", "phase",
-                  "wakes"}                              # answered, but not in the menu
+                  "wakes", "rotate"}                    # answered, but not in the menu
         self.assertEqual(sorted(hidden - written), [])
 
     def test_every_dashboard_button_is_in_the_table(self):

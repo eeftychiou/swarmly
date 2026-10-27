@@ -698,11 +698,17 @@ that cannot rotate has the session forgotten instead, and the next turn re-reads
 from the topic's recap. Session **turn and token limits** are the adapters' own
 (`adapter.session_turn_limit`, `adapter.session_token_limit`), not the transport's.
 
+The admin rotates a session by hand with **`/rotate@bot` in the topic** (#433). The transport
+asks the adapter to rotate it: the old session writes its handover, the new one starts from the
+rulebook, the registry's facts and that handover, and the retired id is never resumed — the next
+turn runs in a new session, and `/topics` shows its id. It answers in one line and costs no model
+turn. Anyone but the admin is refused, and outside a topic there is nothing to rotate.
+
 Still to come, and not to be relied on today: age rotation from `max_age_hours` (nothing
 publishes it to the profile, so only the dashboard's rotation-due badge reads it), the outcome
-kinds (`claimed_ready_while_red`, `pr_closed_unmerged`, `review_ignored`, `stalled_assignment`),
-the `DRIFT` line another transport sends, and `/rotate@bot`. The kinds the ledger records today
-are the ones the transport itself checks, and `/drift@bot` shows them.
+kinds (`claimed_ready_while_red`, `pr_closed_unmerged`, `review_ignored`, `stalled_assignment`)
+and the `DRIFT` line another transport sends. The kinds the ledger records today are the ones the
+transport itself checks, and `/drift@bot` shows them.
 
 ### 11.7 The flags
 
