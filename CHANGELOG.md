@@ -25,8 +25,11 @@ All notable changes to this project are documented here. The format follows
   two minutes, doubling to thirty, reset by the first id that goes. The refusal markers were
   also trimmed to the four wordings Telegram actually sends (`message is too old` was a guess)
   and each is pinned by a test written with Telegram's own text, so a wording change shows up
-  as a red test; and a test now pins that the transport's own sleeper is the one pacing the
-  one-id-at-a-time fallback.
+  as a red test; the denial markers are pinned the same way, in both the Bot API's wording and
+  aiogram's `ChatAdminRequired`; and a test now pins that the transport's own sleeper is the
+  one pacing the one-id-at-a-time fallback. `docs/telegram-channel.md` no longer promises a
+  notice goes "at most a minute" after its limit while a backing-off sweep can take half an
+  hour.
 
 - A throttled sweep no longer forgets what it could not delete (`#398`). Two follow-ups to
   `#395`: `deleteMessages` failing for a reason that is not a refusal — flood control's

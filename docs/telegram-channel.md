@@ -1702,7 +1702,8 @@ failures. Each transport deletes **its own** notices from General once they are 
 transport itself posted *and* marked as machine notices are recorded — never a person's
 message, never a model reply, never a peer's post — and only while they are inside
 Telegram's 48-hour delete window. The sweep runs on its own one-minute timer, so a notice
-disappears at most a minute after its limit. A batch Telegram refuses (an id that is not this
+disappears at most a minute after its limit while the sweep is healthy — and at most half an
+hour while it is backing off. A batch Telegram refuses (an id that is not this
 bot's to delete, a message already gone) is asked about again one id at a time, paced and
 capped, so one such id never costs the batch beside it; a sweep Telegram does not answer at
 all — flood control, a network error, a bot that lost the right to delete — keeps its ids for

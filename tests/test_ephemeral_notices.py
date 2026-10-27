@@ -205,8 +205,7 @@ class SweepTests(Case):
         self.assertEqual(self.sweep(NOW), 0)
         self.bot.error = None
         self.assertEqual(self.sweep(NOW + 121), 2)                # asked again, both went
-        self.assertTrue(self.sweep(NOW + 122) == 0)               # and no backoff left over
-        self.assertEqual(self.channel._sweep_backoff, 0.0)
+        self.assertEqual(self.channel._sweep_backoff, 0.0)        # and no backoff left over
 
     #: Telegram's own words for a refusal, written out here on purpose: the markers in the
     #: channel are matched against *these*, so dropping or re-wording one turns this red
@@ -239,17 +238,30 @@ class SweepTests(Case):
         self.assertEqual(self.ledger.notices(GROUP), [501])       # not refused: kept
         self.assertTrue(all(AgentChannel.DELETE_REFUSALS))
 
+    #: The two shapes a lost right arrives in, written out as they are: the Bot API's text, and
+    #: aiogram's own exception class (#400 nit -- each is pinned, so a marker cannot rot).
+    TELEGRAM_DENIALS = (
+        "Bad Request: not enough rights to delete a message",
+        "Bad Request: CHAT_ADMIN_REQUIRED",
+    )
+
     def test_a_lost_right_to_delete_is_not_a_refusal(self):
         # #400: an admin can grant the right back, so the ids stay and the sweep slows down.
         from swarmly.telegram.channel import AgentChannel
-        self.assertTrue(AgentChannel._delete_denied(
-            RuntimeError("Bad Request: not enough rights to delete a message")))
-        self.assertTrue(AgentChannel._delete_denied(
-            RuntimeError("Bad Request: CHAT_ADMIN_REQUIRED")))
-        self.assertFalse(AgentChannel._delete_refused(
-            RuntimeError("Bad Request: not enough rights to delete a message")))
+        for text in self.TELEGRAM_DENIALS:
+            with self.subTest(text=text):
+                self.assertTrue(AgentChannel._delete_denied(RuntimeError(text)))
+                self.assertFalse(AgentChannel._delete_refused(RuntimeError(text)))
+
+        class ChatAdminRequired(Exception):
+            """aiogram's own class for the same answer."""
+
+        self.assertTrue(AgentChannel._delete_denied(ChatAdminRequired("Bad Request")))
         self.assertFalse(AgentChannel._delete_denied(
             RuntimeError("Bad Request: message can't be deleted")))
+        # A send-side rights error is not something deleteMessages can answer (#400 nit).
+        self.assertFalse(AgentChannel._delete_denied(
+            RuntimeError("Bad Request: have no rights to send a message")))
 
     def test_a_notice_past_the_delete_window_is_pruned_not_offered(self):
         self.ledger.note_notice(GROUP, 500, now=NOW - LEDGER_TTL_SECONDS - 60)

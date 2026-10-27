@@ -2339,7 +2339,7 @@ class AgentChannel:
     #: never sent, one already gone. Everything else (flood control, network, a server error)
     #: means the bot was not answered at all, so the ids must be kept (#398). A wrong marker
     #: only keeps an id until the 48-hour prune, never loses one, so each is pinned by a test
-    #: (`test_telegram_refusals_are_pinned`) rather than trusted (#400).
+    #: (`test_each_refusal_wording_is_pinned`) rather than trusted (#400).
     DELETE_REFUSALS = (
         "message can't be deleted",         # the message exists but is not this bot's
         "message to delete not found",      # already deleted (or never existed)
@@ -2349,8 +2349,7 @@ class AgentChannel:
     #: A refusal is per message, so it settles the ids for good. Losing the right to delete is
     #: not: an admin can grant it back, so those ids are kept and the sweep backs off instead
     #: of asking a chat that answers "no" every minute for the whole 48-hour window (#400).
-    DELETE_DENIALS = ("not enough rights", "chat_admin_required", "chatadminrequired",
-                      "have no rights to send")
+    DELETE_DENIALS = ("not enough rights", "chat_admin_required")
 
     @classmethod
     def _delete_refused(cls, exc: Exception) -> bool:
@@ -2367,6 +2366,10 @@ class AgentChannel:
         Kept apart from a refusal: the ids are not this message's problem, so they stay in
         the ledger; the sweep slows down instead of re-asking a chat that keeps saying no.
         """
+        # aiogram raises its own ChatAdminRequired; the Bot API only sends the text, and which
+        # of the two a transport sees depends on the client, so both are read.
+        if type(exc).__name__.lower() == "chatadminrequired":
+            return True
         text = str(exc).lower()
         return any(marker in text for marker in cls.DELETE_DENIALS)
 
