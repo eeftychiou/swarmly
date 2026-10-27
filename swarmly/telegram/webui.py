@@ -1680,6 +1680,14 @@ function picker(forAction, choices, first, key) {
 function settingsForm(button, target, fields, box) {
   const reads = fields.map((field) => {
     const key = pendingKey(target, button.action + ":" + field.key);
+    box.append(el("span", "sub", field.label));
+    if (!(field.choices || []).length) {
+      // A bot that has not reported what it can run gets no dropdown for it (#461): a select
+      // with only its own value in it looks usable and cannot be used. Said plainly, the way
+      // the Drift table says "not reported", rather than drawn as a choice that is not there.
+      box.append(el("span", "note", "not reported yet"));
+      return null;
+    }
     const select = el("select", "");
     select.dataset.for = button.action + ":" + field.key;
     select.dataset.pending = key;
@@ -1706,10 +1714,9 @@ function settingsForm(button, target, fields, box) {
       rememberFocus(key);
     });
     select.addEventListener("focus", () => rememberFocus(key));
-    box.append(el("span", "sub", field.label));
     box.append(select);
     return {field, key, select};
-  });
+  }).filter((read) => read);        // a field with nothing to pick from drew no dropdown
   const go = el("button", "", button.label || "Apply");
   go.type = "button";
   go.disabled = !ADMIN;
