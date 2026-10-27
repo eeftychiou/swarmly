@@ -74,7 +74,7 @@ def _read_toml(path: Path) -> Dict[str, Any]:
     text = path.read_text(encoding="utf-8-sig")
     try:
         import tomllib
-    except ImportError:                                  # Python 3.10: top-level keys only
+    except ImportError:                                  # Python 3.10: read it here
         return _top_level_toml(text)
     try:
         return tomllib.loads(text)
@@ -87,24 +87,35 @@ _TOML_STRING = re.compile(r'^\s*([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"')
 
 
 def _top_level_toml(text: str) -> Dict[str, Any]:
-    """``key = "value"`` lines, with each ``[[providers]]`` table kept as a mapping.
+    """``key = "value"`` lines, each ``[[providers]]`` table, and their nested tables.
 
     Python 3.10 has no ``tomllib``, and this is the fallback that reads the file for it. The
     top-level keys alone are not enough: a Reasonix file names its providers in
-    ``[[providers]]`` tables, and those names are the models ``/model`` can switch to (#393).
-    Nested tables (``[providers.model_overrides.<name>]``) are still out of reach here; only
-    the strings written directly in a table are read.
+    ``[[providers]]`` tables (those names are the models ``/model`` can switch to, #393), and
+    keeps each model's ``default_effort`` in ``[providers.model_overrides.<model>]`` -- the
+    table ``_reasonix`` reads for the reasoning effort (#397). Deeper nesting, and the inline
+    ``model_overrides = {…}`` form, are still out of reach: only strings written directly in
+    a table are read.
     """
     found: Dict[str, Any] = {}
     providers: List[Dict[str, Any]] = []
-    current: Optional[Dict[str, Any]] = None          # the provider table being read, or None
+    current: Optional[Dict[str, Any]] = None          # the table being read, or None
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("["):
+            header = stripped.strip("[]").replace(" ", "").replace("\t", "")
+            parts = header.split(".")
             current = None
-            if stripped.replace(" ", "").replace("\t", "").lower() == "[[providers]]":
+            if header.lower() == "providers" and stripped.startswith("[["):
                 current = {}
                 providers.append(current)
+            elif parts[0].lower() == "providers" and len(parts) == 3 \
+                    and parts[1].lower() == "model_overrides" and providers:
+                # [providers.model_overrides.<model>]: it belongs to the provider above it.
+                current = providers[-1].setdefault("model_overrides", {}).setdefault(
+                    parts[2], {})
+            elif parts[0].lower() == "model_overrides" and len(parts) == 2:
+                current = found.setdefault("model_overrides", {}).setdefault(parts[1], {})
             continue
         match = _TOML_STRING.match(line)
         if not match:
