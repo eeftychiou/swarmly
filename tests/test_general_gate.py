@@ -106,6 +106,39 @@ class GeneralGateTests(unittest.TestCase):
         self.assertTrue(any("ACK" in m["text"] for m in channel._test_sender.sent),
                         channel._test_sender.sent)
 
+    def test_a_peers_handoff_dropped_by_the_gate_is_said_back(self):
+        """#327: the gate used to return "" for a peer's message, so a hand-off that passed
+        `should_respond` vanished with only a log line the sender cannot read."""
+        channel, adapter, _ = channel_for()
+        run(channel.handle_event(event("@HermesBot can you review #12?")))
+        texts = [m["text"] for m in channel._test_sender.sent]
+        self.assertEqual(adapter.prompts, [])
+        self.assertTrue(any("took no turn" in t and "@HermesBot" in t for t in texts), texts)
+        self.assertTrue(any("general_turns" in t for t in texts), texts)
+
+    def test_a_peers_notice_is_not_answered_with_a_drop_notice(self):
+        """A ⚠️ notice, a command answer and a sign-off never asked for a turn (#27)."""
+        for text in ("⚠️ Hermes paused this topic; @HermesBot is told",
+                     "STATUS to=* intent=PULSE @HermesBot idle",
+                     "@HermesBot: closing here, thanks"):
+            with self.subTest(text=text):
+                channel, adapter, _ = channel_for()
+                run(channel.handle_event(event(text)))
+                self.assertEqual(adapter.prompts, [])
+                self.assertEqual(channel._test_sender.sent, [])
+
+    def test_a_peers_message_that_names_another_bot_says_nothing(self):
+        channel, adapter, _ = channel_for()
+        run(channel.handle_event(event("@CodexBot can you review #12?")))
+        self.assertEqual((adapter.prompts, channel._test_sender.sent), ([], []))
+
+    def test_a_persons_request_the_gate_drops_says_nothing_back(self):
+        """A person is not told about a transport setting it cannot read; the coordinator
+        opens a topic for a person's work above (or nobody can, and that is the log's)."""
+        channel, adapter, opened = channel_for(coordinator=False)
+        run(channel.handle_event(admin("@HermesBot please check the CI flakes")))
+        self.assertEqual((adapter.prompts, opened, channel._test_sender.sent), ([], [], []))
+
     def test_an_own_brief_in_swarm_pulse_goes_to_the_work_topic(self):
         channel, adapter, _ = channel_for()
         channel._last_turn_place = (GROUP, 9400)
