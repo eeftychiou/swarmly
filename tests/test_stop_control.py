@@ -51,6 +51,15 @@ class Store:
         return LeaseClaim(term=self.term, alias="Hermes", expires_at=1e12)
 
 
+class StaleStore(Store):
+    """The gitbus fold just after a yield: it still *names* the bot, and the term is dead."""
+
+    def state(self, *, now=None):
+        from swarmly.telegram.lease import LeaseState
+        return LeaseState(status="ok", term=self.term, holder=self.holder or "Hermes",
+                          expires_at=0.0)
+
+
 class Dispatcher:
     def __init__(self):
         self.stopped = False
@@ -114,6 +123,24 @@ class TestStopping(unittest.TestCase):
         self.assertIn("could not give the lease away", str(caught.exception))
         self.assertFalse(channel.stop_requested)
         self.assertEqual(lines(channel, "Hermes offline"), [])
+
+    def test_a_yielded_lease_is_not_reported_as_still_held(self):
+        """gitbus can still name this bot after the yield; a dead term is not a held one.
+
+        The raw holder made every gitbus stop log "still shows the lease" (#443 review), which
+        is the one line an admin would read as "the stop did not work".
+        """
+        channel = self.channel()
+        channel.store = StaleStore()
+        channel.lease_store = lambda: channel.store
+        with self.assertLogs("swarmly.telegram", level="WARNING") as logged:
+            run(channel.go_offline())
+
+        said = "\n".join(logged.output)
+        self.assertIn("yielded the lease at term 15", said)
+        self.assertNotIn("still holds the lease", said)
+        self.assertEqual(channel.store.yielded, [("offline (dashboard Stop)", 15)])
+        self.assertTrue(channel.stop_requested)
 
     def test_a_lease_tick_after_the_stop_claims_nothing_back(self):
         """The yield leaves no live lease, so the next tick read as "expired, I am next".

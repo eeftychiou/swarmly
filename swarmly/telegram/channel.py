@@ -12352,11 +12352,14 @@ class AgentChannel:
                                                reason="offline (dashboard Stop)",
                                                term=term or None)
                     self._forget_lease_cache()
-                    still = await asyncio.to_thread(store.state, now=self._lease_clock())
-                    if str(getattr(still, "holder", "") or "").strip().lower() == me.lower():
-                        # The store lease returns instead of raising when someone else has
-                        # already moved on; say what is true, not what was asked (#437 review).
-                        logger.warning("stop: %s still shows the lease after the yield", me)
+                    moment = self._lease_clock()
+                    still = await asyncio.to_thread(store.state, now=moment)
+                    # `holds()` -- a *live* term in this bot's name -- not the raw holder: the
+                    # gitbus fold still names the bot whose claim was just yielded until the
+                    # yield is read back, and a store lease returns rather than raising when
+                    # the role has already moved on. Either way, say what is true.
+                    if getattr(still, "holds", lambda *_: False)(me, moment):
+                        logger.warning("stop: %s still holds the lease after the yield", me)
                     else:
                         logger.warning("stop: %s yielded the lease at term %d", me, term)
             except Exception as exc:                   # noqa: BLE001 - refused, in words
