@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A hand-off nobody can answer any more closes. A hand-off closed only on the peer's own reply
+  in that topic, so one about work that ended elsewhere ("Codex owes an answer" on the QA of a
+  PR merged the night before) climbed the stall ladder to "the admin should decide" and stayed
+  open, with nothing the admin or the coordinator could do. Now a hand-off closes when every
+  work item the topic links has merged or closed after it was made, and the admin can close
+  the rows owed in a topic with `/owed close [alias]`; the ladder's last rung says so.
+
 ## [0.12.1] - 2026-10-26
 
 ### Fixed
