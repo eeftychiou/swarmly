@@ -103,10 +103,13 @@ def _top_level_toml(text: str) -> Dict[str, Any]:
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("["):
-            header = stripped.strip("[]").replace(" ", "").replace("\t", "")
-            parts = header.split(".")
+            # `[[providers]]  # the DeepSeek providers` and [providers.model_overrides."x"]
+            # are both ordinary TOML: the comment ends the header, and a key may be quoted.
+            header = stripped.split("#", 1)[0].strip()
+            parts = [part.strip().strip('"').strip("'")
+                     for part in header.strip("[]").split(".")]
             current = None
-            if header.lower() == "providers" and stripped.startswith("[["):
+            if [p.lower() for p in parts] == ["providers"] and stripped.startswith("[["):
                 current = {}
                 providers.append(current)
             elif parts[0].lower() == "providers" and len(parts) == 3 \

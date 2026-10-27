@@ -241,8 +241,8 @@ class TestTheBackgroundLookup(unittest.TestCase):
         """#397: the fallback also has to see ``[providers.model_overrides.<model>]``, which is
         where ``_reasonix`` finds the effort -- it read as "the model default" on 3.10."""
         text = ('default_model = "deepseek-flash"\n\n'
-                '[[providers]]\nname = "deepseek-pro"\n\n'
-                '[providers.model_overrides.deepseek-flash]\ndefault_effort = "high"\n')
+                '[[providers]]  # the DeepSeek providers\nname = "deepseek-pro"\n\n'
+                '[providers.model_overrides."deepseek-flash"]\ndefault_effort = "high"\n')
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
             with mock.patch.dict(sys.modules, {"tomllib": None}):
@@ -307,6 +307,9 @@ class TestTheBackgroundLookup(unittest.TestCase):
 
             async def send_message(self, **kwargs):
                 return types.SimpleNamespace(message_id=1)
+
+            async def delete_webhook(self, **kwargs):
+                return True          # the real Bot has it, so start() takes no warning path
 
             async def close(self):
                 return None
