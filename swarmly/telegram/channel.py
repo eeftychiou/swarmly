@@ -6553,6 +6553,11 @@ class AgentChannel:
         who = args[0].lstrip("@") if args else ""
         if who:
             who = self.config.peer_alias_for(who) or who
+        # ``/owed close @A @B`` scopes to the first name only, so the reply says what it did
+        # with the rest instead of dropping them silently (#384).
+        ignored = args[1:]
+        note = (f" (only the first name is used; ignored: {', '.join(ignored)})"
+                if ignored else "")
         try:
             store = self.owed_store()
             closed = settle(store.load(), Fact(kind="dismiss",
@@ -6565,10 +6570,10 @@ class AgentChannel:
             logger.warning("owed: /owed close failed", exc_info=True)
             return "owed: could not close the rows here (the log has the reason)"
         if not closed:
-            return f"Nothing{' ' + who if who else ''} owes anything here."
+            return f"Nothing{' ' + who if who else ''} owes anything here." + note
         lines = [f"- {row.debtor} owed {row.owes}" for row in closed[:10]]
         more = f"\n- and {len(closed) - 10} more" if len(closed) > 10 else ""
-        return f"Closed {len(closed)} owed row(s) here:\n" + "\n".join(lines) + more
+        return f"Closed {len(closed)} owed row(s) here{note}:\n" + "\n".join(lines) + more
 
     def owed_settle_topics_done(self, *, now: Optional[float] = None) -> List[str]:
         """Close the hand-offs made in a topic whose work has all finished since (live, 27 Oct).

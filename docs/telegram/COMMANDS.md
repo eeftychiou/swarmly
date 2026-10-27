@@ -56,7 +56,7 @@ Any member may use these.
 | `/swarm` | The bus, the coordinator, and every member with its role and whether it is online. Home group only. |
 | `/usage@bot` (`/usage@bot all`) | What the bot spent today from its turn ledger: turns, tokens, cost where the CLI reports it; `all` lists every bot. |
 | `/round@bot` | What the open round waits on. |
-| `/owed@bot` | The open "owed" rows: who owes what to whom (reviews, merges, CI, hand-offs). Rows close themselves from facts (verdicts, CI, merges, GitHub's own state, a topic whose linked work has all finished). `/owed close [alias]` from the admin, inside a topic, closes the rows owed there (or only that bot's); the coordinator answers a bare `/owed` or `/owed close` (the one the admin named, while no lease is live). |
+| `/owed@bot` | The open "owed" rows: who owes what to whom (reviews, merges, CI, hand-offs). Rows close themselves from facts (verdicts, CI, merges, GitHub's own state, a topic whose linked work has all finished). `/owed close [alias]` from the admin, inside a topic, closes the rows owed there (or only that bot's); the `@alias` form works the same way, a second name is ignored and the reply says so. The coordinator answers a bare `/owed` or `/owed close` — the one the admin named, while no lease is live. |
 | `/drift@bot` | Rule violations the transport recorded for this bot, and its drift score (reminder at 3, session reset at 6). |
 | `/state@bot` | The shared state store as this bot sees it: position, lease holder and term, snapshot, whether every bot agrees, owed rows in the store. |
 | `/topics@bot` | The topic registry: topics, their links (work items with phase and assignees), linked bots and each bot's CLI session and turn count. |
