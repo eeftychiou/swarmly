@@ -661,14 +661,14 @@ dashboard show each item and its phase ([COMMANDS.md](COMMANDS.md)). `ref-learni
 off by `state.links: registry`: a number seen in a message's text never adds a link, and it is
 never what moves work — the explicit `LINK:`/`ASSIGN:` lines, `/link` and a GitHub event on an
 item already linked are what link a topic, and **the item's explicit link is what moves a reply
-or a brief into the topic that owns it** (#457, #460). The links an
-earlier build learned from text are dropped from the record the next time it is written, which
-is what took `#42` (a truncated title) and `#13221` (a topic id) off `/topics`; a number cut off
-by a truncated title, and a forum thread's own id, are not refs in either mode. GitHub moves what
-it can see, and only that: a PR opened from an
-item moves it to `review`, a merge — or an issue closing — to `done` / `closed`, and a PR closed
-without a merge only marks the link `closed` and keeps its phase. Green checks plus an approval
-promoting an item to `qa` is **not** implemented yet; that stays the coordinator's `PHASE:` line.
+or a brief into the topic that owns it** (#457, #460). The links an earlier build learned from
+text are dropped from the record the next time it is written, which is what took `#42` (a
+truncated title) and `#13221` (a topic id) off `/topics`; a number cut off by a truncated
+title, and a forum thread's own id, are not refs in either mode. GitHub moves what it can see,
+and only that: a PR opened from an item moves it to `review`, a merge — or an issue closing — to
+`done` / `closed`, and a PR closed without a merge only marks the link `closed` and keeps its
+phase. Green checks plus an approval promoting an item to `qa` is **not** implemented yet; that
+stays the coordinator's `PHASE:` line.
 
 ### 11.4 General and Swarm pulse are transport-only
 
