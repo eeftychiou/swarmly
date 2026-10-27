@@ -1627,5 +1627,89 @@ class TestTheControlCentre(unittest.TestCase):
         for secret in ("secret", str(CHAT)):
             self.assertNotIn(secret, json.dumps(view))
 
+
+class TestAPickSurvivesTheRefresh(unittest.TestCase):
+    """#449: the page redraws every 3 s, and a chosen pick must not be wiped before Set.
+
+    The panic the admin reported: pick an effort, the tick redraws the card, and the pick is
+    blank again before the button can be pressed -- so the press went out empty and the
+    setting looked like it needed a second press. The page keeps a half-done press in
+    `PENDING`, keyed by the card's target and the control's `data-for`.
+    """
+
+    def page(self) -> str:
+        return webui.page_html()
+
+    def test_a_control_keeps_what_was_chosen_until_it_is_pressed(self):
+        page = self.page()
+        # The map itself, and the two accessors every control goes through.
+        self.assertIn("const PENDING = {};", page)
+        self.assertIn("function pendingGet(key) {", page)
+        self.assertIn("function pendingSet(key, value) {", page)
+        # A picker carries its key on the node, so a redraw can find the kept value again.
+        self.assertIn("select.dataset.pending = key;", page)
+        # And it is put back on the next render, from what was kept.
+        self.assertIn("const kept = pendingGet(key);", page)
+        self.assertIn("select.value = kept;", page)
+        self.assertIn("pendingSet(key, select.value);", page)
+
+    def test_a_typed_value_is_kept_the_same_way(self):
+        page = self.page()
+        self.assertIn('typed.dataset.pending = pendingKey(target, button.action + ":typed");',
+                      page)
+        self.assertIn('typed.value = pendingGet(typed.dataset.pending) || "";', page)
+        # Kept as typed and trimmed only by the press, so a trailing space is not eaten and the
+        # caret does not jump to the end on the next render (review, #449).
+        self.assertIn("pendingSet(typed.dataset.pending, typed.value);", page)
+        self.assertNotIn("pendingSet(typed.dataset.pending, typed.value.trim());", page)
+        self.assertIn("else if (typed) value = typed.value.trim();", page)
+
+    def test_a_pick_is_keyed_by_its_card_and_its_control(self):
+        """Two cards offering an effort are two controls: one card's pick is not the other's."""
+        page = self.page()
+        self.assertIn("function pendingKey(target, forAction) {", page)
+        self.assertIn('return (target || "") + "|" + forAction;', page)
+        self.assertIn('pendingKey(target, button.action + ":pick")', page)
+        self.assertIn('pendingKey(target, button.action + ":then")', page)
+
+    def test_a_kept_choice_that_is_no_longer_offered_is_dropped(self):
+        # A bot that stopped offering an effort must not be pressed with the stale one.
+        page = self.page()
+        self.assertIn("(choices || []).some((choice) => choice.value === kept)", page)
+        self.assertIn('else pendingSet(key, "");', page)
+
+    def test_a_press_clears_the_control_it_carried(self):
+        page = self.page()
+        self.assertIn('[pick, then, typed].forEach((node) => {', page)
+        self.assertIn('pendingSet(node.dataset.pending, "");', page)
+        self.assertIn('node.value = "";', page)
+        # Cleared before the press goes out, so a redraw cannot press it twice.
+        self.assertLess(page.index('[pick, then, typed].forEach((node) => {'),
+                        page.index("press(button.action, who, value);"))
+
+    def test_the_keyboard_stays_in_the_control_that_had_it(self):
+        page = self.page()
+        self.assertIn('document.querySelectorAll("[data-pending]")', page)
+        self.assertIn("try { nodes[at].focus(); }", page)
+        # Restored at the end of a render, once every control is drawn.
+        self.assertIn("restoreFocus();", page)
+        self.assertLess(page.index("controlsPanel(state);"),
+                        page.index("restoreFocus();", page.index("function render(state)")))
+        # A tap outside every control is the page's own: no redraw pulls the focus back.
+        self.assertIn('target.closest("[data-pending]")', page)
+
+    def test_a_redraw_never_traps_a_keyboard_user_in_a_pick(self):
+        """Review #449: clearing FOCUS only on a pointer left tab-out pulled back every 3 s."""
+        page = self.page()
+        # The restore gives up when something other than a control holds the keyboard.
+        self.assertIn("const active = document.activeElement;", page)
+        self.assertIn('if (active && active !== document.body', page)
+        self.assertIn('!(active.closest && active.closest("[data-pending]"))) {', page)
+        # And a keyboard move out of the controls clears it as a tap would.
+        self.assertIn('document.addEventListener("focusin", (event) => {', page)
+        self.assertLess(page.index('document.addEventListener("focusin"'),
+                        page.index("function tick()"))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
