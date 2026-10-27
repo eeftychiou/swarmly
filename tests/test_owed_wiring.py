@@ -196,6 +196,19 @@ class TestTheOwedCommand(unittest.TestCase):
             "/owed", author_id=channel.config.identity.admin_user_id, username="admin",
             is_bot=False, thread_id=307)))
 
+    def test_a_named_debtor_does_not_send_owed_close_to_that_bot(self):
+        """Live, 27 Oct: "/owed close @CodexBot" was dropped on the coordinator as addressed
+        to another peer, and the named bot took it as a turn. The @name is the argument."""
+        admin = None
+        for coordinating in (True, False):
+            channel = self.channel()
+            admin = channel.config.identity.admin_user_id
+            channel._answers_for_swarm = lambda c=coordinating: c
+            for text in ("/owed close @CodexBot", "/owed close @Codex", "/owed @HermesBot"):
+                decision, reason = channel.should_respond(event(
+                    text, author_id=admin, username="admin", is_bot=False, thread_id=307))
+                self.assertEqual(decision, coordinating, (text, reason))
+
     def test_a_table_it_cannot_read_is_not_reported_as_nothing(self):
         channel = self.channel()
 

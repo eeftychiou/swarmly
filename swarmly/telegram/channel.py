@@ -156,6 +156,11 @@ def _ref_state(state: Optional[str]) -> Optional[str]:
     return word if word in ("open", "closed", "merged") else None
 
 
+#: Code in a reply, as HTML (``<code>``/``<pre>``) or Markdown backticks: what is quoted there
+#: addresses nobody.
+_CODE_SPAN = re.compile(r"(?is)<pre\b.*?</pre>|<code\b.*?</code>|```.*?```|`[^`\n]*`")
+
+
 def _closes_owed(text: str) -> bool:
     """Whether a ``/owed`` message asks to close rows -- ``/owed close …``, in any case.
 
@@ -1260,9 +1265,15 @@ class AgentChannel:
         # answer, in code: without this gate it never reached the command on any bot, so a
         # bare "/owed close" from the admin was dropped everywhere (live, 27 Oct).
         if (command is not None and not command[1] and command[0] in ("owed", "cleanup")
-                and not event.author_is_bot and not self._peer_handles_named(text)
-                and self._answers_for_swarm()):
-            return True, "a bare swarm command; this bot coordinates"
+                and not event.author_is_bot):
+            # In /owed an @name is an argument -- "/owed close @Codex" names the debtor -- so
+            # it must not send the command to that bot (live, 27 Oct: the coordinator dropped
+            # it as "addressed to another peer", and the named bot took it as a model turn).
+            if command[0] == "owed" or not self._peer_handles_named(text):
+                if self._answers_for_swarm():
+                    return True, "a bare swarm command; this bot coordinates"
+                if command[0] == "owed":
+                    return False, "a bare /owed: the coordinator answers it"
 
         # If this agent is mentioned, ALWAYS DELIVER to current conversation!
         if self.mentions_me(text):
@@ -3079,9 +3090,16 @@ class AgentChannel:
                 continue
             pattern = re.compile(rf"@(?:{re.escape(handle)}|{re.escape(alias)})\b",
                                  re.IGNORECASE)
-            if not pattern.search(body):
+            # A handle inside code is quoted, not addressed -- Telegram wakes nobody there --
+            # so "<code>/owed close @Codex</code>" is neither rewritten nor charged (live,
+            # 27 Oct: three bots were reset for quoting that command).
+            code = [m.span() for m in _CODE_SPAN.finditer(body)]
+            hits = [m for m in pattern.finditer(body)
+                    if not any(start <= m.start() < end for start, end in code)]
+            if not hits:
                 continue
-            body = pattern.sub(alias, body)                # named, not woken
+            for m in reversed(hits):                       # named, not woken
+                body = body[:m.start()] + alias + body[m.end():]
             why = blocked[str(alias).strip().lower()]
             line = f"⛔ Not delivered to {alias}: {why}."
             cover = covers.get(alias)
