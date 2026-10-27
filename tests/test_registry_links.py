@@ -277,7 +277,8 @@ class RoutingAndGitHubTests(unittest.TestCase):
         channel = make_channel(make_config(state={"backend": "telegram", "links": "registry"}))
         channel.state_link.topic_for_refs = lambda refs: (-100, 55) if "#12" in refs else None
         self.assertEqual(channel.topic_for_text("CI went red on #12"), (-100, 55))
-        legacy = make_channel(make_config(state={"backend": "telegram"}))
+        # #424: the default is the registry side on the store, so legacy is asked for.
+        legacy = make_channel(make_config(state={"backend": "telegram", "links": "legacy"}))
         legacy.state_link.topic_for_refs = lambda refs: (-100, 55)
         self.assertIsNone(legacy.topic_for_text("CI went red on #12"))
 

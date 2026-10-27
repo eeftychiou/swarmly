@@ -1029,6 +1029,26 @@ class StateSettings:
     dir: Optional[str] = None
 
 
+#: Issue #424: on a transport that runs the Telegram state store the four registry flags below
+#: default to the registry side; with ``state.backend: off`` (or no ``state:`` section at all)
+#: they keep the legacy defaults, which are the ``StateSettings`` fields above. An explicit
+#: ``shadow`` / ``legacy`` is still honoured, so downgrading is one config line per flag.
+#: ``docs/telegram/PROTOCOL.md`` §11.7 marks those rows with a dagger and states both defaults.
+STATE_REGISTRY_DEFAULTS: Dict[str, str] = {
+    "lease": "store",
+    "owed": "store",
+    "links": "registry",
+    "routing": "registry",
+}
+
+
+def _state_flag_default(name: str, backend: str) -> str:
+    """The default for a registry flag: the registry side on the store, the legacy one off it."""
+    if backend == "telegram":
+        return STATE_REGISTRY_DEFAULTS[name]
+    return getattr(StateSettings, name)
+
+
 @dataclass
 class WebSettings:
     """The local dashboard page (issue #240, slice 1). Off unless the operator turns it on.
@@ -1447,22 +1467,26 @@ class AgentConfig:
                                    state_raw.get("heartbeat_minutes", 10.0), 10.0)
             if minutes <= 0:
                 raise ConfigError("state.heartbeat_minutes must be more than 0")
-            lease = str(state_raw.get("lease") or "shadow").strip().lower()
+            lease = str(state_raw.get("lease")
+                        or _state_flag_default("lease", backend)).strip().lower()
             if lease not in ("shadow", "store"):
                 raise ConfigError(f"state.lease must be shadow or store (got {lease!r})")
             if lease == "store" and backend != "telegram":
                 raise ConfigError("state.lease: store needs state.backend: telegram")
-            links = str(state_raw.get("links") or "legacy").strip().lower()
+            links = str(state_raw.get("links")
+                        or _state_flag_default("links", backend)).strip().lower()
             if links not in ("legacy", "registry"):
                 raise ConfigError(f"state.links must be legacy or registry (got {links!r})")
             if links == "registry" and backend != "telegram":
                 raise ConfigError("state.links: registry needs state.backend: telegram")
-            routing = str(state_raw.get("routing") or "legacy").strip().lower()
+            routing = str(state_raw.get("routing")
+                          or _state_flag_default("routing", backend)).strip().lower()
             if routing not in ("legacy", "registry"):
                 raise ConfigError(f"state.routing must be legacy or registry (got {routing!r})")
             if routing == "registry" and backend != "telegram":
                 raise ConfigError("state.routing: registry needs state.backend: telegram")
-            owed = str(state_raw.get("owed") or "shadow").strip().lower()
+            owed = str(state_raw.get("owed")
+                       or _state_flag_default("owed", backend)).strip().lower()
             if owed not in ("shadow", "store"):
                 raise ConfigError(f"state.owed must be shadow or store (got {owed!r})")
             if owed == "store" and backend != "telegram":
