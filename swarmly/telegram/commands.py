@@ -93,12 +93,18 @@ def parse_command(text: str) -> Optional[Tuple[str, Optional[str]]]:
     return match.group("cmd").lower(), match.group("target")
 
 
-def command_args(text: str) -> List[str]:
+def command_args(text: str, *, keep_handles: bool = False) -> List[str]:
     """The words after ``/cmd[@bot]`` (a sender's "[Alias]" banner is not one), without the
-    @handles of other bots the message names."""
+    @handles of other bots the message names.
+
+    ``keep_handles`` is for the few commands where an ``@name`` *is* an argument rather than a
+    bot the message names -- ``/owed close @Codex`` (bug #382): dropped there, the name came
+    out empty and the command acted on every row.
+    """
     match = _COMMAND.match(text or "")
     rest = (text or "")[match.end():] if match else ""
-    return [word for word in rest.split() if not word.startswith("@")]
+    words = rest.split()
+    return words if keep_handles else [word for word in words if not word.startswith("@")]
 
 
 def _utc(now: Optional[float] = None) -> str:
