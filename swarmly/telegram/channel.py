@@ -2013,9 +2013,49 @@ class AgentChannel:
         return bool(store is not None and store.ready and store.holds_lease())
 
     async def _transport_command(self, event: ChannelEvent) -> Optional[str]:
-        """A command answered by the transport: /cleanup first (it awaits), then the rest."""
-        reply = await self._handle_cleanup(event)
-        return reply if reply is not None else self._handle_command(event)
+        """A command answered by the transport: the ones that await first, then the rest."""
+        for handler in (self._handle_cleanup, self._handle_rotate):
+            reply = await handler(event)
+            if reply is not None:
+                return reply
+        return self._handle_command(event)
+
+    async def _handle_rotate(self, event: ChannelEvent) -> Optional[str]:
+        """``/rotate@bot``: retire this topic's session now (admin only, #433).
+
+        The design's manual rotation (§6, phase 8): the old session writes its handover, the
+        new one starts from the rulebook, the registry's facts and that handover, and the
+        retired session id is never resumed -- ``/topics`` shows the new one after the next
+        turn. Answered here so it costs no model turn.
+        """
+        if not self._commands_enabled():
+            return None
+        parsed = parse_command(event.text or "")
+        if not parsed or parsed[0] != "rotate":
+            return None
+        target = parsed[1]
+        if target:
+            if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
+                return None                            # another bot's rotation
+        elif not (self.mentions_me(event.text or "") or event.replies_to_bot
+                  or self._direct_chat(event)):
+            return None                                # not addressed to this bot
+        if not self.config.is_admin(event.author_id):
+            return "⛔ /rotate is the admin's: it retires this topic's session."
+        if event.thread_id is None:
+            return ("❌ /rotate works inside a topic: the session it retires is that topic's. "
+                    "Send it in the topic you want rotated.")
+        if not self.topics.context(event.chat_id, event.thread_id):
+            return "❌ This topic has no session yet: there is nothing to rotate."
+        rotated = await self._rotate_topic_session(
+            event.chat_id, event.thread_id,
+            lead="[The admin rotated your session for this topic. Read your rulebook again "
+                 "and follow it.]")
+        how = ("the old session wrote its handover, and the new one starts from the rulebook, "
+               "the registry's facts and that handover" if rotated else
+               "no handover came, so the new one starts from the rulebook and the topic's "
+               "recap")
+        return f"♻️ {self.config.identity.alias}: rotated on the admin's request; {how}."
 
     # -- /cli: a native command from the CLI itself, with no model turn (issue #116) ---------
 
@@ -3263,38 +3303,53 @@ class AgentChannel:
         task = loop.create_task(self._drift_reset(chat_id, thread_id, decision, reminder))
         self._self_tasks.add(task)
 
+    async def _rotate_topic_session(self, chat_id: int, thread_id: Optional[int], *,
+                                    lead: str, reminder: str = "") -> bool:
+        """Retire this topic's session as a handover rotation. True when the old session wrote
+        a handover; False when it was only forgotten (an adapter with no ``rotate``, or one
+        that failed). Never raises.
+
+        The old session writes its handover, the transport puts the registry's facts about the
+        topic on top of it, and the next turn starts a **new** session from ``lead``, the
+        ``reminder``, those facts and the handover (docs/design/topic-registry.md, "Drift reset
+        = handover rotation"). ``lead`` is what the new session is told first; every adapter's
+        ``rotate`` bumps its generation, so the retired id is never resumed.
+        """
+        context_id = self.topics.context(chat_id, thread_id)
+        adapter = self._adapter_for(chat_id, thread_id)
+        rotate = getattr(adapter, "rotate", None)
+        try:
+            if context_id and callable(rotate):
+                prefix = "\n\n".join(part for part in (
+                    lead, reminder, self.state_link.registry_facts(chat_id, thread_id)) if part)
+                template = IncomingMessage(
+                    text="", author_alias=self.config.identity.alias, context_id=context_id,
+                    mentions=dict(self.config.peers),
+                    maintainer_username=getattr(self.config.identity, "maintainer_username",
+                                                None))
+                return bool(await rotate(context_id, template, prefix))
+            adapter.forget_session(context_id)
+            return False
+        except Exception:                                  # noqa: BLE001 - the notice still goes
+            logger.warning("rotate: could not retire the session for %s", context_id,
+                           exc_info=True)
+            try:
+                adapter.forget_session(context_id)
+            except Exception:                              # noqa: BLE001
+                pass
+            return False
+
     async def _drift_reset(self, chat_id: int, thread_id: Optional[int], decision: Any,
                            reminder: str = "") -> None:
         """Retire this topic's session after repeated violations, as a handover rotation: the
         old session writes its handover, and the new one starts from the rulebook (its rules,
         read fresh), the rules it broke, the registry's facts about the topic, then the
         handover (docs/design/topic-registry.md, "Drift reset = handover rotation")."""
-        context_id = self.topics.context(chat_id, thread_id)
-        adapter = self._adapter_for(chat_id, thread_id)
-        rotate = getattr(adapter, "rotate", None)
-        rotated = False
-        try:
-            if context_id and callable(rotate):
-                prefix = "\n\n".join(part for part in (
-                    "[A drift reset retired your previous session for this topic. Read your "
-                    "rulebook again and follow it.]",
-                    reminder,
-                    self.state_link.registry_facts(chat_id, thread_id)) if part)
-                template = IncomingMessage(
-                    text="", author_alias=self.config.identity.alias, context_id=context_id,
-                    mentions=dict(self.config.peers),
-                    maintainer_username=getattr(self.config.identity, "maintainer_username",
-                                                None))
-                rotated = bool(await rotate(context_id, template, prefix))
-            else:
-                adapter.forget_session(context_id)
-        except Exception:                                  # noqa: BLE001 - the notice still goes
-            logger.warning("drift: could not retire the session for %s", context_id,
-                           exc_info=True)
-            try:
-                adapter.forget_session(context_id)
-            except Exception:                              # noqa: BLE001
-                pass
+        rotated = await self._rotate_topic_session(
+            chat_id, thread_id,
+            lead="[A drift reset retired your previous session for this topic. Read your "
+                 "rulebook again and follow it.]",
+            reminder=reminder)
         alias = self.config.identity.alias
         how = ("its old session wrote a handover, and the new one starts from the rulebook, "
                "the broken rules and that handover" if rotated else
