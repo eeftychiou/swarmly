@@ -41,15 +41,23 @@ class Sent:
 
 
 class FakeBot:
-    """The aiogram seam: records the delete calls the sweep makes."""
+    """The aiogram seam: records the delete calls the sweep makes.
 
-    def __init__(self, fail: bool = False) -> None:
+    ``refuse`` names the ids Telegram will not delete (a peer's post, a message already
+    gone). ``deleteMessages`` is all-or-nothing: any refused id in the call fails the call.
+    """
+
+    def __init__(self, fail: bool = False, refuse=()) -> None:
         self.messages = []
         self.fail = fail
+        self.refuse = {int(i) for i in refuse}
 
     async def delete_messages(self, chat_id=None, message_ids=None):
-        self.messages.append((chat_id, list(message_ids or [])))
+        ids = [int(i) for i in (message_ids or [])]
+        self.messages.append((chat_id, ids))
         if self.fail:
+            raise RuntimeError("Bad Request: message can't be deleted")
+        if any(mid in self.refuse for mid in ids):
             raise RuntimeError("Bad Request: message can't be deleted")
 
 
@@ -167,6 +175,17 @@ class SweepTests(Case):
         self.assertEqual(self.sweep(NOW), 0)
         self.assertEqual(self.bot.messages, [])
 
+    def test_one_undelatable_notice_does_not_cost_the_batch(self):
+        # #395, live 27 Oct: one refused id failed the whole call, the sweep forgot the batch,
+        # and Swarm pulse kept growing. The good deletes go, one id at a time.
+        for mid in (1, 2, 3):
+            self.ledger.note_notice(GROUP, mid, now=NOW - 2 * 60 * MINUTE)
+        self.bot.refuse = {2}
+        self.assertEqual(self.sweep(NOW), 2)
+        self.assertEqual(self.bot.messages[0], (GROUP, [1, 2, 3]))
+        self.assertEqual([call[1] for call in self.bot.messages[1:]], [[1], [2], [3]])
+        self.assertEqual(self.ledger.notices(GROUP), [])     # the refused one is not retried
+
     def test_many_notices_go_in_batches(self):
         self.ledger.note_notice(GROUP, 1, now=NOW - 2 * 60 * MINUTE)
         self.ledger.note_notice(GROUP, 2, now=NOW - 2 * 60 * MINUTE)
@@ -230,6 +249,13 @@ class SwarmPulseTests(Case):
         self.channel._pulse_message = lambda: (GROUP, self.PULSE, 13)
         self.assertEqual(self.sweep(NOW), 1)
         self.assertEqual(self.bot.messages, [(GROUP, [10])])
+
+    def test_a_peer_post_in_the_pulse_topic_is_not_recorded(self):
+        # #395: a message this transport only *saw* is never its own notice -- Telegram
+        # refuses to delete a peer's post, and recording it poisoned the whole batch.
+        self.channel._note_general_message(GROUP, 900, self.PULSE, own=False)
+        self.channel._note_general_message(GROUP, 901, self.PULSE)
+        self.assertEqual(self.ledger.notices(GROUP), [901])
 
     def test_a_post_in_the_pulse_topic_is_recorded(self):
         self.channel.note_pulse_post(GROUP, 900, self.PULSE)

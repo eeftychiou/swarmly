@@ -17,6 +17,16 @@ All notable changes to this project are documented here. The format follows
   cannot answer: the provider names its own `reasonix.toml` declares. A lookup that fails still
   publishes an empty list, and the card still says it has nothing to pick yet.
 
+- Swarm pulse's old posts are deleted again (`#395`). The sweep recorded every message the
+  transport *saw* as its own notice, and in Swarm pulse that is every peer's post — which
+  Telegram refuses to delete — and `deleteMessages` is all-or-nothing, so one such id failed
+  the whole call of 100 and the sweep dropped the batch without deleting any of it. A message
+  the bot only saw is never marked as its own notice now, and a batch Telegram refuses is
+  asked again one id at a time (`cleanup.delete_message_ids`), so the good deletes still go
+  and only what Telegram really refused is forgotten. Sixty days of pulse therefore still
+  needs the admin's hand: a post older than `deleteMessages`' 48 hours cannot be deleted by a
+  bot at all.
+
 - `/owed close @Name` reaches the coordinator even as a reply, and the debtor's handle is never
   charged as an address (`#391`). Two holes left after `#388`: the bare-command gate sat below
   the reply check in `should_respond`, so a reply to the bot the command names still opened a
