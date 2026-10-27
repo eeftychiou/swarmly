@@ -48,8 +48,8 @@ class FakeHost:
         self.unavailable = None
         #: When set, every call raises this instead -- an error that is not DeleteUnavailable.
         self.crash = None
-        #: When set, every call answers this: None is the host's "could not ask" (#400).
-        self.answer = "count"
+        #: True: every call answers None -- the host's "could not ask" (#400).
+        self.say_nothing = False
         self.protected = set(protected)
         self.deleted_topics = []
         self.deleted_messages = []
@@ -75,7 +75,7 @@ class FakeHost:
             raise DeleteUnavailable(self.unavailable)
         if self.crash is not None:
             raise self.crash
-        if self.answer is None:
+        if self.say_nothing:
             return None                  # not answered: not a refusal (#400)
         if self.message_batches is not None:
             return self.message_batches.pop(0) if self.message_batches else 0
@@ -240,13 +240,14 @@ class OtherFormTests(CleanupCase):
         outage lost every notice that was due. Only a call that comes back with a count
         settles an id.
         """
-        shapes = {"raises": "crash", "says None": "answer"}
-        for label, field in shapes.items():
+        shapes = {"raises": {"crash": RuntimeError("no bot attached")},
+                  "says None": {"say_nothing": True}}
+        for label, settings in shapes.items():
             with self.subTest(label):
                 self.ledger.note(GROUP, [5, 6], now=NOW - HOUR)
                 host = FakeHost()
-                setattr(host, field, RuntimeError("no bot attached") if field == "crash"
-                        else None)
+                for field, value in settings.items():
+                    setattr(host, field, value)
                 reply = self.ask(self.cleanup(host), "general")
                 self.assertIn("2 could not be asked about", reply)
                 self.assertEqual(self.ledger.recent(GROUP, NOW), [5, 6], label)

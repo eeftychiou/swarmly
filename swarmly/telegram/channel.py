@@ -2367,7 +2367,11 @@ class AgentChannel:
         the ledger; the sweep slows down instead of re-asking a chat that keeps saying no.
         """
         # aiogram raises its own ChatAdminRequired; the Bot API only sends the text, and which
-        # of the two a transport sees depends on the client, so both are read.
+        # of the two a transport sees depends on the client, so both are read. The class name
+        # is a convention, not a checked fact (aiogram is not installed where this is tested,
+        # so the test pins the convention with its own class): if it is ever spelled
+        # differently this check goes quiet, and the text marker -- the Bot API's own wording --
+        # is what still catches the denial (#402).
         if type(exc).__name__.lower() == "chatadminrequired":
             return True
         text = str(exc).lower()
