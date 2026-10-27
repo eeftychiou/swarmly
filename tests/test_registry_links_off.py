@@ -129,6 +129,18 @@ class TestTheExplicitLinkStillMoves(unittest.TestCase):
         self.assertEqual(channel._topic_for_brief("re-review PR #12"), (HOME, 55))
         self.assertIsNone(channel._topic_for_brief("a brief about #999"))
 
+    def test_a_brief_falls_back_to_the_learned_topic_when_no_link_exists(self):
+        """The `else` of `_topic_for_brief`: with no explicit link, `legacy` mode still moves.
+
+        Without this, replacing the body with only `_linked_topic(about)` left all the other
+        tests green (#462 review).
+        """
+        channel = self.channel("legacy")            # FakeLink answers nothing in this mode
+        self.assertFalse(channel._transport_only_on())
+        channel._learn_topic_refs(HOME, 55, "#12")
+        self.assertEqual(channel._topic_for_brief("#12"), (HOME, 55))
+        self.assertIsNone(channel._topic_for_brief("#999"), "nothing learned, nothing moves")
+
     def test_a_general_reply_goes_where_its_item_lives(self):
         """The decision the General move takes, message and answer read together."""
         channel = self.channel("registry")
