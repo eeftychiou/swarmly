@@ -293,6 +293,8 @@ class TestTheBackgroundLookup(unittest.TestCase):
             whole = cli_default("reasonix", tmp, env={}, home=Path(tmp))
         self.assertEqual(without.effort, "high")
         self.assertEqual(whole.effort, without.effort)      # the real parser agrees
+
+    def test_the_loop_looks_up_once_before_it_sleeps(self):
         channel = make_channel(make_config(adapter={"type": "antigravity"}))
         beats = []
 
