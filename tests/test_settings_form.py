@@ -302,6 +302,50 @@ class TestTheFormForAPeer(unittest.TestCase):
         self.assertIn("already", again)
 
 
+class TestTheNitsFromTheReviewOf458(unittest.TestCase):
+    """#461: the peer's ack names a refused field, and a field with no choices has no dropdown."""
+
+    def test_a_forwarded_form_names_the_field_its_own_runtime_refused(self):
+        peer = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"}, adapter="claude")
+        said = peer._run_control_now("bot.settings", "model=not-a-model;effort=high")
+        self.assertIsInstance(said, str)                 # an answer in words, not "applied"
+        self.assertIn("refused", said)
+        self.assertIn("model:", said)
+        self.assertIn("not a Claude model", said)        # the typed command's own reason
+        self.assertIn("effort", said)                    # and what it did do
+        self.assertEqual(peer._efforts.get(peer._pick_key()), "high")
+
+    def test_a_forwarded_form_that_all_changed_still_says_applied(self):
+        peer = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"}, adapter="claude")
+        self.assertIs(peer._run_control_now("bot.settings", "model=opus;effort=high"), True)
+
+    def test_a_forwarded_form_the_peer_already_runs_says_so(self):
+        peer = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"}, adapter="claude")
+        peer._run_control_now("bot.settings", "effort=high")
+        again = peer._run_control_now("bot.settings", "effort=high")
+        self.assertIsInstance(again, str)
+        self.assertIn("already", again)
+
+    def test_a_field_a_peer_has_not_reported_gets_no_dropdown(self):
+        page = webui.page_html()
+        self.assertIn("if (!(field.choices || []).length) {", page)
+        self.assertIn('box.append(el("span", "note", "not reported yet"));', page)
+        # What the bot *runs* is still shown: the missing thing is the list of choices, not
+        # the setting (review, #461).
+        self.assertIn('if (field.value) box.append(el("span", "sub", "runs " + field.value));',
+                      page)
+        # And the field draws nothing to read from: the reads that carry a select are the ones
+        # Apply looks at, so a no-choice field cannot be sent.
+        self.assertIn(".filter((read) => read);", page)
+
+    def test_the_form_still_draws_the_fields_that_do_have_choices(self):
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"}, adapter="claude")
+        live(channel, "Hermes", effort="low", efforts=())      # a beat with no list
+        fields = {row["key"]: row for row in channel.settings_fields("Hermes")}
+        self.assertEqual(fields["effort"]["choices"], [])      # nothing to offer
+        self.assertEqual(fields["effort"]["value"], "low")     # but the value is known
+
+
 class TestThePrefill(unittest.TestCase):
     """Review #451: an untouched form sent the first choice because its prefill was empty."""
 

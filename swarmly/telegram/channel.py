@@ -4869,30 +4869,44 @@ class AgentChannel:
     def _apply_remote_settings(self, value: str) -> Any:
         """Apply a forwarded form (#451): each field through the typed command, as a pick is.
 
-        True when at least one field really changed; a form whose every field was already at
-        the value it sends answers in words instead, so a peer's note never reports "applied"
-        for a press that changed nothing.
+        True when every field it carried really changed; otherwise the answer is in words --
+        already at that value, or **refused**, with the typed command's own reason and every
+        refused field named (#461). A peer's ack that said "applied" while one field was
+        refused was the last place a press could look true and not be.
         """
         pairs = control_mod.parse_settings(value)
         if not pairs:
             return False
+        me = self.config.identity.alias
         changed: List[str] = []
         already: List[str] = []
+        refused: List[str] = []
         for key, wanted in pairs:
             action = control_mod.setting_action(key)
             if not action:
-                return False
-            result = self._apply_remote_pick(action, wanted)
-            if result is True:
-                changed.append(f"{key} → {wanted}")
-            elif isinstance(result, str) and "already" in result:
+                refused.append(f"{key} (not a setting this dashboard has)")
+                continue
+            store = self._models if key == "model" else self._efforts
+            before = store.get(self._pick_key())
+            said = self._pick_through("model" if key == "model" else "reasoning", wanted, store,
+                                      key, None)
+            after = store.get(self._pick_key())
+            if after != before:
+                changed.append(f"{key} → {after}")
+            elif str(after or "").strip().lower() == wanted.strip().lower():
                 already.append(f"{key} was already {wanted}")
-        if changed:
+            else:
+                refused.append(f"{key}: {said}")
+        if not refused and not already:
             return True
+        parts: List[str] = [f"accepted: bot.settings -- {me}"]
+        if changed:
+            parts.append(", ".join(changed))
         if already:
-            return (f"accepted: bot.settings -- {self.config.identity.alias} was already at "
-                    + ", ".join(already))
-        return False
+            parts.append(", ".join(already))
+        if refused:
+            parts.append("refused -- " + "; ".join(refused))
+        return ". ".join(parts)
 
     def _notice_soon(self, text: str) -> None:
         """Post a machine line from synchronous code (a control note), once the loop runs."""
