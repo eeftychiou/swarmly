@@ -123,15 +123,31 @@ class TestTheExplicitLinkStillMoves(unittest.TestCase):
         nothing = channel._topic_elsewhere(self.reply_in(28784, "answer here"), "about #999")
         self.assertIsNone(nothing, "a number nobody linked moves nothing")
 
-    def test_a_brief_and_a_general_reply_ask_the_helper(self):
-        """`_open_topic` and the General move used `_topic_for_refs`, which is now empty under
-        the flag: they ask `topic_for_text`, so the explicit link still wins."""
-        import inspect
-        from swarmly.telegram import channel as channel_mod
-        self.assertIn("self.topic_for_text(about)",
-                      inspect.getsource(channel_mod.AgentChannel._open_topic))
-        self.assertIn("self.topic_for_text(f\"{event.text or ''}",
-                      inspect.getsource(channel_mod.AgentChannel._run_turn))
+    def test_a_brief_goes_to_the_topic_its_item_is_linked_in(self):
+        """The decision `_open_topic` takes, driven: not a string match on the source (#457)."""
+        channel = self.channel("registry")
+        self.assertEqual(channel._topic_for_brief("re-review PR #12"), (HOME, 55))
+        self.assertIsNone(channel._topic_for_brief("a brief about #999"))
+
+    def test_a_general_reply_goes_where_its_item_lives(self):
+        """The decision the General move takes, message and answer read together."""
+        channel = self.channel("registry")
+        event = self.reply_in(None, "handing the review over")
+        self.assertEqual(channel._topic_for_general_work(event, "reviewed #12"), (HOME, 55))
+        self.assertIsNone(channel._topic_for_general_work(event, "reviewed #999"))
+
+    def test_transport_only_moves_a_brief_on_a_link_never_on_a_guess(self):
+        """With General and pulse transport-only only a link moves a brief (admin, 25 Oct)."""
+        linked = self.channel("registry")
+        linked.config.limits.general_turns = "never"
+        self.assertEqual(linked._topic_for_brief("#12"), (HOME, 55))
+
+        guessed = self.channel("legacy")
+        guessed.config.limits.general_turns = "never"
+        guessed._learn_topic_refs(HOME, 55, "#12")     # a learned ref, the legacy way
+        self.assertIn("#12", guessed._ref_topics)
+        self.assertIsNone(guessed._topic_for_brief("#12"),
+                          "a guess does not move a brief: it stays where it was asked")
 
     def reply_in(self, thread, text):
         from swarmly.telegram.channel import ChannelEvent
