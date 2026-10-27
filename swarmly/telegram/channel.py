@@ -6563,7 +6563,7 @@ class AgentChannel:
                 # than dropped quietly (#213 review: `until=` was the same bug one keyword
                 # over).
                 said = "`every=`" if repeats else "`until=`"
-                notes.append(f"WAKE refused: {said} is not carried -- a WAKE becomes a row, "
+                notes.append(f"⚠️ WAKE refused: {said} is not carried -- a WAKE becomes a row, "
                              "opened once and then woken by facts. Write one `WAIT`; the "
                              "ladder (limits.stall_minutes) reminds you if it stalls")
                 continue
@@ -6571,10 +6571,10 @@ class AgentChannel:
                 rows.append(from_wake(spec, alias=self.config.identity.alias, topic=topic,
                                       at=moment))
             except OwedError as exc:
-                notes.append(f"WAKE refused: {exc}")
+                notes.append(f"⚠️ WAKE refused: {exc}")
         if len(specs) > per_reply:
-            notes.append(f"WAKE refused: a reply may carry at most {per_reply} of them")
-        notes.extend(f"WAKE refused: {reason}" for reason in reasons)
+            notes.append(f"⚠️ WAKE refused: a reply may carry at most {per_reply} of them")
+        notes.extend(f"⚠️ WAKE refused: {reason}" for reason in reasons)
         if rows:
             try:
                 self.owed_store().save_all(rows)

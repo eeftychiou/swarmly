@@ -175,6 +175,32 @@ class TestChannelWiring(unittest.TestCase):
         self.assertIn("WAKE refused", body)
         self.assertEqual(channel._test_table.load(), [])
 
+    def test_every_refusal_note_is_marked_and_cannot_be_copied_back(self):
+        """#364: a bare ``WAKE refused:`` note is a line a bot copies back and gets refused for.
+
+        Every refusal path carries the same ⚠️ the "WAKE not recorded" note does (#353), so a
+        note never opens with a word the extractor reads as a directive.
+        """
+        channel, event = self.channel()
+        body = channel.apply_wake_lines(
+            'x\n'
+            'WAKE in=1m check="gh pr merge 75" then="go"\n'          # the command is refused
+            'WAKE in=1m every=5m check="gh pr checks 1" then="y"\n'  # `every=` is not carried
+            'WAKE in=1m check="gh pr checks 11" then="a"\n'
+            'WAKE in=2m check="gh pr checks 12" then="b"\n'
+            'WAKE in=3m check="gh pr checks 13" then="c"\n'
+            'WAKE in=4m check="gh pr checks 14" then="d"\n',         # one over the limit
+            event("hi", username="ClaudeBot"))
+        notes = [line for line in body.splitlines() if "WAKE refused" in line]
+        self.assertEqual(len(notes), 3, body)                     # reasons, every=, the limit
+        for note in notes:
+            self.assertTrue(note.startswith("⚠️ "), note)
+        # Copied back whole, the notes are prose: not one more refusal comes of them.
+        again = channel.apply_wake_lines(body, event("hi", username="ClaudeBot"))
+        self.assertEqual(again.count("WAKE refused"), len(notes), again)
+        # Three specs get a slot, `every=` spends one of them, so two rows opened.
+        self.assertEqual(len(channel._test_table.load()), 2)
+
     def test_slash_wakes_points_at_the_rows_instead(self):
         """#215: the command outlives the timers, as a pointer to what replaced them."""
         channel, event = self.channel()
