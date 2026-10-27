@@ -191,6 +191,9 @@ class TestTheChannelActs(unittest.TestCase):
         code = channel.control_policy().pending()[0].code
         done = run(channel.handle_control_press(press("ctl:confirm:" + code)))
         self.assertIn("Restart done", done)
+        self.assertFalse(channel.restart_requested)          # the press only *asks* (#432)
+        self.assertTrue(channel._restart_pending)
+        channel.carry_out_pending_restart()                  # what the delivering caller does
         self.assertTrue(channel.restart_requested)
 
 
@@ -234,6 +237,32 @@ class TestTheAiogramCallback(unittest.TestCase):
         run(channel._on_aiogram_callback(self.callback("v2:elsewhere", answered)))
         self.assertEqual(answered, [])
         self.assertEqual(channel.bot.sent, [])
+
+    def test_the_press_answers_before_the_restart_stops_polling(self):
+        """#432 review: the button's answer went out after the restart had stopped polling."""
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.restart")))
+        code = channel.control_policy().pending()[0].code
+        order = []
+        real_restart = channel.request_restart
+
+        def restart() -> None:
+            order.append("restart")
+            real_restart()
+
+        channel.request_restart = restart
+        answered: list = []
+
+        async def answer(text: str = "") -> None:
+            order.append("answer")
+            answered.append(text)
+
+        callback = self.callback("ctl:confirm:" + code, [])
+        callback.answer = answer
+        run(channel._on_aiogram_callback(callback))
+        self.assertEqual(order, ["answer", "restart"])       # answered, and only then stopped
+        self.assertIn("Restart done", answered[0])
+        self.assertTrue(channel.restart_requested)
 
 
 class TestAnotherBotsControl(unittest.TestCase):
@@ -884,6 +913,25 @@ class TestTheSecondTapIsDeliverable(unittest.TestCase):
                       message_id=9))), text)
 
     # -- the record --------------------------------------------------------------------
+    def test_a_typed_restart_answers_before_polling_stops(self):
+        """#432 review: the typed form carried the restart out before its answer went out."""
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.restart")))
+        code = channel.control_policy().pending()[0].code
+        order = []
+        real_restart = channel.request_restart
+        channel.request_restart = lambda: (order.append("restart"), real_restart())
+
+        async def send(text, **kwargs):
+            order.append("answer")
+            return {"text": text}
+
+        channel.send = send
+        self.typed(channel, "ctl:confirm:" + code)
+        self.assertEqual(order[-1], "restart")               # the answer is out first
+        self.assertIn("answer", order[:-1])
+        self.assertTrue(channel.restart_requested)
+
     def test_the_control_note_names_the_value_that_was_picked(self):
         channel = self.channel()
         run(channel.handle_control_press(press("ctl:bot.model::claude-opus-4")))
@@ -1406,6 +1454,39 @@ class TestTheDashboardWritePath(unittest.TestCase):
         self.assertNotIn("the press failed", done["text"])
         self.assertEqual(order, ["note", "restart"])         # the note is out before the stop
         self.assertTrue(channel.restart_requested)
+
+    def test_a_failed_note_is_not_answered_as_a_failed_press(self):
+        """#432 review: a note that does not go out must not drop the restart it recorded."""
+        channel = self.channel()
+        code = self.ask(channel, action="bot.restart")["confirm"]
+
+        async def broken(line: str) -> None:
+            raise RuntimeError("the connection is gone")
+
+        channel._post_control_note = broken
+        done = self.ask(channel, action="bot.restart", code=code)
+        self.assertTrue(done["ok"], done)                    # the control did run
+        self.assertIn("Restart done", done["text"])
+        self.assertIn("the note did not go out", done["text"])
+        self.assertTrue(channel.restart_requested)
+
+    def test_an_armed_restart_never_fires_on_a_later_press(self):
+        """#432 review: a press whose note failed left the flag armed for the next press."""
+        channel = self.channel()
+
+        async def broken(line: str) -> None:
+            raise RuntimeError("the connection is gone")
+
+        channel._post_control_note = broken
+        code = self.ask(channel, action="bot.restart")["confirm"]
+        self.ask(channel, action="bot.restart", code=code)
+        self.assertTrue(channel.restart_requested)
+        self.assertFalse(channel._restart_pending)
+        channel.restart_requested = False                    # a fresh start, as after a restart
+        channel._post_control_note = lambda line: asyncio.sleep(0)
+        self.ask(channel, action="bot.pause")
+        self.assertFalse(channel.restart_requested)          # the pause pressed no restart
+        self.assertFalse(channel._restart_pending)
 
     def test_a_code_is_single_use(self):
         channel = self.channel()

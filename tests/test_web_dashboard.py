@@ -12,12 +12,13 @@ import hashlib
 import hmac
 import json
 import re
+import socket
 import time
 import unittest
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from swarmly.state import keys as K
 from swarmly.state.records import (AgentInTopic, Assignment, Binding, Link, Profile, Topic)
@@ -953,6 +954,45 @@ class TestTheWritePath(unittest.TestCase):
             self.assertEqual(self.asked, [])
         finally:
             server.stop()
+
+    def test_a_refused_write_reads_its_body_so_the_connection_closes_cleanly(self):
+        """#432 review: an unread body made the close a reset -- WinError 10053 on Windows CI.
+
+        A refusal is answered without the body ever being looked at, and the server then closes.
+        Closing a socket that still holds unread bytes sends a reset instead of a clean end, so
+        a client that sent its body on its own (the kernel keeps it) saw the connection aborted
+        rather than the 403 that was sent -- which is what the Windows CI run reported.
+        """
+        server = self.server()
+        try:
+            url = server.start()
+            where = urlsplit(url.rstrip("/") + webui.ACTION_PATH)
+            body = json.dumps({"action": "bot." + "x" * 2000}).encode("utf-8")
+            head = ("POST %s HTTP/1.1\r\nHost: %s\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %d\r\n\r\n"
+                    % (where.path, where.netloc, len(body))).encode("utf-8")
+            with socket.create_connection((where.hostname, where.port), timeout=5) as sock:
+                sock.sendall(head)                             # the body is still in flight
+                time.sleep(0.15)
+                sock.sendall(body)
+                got = b""
+                while b"\r\n\r\n" not in got:
+                    chunk = sock.recv(4096)                    # a reset would raise here
+                    self.assertTrue(chunk, "the server closed before answering")
+                    got += chunk
+                head_only, _, rest = got.partition(b"\r\n\r\n")
+                self.assertIn(b" 403 ", b" " + head_only.split(b"\r\n")[0] + b" ")
+                wanted = int(re.search(rb"Content-Length: (\d+)", head_only).group(1))
+                while len(rest) < wanted:
+                    chunk = sock.recv(4096)
+                    self.assertTrue(chunk, "the server closed before the body was read")
+                    rest += chunk
+                self.assertFalse(json.loads(rest.split(b"\r\n\r\n")[0])["ok"])
+                self.assertEqual(sock.recv(4096), b"")         # a clean end, not a reset
+        finally:
+            server.stop()
+        self.assertEqual(self.asked, [])                     # the refused write never ran
 
     def test_a_login_that_is_not_the_admins_is_refused(self):
         server = self.server()

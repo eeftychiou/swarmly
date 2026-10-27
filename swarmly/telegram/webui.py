@@ -1839,6 +1839,26 @@ class DashboardServer:
             def _not_found(self) -> None:
                 self._send(404, b'{"error":"not found"}', "application/json")
 
+            def _drain(self) -> None:
+                """Consume a request body this answer never looked at (#432 review).
+
+                Answering a write without reading its body leaves unread bytes in the socket,
+                and the close that follows resets the connection instead of ending it cleanly:
+                the client gets ``WinError 10053`` / ``ECONNRESET`` rather than the 403 that was
+                sent -- which is what made ``test_a_forged_or_expired_login_is_refused`` fail on
+                Windows CI. Reading it first makes the close clean. Bounded, and never fatal:
+                a refusal must not become an exception because the body was odd.
+                """
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    return
+                if 0 < length <= MAX_BODY_BYTES:
+                    try:
+                        self.rfile.read(length)
+                    except (OSError, ValueError):
+                        pass
+
             def _host_ok(self) -> bool:
                 """Whether the request's ``Host`` is one this server answers for (#256 review).
 
@@ -1965,15 +1985,19 @@ class DashboardServer:
             def do_POST(self) -> None:                      # noqa: N802
                 path = self.path.partition("?")[0]
                 if not self._host_ok():
+                    self._drain()
                     self._not_found()
                     return
                 if path != ACTION_PATH:
+                    self._drain()
                     self._read_only()                       # every other path stays read-only
                     return
                 if server.action is None:
+                    self._drain()
                     self._read_only()                       # no controls wired: still a 405
                     return
                 if not self._origin_ok():
+                    self._drain()
                     self._write(403, {"ok": False, "refused": "origin",
                                       "text": "that origin may not write here"})
                     return
@@ -1984,6 +2008,7 @@ class DashboardServer:
                     # A write fails closed: the age check is what makes a captured payload
                     # useless, and config refuses a window of 0 anyway (review, #347).
                     logger.info("web dashboard: refused a write (no init_max_age window)")
+                    self._drain()
                     self._write(403, {"ok": False, "refused": "auth",
                                       "text": "this page has no initData window to check"})
                     return
@@ -1993,6 +2018,7 @@ class DashboardServer:
                                           now=time.time(), max_age=server.init_max_age)
                 if not ok:
                     logger.info("web dashboard: refused a write (%s)", why)
+                    self._drain()
                     self._write(403, {"ok": False, "refused": "auth", "text": why})
                     return
                 try:
