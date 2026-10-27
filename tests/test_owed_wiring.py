@@ -181,6 +181,21 @@ class TestTheOwedCommand(unittest.TestCase):
         self.assertIsNotNone(channel._handle_command(
             event("/owed@HermesBot", author_id=202, username="CodexBot", thread_id=307)))
 
+    def test_a_bare_owed_passes_the_routing_gate_on_the_coordinator_only(self):
+        """Live, 27 Oct: a bare /owed (or /owed close) was dropped on every bot by the gate."""
+        channel = self.channel()
+        for text in ("/owed", "/owed close"):
+            bare = event(text, author_id=channel.config.identity.admin_user_id,
+                         username="admin", is_bot=False, thread_id=307)
+            channel._answers_for_swarm = lambda: False
+            self.assertFalse(channel.should_respond(bare)[0])
+            channel._answers_for_swarm = lambda: True
+            self.assertTrue(channel.should_respond(bare)[0])
+        channel.is_coordinator = lambda **kwargs: True
+        self.assertIsNotNone(channel._handle_command(event(
+            "/owed", author_id=channel.config.identity.admin_user_id, username="admin",
+            is_bot=False, thread_id=307)))
+
     def test_a_table_it_cannot_read_is_not_reported_as_nothing(self):
         channel = self.channel()
 

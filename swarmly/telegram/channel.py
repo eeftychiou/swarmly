@@ -1246,6 +1246,14 @@ class AgentChannel:
             if routed is not None:
                 return routed
 
+        # A bare swarm-wide command from a person (/owed, /cleanup) is the coordinator's to
+        # answer, in code: without this gate it never reached the command on any bot, so a
+        # bare "/owed close" from the admin was dropped everywhere (live, 27 Oct).
+        if (command is not None and not command[1] and command[0] in ("owed", "cleanup")
+                and not event.author_is_bot and not self._peer_handles_named(text)
+                and self._answers_for_swarm()):
+            return True, "a bare swarm command; this bot coordinates"
+
         # If this agent is mentioned, ALWAYS DELIVER to current conversation!
         if self.mentions_me(text):
             return True, "mentioned"
@@ -1806,8 +1814,9 @@ class AgentChannel:
             if not self.is_coordinator():
                 return None                         # one bot answers a bare /owed close
         elif not (self.mentions_me(event.text or "") or event.replies_to_bot
-                  or self._direct_chat(event)):
-            return None
+                  or self._direct_chat(event)
+                  or (command == "owed" and self._answers_for_swarm())):
+            return None                         # a bare /owed: the coordinator's table
         if command == "model":
             return self._model_command(event)
         if command == "reasoning":
