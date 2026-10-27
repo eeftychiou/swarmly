@@ -7523,6 +7523,9 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - a tick must survive
             logger.warning("owed guard: the table could not be read", exc_info=True)
             return []
+        coordinating = self.is_coordinator()
+        if coordinating:
+            rows = self._bounce_frozen_handoffs(store, rows, moment)
         decided = stalls(rows, now=moment, minutes=minutes, unable=self.blocked_peers())
         if not decided:
             return []
@@ -7531,7 +7534,6 @@ class AgentChannel:
         # ladder and advance it for everyone: four bots, one stall, four reminders and four
         # rungs (#177's rule, and the reason `stalls` is durable).
         me = str(self.config.identity.alias or "").strip().lower()
-        coordinating = self.is_coordinator()
         done: List[str] = []
         climbed: List[Any] = []
         fired: Set[Any] = set()
@@ -7567,6 +7569,44 @@ class AgentChannel:
         if done:
             logger.info("owed guard: %s", "; ".join(done[:8]))
         return done
+
+    def _bounce_frozen_handoffs(self, store: Any, rows: List[Any], moment: float) -> List[Any]:
+        """Close the hand-offs owed by a bot that ran out of quota.
+
+        A hand-off to a frozen peer is never recorded (#237), but one made a moment before the
+        peer froze was: Codex ran out of quota on the very turn the hand-off started, and its
+        "owes an answer" row sat open for good, climbing the ladder to the coordinator and the
+        admin, who could not close it (live, 27 Oct). The hand-off bounced; the row says so.
+        Not a pause: ``/pause`` freezes peers mid-turn, and the work they hold is still theirs
+        after ``/resume`` (review). Only hand-offs: a review or a merge stays owed on its PR. The
+        coordinator writes the close, and the closed copy wins the fold for every reader.
+        """
+        try:
+            frozen = {str(alias).strip().lower(): entry
+                      for alias, entry in self.frozen_peers().items()
+                      if str(entry.get("ref") or "") == "quota"}
+        except Exception:                          # noqa: BLE001 - unknown is not frozen
+            return rows
+        if not frozen:
+            return rows
+        bounced: List[Any] = []
+        for row in rows:
+            if str(row.debtor or "").strip().lower() not in frozen or row.kind != "handoff" or not row.is_open:
+                continue
+            row.state, row.updated_at = "closed", moment
+            row.closed_by = f"{row.debtor} cannot act (out of quota): the hand-off bounced"
+            bounced.append(row)
+        if not bounced:
+            return rows
+        try:
+            store.save_all(bounced)
+        except Exception:                          # noqa: BLE001 - the next tick tries again
+            logger.warning("owed guard: could not close the bounced hand-offs", exc_info=True)
+            return rows
+        logger.info("owed guard: %s", "; ".join(f"closed {row.id} ({row.closed_by})"
+                                               for row in bounced[:8]))
+        gone = {row.id for row in bounced}
+        return [row for row in rows if row.id not in gone]
 
     def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
                             thread_id: Optional[int]) -> None:

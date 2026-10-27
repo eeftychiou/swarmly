@@ -363,6 +363,45 @@ class TestTheGuardTick(unittest.TestCase):
         self.assertIn("cannot act (paused)", channel._test_turns[0][0])
         self.assertEqual([r.stalls for r in channel._test_table[1].load()], [2])  # both spent
 
+    def test_a_hand_off_to_a_bot_that_froze_bounces(self):
+        """Live, 27 Oct: Codex ran out of quota on the turn the hand-off started, and its
+        "owes an answer" row climbed to the coordinator and the admin, who could not close it."""
+        channel = self.channel()
+        channel._peers_frozen["Codex"] = {"ref": "quota", "until": None}
+        here = channel.topics.context(GROUP, 5122)
+        channel._test_table[1].save_all([
+            row(kind="handoff", debtor="Codex", owes="an answer", topic=here, key_extra=here,
+                updated_at=1000.0),
+            row(kind="verdict", debtor="Codex", owes="a review verdict on #9", item="#9",
+                head="abc1234", updated_at=1000.0, topic=here)])
+        channel.owed_guard_tick(now=1000.0 + 31 * 60)       # not the coordinator: untouched
+        self.assertEqual(len(channel._test_table[1].open_rows(now=1000.0)), 2)
+        channel.is_coordinator = lambda **kwargs: True
+        channel.owed_guard_tick(now=1000.0 + 31 * 60)
+        rows = {r.kind: r for r in channel._test_table[1].load()}
+        self.assertFalse(rows["handoff"].is_open)
+        self.assertIn("out of quota", rows["handoff"].closed_by)
+        self.assertTrue(rows["verdict"].is_open)            # a PR's debt settles on the PR
+        self.assertTrue(all("an answer" not in turn[0] for turn in channel._test_turns))
+
+    def test_a_paused_bots_hand_off_stays_owed(self):
+        """/pause freezes peers mid-turn: the work they hold is theirs after /resume (review)."""
+        channel = self.channel()
+        channel.is_coordinator = lambda **kwargs: True
+        channel._peers_frozen["Codex"] = {"ref": "pause", "until": None}
+        here = channel.topics.context(GROUP, 5122)
+        channel._test_table[1].save_all([row(kind="handoff", debtor="Codex", owes="an answer",
+                                             topic=here, key_extra=here, updated_at=1000.0)])
+        channel.owed_guard_tick(now=1000.0 + 31 * 60)
+        self.assertTrue(channel._test_table[1].load()[0].is_open)
+
+    def test_the_admin_rung_speaks_to_the_admin(self):
+        from swarmly.telegram.owed_guard import STALL_ADMIN, stall_text
+        text = stall_text(row(kind="handoff", debtor="Codex", owes="an answer", topic="tg-1"),
+                          STALL_ADMIN, minutes=31, unable="out of quota")
+        self.assertIn("the admin should decide", text)
+        self.assertNotIn("Coordinator: reassign", text)
+
     def test_two_bots_on_one_table_climb_one_rung_between_them(self):
         """Four bots on the beat used to mean four reminders and four rungs for one stall."""
         first = self.channel()
