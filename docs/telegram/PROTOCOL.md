@@ -631,13 +631,15 @@ agent's session for this topic**, queued when busy (§8). Swarm pulse and closed
 routed from the registry, and a mention alone never opens a topic record.
 
 Two consequences are worth knowing before a message is sent. **Every `@handle` in a message is an
-address**, so a pasted transcript carries its own addresses: the bots it names take the turn, and
-the coordinator stays out of a message addressed to agents that will take it. And **until phase 9
-an agent that has already had turns in a topic counts as linked there**, so a peer's mention of it
-in that topic is delivered rather than refused (`/unlink` takes it off again).
+address**, so a pasted transcript carries its own addresses: a person's paste addressed to bots
+that will take it starts a turn on the first bot it names, and the coordinator stays out of it (a
+peer's mention of an unlinked agent is refused rather than delivered, as above). And **until phase
+9 an agent that has already had turns in a topic counts as linked there**, so a peer's mention of
+it in that topic is delivered rather than refused (`/unlink` takes it off again).
 
-> **Tip:** to reach the coordinator with a pasted transcript, start the message with its handle, or
-> leave the `@handles` out of the paste.
+> **Tip:** to reach the coordinator with a pasted transcript, start the message with its handle —
+> with the default `limits.multi_mention: first` it then takes the turn and the other bots the
+> paste names wait for a hand-off — or, quietest, leave the `@handles` out of the paste.
 
 ### 11.3 Work items, links and phases
 
