@@ -1,7 +1,6 @@
 """/model with no name lists the models the bot's CLI can switch to."""
 
 import asyncio
-import inspect
 import json
 import os
 import sys
@@ -13,7 +12,7 @@ from unittest import mock
 
 from swarmly.telegram import channel as channel_mod
 from swarmly.telegram import model_list
-from swarmly.telegram.cli_defaults import reasonix_provider_names
+from swarmly.telegram.cli_defaults import cli_default, reasonix_provider_names
 from swarmly.telegram.model_list import (available_models, parse_agy_models,
                                          parse_codex_cache, parse_reasonix_doctor)
 from tests.test_telegram_channel import ADMIN_ID, event, make_channel, make_config, run
@@ -238,6 +237,20 @@ class TestTheBackgroundLookup(unittest.TestCase):
                 names = reasonix_provider_names(tmp, env={}, home=Path(tmp))
         self.assertEqual(names, ["deepseek-flash", "deepseek-pro"])
 
+    def test_a_python_without_tomllib_reads_a_models_effort_too(self):
+        """#397: the fallback also has to see ``[providers.model_overrides.<model>]``, which is
+        where ``_reasonix`` finds the effort -- it read as "the model default" on 3.10."""
+        text = ('default_model = "deepseek-flash"\n\n'
+                '[[providers]]\nname = "deepseek-pro"\n\n'
+                '[providers.model_overrides.deepseek-flash]\ndefault_effort = "high"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                without = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+            whole = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+        self.assertEqual(without.effort, "high")
+        self.assertEqual(whole.effort, without.effort)      # the real parser agrees
+
     def test_the_loop_looks_up_once_before_it_sleeps(self):
         channel = make_channel(make_config(adapter={"type": "antigravity"}))
         beats = []
@@ -267,15 +280,90 @@ class TestTheBackgroundLookup(unittest.TestCase):
             run(channel._refresh_models())
         self.assertEqual(seen["env"], {"ONLY": "the adapter's"})
 
-    def test_the_transport_starts_the_lookup(self):
-        """The loop must be started by the transport, not merely exist (#393 review).
+    def test_start_starts_the_lookup(self):
+        """#397: drive the real ``start()``, not its source text.
 
-        Driving ``start()`` here would need the whole aiogram boundary stubbed (and the
-        online-receipt test shows how much of it that takes), so this pins the two facts that
-        matter instead: ``start()`` calls the scheduler, and the scheduler starts one loop.
+        The aiogram boundary is stubbed exactly as the online-receipt test does it; the loop
+        itself is stubbed too (a real one would spawn ``agy models`` and sleep), so what this
+        pins is that ``start()`` schedules it and that it runs before anything else.
         """
-        source = inspect.getsource(type(make_channel()).start)
-        self.assertIn("self._schedule_models_lookup()", source)
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        beats = []
+
+        async def one_wake():
+            beats.append(1)
+
+        channel._models_loop = one_wake
+
+        async def noop(*args, **kwargs):
+            return None
+
+        class FakeBot:
+            def __init__(self, token=None, default=None):
+                self.token = token
+
+            async def get_me(self):
+                return types.SimpleNamespace(username="HermesBot")
+
+            async def send_message(self, **kwargs):
+                return types.SimpleNamespace(message_id=1)
+
+            async def close(self):
+                return None
+
+        dispatcher = types.SimpleNamespace(
+            message=types.SimpleNamespace(register=lambda *a, **k: None),
+            edited_message=types.SimpleNamespace(register=lambda *a, **k: None),
+            start_polling=noop, stop_polling=noop)
+        fake_client = types.ModuleType("aiogram.client")
+        fake_default = types.ModuleType("aiogram.client.default")
+        fake_default.DefaultBotProperties = lambda **kwargs: types.SimpleNamespace(**kwargs)
+        fake_client.default = fake_default
+        fake_exceptions = types.ModuleType("aiogram.exceptions")
+        fake_exceptions.TelegramRetryAfter = type("TelegramRetryAfter", (Exception,), {})
+        fake_types = types.ModuleType("aiogram.types")
+        for name in ("BotCommand", "BotCommandScopeAllGroupChats",
+                     "BotCommandScopeAllPrivateChats", "BotCommandScopeChat"):
+            setattr(fake_types, name, type(name, (), {"__init__": lambda self, **kw: None}))
+        fake_aiogram = types.ModuleType("aiogram")
+        fake_aiogram.Bot = FakeBot
+        fake_aiogram.Dispatcher = lambda: dispatcher
+        fake_aiogram.client = fake_client
+        fake_aiogram.exceptions = fake_exceptions
+        fake_aiogram.types = fake_types
+
+        async def sender(payload, reply_to_message_id=None):
+            return payload
+
+        channel._sender = sender
+        scheduled = []
+
+        async def scenario():
+            await channel.start()
+            scheduled.append(channel._models_task)
+            # The transport's other ticks are not what this test is about, and one of them
+            # spins without a bus, so they are cancelled before the loop gets a turn.
+            for task in (channel._reply_task, channel._ack_task, channel._bus_task,
+                         channel._ephemeral_task, channel._lease_task, channel._github_task,
+                         channel._heartbeat_task):
+                if task is not None:
+                    task.cancel()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            if channel._models_task is not None:
+                channel._models_task.cancel()
+
+        with mock.patch.dict(sys.modules, {
+            "aiogram": fake_aiogram,
+            "aiogram.client": fake_client,
+            "aiogram.client.default": fake_default,
+            "aiogram.exceptions": fake_exceptions,
+            "aiogram.types": fake_types,
+        }):
+            run(scenario())
+        self.assertEqual(len(scheduled), 1)
+        self.assertIsNotNone(scheduled[0], "start() scheduled no lookup")
+        self.assertEqual(beats, [1], "the scheduled loop never ran")
 
     def test_the_scheduler_starts_one_loop(self):
         channel = make_channel(make_config(adapter={"type": "antigravity"}))
