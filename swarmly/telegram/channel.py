@@ -347,6 +347,14 @@ _DELEGATION_VERBS = (r"hands?|handing|asks?|asking|tells?|telling|has|have|havin
 #: as a taken job, so the sender hears it like any other dropped mention (#27).
 GENERAL_GATE_REASON = ("this bot takes no turns in General or Swarm pulse on this host "
                        "(limits.general_turns: never)")
+#: What a *gate*-dropped hand-off is told to do instead (#418): no handle reaches this bot
+#: there, so the default "address one handle alone" advice would loop the sender. A work topic
+#: is the way in, and it is the sender's to choose.
+GATE_DROP_ADVICE = ("Send it in a work topic instead: in General, addressing this bot is not "
+                    "what decides whether it acts.")
+#: What any other dropped mention is told: the handle rule, which is the sender's to fix.
+ADDRESS_ALONE = "Address one of those handles alone if the work is meant for me."
+
 #: One drop notice per reason per topic per window: a peer that keeps naming this bot in the
 #: same dropped shape hears it once, not once per message.
 DROP_NOTICE_SECONDS = 600.0
@@ -10090,7 +10098,8 @@ class AgentChannel:
             reply_to_message_id=event.message_id, chat_id=event.chat_id,
             thread_id=event.thread_id, silent=True, notice=True)
 
-    async def _mention_drop_notice(self, event: ChannelEvent, reason: str) -> None:
+    async def _mention_drop_notice(self, event: ChannelEvent, reason: str,
+                                   advice: Optional[str] = None) -> None:
         """Tell a peer bot which of its handles this bot left unanswered, and why (issue #27).
 
         Every @handle in a bot's hand-off counts as addressed, so a message that names this bot
@@ -10098,6 +10107,11 @@ class AgentChannel:
         instead of silently assuming the work was taken. Machine traffic (a notice, a command
         answer, a sign-off) never asked for a turn and a bot's own echo is addressed to nobody,
         so those stay silent; peers' transports drop "⚠️" notices, so this starts no turn back.
+
+        *advice* is what the sender can do about it, and defaults to the handle rule. A drop
+        that no handle can undo passes its own: the General gate drops *everything* in that
+        place, so "address one of those handles alone" would send the sender round a loop
+        (#418).
         """
         if not event.author_is_bot or not event.text or reason in _NO_DROP_NOTICE_REASONS:
             return
@@ -10116,8 +10130,7 @@ class AgentChannel:
         # No @ on the sender: mentioning it back would hand it a turn (and a notice of ours).
         await self.send(
             f"⚠️ {self.config.identity.alias} took no turn: your message names "
-            f"{', '.join(handles)}, but {reason}. Address one of those handles alone if the "
-            "work is meant for me.",
+            f"{', '.join(handles)}, but {reason}. {advice or ADDRESS_ALONE}",
             reply_to_message_id=event.message_id, chat_id=event.chat_id,
             thread_id=event.thread_id, silent=True, notice=True)
 
@@ -10529,7 +10542,8 @@ class AgentChannel:
             # vanished with only a log line its author cannot read -- and a lost hand-off that
             # looks taken is what the notice exists to prevent.
             if not self._machine_traffic(event):
-                await self._mention_drop_notice(event, GENERAL_GATE_REASON)
+                await self._mention_drop_notice(event, GENERAL_GATE_REASON,
+                                                advice=GATE_DROP_ADVICE)
             return ""
         if where != "General":
             logger.info("general gate: no turn in %s", where)

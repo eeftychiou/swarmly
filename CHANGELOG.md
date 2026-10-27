@@ -30,7 +30,8 @@ All notable changes to this project are documented here. The format follows
   log line, so from the sender's side a lost hand-off looked exactly like a taken one — the
   noise the §5 ACK and the `#27` drop notice exist to prevent. The gate now sends the same
   `⚠️ … took no turn` notice any other dropped mention gets, naming the handle and the reason,
-  once per window; a peer's notice, command answer or sign-off is machine traffic and still
+  once per window — and advising a work topic rather than "address one handle alone", which
+  cannot help where nothing runs (`#418`); a peer's notice, command answer or sign-off is machine traffic and still
   hears nothing. `limits.general_turns` is also documented where operators look —
   `config/telegram.template.yaml` beside the other limits, and `docs/telegram-channel.md` —
   which it was not: it superseded `work_in_topics` with a single passing mention.
