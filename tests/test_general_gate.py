@@ -132,12 +132,31 @@ class GeneralGateTests(unittest.TestCase):
         run(channel.handle_event(event("@CodexBot can you review #12?")))
         self.assertEqual((adapter.prompts, channel._test_sender.sent), ([], []))
 
-    def test_a_persons_request_the_gate_drops_says_nothing_back(self):
-        """A person is not told about a transport setting it cannot read; the coordinator
-        opens a topic for a person's work above (or nobody can, and that is the log's)."""
-        channel, adapter, opened = channel_for(coordinator=False)
-        run(channel.handle_event(admin("@HermesBot please check the CI flakes")))
+    def test_a_persons_message_the_gate_drops_says_nothing_back(self):
+        """A person is not told about a transport setting it cannot read (#418).
+
+        In Swarm pulse, where a person's message really does reach the gate: General is
+        handled above it (`_general_request` opens a topic or leaves it), so a General message
+        would never get here and a test written that way proves nothing -- the reviewed test
+        did exactly that.
+        """
+        # The coordinator, so the *only* thing keeping this from becoming a topic is the
+        # gate's own pulse branch: with that branch gone this message would open one, which
+        # is what the mutation check below shows.
+        channel, adapter, opened = channel_for()
+        run(channel.handle_event(admin("@HermesBot hello", thread_id=PULSE)))
         self.assertEqual((adapter.prompts, opened, channel._test_sender.sent), ([], [], []))
+
+    def test_the_gate_drop_notice_advises_something_that_works(self):
+        """#418: "address one of those handles alone" cannot help when the place takes no
+        turns at all -- the sender may already have done that. A work topic can."""
+        channel, adapter, _ = channel_for()
+        run(channel.handle_event(event("@HermesBot can you review #12?")))
+        texts = [m["text"] for m in channel._test_sender.sent]
+        self.assertEqual(adapter.prompts, [])
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("work topic", texts[0])
+        self.assertNotIn("Address one of those handles alone", texts[0])
 
     def test_an_own_brief_in_swarm_pulse_goes_to_the_work_topic(self):
         channel, adapter, _ = channel_for()

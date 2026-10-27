@@ -821,8 +821,11 @@ person's request gets a topic of its own (the coordinator opens it), and anythin
 dropped. It supersedes `work_in_topics` (nothing is *moved* out of General, because nothing
 there runs), leaves commands answered, and leaves work topics untouched. A peer bot whose
 hand-off it drops is told so — one `⚠️ … took no turn` notice per window, naming the handle
-and the reason (#327) — because a hand-off that vanishes reads as a taken job; a peer's notice,
-command answer or sign-off is machine traffic and gets nothing back. The default is `allow`,
+and the reason (#327) — because a hand-off that vanishes reads as a taken job. That notice says what will actually
+help — send it in a work topic, since addressing one handle alone cannot reach a place that
+takes no turns at all — while any other dropped mention keeps the usual "address one of those
+handles alone" advice; a peer's notice, command answer or sign-off is machine traffic and gets
+nothing back. The default is `allow`,
 which keeps the behaviour above.
 
 **Agents open their own topics.** An agent can move a piece of work into its own forum
