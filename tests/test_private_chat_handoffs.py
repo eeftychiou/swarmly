@@ -62,15 +62,18 @@ def a_store(records=None):
     return Store()
 
 
-def private_channel(adapter=None, *, linked=True, bus_repo=None):
-    """A channel whose one topic is (or is not) linked to #424 in the registry."""
+def private_channel(adapter=None, *, linked=True, bus_repo=None, records=None):
+    """A channel whose topics are (or are not) linked to their items in the registry."""
     channel = make_channel(
         make_config(projects={"swarmly": {"repo": REPO, "cwd": "."}},
                     state={"backend": "telegram", "links": "registry"},
                     **({"bus": {"repo": bus_repo}} if bus_repo else {})),
         adapter=adapter)
     channel._pulse_topic = lambda: None
-    channel.state_link.store = a_store() if linked else a_store({})
+    if records is not None:
+        channel.state_link.store = a_store(records)
+    else:
+        channel.state_link.store = a_store() if linked else a_store({})
     channel.bot = TopicBot()
     return channel
 
@@ -198,6 +201,19 @@ class TheHandOffChoosesItsOwnItemTests(unittest.TestCase):
         self.assertEqual([(chat, thread) for chat, thread, _ in spy.posts],
                          [(ADMIN_ID, None), (GROUP, TOPIC), (ADMIN_ID, None)], spy.posts)
         self.assertIn("take that over", spy.posts[1][2])
+
+    def test_a_hand_off_naming_an_unlinked_item_is_refused_not_redirected(self):
+        # The hand-off names #424, which has no linked topic, while the admin's message names
+        # #260, which has: the admin's topic is not lent to an item that is not linked
+        # (#427 re-review). Refused, not posted into #260's discussion.
+        only_260 = {K.topic(TOPIC_260): {"status": "open", "links": [a_link(ITEM_260)]}}
+        channel = private_channel(adapter=Scripted(HANDOFF), records=only_260)
+        spy = Spy(channel)
+        turn(channel, text="@HermesBot go ahead on #260")
+        self.assertEqual([(chat, thread) for chat, thread, _ in spy.posts],
+                         [(ADMIN_ID, None), (ADMIN_ID, None)], spy.posts)
+        self.assertIn("did not reach", spy.posts[1][2])
+        self.assertEqual(channel.bot.created, [])
 
 
 class AHandoffWithNoLinkedTopicIsRefusedTests(unittest.TestCase):

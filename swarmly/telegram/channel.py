@@ -10629,11 +10629,15 @@ class AgentChannel:
             logger.info("a private-chat reply hands work to %s but has no hand-off line: "
                         "not placed", ", ".join(peers))
             return False
-        # The hand-off's own refs decide first: the item being handed over is the one that
-        # must get the topic, not whatever item the admin's message happened to name
-        # (#427 review: "go ahead on #260" plus "@CodexBot please take #424" went to #260).
-        topic = self._linked_topic(handoff) \
-            or self._linked_topic(f"{event.text or ''}\n{body}")
+        # The hand-off's own refs decide, and they decide alone: the item being handed over is
+        # the one that must get the topic, not whatever item the admin's message happened to
+        # name (#427 review: "go ahead on #260" plus "@CodexBot please take #424" went to
+        # #260's topic). The admin's text is a fallback only when the hand-off names no item
+        # at all -- not when the item it names has no linked topic, which is a refusal.
+        if issue_refs(handoff):
+            topic = self._linked_topic(handoff)
+        else:
+            topic = self._linked_topic(f"{event.text or ''}\n{body}")
         if topic is None:
             logger.info("a hand-off from the private chat names %s but no item it names has a "
                         "linked topic: not delivered", ", ".join(peers))
