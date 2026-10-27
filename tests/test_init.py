@@ -242,6 +242,34 @@ class TestStateRootForAnInstalledWheel(unittest.TestCase):
         self.assertNotEqual(root.resolve(), ROOT)
         self.assertEqual(root, Path(os.environ["SWARMLY_STATE_ROOT"]))
 
+    def test_a_transport_write_lands_under_that_root_and_not_in_the_checkout(self):
+        """The resolution is not the promise: where a write *lands* is (#322 review).
+
+        `transport_state_root` returning the test's folder says nothing about the files the
+        transport then writes. This makes the transport write one of its own -- the memory
+        turn counter, which every prompt bumps -- and looks for the file on disk.
+        """
+        from swarmly.telegram.poll import state_dir
+        from tests.test_telegram_channel import make_channel, make_config
+
+        alias = "StaterootProbe"
+        with TemporaryDirectory() as tmp:
+            config = make_config(agent={"name": "StaterootProbeBot", "alias": alias},
+                                 fallback={})            # no bus
+            config.source_path = Path(tmp) / "config.yaml"   # so its state has a home
+            channel = make_channel(config)
+            channel.lessons.note_turn()                 # one real write, the transport's way
+        # Not `root.rglob(...)` alone: that would only say the file is under the root it was
+        # found in. The file must be in the folder the transport *says* it writes to, and the
+        # checkout must hold no copy (#322 review).
+        written = list(state_dir(config).glob("memory-turns-staterootprobe.json"))
+        self.assertEqual(len(written), 1, written)
+        self.assertIn(Path(os.environ["SWARMLY_STATE_ROOT"]).resolve(),
+                      written[0].resolve().parents)
+        checkout_state = ROOT / ".agents" / "state"
+        self.assertFalse(list(checkout_state.rglob("memory-turns-staterootprobe*.json")),
+                         "the transport wrote its state into the checkout")
+
 
 class TestConfigFlagPlacement(unittest.TestCase):
     def test_config_works_before_and_after_the_command(self):

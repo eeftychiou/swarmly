@@ -173,11 +173,24 @@ PY
     ); then
         ok=1
     fi
-    if [ "$ok" -eq 0 ] && ! (
+    # The suite is one worker per core now (#320): serially it is most of the job's wall time,
+    # and `-n auto` is what CI and the maintainers run. pytest and xdist are the `test` extra,
+    # which a transport's own venv may not have -- so ask, and fall back to the stdlib runner
+    # rather than failing a verify on a host that only installed the transport (#322).
+    if [ "$ok" -eq 0 ] && (
         cd "$wt"
-        PYTHONPATH="$wt" "$PYTHON" -m unittest discover tests
+        "$PYTHON" -c "import pytest, xdist" >/dev/null 2>&1
     ); then
-        ok=1
+        (
+            cd "$wt"
+            PYTHONPATH="$wt" "$PYTHON" -m pytest -n auto -q tests
+        ) || ok=1
+    elif [ "$ok" -eq 0 ]; then
+        echo "verify: pytest/xdist not in $PYTHON; running the suite serially" >&2
+        (
+            cd "$wt"
+            PYTHONPATH="$wt" "$PYTHON" -m unittest discover tests
+        ) || ok=1
     fi
     git -C "$REPO" worktree remove --force "$wt" 2>/dev/null || true
     return "$ok"
