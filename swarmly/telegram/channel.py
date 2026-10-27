@@ -7919,17 +7919,18 @@ class AgentChannel:
         return [row for row in rows if row.id not in gone]
 
     def _note_owed_handoffs(self, peers: Iterable[str], chat_id: int,
-                            thread_id: Optional[int], item: str = "") -> None:
+                            thread_id: Optional[int], items: Optional[Dict[str, str]] = None
+                            ) -> None:
         """Record a durable row per peer just handed work (#162, the wiring).
 
         The in-memory ``_pending_handoffs`` is the same debt in a second book and is lost on a
         restart; these rows are the copy the swarm and a successor coordinator can read. A
         book-keeping failure is logged and never fails the hand-off itself.
 
-        ``item`` is the ``#N`` the hand-off names (#428): the row is settled when that item
-        merges or closes, which is the only way some hand-offs ever end. Nothing is recorded
-        for the admin's private chat: no peer can post there, so the row could never be
-        answered and every reminder would land where the peer cannot read it.
+        ``items`` maps each peer to the ``#N`` its own hand-off line names (#428): the row is
+        settled when that item merges or closes, which is the only way some hand-offs ever
+        end. Nothing is recorded for the admin's private chat: no peer can post there, so the
+        row could never be answered and every reminder would land where the peer cannot read it.
         """
         from swarmly.telegram.owed import handoff_rows
         # A peer that cannot act gets no row: the hand-off was refused and bounced (#237).
@@ -7942,11 +7943,16 @@ class AgentChannel:
             logger.info("hand-off to %s in the admin's private chat: no row kept (#428)",
                         ", ".join(asked))
             return
+        items = items or {}
         try:
             store = self.owed_store()
-            rows = store.observe(handoff_rows(asked=asked, asker=self.config.identity.alias,
-                                              item=item, topic=topic, place=place,
-                                              opened_by=f"hand-off in {topic or 'a topic'}"))
+            rows: List[Any] = []
+            for peer in asked:
+                # Each peer's row names the item *its* hand-off is about (#429 review).
+                rows.extend(handoff_rows(asked=[peer], asker=self.config.identity.alias,
+                                         item=items.get(peer, ""), topic=topic, place=place,
+                                         opened_by=f"hand-off in {topic or 'a topic'}"))
+            store.observe(rows)
             store.save_all(rows)               # one push for the whole reply, not one per peer
         except Exception:                          # noqa: BLE001 - reported, not swallowed
             logger.warning("owed: could not record the hand-off to %s",
@@ -7969,19 +7975,32 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - book-keeping, not a turn
             return ""
 
-    @staticmethod
-    def _handoff_item(text: str) -> str:
-        """The item a reply hands work about: the first ``#N`` in its hand-off lines (#428).
+    def _handoff_item(self, text: str, peer: str = "") -> str:
+        """The item a reply hands to *peer*: the first ``#N`` of that peer's own hand-off lines.
 
         The lines decide, not the whole reply: a reply that discusses #260 and hands over #424
-        is a hand-off about #424, and that is the item whose merge settles it.
+        is a hand-off about #424, and that is the item whose merge settles it. And each peer's
+        lines decide for itself (#429 review): "@CodexBot: #424. @DeepSeek: #430." opens one row
+        per peer, each bound to its own item, not both to the first one read. With no peer, or
+        a peer no block names, every hand-off line counts.
         """
-        from swarmly.telegram.handoff_split import handoff_lines
-        refs = issue_refs(handoff_lines(text) or str(text or ""))
+        from swarmly.telegram.handoff_split import handoff_blocks
+        blocks = handoff_blocks(text)
+        names = {str(peer or "").strip().lstrip("@").lower()}
+        names.add(str(self.config.peers.get(peer, "") or "").strip().lstrip("@").lower())
+        names.discard("")
+        own = [block for handle, block in blocks if handle and handle in names]
+        refs = issue_refs("\n".join(own)) if own else []
+        if not refs:
+            refs = issue_refs("\n".join(block for _handle, block in blocks) or str(text or ""))
         return refs[0] if refs else ""
 
     def _registry_item_done(self, item: str) -> bool:
-        """Whether the registry shows the work item ``#N`` finished (local read only)."""
+        """Whether the registry shows the work item ``#N`` finished (local read only).
+
+        The repo counts as well as the number (#429 review): #424 in another repo is not this
+        repo's #424, and the registry links carry the whole URL.
+        """
         from swarmly.state import keys as K
         store = self.state_link.store
         if store is None or not getattr(store, "ready", False):
@@ -7989,6 +8008,8 @@ class AgentChannel:
         wanted = str(item or "").strip().lstrip("#")
         if not wanted:
             return False
+        repos = {str(settings.repo).strip().lower() for settings in self.config.projects.values()
+                 if getattr(settings, "repo", None)}
         for key in store.keys("topic/"):
             if K.topic_of(key) is None:
                 continue
@@ -7996,9 +8017,11 @@ class AgentChannel:
             for link in record.get("links") or []:
                 if not isinstance(link, dict) or link.get("role") != "work":
                     continue
-                found = re.search(r"/(?:issues|pull)/(\d+)(?:[/?#].*)?$",
-                                  str(link.get("ref") or ""))
-                if found is None or found.group(1) != wanted:
+                found = re.search(r"github\.com/([^/]+/[^/]+)/(?:issues|pull)/(\d+)(?:[/?#].*)?$",
+                                  str(link.get("ref") or ""), re.I)
+                if found is None or found.group(2) != wanted:
+                    continue
+                if repos and found.group(1).lower() not in repos:
                     continue
                 status = str(link.get("status") or "").strip().lower()
                 phase = str(link.get("phase") or "").strip().lower()
@@ -10814,26 +10837,29 @@ class AgentChannel:
         leads = {name.strip().lower() for name in
                  (self.membership.state.coordinator, self.current_coordinator())
                  if isinstance(name, str) and name.strip()}
-        # #428: the item the hand-off is about travels with the debt. A hand-off whose item
-        # merges or closes is answered, which is the only way some of them ever end.
-        item = self._handoff_item(body)
+        # #428: the item each hand-off is about travels with the debt. A hand-off whose item
+        # merges or closes is answered, which is the only way some of them ever end. It is read
+        # per peer from that peer's own lines (#429 review): a reply that hands #424 to Codex
+        # and #430 to DeepSeek opens one row per item, not two for the first one found.
+        items = {peer: self._handoff_item(body, peer) for peer in named}
         owed_to_leads: List[str] = []
         for peer in named:
             if peer not in peers and peer.strip().lower() in leads                     and peer.strip().lower() != self.config.identity.alias.strip().lower():
                 self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
                     "at": self._clock(), "message_id": message_id, "nudged": False,
-                    "item": item}
+                    "item": items.get(peer, "")}
                 owed_to_leads.append(peer)          # waited on, so it is owed a row (#173)
         if owed_to_leads:
             # Recorded before the early return: a reply that hands work only to the coordinator
             # has no mirror copy, and used to open no row at all (#173 review).
-            self._note_owed_handoffs(owed_to_leads, chat_id, thread_id, item=item)
+            self._note_owed_handoffs(owed_to_leads, chat_id, thread_id, items=items)
         if not peers:
             return
         for peer in peers:
             self._pending_handoffs[(int(chat_id), thread_id, peer)] = {
-                "at": self._clock(), "message_id": message_id, "nudged": False, "item": item}
-        self._note_owed_handoffs(peers, chat_id, thread_id, item=item)
+                "at": self._clock(), "message_id": message_id, "nudged": False,
+                "item": items.get(peer, "")}
+        self._note_owed_handoffs(peers, chat_id, thread_id, items=items)
         if not (self.config.bus.repo and getattr(self.config.bus, "mirror_handoffs", True)):
             return
         # Issue #22: the bus carries a topic token, never the chat id. The token resolves

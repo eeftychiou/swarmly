@@ -134,34 +134,48 @@ def is_multi_recipient(text: str, handles: Iterable[str]) -> bool:
     return len(requests(text, handles)) >= 2
 
 
-def handoff_lines(text: str) -> str:
-    """The lines of a reply that hand work to a peer, as one block.
+def handoff_blocks(text: str) -> List[Tuple[str, str]]:
+    """``(handle, block)`` for each hand-off in a reply, in the order they are written.
 
-    A line (bullet or not) that opens with an ``@handle`` is what
-    :meth:`AgentChannel.assigned_peers` reads as an assignment, and a line that is *only* a
-    handle is a heading: its ask is the next paragraph, blank lines and all (review of #425
-    on #427: ``"@CodexBot:\\n\\nPlease review #424."`` is how a model naturally writes it, and
-    keeping only the bare handle dropped the instruction). Those lines are carried out of a
-    place no peer can see -- the admin's private chat (#425) -- into the work item's own
-    topic; the rest of the reply stays where it was written. "" when nothing is handed over.
+    A line (bullet or not) that opens with an ``@handle`` is a hand-off for that handle, and a
+    line that is *only* a handle is a heading: its ask is the next paragraph, blank lines and
+    all (review of #425 on #427: ``"@CodexBot:\\n\\nPlease review #424."`` is how a model
+    writes it, and keeping only the bare handle dropped the instruction). One peer's block ends
+    where the next begins, so a reply that hands #424 to one bot and #430 to another gives each
+    of them its own -- which is the item each one's row records (#429 review).
     """
     lines = str(text or "").splitlines()
-    out: List[str] = []
+    blocks: List[Tuple[str, List[str]]] = []
     index = 0
+    taking = False              # a handle-alone block runs on through its paragraph
     while index < len(lines):
         line = lines[index]
         index += 1
-        if _HANDLE_ALONE.match(line):
-            out.append(line)
-            while index < len(lines) and not lines[index].strip():
-                index += 1              # the ask is the next paragraph, after any blank line
-            while index < len(lines) and lines[index].strip():
-                out.append(lines[index])
-                index += 1
-        elif _OPENING_HANDLE.match(line):
-            # The ask is on this line: the rest of the reply is not part of the hand-off.
-            out.append(line)
-    return "\n".join(out).strip()
+        found = _HANDLE.search(line) if _OPENING_HANDLE.match(line) else None
+        if found is not None:
+            block = [line]
+            blocks.append((_norm(found.group(1)), block))
+            taking = bool(_HANDLE_ALONE.match(line))
+            if taking:
+                while index < len(lines) and not lines[index].strip():
+                    index += 1      # the ask is the next paragraph, after any blank line
+            continue
+        if taking and line.strip():
+            blocks[-1][1].append(line)
+        elif taking:
+            taking = False          # the paragraph ended: the rest is not the hand-off
+    return [(handle, "\n".join(block).strip()) for handle, block in blocks]
+
+
+def handoff_lines(text: str) -> str:
+    """The lines of a reply that hand work to a peer, as one block.
+
+    Every block :func:`handoff_blocks` finds, in the order written. Those lines are carried
+    out of a place no peer can see -- the admin's private chat (#425) -- into the work item's
+    own topic; the rest of the reply stays where it was written. "" when nothing is handed
+    over.
+    """
+    return "\n".join(block for _handle, block in handoff_blocks(text)).strip()
 
 
 def own_brief(text: str, me: str, handles: Iterable[str]) -> str:

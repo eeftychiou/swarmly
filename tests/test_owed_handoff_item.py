@@ -37,10 +37,10 @@ def tick(channel, minutes):
     return channel._test_sender.sent
 
 
-def a_registry(done):
+def a_registry(done, ref=ITEM):
     """A registry store reader: one topic whose work link is #424, done or open."""
     record = {"status": "open", "links": [{
-        "id": "L1", "provider": "github", "kind": "pr", "role": "work", "ref": ITEM,
+        "id": "L1", "provider": "github", "kind": "pr", "role": "work", "ref": ref,
         "status": "closed" if done else "open", "phase": "done" if done else "development",
         "added_at": "2026-10-27T10:00:00Z"}]}
 
@@ -64,6 +64,24 @@ class TheRowNamesItsItemTests(unittest.TestCase):
             channel._mirror_handoffs("Thanks.\n@CodexBot please review #424", GROUP, TOPIC, 55)
             rows = channel.owed_store().open_rows()
         self.assertEqual([(row.kind, row.item) for row in rows], [("handoff", "#424")])
+
+    def test_each_peer_gets_the_item_from_its_own_line(self):
+        # #429 review: one reply handing two items to two peers opened two rows that both
+        # named the first item, so the second peer's debt was settled by the wrong merge.
+        with TemporaryDirectory() as tmp:
+            channel = a_channel(tmp)
+            channel._mirror_handoffs(
+                "@CodexBot please review #424\n@AntigravityBot please QA #430",
+                GROUP, TOPIC, 55)
+            rows = {row.debtor: row.item for row in channel.owed_store().open_rows()}
+        self.assertEqual(rows, {"Codex": "#424", "Antigravity": "#430"})
+
+    def test_a_handle_alone_block_gives_its_item(self):
+        with TemporaryDirectory() as tmp:
+            channel = a_channel(tmp)
+            channel._mirror_handoffs("@CodexBot:\n\nPlease review #424.", GROUP, TOPIC, 55)
+            rows = {row.debtor: row.item for row in channel.owed_store().open_rows()}
+        self.assertEqual(rows, {"Codex": "#424"})
 
     def test_a_merge_or_a_close_of_that_item_answers_it(self):
         def row():
@@ -114,6 +132,22 @@ class APrivateChatKeepsNoHandOffTests(unittest.TestCase):
             channel._mirror_handoffs("@CodexBot please take #424", ADMIN_ID, None, 55)
             self.assertEqual(channel.owed_store().open_rows(), [])
 
+    def test_a_row_from_before_427_is_closed_by_a_beat_with_nothing_posted(self):
+        # #429 review: the whole path, not just the sweep method -- a transport that comes up
+        # on old rows clears them on its beat, and the private chat gets no reminder.
+        with TemporaryDirectory() as tmp:
+            channel = a_channel(tmp)
+            place = channel._private_chat_place()
+            store = channel.owed_store()
+            store.save_all(store.observe(handoff_rows(
+                asked=["Codex"], asker="Claudebot", item="#424", place=place,
+                opened_by="hand-off in a topic")))
+            run(channel._heartbeat_tick())
+            self.assertEqual(channel.owed_store().open_rows(), [])
+        posted = [str(sent) for sent in channel._test_sender.sent]
+        self.assertFalse([text for text in posted
+                          if "reminder" in text or "has not answered" in text], posted)
+
     def test_no_reminder_is_posted_there(self):
         with TemporaryDirectory() as tmp:
             channel = a_channel(tmp)
@@ -141,6 +175,18 @@ class AFinishedHandOffIsNotChasedTests(unittest.TestCase):
             channel._mirror_handoffs("@CodexBot please review #424", GROUP, TOPIC, 55)
             channel.state_link.store = a_registry(done=True)
             self.assertEqual(tick(channel, 11), [])
+
+    def test_another_repos_done_item_does_not_stop_it(self):
+        # #429 review, the nit: #424 in another repo is not this repo's #424.
+        with TemporaryDirectory() as tmp:
+            channel = a_channel(tmp, projects={"swarmly": {"repo": "owner/swarmly",
+                                                            "cwd": "."}})
+            channel._mirror_handoffs("@CodexBot please review #424", GROUP, TOPIC, 55)
+            channel.state_link.store = a_registry(
+                done=True, ref="https://github.com/other/repo/pull/424")
+            sent = tick(channel, 11)
+            self.assertEqual(len(sent), 1, sent)
+            self.assertIn("@CodexBot reminder", str(sent[-1]))
 
     def test_an_open_item_still_gets_its_reminder(self):
         with TemporaryDirectory() as tmp:
