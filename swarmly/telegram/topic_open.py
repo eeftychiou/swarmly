@@ -68,10 +68,40 @@ def strip_report_marker(body: str) -> str:
 
 _REF = re.compile(r"(?:(?<![\w/])#|/(?:pull|issues)/|\bPR ?#?)(\d{1,7})\b")
 
+#: What a cut number looks like: a title the transport truncated ("(#42…"), so the digits are
+#: the start of a longer number, not a ref (#457: the live phantom `#42` for #421).
+_TRUNCATED = ("\u2026", "...")
 
-def issue_refs(text: str) -> list:
-    """The issue and PR numbers a message is about ("#12", ".../pull/12", "PR 12"), as "#12"."""
-    return list(dict.fromkeys(f"#{n}" for n in _REF.findall(text or "")))
+
+def issue_refs(text: str, topic_ids=()) -> list:
+    """The issue and PR numbers a message is about ("#12", ".../pull/12", "PR 12"), as "#12".
+
+    Two things are not refs (#457). A number a truncated title cut off -- ``(#42…`` is the
+    start of #421, and learning ``#42`` invented an issue nobody linked -- and a forum topic's
+    own thread id, which reads exactly like a number and is not one (`#13221` was a topic).
+    *topic_ids* is the caller's list of the thread ids it knows in that chat.
+    """
+    body = text or ""
+    skip = set()
+    for value in topic_ids or ():
+        try:
+            skip.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    found = []
+    for match in _REF.finditer(body):
+        if body[match.end():match.end() + 3].startswith(_TRUNCATED):
+            continue                                # a title cut mid-number, not a ref
+        try:
+            number = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if number in skip:
+            continue                                # a topic id, not an issue
+        ref = f"#{number}"
+        if ref not in found:
+            found.append(ref)
+    return found
 
 
 def topic_link(chat_id: int, thread_id: int) -> str:

@@ -658,7 +658,13 @@ PHASE: <ref|L1> <phase>
 
 The admin does the same with `/topic #N`, `/link`, `/unlink` and `/phase`; `/topics` and the
 dashboard show each item and its phase ([COMMANDS.md](COMMANDS.md)). `ref-learning` is switched
-off by `state.links: registry`. GitHub moves what it can see, and only that: a PR opened from an
+off by `state.links: registry`, and so is the topic move that went with it: a number seen in a
+message's text never adds a link and never moves a reply — the explicit `LINK:`/`ASSIGN:` lines,
+`/link` and a GitHub event on an item already linked are what link a topic (#457). The links an
+earlier build learned from text are dropped from the record the next time it is written, which
+is what took `#42` (a truncated title) and `#13221` (a topic id) off `/topics`; a number cut off
+by a truncated title, and a forum thread's own id, are not refs in either mode. GitHub moves what
+it can see, and only that: a PR opened from an
 item moves it to `review`, a merge — or an issue closing — to `done` / `closed`, and a PR closed
 without a merge only marks the link `closed` and keeps its phase. Green checks plus an approval
 promoting an item to `qa` is **not** implemented yet; that stays the coordinator's `PHASE:` line.
@@ -726,7 +732,7 @@ that drifts from the code fails the suite.
 | `state.owed` | `shadow` † | `shadow`, `store` | 3 | `store`: the owed / `WAIT` table lives in the store, and nothing goes to gitbus. |
 | `bus.transport` | `git` | `git`, `folder`, `gdrive`, `telegram` | 3 | `telegram`: gitbus is off; the store is the durable plane (needs `state.backend: telegram`). |
 | `limits.general_turns` | `allow` | `allow`, `never` | 4 | `never`: no model turn in General or Swarm pulse; work typed there gets its own topic. |
-| `state.links` | `legacy` † | `legacy`, `registry` | 5 | `registry`: a notification's topic comes from the item's links, not from ref-learning. |
+| `state.links` | `legacy` † | `legacy`, `registry` | 5 | `registry`: a notification's topic comes from the item's links, not from ref-learning — and ref-learning is off, with the topic move it drove (#457). |
 | `state.routing` | `legacy` † | `legacy`, `registry` | 6 | `registry`: the transport routes from the registry (§11.2), not each bot's mention rules. |
 | `adapter.type` | `echo` | any adapter, `claude_thread` for Claude | 7 | `claude_thread`: one resumable session per topic, like the other adapters. |
 | `adapter.session_turn_limit` | `unset` | turns > 0 | 7 | Turns a topic's session may run before the adapter hands over to a new one. |

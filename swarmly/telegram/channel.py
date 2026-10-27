@@ -10715,13 +10715,20 @@ class AgentChannel:
         transport sees the group), so later work on it goes there, not to a new topic.
         An entry not seen for REF_TOPIC_SECONDS is let go: the item has moved on.
         ``pin``: the admin's ``/topic #N`` -- this topic takes the item, whoever spoke first.
-        Nothing is learned in Swarm pulse: bots' chatter there is not work about an item."""
+        Nothing is learned in Swarm pulse: bots' chatter there is not work about an item.
+
+        With ``state.links: registry`` **text is not learned** (#457, design §6 phase 5): the
+        registry's links are the explicit ones -- ``LINK:``/``ASSIGN:`` lines, ``/link`` and a
+        GitHub event on an item already linked -- and a mention in a message is not a link. The
+        admin's own ``/topic``/``/link`` still pin (`pin=True`): a person said so."""
         if not self._work_topic((int(chat_id), int(thread_id))):
             return
+        if not pin and self.state_link.links_mode != "legacy":
+            return                          # the registry's explicit links decide; text does not
         now = time.time()
         changed = False
         topic = (int(chat_id), int(thread_id))
-        for ref in issue_refs(text):
+        for ref in issue_refs(text, topic_ids=self._topic_ids(chat_id)):
             known = self._ref_topics.get(ref)
             if known is None or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS \
                     or (pin and known != topic):
@@ -10735,9 +10742,26 @@ class AgentChannel:
         if changed:
             self._save_ref_topics()
 
+    def _topic_ids(self, chat_id: Optional[int] = None) -> Tuple[int, ...]:
+        """The thread ids of the topics this bot knows -- in *chat_id* when it is given.
+
+        A forum thread id reads exactly like an issue number, and one was learned as a ref
+        (#457: `#13221`, a topic). Naming a topic is not naming an issue.
+        """
+        try:
+            entries = self.topics.entries()
+        except Exception:                               # noqa: BLE001 - a map that will not read
+            return ()
+        return tuple(int(thread) for chat, thread, _name in entries
+                     if chat_id is None or int(chat) == int(chat_id))
+
     def _topic_for_refs(self, text: str) -> Optional[Tuple[int, int]]:
+        if self.state_link.links_mode != "legacy":
+            # Phase 5 (#457): a topic move *by guess* is off with the registry's links on.
+            # `topic_for_text` still follows the topics' explicit links.
+            return None
         now = time.time()
-        for ref in issue_refs(text):
+        for ref in issue_refs(text, topic_ids=self._topic_ids()):
             if ref in self._ref_topics \
                     and now - self._ref_seen.get(ref, now) < REF_TOPIC_SECONDS \
                     and self._work_topic(self._ref_topics[ref]):
