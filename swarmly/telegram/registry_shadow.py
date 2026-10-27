@@ -23,11 +23,13 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from swarmly.state import keys as K
+from swarmly.telegram import topic_filter
 from swarmly.state.records import (AgentInTopic, Binding, Link, Profile, RecordError,
                                    Topic, now_iso)
 
 if TYPE_CHECKING:  # pragma: no cover
     from swarmly.state.store import StateStore
+    from swarmly.telegram.topic_filter import Filters
     from swarmly.telegram.channel import AgentChannel
 
 logger = logging.getLogger("swarmly.telegram.registry")
@@ -275,26 +277,48 @@ class RegistryShadow:
             return name if link.get("added_by") != "legacy" else str(link.get("title") or name)
         who = ", ".join(f"{a.get('agent')} {a.get('as')}" for a in link.get("assignees") or [])
         return f"{name} {link.get('phase')}" + (f" [{who}]" if who else "")
-    def describe(self, store: Optional["StateStore"], *, show_all: bool = False) -> str:
+    def describe(self, store: Optional["StateStore"], *, show_all: bool = False,
+                 filters: Optional["Filters"] = None) -> str:
         """``/topics``: the **open** topics, plus how many closed ones are left out (#435).
 
         ``show_all`` (``/topics all``) lists the closed records too, marked as such. A closed
         record is a topic that is gone (``/cleanup`` deleted it) or one closed by hand; the
         registry keeps it, so a listing that ignored ``status`` grew a page per cleanup.
+
+        *filters* are the dashboard's own (#438) -- type, state and stage, read by
+        :mod:`swarmly.telegram.topic_filter` -- so a typed filter and a pressed one answer
+        the same. With none, the default view holds: open topics that still have something
+        to do, with the items already ``done`` left out.
         """
         if store is None or not store.ready:
             return "Topic registry: the state store is not running (state.backend)."
-        lines, closed = [], 0
+        chosen = filters if filters is not None else (
+            topic_filter.Filters(show_closed=True) if show_all else topic_filter.DEFAULT)
+        if show_all and filters is not None:
+            chosen = topic_filter.Filters(types=filters.types, states=filters.states,
+                                          stages=filters.stages, show_closed=True,
+                                          unknown=filters.unknown)
+        records, closed = [], 0
         for key in store.keys("topic/"):
             place = K.topic_of(key)
             if place is None or place[1] is not None:
                 continue
             data = store.read(key) or {}
-            is_open = str(data.get("status") or "open").strip().lower() == "open"
-            if not is_open:
+            status = str(data.get("status") or "open").strip().lower()
+            if status != "open":
                 closed += 1
-                if not show_all:
-                    continue                            # only counted unless /topics all
+            records.append((place[0], status, data))
+        lines, hidden = [], 0
+        for thread, status, data in records:
+            is_open = status == "open"
+            links = list(data.get("links") or ())
+            if not chosen.topic_ok(status, links):
+                # Counted only when the state rule would have listed it: a closed record the
+                # admin did not ask for is the "+N closed" line, not a filter's doing.
+                if status in chosen.topic_states:
+                    hidden += 1
+                continue
+            place = (thread, None)
             bindings = {K.norm(a): b for a, b in (data.get("agents") or {}).items()}
             sessions = {k.rsplit("/", 1)[1] for k in store.keys(f"topic/{place[0]}/agent/")}
             agents = self._agent_rows(sorted(set(bindings) | sessions), bindings, store,
@@ -306,9 +330,20 @@ class RegistryShadow:
                          + ("".join(f"\n    {a}" for a in agents)))
         suffix = ""
         if closed:
-            suffix = (f"\n+{closed} closed (listed above)" if show_all
-                      else f"\n+{closed} closed (/topics all shows them)")
+            suffix = (f"\n+{closed} closed (listed above)" if chosen.show_closed
+                      else f"\n+{closed} closed (state=closed lists them)")
+        if chosen.unknown:
+            suffix += "\nunknown filter: " + " ".join(chosen.unknown)
+        said = []
+        if chosen.asked:
+            said.append(f"{len(lines)} topic(s) for {chosen.describe()}")
+        if hidden:
+            said.append(f"{hidden} hidden by the filters")
+        if said:
+            suffix += "\n" + " · ".join(said)
         if not lines:
+            if chosen.asked:
+                return f"Topic registry: no topic matches {chosen.describe()}." + suffix
             # Every record closed by /cleanup: the registry still holds them, so "empty so
             # far" would be a lie -- the count line says what is left out (#435 review).
             if closed:

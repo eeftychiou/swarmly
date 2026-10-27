@@ -225,7 +225,7 @@ class RegistryShadowTests(unittest.TestCase):
         text = shadow.describe(a)
         self.assertIn("Stability round (10134)", text)
         self.assertNotIn("a topic that is gone", text)
-        self.assertIn("+1 closed (/topics all shows them)", text)
+        self.assertIn("+1 closed (state=closed lists them)", text)
 
     def test_topics_all_shows_the_closed_records_marked_closed(self):
         claude = channel_for("Claudebot", self.clock)
@@ -251,7 +251,7 @@ class RegistryShadowTests(unittest.TestCase):
 
         text = shadow.describe(a)
         self.assertIn("no open topics", text)
-        self.assertIn("+2 closed (/topics all shows them)", text)
+        self.assertIn("+2 closed (state=closed lists them)", text)
         self.assertNotIn("empty so far", text)
 
     def test_an_agents_handle_and_its_alias_are_one_row(self):
@@ -288,8 +288,8 @@ class RegistryShadowTests(unittest.TestCase):
         seen = []
 
         class Recorder:
-            def describe(self, store, *, show_all=False):
-                seen.append(show_all)
+            def describe(self, store, *, show_all=False, filters=None):
+                seen.append((show_all, filters.describe() if filters else ""))
                 return "Topic registry:\n• x (1)"
 
         stub = SimpleNamespace(
@@ -297,11 +297,13 @@ class RegistryShadowTests(unittest.TestCase):
             config=SimpleNamespace(identity=SimpleNamespace(name="Claudebot_bot")),
             state_link=SimpleNamespace(store=None, registry=Recorder()))
         for text in ("/topics@Claudebot_bot", "/topics@Claudebot_bot all",
-                     "/topics@Claudebot_bot ALL"):
+                     "/topics@Claudebot_bot ALL",
+                     "/topics@Claudebot_bot stage=review type=pr"):
             reply = AgentChannel._handle_command(stub, ChannelEvent(text=text, chat_id=HOME,
                                                                     thread_id=1))
             self.assertIn("Topic registry", reply or "")
-        self.assertEqual(seen, [False, True, True])
+        self.assertEqual(seen, [(False, ""), (True, "all"), (True, ""),
+                                (False, "type=pr stage=review")])
 
     def test_no_agent_row_for_a_bot_that_never_spoke(self):
         """An agent with no binding and no turns is noise: no `not linked … t=0` row (#435).
