@@ -87,14 +87,34 @@ _TOML_STRING = re.compile(r'^\s*([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"')
 
 
 def _top_level_toml(text: str) -> Dict[str, Any]:
-    """``key = "value"`` lines before the first table: enough for the keys read here."""
+    """``key = "value"`` lines, with each ``[[providers]]`` table kept as a mapping.
+
+    Python 3.10 has no ``tomllib``, and this is the fallback that reads the file for it. The
+    top-level keys alone are not enough: a Reasonix file names its providers in
+    ``[[providers]]`` tables, and those names are the models ``/model`` can switch to (#393).
+    Nested tables (``[providers.model_overrides.<name>]``) are still out of reach here; only
+    the strings written directly in a table are read.
+    """
     found: Dict[str, Any] = {}
+    providers: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None          # the provider table being read, or None
     for line in text.splitlines():
-        if line.lstrip().startswith("["):
-            break
+        stripped = line.strip()
+        if stripped.startswith("["):
+            current = None
+            if stripped.replace(" ", "").replace("\t", "").lower() == "[[providers]]":
+                current = {}
+                providers.append(current)
+            continue
         match = _TOML_STRING.match(line)
-        if match:
+        if not match:
+            continue
+        if current is not None:
+            current[match.group(1)] = match.group(2)
+        else:
             found[match.group(1)] = match.group(2)
+    if providers:
+        found["providers"] = providers
     return found
 
 

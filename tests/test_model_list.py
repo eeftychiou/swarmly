@@ -1,14 +1,19 @@
 """/model with no name lists the models the bot's CLI can switch to."""
 
 import asyncio
+import inspect
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from swarmly.telegram import channel as channel_mod
 from swarmly.telegram import model_list
+from swarmly.telegram.cli_defaults import reasonix_provider_names
 from swarmly.telegram.model_list import (available_models, parse_agy_models,
                                          parse_codex_cache, parse_reasonix_doctor)
 from tests.test_telegram_channel import ADMIN_ID, event, make_channel, make_config, run
@@ -222,6 +227,17 @@ class TestTheBackgroundLookup(unittest.TestCase):
             self.assertIsNone(self.beat(channel))
         self.assertEqual(channel.status_snapshot().models, ())    # nothing invented
 
+    def test_a_reasonix_file_is_read_without_tomllib_too(self):
+        """CI py3.10 has no ``tomllib``: the fallback stopped at the first table, so the list
+        came back as ``default_model`` alone (#393 review)."""
+        text = ('default_model = "deepseek-flash"\n\n'
+                '[[providers]]\nname = "deepseek-pro"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                names = reasonix_provider_names(tmp, env={}, home=Path(tmp))
+        self.assertEqual(names, ["deepseek-flash", "deepseek-pro"])
+
     def test_the_loop_looks_up_once_before_it_sleeps(self):
         channel = make_channel(make_config(adapter={"type": "antigravity"}))
         beats = []
@@ -234,6 +250,50 @@ class TestTheBackgroundLookup(unittest.TestCase):
         with mock.patch.object(asyncio, "sleep", mock.AsyncMock()):
             with self.assertRaises(asyncio.CancelledError):
                 run(channel._models_loop())
+        self.assertEqual(beats, [1])
+
+
+    def test_the_lookup_gets_the_env_the_adapter_builds(self):
+        """#393 review: building the env by hand handed the CLI what the adapter strips."""
+        seen = {}
+
+        async def capture(adapter_type, env=None, **kwargs):
+            seen["env"] = env
+            return ["a-model"]
+
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        channel.adapter.environment = lambda: {"ONLY": "the adapter's"}
+        with mock.patch.object(channel_mod, "available_models", capture):
+            run(channel._refresh_models())
+        self.assertEqual(seen["env"], {"ONLY": "the adapter's"})
+
+    def test_the_transport_starts_the_lookup(self):
+        """The loop must be started by the transport, not merely exist (#393 review).
+
+        Driving ``start()`` here would need the whole aiogram boundary stubbed (and the
+        online-receipt test shows how much of it that takes), so this pins the two facts that
+        matter instead: ``start()`` calls the scheduler, and the scheduler starts one loop.
+        """
+        source = inspect.getsource(type(make_channel()).start)
+        self.assertIn("self._schedule_models_lookup()", source)
+
+    def test_the_scheduler_starts_one_loop(self):
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        beats = []
+
+        async def one_wake():
+            beats.append(1)
+            return None
+
+        channel._models_loop = one_wake
+
+        async def scenario():
+            channel._schedule_models_lookup()
+            channel._schedule_models_lookup()          # a second start starts nothing new
+            await asyncio.sleep(0)
+            channel._models_task.cancel()
+
+        run(scenario())
         self.assertEqual(beats, [1])
 
 

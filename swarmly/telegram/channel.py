@@ -1821,7 +1821,10 @@ class AgentChannel:
         """
         adapter = self.config.adapter
         try:
-            env = {**os.environ, **adapter.extra_env}
+            # The adapter's own env, not os.environ plus extra_env: it is the one that
+            # strips what the CLI must not see (bot tokens and other secrets), so a bare
+            # /model and the beat ask the CLI in the same env.
+            env = self.adapter.environment()
         except Exception:                              # noqa: BLE001 - the CLI's own env
             env = None
         try:
@@ -1842,6 +1845,11 @@ class AgentChannel:
         while True:
             await self._refresh_models()
             await asyncio.sleep(REFRESH_SECONDS)
+
+    def _schedule_models_lookup(self) -> None:
+        """Start the background model-list lookup, once: the beat publishes what it finds."""
+        if self._models_task is None:
+            self._models_task = asyncio.create_task(self._models_loop())
 
     def _direct_chat(self, event: ChannelEvent) -> bool:
         """The admin's private chat with this bot, where a bare command can only mean this bot.
@@ -11697,9 +11705,7 @@ class AgentChannel:
             self._github_task = asyncio.create_task(self._github_tick())
         if self._heartbeat_task is None and self.heartbeat_seconds() > 0:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        if self._models_task is None:
-            # #393: published with the first beat, not after someone sends /model.
-            self._models_task = asyncio.create_task(self._models_loop())
+        self._schedule_models_lookup()
         self.state_link.start()                    # its own switch, not the heartbeat's
         replayed = self.replay_interrupted()      # what the last run accepted and never finished
         if replayed:
