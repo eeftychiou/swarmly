@@ -1,13 +1,19 @@
 """/model with no name lists the models the bot's CLI can switch to."""
 
+import asyncio
+import inspect
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from swarmly.telegram import channel as channel_mod
 from swarmly.telegram import model_list
+from swarmly.telegram.cli_defaults import reasonix_provider_names
 from swarmly.telegram.model_list import (available_models, parse_agy_models,
                                          parse_codex_cache, parse_reasonix_doctor)
 from tests.test_telegram_channel import ADMIN_ID, event, make_channel, make_config, run
@@ -161,6 +167,134 @@ class TestModelCommandLists(unittest.TestCase):
             run(channel.handle_event(event("/model@CodexBot", author_id=ADMIN_ID,
                                            username="alice", is_bot=False)))
         self.assertEqual(calls, [])
+
+
+class TestTheBackgroundLookup(unittest.TestCase):
+    """#393: a bot that was never sent /model still publishes what it can run.
+
+    The dashboard greys a Model pick out when the card's list is empty, and a card was empty
+    until someone asked the bot ``/model`` with no name, so every peer but the one with a
+    built-in list showed a dead button. The list is now looked up in the background.
+    """
+
+    def setUp(self):
+        model_list._cache.clear()
+        self.addCleanup(model_list._cache.clear)
+
+    def beat(self, channel):
+        """One wake of the background loop, as it runs at start."""
+        return run(channel._refresh_models())
+
+    def test_antigravity_publishes_its_models_after_one_beat(self):
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        with mock.patch.object(model_list, "_spawn", spawner(FakeProcess())):
+            self.beat(channel)
+        self.assertIn("gemini-3.8-flash-medium (Gemini 3.8 Flash (Medium))",
+                      channel.status_snapshot().models)
+
+    def test_codex_publishes_its_models_after_one_beat(self):
+        channel = make_channel(make_config(adapter={"type": "codex"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "models_cache.json").write_text(CODEX_CACHE, encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                self.beat(channel)
+        self.assertIn("gpt-6-luna", channel.status_snapshot().models)
+
+    def test_reasonix_publishes_its_models_after_one_beat(self):
+        channel = make_channel(make_config(adapter={"type": "reasonix"}))
+        with mock.patch.object(model_list, "_spawn", spawner(FakeProcess(REASONIX_OUTPUT))):
+            self.beat(channel)
+        self.assertIn("deepseek-v4-pro", channel.status_snapshot().models)
+
+    def test_a_reasonix_bot_whose_doctor_fails_reads_its_own_settings_file(self):
+        """The DeepSeek bots run this adapter; its settings file names the providers even
+        when the CLI cannot list them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(
+                'default_model = "deepseek-flash"\n\n'
+                '[[providers]]\nname = "deepseek-pro"\n', encoding="utf-8")
+            channel = make_channel(make_config(adapter={"type": "reasonix", "cwd": tmp}))
+            with mock.patch.object(model_list, "_spawn",
+                                   spawner(FakeProcess(returncode=1))):
+                names = self.beat(channel)
+            self.assertEqual(list(channel.status_snapshot().models),
+                             ["deepseek-flash", "deepseek-pro"])
+        self.assertEqual(names, ["deepseek-flash", "deepseek-pro"])
+
+    def test_a_lookup_that_fails_still_publishes_an_empty_list(self):
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        with mock.patch.object(model_list, "_spawn", spawner(FakeProcess(returncode=1))):
+            self.assertIsNone(self.beat(channel))
+        self.assertEqual(channel.status_snapshot().models, ())    # nothing invented
+
+    def test_a_reasonix_file_is_read_without_tomllib_too(self):
+        """CI py3.10 has no ``tomllib``: the fallback stopped at the first table, so the list
+        came back as ``default_model`` alone (#393 review)."""
+        text = ('default_model = "deepseek-flash"\n\n'
+                '[[providers]]\nname = "deepseek-pro"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                names = reasonix_provider_names(tmp, env={}, home=Path(tmp))
+        self.assertEqual(names, ["deepseek-flash", "deepseek-pro"])
+
+    def test_the_loop_looks_up_once_before_it_sleeps(self):
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        beats = []
+
+        async def one_wake():
+            beats.append(1)
+            raise asyncio.CancelledError
+
+        channel._refresh_models = one_wake
+        with mock.patch.object(asyncio, "sleep", mock.AsyncMock()):
+            with self.assertRaises(asyncio.CancelledError):
+                run(channel._models_loop())
+        self.assertEqual(beats, [1])
+
+
+    def test_the_lookup_gets_the_env_the_adapter_builds(self):
+        """#393 review: building the env by hand handed the CLI what the adapter strips."""
+        seen = {}
+
+        async def capture(adapter_type, env=None, **kwargs):
+            seen["env"] = env
+            return ["a-model"]
+
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        channel.adapter.environment = lambda: {"ONLY": "the adapter's"}
+        with mock.patch.object(channel_mod, "available_models", capture):
+            run(channel._refresh_models())
+        self.assertEqual(seen["env"], {"ONLY": "the adapter's"})
+
+    def test_the_transport_starts_the_lookup(self):
+        """The loop must be started by the transport, not merely exist (#393 review).
+
+        Driving ``start()`` here would need the whole aiogram boundary stubbed (and the
+        online-receipt test shows how much of it that takes), so this pins the two facts that
+        matter instead: ``start()`` calls the scheduler, and the scheduler starts one loop.
+        """
+        source = inspect.getsource(type(make_channel()).start)
+        self.assertIn("self._schedule_models_lookup()", source)
+
+    def test_the_scheduler_starts_one_loop(self):
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        beats = []
+
+        async def one_wake():
+            beats.append(1)
+            return None
+
+        channel._models_loop = one_wake
+
+        async def scenario():
+            channel._schedule_models_lookup()
+            channel._schedule_models_lookup()          # a second start starts nothing new
+            await asyncio.sleep(0)
+            channel._models_task.cancel()
+
+        run(scenario())
+        self.assertEqual(beats, [1])
 
 
 if __name__ == "__main__":

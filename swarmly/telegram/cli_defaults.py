@@ -30,7 +30,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 logger = logging.getLogger("swarmly.telegram.cli_defaults")
 
@@ -87,15 +87,69 @@ _TOML_STRING = re.compile(r'^\s*([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"')
 
 
 def _top_level_toml(text: str) -> Dict[str, Any]:
-    """``key = "value"`` lines before the first table: enough for the keys read here."""
+    """``key = "value"`` lines, with each ``[[providers]]`` table kept as a mapping.
+
+    Python 3.10 has no ``tomllib``, and this is the fallback that reads the file for it. The
+    top-level keys alone are not enough: a Reasonix file names its providers in
+    ``[[providers]]`` tables, and those names are the models ``/model`` can switch to (#393).
+    Nested tables (``[providers.model_overrides.<name>]``) are still out of reach here; only
+    the strings written directly in a table are read.
+    """
     found: Dict[str, Any] = {}
+    providers: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None          # the provider table being read, or None
     for line in text.splitlines():
-        if line.lstrip().startswith("["):
-            break
+        stripped = line.strip()
+        if stripped.startswith("["):
+            current = None
+            if stripped.replace(" ", "").replace("\t", "").lower() == "[[providers]]":
+                current = {}
+                providers.append(current)
+            continue
         match = _TOML_STRING.match(line)
-        if match:
+        if not match:
+            continue
+        if current is not None:
+            current[match.group(1)] = match.group(2)
+        else:
             found[match.group(1)] = match.group(2)
+    if providers:
+        found["providers"] = providers
     return found
+
+
+def reasonix_provider_names(cwd: Optional[str] = None, *, env: Optional[Mapping[str, str]] = None,
+                            home: Optional[Path] = None) -> List[str]:
+    """The provider names ``reasonix.toml`` already lists, without running the CLI (#393).
+
+    ``/model`` on the Reasonix adapter takes a provider name, so the names the settings file
+    declares are the switchable set: the ``[[providers]]`` entries' ``name`` plus the models
+    each one overrides, and the file's own ``default_model`` first. Read here so a bot whose
+    ``reasonix doctor`` cannot answer still has a list to publish.
+    """
+    env = os.environ if env is None else env
+    home = Path.home() if home is None else home
+    layers = [_read_toml(_reasonix_global(env, home))]
+    if cwd:
+        layers.append(_read_toml(Path(cwd) / "reasonix.toml"))
+    merged: Dict[str, Any] = {}
+    for layer in layers:                                 # the project file wins
+        merged.update(layer)
+    tables = [merged] + [p for p in merged.get("providers") or [] if isinstance(p, dict)]
+    names: List[str] = []
+
+    def add(name: Any) -> None:
+        word = _text(name)
+        if word and word not in names:
+            names.append(word)
+
+    add(merged.get("default_model"))
+    for table in tables:
+        add(table.get("name"))
+        overrides = table.get("model_overrides")
+        for model in (overrides if isinstance(overrides, dict) else {}):
+            add(model)
+    return names
 
 
 def _codex(env: Mapping[str, str], home: Path) -> CliDefault:

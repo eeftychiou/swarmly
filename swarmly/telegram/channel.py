@@ -687,6 +687,9 @@ class AgentChannel:
         self._pulsebus: Optional[PulseBus] = None
         self._pulsebus_checked = False
         self._heartbeat_task: Optional[asyncio.Task] = None
+        #: The background model-list lookup (#393): a bot publishes its models without anyone
+        #: sending it /model first, so the dashboard's Model pick is not greyed out.
+        self._models_task: Optional[asyncio.Task] = None
         #: alias -> wall time its current DOWN episode was announced, so one return line closes it.
         self._down_announced: Dict[str, float] = {}
 
@@ -1807,11 +1810,46 @@ class AgentChannel:
             return
         if not self.config.adapter.model_switchable:
             return
+        await self._refresh_models()
+
+    async def _refresh_models(self) -> Optional[List[str]]:
+        """Ask this bot's CLI which models it can run, off the turn path (#393).
+
+        The answer lands in ``model_list``'s cache, which is what the beat publishes and what
+        a bare /model lists. None when the CLI cannot say; the cache keeps that too, so the
+        card still shows it has nothing to offer yet.
+        """
+        adapter = self.config.adapter
         try:
+            # The adapter's own env, not os.environ plus extra_env: it is the one that
+            # strips what the CLI must not see (bot tokens and other secrets), so a bare
+            # /model and the beat ask the CLI in the same env.
             env = self.adapter.environment()
         except Exception:                              # noqa: BLE001 - the CLI's own env
             env = None
-        await available_models(self.config.adapter.type, env=env)
+        try:
+            return await available_models(adapter.type, env=env, cwd=adapter.cwd)
+        except Exception:                              # noqa: BLE001 - a beat without a list
+            logger.warning("could not look up the models of the %s adapter",
+                           adapter.type, exc_info=True)
+            return None
+
+    async def _models_loop(self) -> None:
+        """Keep the model list fresh: once at start, then whenever a lookup could be retried.
+
+        A bot published ``models: []`` until someone sent it ``/model``, so the dashboard's
+        Model pick was greyed out for every bot but the one with a built-in list (#393). The
+        wake-up is a cache read while the list is fresh, so this costs nothing on the beat.
+        """
+        from swarmly.telegram.model_list import REFRESH_SECONDS
+        while True:
+            await self._refresh_models()
+            await asyncio.sleep(REFRESH_SECONDS)
+
+    def _schedule_models_lookup(self) -> None:
+        """Start the background model-list lookup, once: the beat publishes what it finds."""
+        if self._models_task is None:
+            self._models_task = asyncio.create_task(self._models_loop())
 
     def _direct_chat(self, event: ChannelEvent) -> bool:
         """The admin's private chat with this bot, where a bare command can only mean this bot.
@@ -11667,6 +11705,7 @@ class AgentChannel:
             self._github_task = asyncio.create_task(self._github_tick())
         if self._heartbeat_task is None and self.heartbeat_seconds() > 0:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._schedule_models_lookup()
         self.state_link.start()                    # its own switch, not the heartbeat's
         replayed = self.replay_interrupted()      # what the last run accepted and never finished
         if replayed:
@@ -11726,6 +11765,9 @@ class AgentChannel:
             if self._heartbeat_task is not None:
                 self._heartbeat_task.cancel()
                 self._heartbeat_task = None
+            if self._models_task is not None:
+                self._models_task.cancel()
+                self._models_task = None
             if self._bus_task is not None:
                 self._bus_task.cancel()
                 self._bus_task = None

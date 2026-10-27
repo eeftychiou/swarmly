@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from swarmly.telegram.cli_defaults import reasonix_provider_names
+
 logger = logging.getLogger("swarmly.telegram")
 
 DISCOVERY_TIMEOUT = 20.0
@@ -32,6 +34,10 @@ LIST_TTL_SECONDS = 3600.0
 FAILED_TTL_SECONDS = 120.0
 #: At most this many names in one reply.
 MAX_LISTED = 40
+#: How often a bot wakes to keep its list fresh (#393). The cache answers a fresh list
+#: instantly, so most wakes cost nothing and a failed lookup is retried on this beat rather
+#: than on the next /model.
+REFRESH_SECONDS = FAILED_TTL_SECONDS
 
 Spawner = Callable[..., Any]
 _cache: Dict[str, Tuple[float, Optional[List[str]]]] = {}
@@ -57,7 +63,9 @@ def cached_models(adapter_type: str) -> Optional[List[str]]:
 async def available_models(adapter_type: str, env: Optional[Dict[str, str]] = None,
                            spawn: Optional[Spawner] = None,
                            clock: Callable[[], float] = time.monotonic,
-                           codex_home: Optional[Path] = None) -> Optional[List[str]]:
+                           codex_home: Optional[Path] = None,
+                           cwd: Optional[str] = None,
+                           home: Optional[Path] = None) -> Optional[List[str]]:
     """The models this adapter's CLI offers, or None when it cannot say (the CLI is missing,
     signed out or too slow, or its list is unreadable)."""
     static = static_models(adapter_type)
@@ -89,6 +97,14 @@ async def available_models(adapter_type: str, env: Optional[Dict[str, str]] = No
     except Exception as exc:                           # noqa: BLE001 - no list then
         logger.info("could not list the %s models: %s", family, exc)
         found = []
+    if not found and family == "reasonix":
+        # The Reasonix CLI's own settings file already names its providers, so a bot whose
+        # `doctor` cannot answer still has a list to publish (#393) -- the DeepSeek bots run
+        # this adapter, and their Model pick stayed greyed out without one.
+        try:
+            found = reasonix_provider_names(cwd, env=env, home=home)
+        except Exception as exc:                       # noqa: BLE001 - no list then
+            logger.info("could not read the Reasonix providers: %s", exc)
     _cache[family] = (now, found or None)
     return found or None
 
