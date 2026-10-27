@@ -68,6 +68,9 @@ _COMMAND_REPLY = re.compile(r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\]\s*)?"
                             r"|Topic registry(?: \(shadow\))?: the state store is not running"
                             r"|Topic registry: empty so far"
                             r"|Topic registry: no open topics\."
+                            # #438: nothing matched the filters asked for (`/topics
+                            # stage=review`), which is an answer, not a hand-off.
+                            r"|Topic registry: no topic matches "
                             # A listing, by its first line (a topic or a count line), never a
                             # peer's "Topic registry: I pushed the phase 4 fix" (#435).
                             r"|Topic registry(?: \(shadow\))?:\n(?:[^\s]|\s{4})"

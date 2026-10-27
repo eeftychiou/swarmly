@@ -130,6 +130,13 @@ class TestTheWords(unittest.TestCase):
         self.assertEqual(sorted(from_url.as_query().items()),
                          [("all", "1"), ("stage", "review"), ("type", "issue,pr")])
 
+    def test_all_is_one_word_whatever_its_case(self):
+        """`/topics ALL` has always meant all (#438 review): it is never "unknown filter"."""
+        for word in ("all", "ALL", "All", "show-all"):
+            filters = tf.parse([word])
+            self.assertTrue(filters.show_closed, word)
+            self.assertEqual(filters.unknown, (), word)
+
     def test_the_words_come_back_out_as_they_went_in(self):
         self.assertEqual(tf.parse(["type=pr", "stage=qa"]).words(),
                          ["type=pr", "stage=qa"])

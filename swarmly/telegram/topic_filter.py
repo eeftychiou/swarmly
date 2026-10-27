@@ -204,7 +204,10 @@ def parse(words: Iterable[Any] = ()) -> Filters:
     unknown: List[str] = []
     show_closed = False
     for token in _words_or_tokens(words):
-        if token in ("all", "show-all"):
+        token = token.strip()
+        if token.lower() in ("all", "show-all"):
+            # `/topics ALL` has been the same ask since #435: a word this command accepts is
+            # never reported back as unknown (#438 review).
             show_closed = True
             continue
         key, _, value = token.partition("=")

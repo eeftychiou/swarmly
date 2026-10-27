@@ -330,7 +330,10 @@ class RegistryShadow:
                          + ("".join(f"\n    {a}" for a in agents)))
         suffix = ""
         if closed:
-            suffix = (f"\n+{closed} closed (listed above)" if chosen.show_closed
+            # "state=closed lists them" only where they are not already listed: an admin who
+            # asked for the closed ones is not told to ask again (#438 review).
+            listed = "closed" in chosen.topic_states
+            suffix = (f"\n+{closed} closed (listed above)" if listed
                       else f"\n+{closed} closed (state=closed lists them)")
         if chosen.unknown:
             suffix += "\nunknown filter: " + " ".join(chosen.unknown)

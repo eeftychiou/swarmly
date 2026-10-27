@@ -302,7 +302,9 @@ class RegistryShadowTests(unittest.TestCase):
             reply = AgentChannel._handle_command(stub, ChannelEvent(text=text, chat_id=HOME,
                                                                     thread_id=1))
             self.assertIn("Topic registry", reply or "")
-        self.assertEqual(seen, [(False, ""), (True, "all"), (True, ""),
+        # `/topics ALL` is the same ask (#438 review): it parses as `all`, not as a word the
+        # filter does not know.
+        self.assertEqual(seen, [(False, ""), (True, "all"), (True, "all"),
                                 (False, "type=pr stage=review")])
 
     def test_no_agent_row_for_a_bot_that_never_spoke(self):

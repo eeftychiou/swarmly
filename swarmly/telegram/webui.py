@@ -643,8 +643,15 @@ def registry_panel(*, now: float, store: Any = None,
     return {"ready": True,
             "topics": cards,
             # What the filters did, so the panel can say "3 hidden" rather than look empty
-            # (#438): the count is of records this bot can read, minus the ones it shows.
-            "hidden": max(0, len(topics) - len(cards)),
+            # (#438). Counted the way `/topics` counts it: a record the *filters* left out,
+            # not every closed record the view never asked for (#438 review).
+            "hidden": sum(
+                1 for raw in topics
+                if str(as_dict(raw).get("status") or "open").strip().lower()
+                in chosen.topic_states
+                and not chosen.topic_ok(
+                    str(as_dict(raw).get("status") or "open").strip().lower(),
+                    list(as_dict(raw).get("links") or ()))),
             "filters": filters_view(chosen)}
 
 
@@ -1183,8 +1190,11 @@ function topicCard(topic) {
   const box = el("article", "card");
   const top = el("div", "top");
   top.append(el("span", "alias", topic.topic || "?"));
-  top.append(el("span", "badge " + (topic.stalled ? "stuck" : "idle"),
-    topic.stalled ? "stalled" : "open"));
+  // A closed record is only on the page when `state=closed` (or `all`) asked for it, and it
+  // must not draw as open (#438 review): the badge says what the record is.
+  const closed = topic.status === "closed";
+  top.append(el("span", "badge " + (closed ? "paused" : (topic.stalled ? "stuck" : "idle")),
+    closed ? "closed" : (topic.stalled ? "stalled" : "open")));
   if (topic.updated !== null && topic.updated !== undefined)
     top.append(el("span", "sub", "active " + ago(topic.updated) + " ago"));
   box.append(top);
