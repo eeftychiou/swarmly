@@ -249,6 +249,7 @@ class TestStateRootForAnInstalledWheel(unittest.TestCase):
         transport then writes. This makes the transport write one of its own -- the memory
         turn counter, which every prompt bumps -- and looks for the file on disk.
         """
+        from swarmly.telegram.poll import state_dir
         from tests.test_telegram_channel import make_channel, make_config
 
         alias = "StaterootProbe"
@@ -258,11 +259,13 @@ class TestStateRootForAnInstalledWheel(unittest.TestCase):
             config.source_path = Path(tmp) / "config.yaml"   # so its state has a home
             channel = make_channel(config)
             channel.lessons.note_turn()                 # one real write, the transport's way
-        root = Path(os.environ["SWARMLY_STATE_ROOT"]).resolve()
-        written = list(root.rglob("memory-turns-*.json"))
-        self.assertTrue(any("staterootprobe" in path.name.lower() for path in written), written)
-        for path in written:
-            self.assertIn(root, path.resolve().parents, path)
+        # Not `root.rglob(...)` alone: that would only say the file is under the root it was
+        # found in. The file must be in the folder the transport *says* it writes to, and the
+        # checkout must hold no copy (#322 review).
+        written = list(state_dir(config).glob("memory-turns-staterootprobe.json"))
+        self.assertEqual(len(written), 1, written)
+        self.assertIn(Path(os.environ["SWARMLY_STATE_ROOT"]).resolve(),
+                      written[0].resolve().parents)
         checkout_state = ROOT / ".agents" / "state"
         self.assertFalse(list(checkout_state.rglob("memory-turns-staterootprobe*.json")),
                          "the transport wrote its state into the checkout")
