@@ -46,6 +46,10 @@ class FakeHost:
         self.refuse_messages = {int(i) for i in refuse_messages}
         #: When set, every call raises as though Telegram never answered (#398).
         self.unavailable = None
+        #: When set, every call raises this instead -- an error that is not DeleteUnavailable.
+        self.crash = None
+        #: When set, every call answers this: None is the host's "could not ask" (#400).
+        self.answer = "count"
         self.protected = set(protected)
         self.deleted_topics = []
         self.deleted_messages = []
@@ -69,6 +73,10 @@ class FakeHost:
         self.deleted_messages.append(batch)
         if self.unavailable:
             raise DeleteUnavailable(self.unavailable)
+        if self.crash is not None:
+            raise self.crash
+        if self.answer is None:
+            return None                  # not answered: not a refusal (#400)
         if self.message_batches is not None:
             return self.message_batches.pop(0) if self.message_batches else 0
         if any(mid in self.refuse_messages for mid in batch):
@@ -223,6 +231,25 @@ class OtherFormTests(CleanupCase):
         host.unavailable = None
         self.assertIn("deleted 2 General message(s)", self.ask(self.cleanup(host), "general"))
         self.assertEqual(self.ledger.recent(GROUP, NOW), [])
+
+    def test_a_host_that_never_answers_keeps_the_ids_whatever_the_shape(self):
+        """#400: an error, or a host that says ``None``, is not a refusal.
+
+        A host with no bot attached or a broken transport used to answer 0 for every call,
+        which read as "Telegram refused them all" and dropped every id from the ledger -- one
+        outage lost every notice that was due. Only a call that comes back with a count
+        settles an id.
+        """
+        shapes = {"raises": "crash", "says None": "answer"}
+        for label, field in shapes.items():
+            with self.subTest(label):
+                self.ledger.note(GROUP, [5, 6], now=NOW - HOUR)
+                host = FakeHost()
+                setattr(host, field, RuntimeError("no bot attached") if field == "crash"
+                        else None)
+                reply = self.ask(self.cleanup(host), "general")
+                self.assertIn("2 could not be asked about", reply)
+                self.assertEqual(self.ledger.recent(GROUP, NOW), [5, 6], label)
 
     def test_the_one_at_a_time_fallback_pauses_between_calls(self):
         # #398: the fallback is one Bot API call per id; unpaced it walked into ~30/s.
