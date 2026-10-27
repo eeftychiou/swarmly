@@ -67,6 +67,10 @@ ACTION_PATH = "/api/action"
 #: The most a write's body may carry: an action, a target, a value and a confirm code. A body
 #: larger than this is refused unread, so a page cannot be made to buffer something huge.
 MAX_BODY_BYTES = 8192
+#: How long one request may stall before its handler gives up on it (#442). A client that
+#: promises a body and never sends it would otherwise hold its thread for good, in the drain
+#: a refusal reads before answering; and the drain happens for unauthenticated writes too.
+DRAIN_TIMEOUT = 5.0
 #: ``/memory``'s own view (#344): this bot's lessons, for the admin's eyes and nobody else's.
 #: It asks for the verified login *always*, the loopback included -- a bot's working notes are
 #: not a status field, and the plain local page stays a page about the swarm.
@@ -1821,8 +1825,8 @@ class DashboardServer:
             sys_version = ""
             # A stalled client must not hold its thread for good: the body a refusal drains is
             # read from the socket, and a request that promises more than it sends would block
-            # here until the socket times out (#432 review).
-            timeout = 5
+            # here until the socket times out (#432 review, #442).
+            timeout = DRAIN_TIMEOUT
 
             def log_message(self, fmt: str, *args: Any) -> None:   # never on stderr
                 return
