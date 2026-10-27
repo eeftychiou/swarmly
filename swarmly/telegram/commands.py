@@ -65,8 +65,8 @@ _COMMAND_REPLY = re.compile(r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\]\s*)?"
                             r"|State store(?: \([^()\n]{1,40}\))?: "
                             r"(?:ready|not ready|off \(state\.backend|not started\.)"
                             r"|Store test \d+-[\w.-]{1,40}-[0-9a-f]{4}(?: started)?:"
-                            r"|Topic registry(?: \(shadow\):\n|: the state store is not running"
-                            r"|: empty so far))")
+                            r"|Topic registry(?: \(shadow\))?:(?:\n| the state store is not running"
+                            r"| empty so far))")
 # The /model and /reasoning answers lead with the bot's alias ("Codex runs gpt-x here ...").
 _SETTING_REPLY = re.compile(
     r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\])?[\w .-]{0,40}?"

@@ -199,6 +199,66 @@ class RegistryShadowTests(unittest.TestCase):
         self.assertEqual((binding.model, binding.model_source),
                          ("claude-fable-5-1", "topic"))
 
+    def _holding(self, alias="Claudebot"):
+        """A store whose bot holds the lease: only the lease holder may write a topic record."""
+        store = self.store(alias)
+        asyncio.run(store.claim_lease(10 ** 6))
+        return store
+
+    def _closed_topic(self, store, thread=8, title="a topic that is gone"):
+        """A record `/cleanup` closed: the registry keeps it, the listing must not show it."""
+        record = {"topic_id": thread, "chat_id": HOME, "title": title, "status": "closed",
+                  "opened_by": "admin", "opened_at": "2026-10-27T00:00:00Z",
+                  "closed_at": "2026-10-27T01:00:00Z",
+                  "last_activity": "2026-10-27T01:00:00Z", "links": [], "agents": {}}
+        asyncio.run(store.write(K.topic(thread), record))
+
+    def test_topics_lists_open_records_and_counts_the_closed_ones(self):
+        """#435: a closed record is left out of /topics and counted, not printed."""
+        claude = channel_for("Claudebot", self.clock)
+        seen(claude, 10134, "Stability round")
+        a = self._holding()
+        self._closed_topic(a)
+        shadow = RegistryShadow(claude, clock=self.clock)
+        asyncio.run(shadow.sync(a))
+
+        text = shadow.describe(a)
+        self.assertIn("Stability round (10134)", text)
+        self.assertNotIn("a topic that is gone", text)
+        self.assertIn("+1 closed (/topics all shows them)", text)
+
+    def test_topics_all_shows_the_closed_records_marked_closed(self):
+        claude = channel_for("Claudebot", self.clock)
+        seen(claude, 10134, "Stability round")
+        a = self._holding()
+        self._closed_topic(a)
+        shadow = RegistryShadow(claude, clock=self.clock)
+        asyncio.run(shadow.sync(a))
+
+        text = shadow.describe(a, show_all=True)
+        self.assertIn("a topic that is gone (8) closed", text)
+        self.assertIn("+N closed", text)
+
+    def test_no_agent_row_for_a_bot_that_never_spoke(self):
+        """An agent with no binding and no turns is noise: no `not linked … t=0` row (#435).
+
+        A peer's own key is the only way such a row appears (`topic/<id>/agent/<alias>` is
+        written by that agent), so two stores share the log here, as on the live swarm.
+        """
+        claude = channel_for("Claudebot", self.clock)
+        a = self._holding()
+        b = self.store("DeepSeek")
+        record = {"topic_id": 11, "chat_id": HOME, "title": "quiet", "status": "open",
+                  "opened_at": "2026-10-27T00:00:00Z", "last_activity": "2026-10-27T00:00:00Z",
+                  "links": [], "agents": {"Claudebot": {"role": "coordinator"}}}
+        asyncio.run(a.write(K.topic(11), record))
+        asyncio.run(b.write(K.topic_agent(11, "deepseek"), {"turns": 0}))   # never spoke
+        asyncio.run(a.refresh())
+        text = RegistryShadow(claude, clock=self.clock).describe(a)
+        self.assertIn("quiet (11)", text)
+        self.assertIn("claudebot coordinator", text)
+        self.assertNotIn("deepseek", text, "a silent, unbound agent gets no row")
+
     def test_session_of_each_runtime(self):
         self.assertIsNone(session_of(None, "c"))
         codex = ThreadAdapter()

@@ -59,7 +59,7 @@ Any member may use these.
 | `/owed@bot` | The open "owed" rows: who owes what to whom (reviews, merges, CI, hand-offs). Rows close themselves from facts (verdicts, CI, merges, GitHub's own state, a topic whose linked work has all finished). `/owed close [alias]` from the admin, inside a topic, closes the rows owed there (or only that bot's); the `@alias` form works the same way, a second name is ignored and the reply says so. The coordinator answers a bare `/owed` or `/owed close` — the one the admin named, while no lease is live. |
 | `/drift@bot` | Rule violations the transport recorded for this bot, and its drift score (reminder at 3, session reset at 6). |
 | `/state@bot` | The shared state store as this bot sees it: position, lease holder and term, snapshot, whether every bot agrees, owed rows in the store. |
-| `/topics@bot` | The topic registry: topics, their links (work items with phase and assignees), linked bots and each bot's CLI session and turn count. |
+| `/topics@bot [all]` | The topic registry: the **open** topics, their links (work items with phase and assignees), linked bots and each bot's CLI session and turn count. Closed records (`/cleanup`, a closed topic) are counted on a last line, `+N closed`; `/topics all` lists them too, marked `closed`. |
 | `/storetest@bot [-Alias]` (admin) | A one-minute check of the Telegram facts the state store relies on; `-Alias` leaves a bot out. Not in the `/` menu. |
 
 ## Per-topic settings

@@ -275,29 +275,71 @@ class RegistryShadow:
             return name if link.get("added_by") != "legacy" else str(link.get("title") or name)
         who = ", ".join(f"{a.get('agent')} {a.get('as')}" for a in link.get("assignees") or [])
         return f"{name} {link.get('phase')}" + (f" [{who}]" if who else "")
-    def describe(self, store: Optional["StateStore"]) -> str:
+    def describe(self, store: Optional["StateStore"], *, show_all: bool = False) -> str:
+        """``/topics``: the **open** topics, plus how many closed ones are left out (#435).
+
+        ``show_all`` (``/topics all``) lists the closed records too, marked as such. A closed
+        record is a topic that is gone (``/cleanup`` deleted it) or one closed by hand; the
+        registry keeps it, so a listing that ignored ``status`` grew a page per cleanup.
+        """
         if store is None or not store.ready:
             return "Topic registry: the state store is not running (state.backend)."
-        lines = []
+        lines, closed = [], 0
         for key in store.keys("topic/"):
             place = K.topic_of(key)
             if place is None or place[1] is not None:
                 continue
             data = store.read(key) or {}
-            agents = []
+            is_open = str(data.get("status") or "open").strip().lower() == "open"
+            if not is_open:
+                closed += 1
+                if not show_all:
+                    continue                            # only counted unless /topics all
             bindings = {K.norm(a): b for a, b in (data.get("agents") or {}).items()}
             sessions = {k.rsplit("/", 1)[1] for k in store.keys(f"topic/{place[0]}/agent/")}
-            for alias in sorted(set(bindings) | sessions):
-                binding = bindings.get(alias) or {}
-                session = store.read(K.topic_agent(place[0], alias)) or {}
-                sid = str(session.get("session_id") or "-")[:10]
-                what = (f"{binding.get('role')} {binding.get('model')}/{binding.get('effort')}"
-                        if binding else "not linked")
-                agents.append(f"{alias} {what} s={sid} t={session.get('turns', 0)}")
+            agents = self._agent_rows(sorted(set(bindings) | sessions), bindings, store,
+                                      place[0])
             links = ", ".join(self._link_text(link) for link in data.get("links") or [])
             lines.append(f"• {data.get('title')} ({place[0]})"
+                         + ("" if is_open else " closed")
                          + (f" — {links}" if links else "")
                          + ("".join(f"\n    {a}" for a in agents)))
         if not lines:
             return "Topic registry: empty so far (the lease holder fills it on its beat)."
-        return "Topic registry (shadow):\n" + "\n".join(lines)
+        suffix = ""
+        if closed:
+            suffix = "\n+N closed" if show_all else f"\n+{closed} closed (/topics all shows them)"
+        return f"Topic registry{self._shadow_label()}:\n" + "\n".join(lines) + suffix
+
+    def _shadow_label(self) -> str:
+        """``" (shadow)"`` while any registry flag still runs the legacy path (#435)."""
+        link = getattr(self.channel, "state_link", None)
+        modes = {getattr(link, name, None) for name in
+                 ("lease_mode", "owed_mode", "links_mode", "routing_mode")}
+        if not modes or None in modes or modes & {"shadow", "legacy", "off"}:
+            return " (shadow)"
+        return ""
+
+    def _agent_rows(self, aliases, bindings: Dict[str, Any], store: Any,
+                    thread: int) -> List[str]:
+        """The rows under one topic: no silence, and no stray handle alias (#423, #435).
+
+        An agent with no binding and no turn in the topic is noise (``not linked … t=0``), and
+        an ``ASSIGN:`` line written with a handle recorded ``<handle>`` beside the alias: a row
+        that is only the longer spelling of another row is dropped.
+        """
+        rows = []
+        for alias in aliases:
+            if alias.endswith("_bot") and any(
+                    other != alias and alias.startswith(other) for other in aliases):
+                continue                                # a handle beside its own alias
+            binding = bindings.get(alias) or {}
+            session = store.read(K.topic_agent(thread, alias)) or {}
+            turns = session.get("turns", 0)
+            if not binding and not turns:
+                continue                                # linked to nothing, never spoke
+            sid = str(session.get("session_id") or "-")[:10]
+            what = (f"{binding.get('role')} {binding.get('model')}/{binding.get('effort')}"
+                    if binding else "not linked")
+            rows.append(f"{alias} {what} s={sid} t={turns}")
+        return rows
