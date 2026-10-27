@@ -65,8 +65,13 @@ _COMMAND_REPLY = re.compile(r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\]\s*)?"
                             r"|State store(?: \([^()\n]{1,40}\))?: "
                             r"(?:ready|not ready|off \(state\.backend|not started\.)"
                             r"|Store test \d+-[\w.-]{1,40}-[0-9a-f]{4}(?: started)?:"
-                            r"|Topic registry(?: \(shadow\):\n|: the state store is not running"
-                            r"|: empty so far))")
+                            r"|Topic registry(?: \(shadow\))?: the state store is not running"
+                            r"|Topic registry: empty so far"
+                            r"|Topic registry: no open topics\."
+                            # A listing, by its first line (a topic or a count line), never a
+                            # peer's "Topic registry: I pushed the phase 4 fix" (#435).
+                            r"|Topic registry(?: \(shadow\))?:\n(?:[^\s]|\s{4})"
+                            r")")
 # The /model and /reasoning answers lead with the bot's alias ("Codex runs gpt-x here ...").
 _SETTING_REPLY = re.compile(
     r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\])?[\w .-]{0,40}?"

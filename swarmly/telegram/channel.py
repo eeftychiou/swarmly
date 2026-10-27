@@ -1965,7 +1965,10 @@ class AgentChannel:
         if command == "state":
             return self.state_link.describe()
         if command == "topics":
-            return self.state_link.registry.describe(self.state_link.store)
+            return self.state_link.registry.describe(
+                self.state_link.store,
+                show_all=any(word.lower() == "all"
+                             for word in command_args(event.text or "")))
         return self._command_reply(command, event)
 
     def _storetest_command(self, event: ChannelEvent) -> str:

@@ -116,6 +116,12 @@ class TestRegistryAnswersAreMachineTraffic(unittest.TestCase):
                      "[Claudebot] Topic registry (shadow):\n- 🧪 Swarm test: ...",
                      "[Claudebot] Topic registry: the state store is not running (x).",
                      "[Claudebot] Topic registry: empty so far (the lease holder fills it).",
+                     # #435: the "(shadow)" label goes once no registry flag is in shadow, and
+                     # a closed record is a count line, not a topic.
+                     "[Claudebot] Topic registry:\n• Stability round (10134)",
+                     "[Claudebot] Topic registry:\n• a gone one (8) closed"
+                     "\n+1 closed (listed above)",
+                     "[Claudebot] Topic registry: no open topics.\n+2 closed (listed above)",
                      "[Claudebot] SWARM bus: unknown\ncoordinator: Codex"):
             self.assertTrue(is_command_reply(text), text)
 
