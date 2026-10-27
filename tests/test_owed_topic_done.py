@@ -142,6 +142,21 @@ class TestTheAdminClosesARow(unittest.TestCase):
             self.assertIn("Closed 1", channel._handle_command(self.admin(command)))
             self.assertEqual(open_ids(store), [other.id], command)
 
+    def test_a_second_name_is_ignored_and_the_reply_says_so(self):
+        """Nit from the #383 review: ``close @A @B`` used the first name and said nothing."""
+        other = handoff(debtor="Reasonix")
+        channel, store = channel_with([handoff(), other], {})
+        reply = channel._handle_command(self.admin("/owed@HermesBot close @Codex @Reasonix"))
+        self.assertIn("only the first name is used", reply)
+        self.assertIn("Reasonix", reply)                     # the word it ignored, named
+        self.assertIn("Closed 1", reply)                     # and still scoped to Codex
+        self.assertEqual(open_ids(store), [other.id])
+
+    def test_one_name_alone_carries_no_such_note(self):
+        channel, store = channel_with([handoff()], {})
+        self.assertNotIn("only the first name", channel._handle_command(
+            self.admin("/owed@HermesBot close @Codex")))
+
     def test_the_close_word_is_read_in_any_case(self):
         other = handoff(debtor="Reasonix")
         channel, store = channel_with([handoff(), other], {})

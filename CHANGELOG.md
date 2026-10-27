@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `/owed close` says what it does with a second name (`#384`). `/owed close @A @B` scoped to the
+  first name and said nothing about the rest, so the close read as if both had been used; the
+  reply now adds "only the first name is used; ignored: @B". `docs/telegram/COMMANDS.md` shows
+  the `@alias` form beside the bare word.
+
 - A bare `/owed close` is answered by the coordinator the admin named, even while no lease is
   live (`#385`). `should_respond` routes a bare `/owed close` to that coordinator (`#381`), but
   the command itself still demanded a live bus lease, so a paused swarm — which renews no
