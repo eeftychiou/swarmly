@@ -1304,7 +1304,13 @@ class TestTheReadCommandViews(unittest.TestCase):
         self.assertIsNone(reasonix["newest_kind"])
         self.assertIsNone(reasonix["newest_age"])
 
-    def test_usage_and_settings_have_one_row_per_bot(self):
+    def test_usage_and_settings_panels_have_inner_containers_and_rows_per_bot(self):
+        page = webui.page_html(title="Swarm")
+        self.assertIn('<div id="usage-rows"></div>', page)
+        self.assertIn('document.getElementById("usage-rows")', page)
+        self.assertIn('<div id="settings-rows"></div>', page)
+        self.assertIn('document.getElementById("settings-rows")', page)
+
         snaps = [
             snap("Claudebot", state=IDLE),
             snap("DeepSeek", state=IDLE, model="deepseek", effort="high"),

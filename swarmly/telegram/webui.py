@@ -271,8 +271,7 @@ def roster_view(*, cards: Sequence[Mapping[str, Any]] = (),
 def _drift_bots(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
                 recent: Sequence[Mapping[str, Any]] = (),
                 snapshots: Sequence[Snapshot] = (),
-                cards: Sequence[Mapping[str, Any]] = (),
-                now: float = 0.0) -> List[Dict[str, Any]]:
+                cards: Sequence[Mapping[str, Any]] = ()) -> List[Dict[str, Any]]:
     """One row per bot for the Drift table across the swarm (#452).
 
     Peers' rows come from their beats (via snapshot: drift_score, drift_hard, drift_resets_today,
@@ -340,8 +339,8 @@ def _drift_bots(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
                 "alias": name,
                 "reported": True,
                 "score": snap.drift_score,
-                "hard": snap.drift_hard if snap.drift_hard is not None else 0,
-                "resets_today": snap.drift_resets_today if snap.drift_resets_today is not None else 0,
+                "hard": snap.drift_hard,
+                "resets_today": snap.drift_resets_today,
                 "standing": snap.drift_standing or "nothing due",
                 "newest_kind": snap.drift_kind,
                 "newest_age": snap.drift_age,
@@ -382,7 +381,7 @@ def drift_view(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
                      "age": (max(0.0, moment - at) if at else None)})
     decided_dict = dict(decided or {}) if decided is not None else None
     bots = _drift_bots(alias=alias, decided=decided_dict, recent=rows,
-                       snapshots=snapshots, cards=cards, now=moment)
+                       snapshots=snapshots, cards=cards)
     return {
         "ready": True,
         "alias": str(alias or "") or None,
@@ -734,7 +733,7 @@ def _enrich_drift(drift: Dict[str, Any], *, snapshots: Sequence[Snapshot] = (),
         return drift
     alias = str(drift.get("alias") or "")
     drift["bots"] = _drift_bots(alias=alias, decided=drift, recent=drift.get("recent") or (),
-                                snapshots=snapshots, cards=cards, now=now)
+                                snapshots=snapshots, cards=cards)
     return drift
 
 
@@ -1434,9 +1433,9 @@ function drift(state) {
       cell.colSpan = 5;
       row.append(cell);
     } else {
-      row.append(el("td", "", num(bot.score)));
-      row.append(el("td", "", num(bot.hard)));
-      row.append(el("td", "", num(bot.resets_today)));
+      row.append(el("td", "", bot.score !== null && bot.score !== undefined ? num(bot.score) : "not reported"));
+      row.append(el("td", "", bot.hard !== null && bot.hard !== undefined ? num(bot.hard) : "not reported"));
+      row.append(el("td", "", bot.resets_today !== null && bot.resets_today !== undefined ? num(bot.resets_today) : "not reported"));
       row.append(el("td", "", bot.standing || "nothing due"));
       let newest = "none";
       if (bot.newest_kind) {
