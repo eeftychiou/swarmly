@@ -10622,8 +10622,18 @@ class AgentChannel:
                  and str(self.config.peers.get(p, "")).lstrip("@").lower() != who]
         if not peers:
             return False
-        handoff = handoff_lines(body) or body
-        topic = self._linked_topic(f"{event.text or ''}\n{body}")
+        handoff = handoff_lines(body)
+        if not handoff:
+            # Assigned peers and a hand-off line disagreed: fail closed rather than post a
+            # whole private reply where a peer can read it (#427 nit 3).
+            logger.info("a private-chat reply hands work to %s but has no hand-off line: "
+                        "not placed", ", ".join(peers))
+            return False
+        # The hand-off's own refs decide first: the item being handed over is the one that
+        # must get the topic, not whatever item the admin's message happened to name
+        # (#427 review: "go ahead on #260" plus "@CodexBot please take #424" went to #260).
+        topic = self._linked_topic(handoff) \
+            or self._linked_topic(f"{event.text or ''}\n{body}")
         if topic is None:
             logger.info("a hand-off from the private chat names %s but no item it names has a "
                         "linked topic: not delivered", ", ".join(peers))

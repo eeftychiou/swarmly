@@ -98,14 +98,17 @@ fires) *and* the mention entity (so Telegram delivers).
 discussion: no peer sees a reply there, so a hand-off written there used to be lost (27 Oct:
 `@DeepSeek_dd_bot please take #424`, answered in the private chat, never reached DeepSeek).
 The turn rules of such a turn say where it is and that peers cannot see it, and never say
-"in General". A hand-off line — a line that opens with a peer's `@handle` (with the lines
-below it, when the line is only the handle) — is placed by the transport, not by the model:
+"in General". A hand-off line — a line that opens with a peer's `@handle`, plus the paragraph
+below it when the line is only the handle — is placed by the transport, not by the model:
 
-- **The item it names has a topic linked to it** (a `LINK` in the registry, §11.3): the
-  hand-off lines are posted in that topic, and mirrored to the bus from there, so the peer
-  reads them where the work lives.
+- **The item the hand-off itself names has a topic linked to it** (a `LINK` in the registry,
+  §11.3): the hand-off lines are posted in that topic, and mirrored to the bus from there, so
+  the peer reads them where the work lives. The admin's own message decides only when the
+  hand-off names no item — the item being handed over is the one that must get the topic.
 - **No linked topic:** the hand-off is **not delivered**; the transport answers in the
-  private chat with a notice telling the bot to take it to the item's own topic.
+  private chat with a notice telling the bot to take it to the item's own topic. A reply the
+  transport cannot pick a hand-off line out of is not placed at all: a private reply is never
+  posted whole into a topic peers can read.
 - **A private chat never opens a topic.** Decided with the admin on 27 Oct, so private chats
   cannot create duplicate topics. Everything else in the reply stays in the private chat.
 

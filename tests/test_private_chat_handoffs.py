@@ -25,6 +25,9 @@ from tests.test_topic_open import Scripted, TopicBot, drain
 REPO = "owner/swarmly"
 TOPIC = 9424
 ITEM = "https://github.com/owner/swarmly/issues/424"
+#: A second linked item: the admin's own message names this one, the hand-off names #424.
+TOPIC_260 = 9260
+ITEM_260 = "https://github.com/owner/swarmly/issues/260"
 HANDOFF = "@CodexBot please review the PR on #424"
 
 
@@ -32,13 +35,20 @@ def private_message(**kw):
     return IncomingMessage(text="go ahead", author_alias="alice", private_chat=True, **kw)
 
 
+def a_link(ref, added_at="2026-10-27T10:00:00Z"):
+    return {"provider": "github", "kind": "issue", "role": "work", "ref": ref,
+            "status": "open", "phase": "development", "added_by": "claudebot",
+            "added_at": added_at}
+
+
 def a_store(records=None):
     """A reader shaped like the registry store: topic records by key."""
     if records is None:
-        records = {K.topic(TOPIC): {"status": "open", "links": [
-            {"provider": "github", "kind": "issue", "role": "work", "ref": ITEM,
-             "status": "open", "phase": "development", "added_by": "claudebot",
-             "added_at": "2026-10-27T10:00:00Z"}]}}
+        records = {K.topic(TOPIC): {"status": "open", "links": [a_link(ITEM)]},
+                   # Linked *later* than #424: the newest link wins, so a lookup that reads
+                   # the admin's message first would pick #260's topic and prove nothing.
+                   K.topic(TOPIC_260): {"status": "open",
+                                        "links": [a_link(ITEM_260, "2026-10-27T11:00:00Z")]}}
 
     class Store:
         ready = True
@@ -69,7 +79,7 @@ def dm(text="@HermesBot please file this"):
     return event(text, author_id=ADMIN_ID, username="alice", is_bot=False, chat_id=ADMIN_ID)
 
 
-def turn(channel):
+def turn(channel, text="@HermesBot please file this"):
     """Run one private-chat turn, with the bus mirror collected rather than left running."""
     posted = []
 
@@ -78,7 +88,7 @@ def turn(channel):
 
     async def go():
         with mock.patch("swarmly.telegram.relay.post_and_notify", fake_post):
-            await channel.handle_event(dm())
+            await channel.handle_event(dm(text))
             await drain(channel)
             await asyncio.gather(*list(channel._mirror_tasks))
 
@@ -100,6 +110,15 @@ class TheHandoffLinesTests(unittest.TestCase):
     def test_a_handle_alone_carries_its_block(self):
         body = "@CodexBot:\nReview the PR on #424.\n\nAnything else is mine."
         self.assertEqual(handoff_lines(body), "@CodexBot:\nReview the PR on #424.")
+
+    def test_a_handle_alone_above_a_blank_line_still_carries_its_ask(self):
+        # The shape a model naturally writes, and the one #427 review found dropped: the
+        # topic got a bare handle while the private chat said "handed that over".
+        self.assertEqual(handoff_lines("@CodexBot:\n\nPlease review #424."),
+                         "@CodexBot:\nPlease review #424.")
+        self.assertEqual(
+            handoff_lines("@CodexBot:\n\n\nPlease review #424.\n\nThat second part is yours."),
+            "@CodexBot:\nPlease review #424.")
 
     def test_a_reply_that_names_nobody(self):
         # A handle in passing is not a hand-off: assigned_peers ignores it, and so does this.
@@ -160,6 +179,27 @@ class AHandoffGoesToTheLinkedTopicTests(unittest.TestCase):
                              GROUP, TOPIC, channel.router))
 
 
+class TheHandOffChoosesItsOwnItemTests(unittest.TestCase):
+    """#427 review: the topic follows the item the hand-off names, not the admin's message."""
+
+    def test_the_hand_offs_own_item_decides_the_topic(self):
+        # Both items have a linked topic. The admin's message names #260, the hand-off #424.
+        channel = private_channel(adapter=Scripted(HANDOFF + "\nThanks."))
+        spy = Spy(channel)
+        turn(channel, text="@HermesBot go ahead on #260")
+        self.assertEqual([(chat, thread) for chat, thread, _ in spy.posts],
+                         [(ADMIN_ID, None), (GROUP, TOPIC), (ADMIN_ID, None)], spy.posts)
+        self.assertIn(HANDOFF, spy.posts[1][2])
+
+    def test_the_admins_text_answers_only_when_the_hand_off_names_no_item(self):
+        channel = private_channel(adapter=Scripted("@CodexBot please take that over."))
+        spy = Spy(channel)
+        turn(channel, text="@HermesBot go ahead on #424")
+        self.assertEqual([(chat, thread) for chat, thread, _ in spy.posts],
+                         [(ADMIN_ID, None), (GROUP, TOPIC), (ADMIN_ID, None)], spy.posts)
+        self.assertIn("take that over", spy.posts[1][2])
+
+
 class AHandoffWithNoLinkedTopicIsRefusedTests(unittest.TestCase):
     """Without a linked topic it is not delivered, and the bot is told where to take it."""
 
@@ -181,6 +221,16 @@ class AHandoffWithNoLinkedTopicIsRefusedTests(unittest.TestCase):
         turn(channel)
         self.assertEqual([(chat, thread) for chat, thread, _ in spy.posts], [(ADMIN_ID, None)])
         self.assertIn("Yes, #424 is ready.", spy.posts[0][2])
+
+    def test_no_hand_off_line_fails_closed(self):
+        # "@CodexBot(please ...)" counts as an assignment for assigned_peers but opens no
+        # hand-off line: nothing is placed, and the whole private reply is never posted into
+        # a topic a peer can read (#427 review, nit 3).
+        channel = private_channel(adapter=Scripted("@CodexBot(please check #424)"))
+        spy = Spy(channel)
+        turn(channel)
+        self.assertEqual([(chat, thread) for chat, thread, _ in spy.posts], [(ADMIN_ID, None)])
+        self.assertIn("@CodexBot(please check #424)", spy.posts[0][2])
 
 
 if __name__ == "__main__":

@@ -139,23 +139,28 @@ def handoff_lines(text: str) -> str:
 
     A line (bullet or not) that opens with an ``@handle`` is what
     :meth:`AgentChannel.assigned_peers` reads as an assignment, and a line that is *only* a
-    handle carries its ask on the lines below it. Those lines are carried out of a place no
-    peer can see -- the admin's private chat (#425) -- into the work item's own topic; the
-    rest of the reply stays where it was written. "" when the reply hands nothing over.
+    handle is a heading: its ask is the next paragraph, blank lines and all (review of #425
+    on #427: ``"@CodexBot:\\n\\nPlease review #424."`` is how a model naturally writes it, and
+    keeping only the bare handle dropped the instruction). Those lines are carried out of a
+    place no peer can see -- the admin's private chat (#425) -- into the work item's own
+    topic; the rest of the reply stays where it was written. "" when nothing is handed over.
     """
+    lines = str(text or "").splitlines()
     out: List[str] = []
-    taking = False
-    for line in str(text or "").splitlines():
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
         if _HANDLE_ALONE.match(line):
-            taking = True
             out.append(line)
+            while index < len(lines) and not lines[index].strip():
+                index += 1              # the ask is the next paragraph, after any blank line
+            while index < len(lines) and lines[index].strip():
+                out.append(lines[index])
+                index += 1
         elif _OPENING_HANDLE.match(line):
-            taking = False          # the ask is on this line: the rest is not the hand-off
+            # The ask is on this line: the rest of the reply is not part of the hand-off.
             out.append(line)
-        elif taking and line.strip():
-            out.append(line)
-        elif taking:
-            taking = False
     return "\n".join(out).strip()
 
 
