@@ -157,6 +157,34 @@ public_redactions:                       # optional: literal -> replacement
 - **`check` validates the map**: an empty key or a non-mapping value is an error, and an
   unset map changes nothing.
 
+### Before a repository goes public — `audit-public`
+
+Redaction stops the raw values leaving a host; it cannot say what is *already* out there. One
+command can:
+
+```bash
+python -m swarmly.telegram.cli --config config.yaml audit-public owner/repo
+```
+
+It looks for exactly what the transport would scrub -- the maintainer's handle,
+`public_redactions` keys, chat ids, `admin_user_id` and long allowed/peer ids, absolute local
+paths (`adapter.cwd`, every project's `cwd`, your home) -- plus two backstops (a Telegram
+`-100…` chat id and an absolute path under a home directory) that need no config entry.
+
+- **Every ref of a mirror clone**, `refs/pull/*` included: a leak on an abandoned branch or a
+  pull-request head is as public as `main`, and fixing `main` does not remove it. The files
+  reachable from every ref are scanned, and so are commit messages and tag messages.
+- **The issue/PR side**, through `gh`: issue and pull-request bodies (`issues?state=all`, which
+  includes PRs), issue comments and review comments.
+- **Exit status**: `0` nothing found, `1` at least one hit (do not publish until it is purged
+  and the command is re-run), `2` something could not be scanned -- a missing `gh`, a failed
+  clone -- which is never a clean result. `--json` gives the same report machine-readably.
+- **An excerpt is redacted before it is printed**, so running the audit cannot copy the value
+  it just found into a terminal, a log or a PR.
+- `--clone PATH` reuses (and fetches) a mirror clone instead of making a temporary one;
+  `--no-fetch` audits it exactly as it stands, `--no-github` skips the issue/PR side, and
+  `--keep` leaves a temporary clone for looking a hit up by hand.
+
 Values are parsed strictly. A switch such as `adapter.enabled` or `bus.enabled` takes
 true/false, yes/no, on/off or 1/0 (quoted or not), and anything else is an error naming the
 key. `adapter.timeout_seconds` and `adapter.max_output_chars` must be positive integers (`0`
