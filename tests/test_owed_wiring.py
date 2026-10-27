@@ -209,6 +209,21 @@ class TestTheOwedCommand(unittest.TestCase):
                     text, author_id=admin, username="admin", is_bot=False, thread_id=307))
                 self.assertEqual(decision, coordinating, (text, reason))
 
+    def test_a_reply_to_the_named_bot_gives_it_no_turn_either(self):
+        """#391: the gate ran below ``replies_to_bot``, so a reply to the bot "/owed close @X"
+        names still opened a model turn on it."""
+        channel = self.channel()
+        admin = channel.config.identity.admin_user_id
+        channel._answers_for_swarm = lambda: False
+        decision, reason = channel.should_respond(event(
+            "/owed close @CodexBot", author_id=admin, username="admin", is_bot=False,
+            thread_id=307, replies_to_bot=True))
+        self.assertFalse(decision, reason)
+        channel._answers_for_swarm = lambda: True
+        self.assertTrue(channel.should_respond(event(
+            "/owed close @CodexBot", author_id=admin, username="admin", is_bot=False,
+            thread_id=307, replies_to_bot=True))[0])
+
     def test_a_table_it_cannot_read_is_not_reported_as_nothing(self):
         channel = self.channel()
 

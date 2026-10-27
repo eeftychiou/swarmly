@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `/owed close @Name` reaches the coordinator even as a reply, and the debtor's handle is never
+  charged as an address (`#391`). Two holes left after `#388`: the bare-command gate sat below
+  the reply check in `should_respond`, so a reply to the bot the command names still opened a
+  model turn on it (it now returns the coordinator's answer, or the refusal, before the reply
+  check); and only a *quoted* handle was exempt from the frozen-peer charge, so a plain-text
+  `/owed close @Codex` was still rewritten to the alias and counted as drift. The handle that is
+  `/owed`'s argument is now exempt unquoted too, while a real address elsewhere on the same
+  line is still charged.
+
 - `/owed close` says what it does with a second name (`#384`). `/owed close @A @B` scoped to the
   first name and said nothing about the rest, so the close read as if both had been used; the
   reply now adds "only the first name is used; ignored: @B". `docs/telegram/COMMANDS.md` shows
