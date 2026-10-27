@@ -92,6 +92,11 @@ class Control:
     #: of dropdowns and one Apply cannot be a keypad, and a chat button for it would carry no
     #: value and answer nothing. It is still wired, so a typed ``ctl:`` code runs it.
     page_only: bool = False
+    #: A valued press that runs without a second tap (#451). #153's rule is that a picked
+    #: value asks twice because it *changes* something -- and the admin's complaint was that
+    #: setting a model took two presses. A settings form starts nothing and stops nothing, so
+    #: it is one tap, with the same durable CONTROL line.
+    one_tap: bool = False
 
 
 CONTROLS: Tuple[Control, ...] = (
@@ -112,7 +117,7 @@ CONTROLS: Tuple[Control, ...] = (
     # #451: the whole settings form as one press. Only the fields that changed are in the
     # value, so one Apply is one line -- and no second tap: setting a model or an effort
     # starts nothing, and the admin's complaint was that it took two presses.
-    Control("bot.settings", "Apply", page_only=True,
+    Control("bot.settings", "Apply", page_only=True, one_tap=True, report=True,
             note="only the fields you changed are sent"),
     Control("bot.cli", "CLI", note="read-only commands only", report=True),
     Control("bot.memory", "Memory", confirm=True,

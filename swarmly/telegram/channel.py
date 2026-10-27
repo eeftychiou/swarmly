@@ -5324,7 +5324,9 @@ class AgentChannel:
                 choices = self.control_choices(action)
             else:
                 value = self.peer_pick_value(alias, action)
-                choices = list(self.peer_choices(action, alias))
+                # That bot's own list, as its beat reported it (#373): the values it offers
+                # are the labels too, since a peer publishes names and not pairs.
+                choices = [(name, name) for name in self.peer_choices(action, alias)]
             out.append({"key": key, "label": key.capitalize(), "value": str(value),
                         "choices": [[str(label), str(val)] for label, val in choices]})
         return out
