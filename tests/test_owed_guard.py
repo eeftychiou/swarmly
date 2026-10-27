@@ -384,6 +384,17 @@ class TestTheGuardTick(unittest.TestCase):
         self.assertTrue(rows["verdict"].is_open)            # a PR's debt settles on the PR
         self.assertTrue(all("an answer" not in turn[0] for turn in channel._test_turns))
 
+    def test_a_paused_bots_hand_off_stays_owed(self):
+        """/pause freezes peers mid-turn: the work they hold is theirs after /resume (review)."""
+        channel = self.channel()
+        channel.is_coordinator = lambda **kwargs: True
+        channel._peers_frozen["Codex"] = {"ref": "pause", "until": None}
+        here = channel.topics.context(GROUP, 5122)
+        channel._test_table[1].save_all([row(kind="handoff", debtor="Codex", owes="an answer",
+                                             topic=here, key_extra=here, updated_at=1000.0)])
+        channel.owed_guard_tick(now=1000.0 + 31 * 60)
+        self.assertTrue(channel._test_table[1].load()[0].is_open)
+
     def test_the_admin_rung_speaks_to_the_admin(self):
         from swarmly.telegram.owed_guard import STALL_ADMIN, stall_text
         text = stall_text(row(kind="handoff", debtor="Codex", owes="an answer", topic="tg-1"),

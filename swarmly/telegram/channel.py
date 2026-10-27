@@ -7461,31 +7461,30 @@ class AgentChannel:
         return done
 
     def _bounce_frozen_handoffs(self, store: Any, rows: List[Any], moment: float) -> List[Any]:
-        """Close the hand-offs owed by a bot that is frozen (out of quota, or paused).
+        """Close the hand-offs owed by a bot that ran out of quota.
 
         A hand-off to a frozen peer is never recorded (#237), but one made a moment before the
         peer froze was: Codex ran out of quota on the very turn the hand-off started, and its
         "owes an answer" row sat open for good, climbing the ladder to the coordinator and the
         admin, who could not close it (live, 27 Oct). The hand-off bounced; the row says so.
-        Only hand-offs: a review or a merge stays owed on its PR and settles there. The
+        Not a pause: ``/pause`` freezes peers mid-turn, and the work they hold is still theirs
+        after ``/resume`` (review). Only hand-offs: a review or a merge stays owed on its PR. The
         coordinator writes the close, and the closed copy wins the fold for every reader.
         """
         try:
             frozen = {str(alias).strip().lower(): entry
-                      for alias, entry in self.frozen_peers().items()}
+                      for alias, entry in self.frozen_peers().items()
+                      if str(entry.get("ref") or "") == "quota"}
         except Exception:                          # noqa: BLE001 - unknown is not frozen
             return rows
         if not frozen:
             return rows
         bounced: List[Any] = []
         for row in rows:
-            entry = frozen.get(str(row.debtor or "").strip().lower())
-            if entry is None or row.kind != "handoff" or not row.is_open:
+            if str(row.debtor or "").strip().lower() not in frozen or row.kind != "handoff" or not row.is_open:
                 continue
-            why = {"quota": "out of quota", "pause": "paused"}.get(
-                str(entry.get("ref") or ""), "frozen")
             row.state, row.updated_at = "closed", moment
-            row.closed_by = f"{row.debtor} cannot act ({why}): the hand-off bounced"
+            row.closed_by = f"{row.debtor} cannot act (out of quota): the hand-off bounced"
             bounced.append(row)
         if not bounced:
             return rows
