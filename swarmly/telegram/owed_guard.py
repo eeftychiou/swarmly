@@ -183,7 +183,8 @@ def stall_text(row: Row, step: str, *, minutes: float, unable: str = "",
         # The admin's rung says the admin's line, not the coordinator's again (live, 27 Oct:
         # all three rungs told the coordinator to reassign, and the third one was the admin's).
         return (f"{row.debtor} owes {row.owes} on {row.subject}, {waited}, and cannot act "
-                f"({unable}). The coordinator has been told; the admin should decide.")
+                f"({unable}). The coordinator has been told; the admin should decide: if it no "
+                f"longer applies, /owed close in that discussion clears it.")
     if unable and step != STALL_REMINDER:
         if skipped:
             return (f"{row.debtor} owes {row.owes} on {row.subject} and {waited}, but cannot "
