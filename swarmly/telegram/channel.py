@@ -42,8 +42,8 @@ import dataclasses
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Set,
-                    Tuple, Union)
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, MutableMapping,
+                    NamedTuple, Optional, Set, Tuple, Union)
 
 from swarmly.telegram.acks import AckTracker, parse_ttl
 from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapter
@@ -835,8 +835,6 @@ class AgentChannel:
         self.bot: Any = None
         self.dispatcher: Any = None
         self.restart_requested = False           # request_restart(): the launcher starts again
-        #: A restart a press asked for and the press path has not carried out yet (#432).
-        self._restart_pending = False
         self.replies = None
         self._reply_task: Optional[asyncio.Task] = None
         if config.adapter.type == "codex_thread" and (config.source_path or config.adapter.reply_state_path):
@@ -4630,9 +4628,6 @@ class AgentChannel:
             # setting -- a model or an effort pressed for this bot (#373) -- and is applied
             # below, under this bot's own rules.
             return f"refused: {note.action} is a report, not a control"
-        # Only this note may carry out a restart: one an earlier press armed must not fire
-        # here, on an unrelated note (#432).
-        self._restart_pending = False
         try:
             # Synchronous on purpose: this runs inside the machine-note path, which must not
             # need an event loop of its own to hold a bot. A control that schedules its work
@@ -4655,9 +4650,6 @@ class AgentChannel:
                            note.action)
             return f"failed: {note.action} is not carried out here"
         logger.info("control: %s applied from a peer note (by=%s)", note.action, note.by)
-        # A peer's restart reaches this bot by note, not by a press: there is no note or answer
-        # of this bot's own left to send, so it is carried out here (#432).
-        self.carry_out_pending_restart()
         return f"applied: {note.action}"
 
     def _note_sender_may_command(self, sender: str, action: str = "") -> bool:
@@ -4707,13 +4699,18 @@ class AgentChannel:
         except (TypeError, ValueError):
             return False
 
-    def _run_control_now(self, action: str, value: str = "") -> Any:
+    def _run_control_now(self, action: str, value: str = "", *,
+                         pending: Optional[Dict[str, Any]] = None) -> Any:
         """The synchronous half of :meth:`_run_control`: the controls that only set state.
 
         Returns whether it actually carried the action out. That matters more than it looks:
         a note this bot cannot carry out must say **failed**, never ``applied`` -- the peer
         that broadcast it, and the admin reading the log, would otherwise be told that a
         swarm-wide pause happened on a bot that never froze (review, #133).
+
+        *pending*, when given, is the value of the press being carried out: a restart is
+        recorded **there**, not in channel state, so two presses at once cannot cancel each
+        other's restart (#442).
         """
         if value and control_mod.remote_pick(action):
             # A pick a peer forwarded for this bot (#373): the typed command's own function
@@ -4733,8 +4730,13 @@ class AgentChannel:
             # Asked for, not carried out: the shutdown takes this bot's own connection with
             # it, so a press that restarted here could not send its CONTROL note or answer
             # afterwards -- the send failed and the presser was told "the press failed" while
-            # the restart went through (#432). The caller carries it out once it is done.
-            self._restart_pending = True
+            # the restart went through (#432). The caller that delivers the answer carries it
+            # out, from the value it passed in (#442).
+            if pending is None:
+                # A peer's note has no answer of its own still to send, so it goes out here.
+                self.request_restart()
+            else:
+                pending["restart"] = True
         elif action == "bot.stop_turn":
             self._stop_every_turn()
         elif action == "swarm.lease":
@@ -5202,7 +5204,8 @@ class AgentChannel:
         return f"{line} via={via}" if via else line
 
     async def handle_control_press(self, press: Any, *, via: str = "",
-                                   observed: Optional[Dict[str, Any]] = None) -> str:
+                                   observed: Optional[Dict[str, Any]] = None,
+                                   pending: Optional[Dict[str, Any]] = None) -> str:
         """One button press: decide, act, log, answer. Never raises.
 
         Answering is what the presser sees in the chat; the log line rides the channel NOTE
@@ -5215,6 +5218,14 @@ class AgentChannel:
         reads it after this returns, and nothing is shared between presses -- so two at once
         cannot swap answers, and a press refused for a stale lease reports ``refused`` instead
         of the decision it began with (review, #347).
+
+        *pending*, when given, is this press's own value: a ``bot.restart`` it carries out is
+        recorded there and **not** carried out here, so the caller that delivers the answer
+        can restart once it is out (#432) -- and two presses at once each keep their own,
+        neither cancelling the other's (#442). A caller that passes nothing is delivering its
+        own answer, so the restart is carried out *here*, before this returns -- the CONTROL
+        note is out by then, and the answer the caller is about to send may not be. Every
+        production caller passes *pending*; the no-value path is for a direct press in a test.
         """
         def record(verdict: str, *, action: str = "", target: str = "", code: str = "",
                    reason: str = "") -> None:
@@ -5222,10 +5233,7 @@ class AgentChannel:
                 observed.update({"verdict": verdict, "action": action, "target": target,
                                  "code": code, "reason": reason})
 
-        # A restart is this press's own, and whoever delivers its answer carries it out
-        # (#432). An armed restart from an earlier press must never fire on this one, so the
-        # flag starts clear: nothing but this press can set it again.
-        self._restart_pending = False
+        asked: Dict[str, Any] = pending if pending is not None else {}
         try:
             decision = self.control_policy().decide(press, actor=str(press.user_id))
             if decision.verdict == press_mod.REFUSED:
@@ -5256,7 +5264,8 @@ class AgentChannel:
             if decision.verdict == press_mod.RUN:
                 answer = await self._run_control(decision.action, decision.target,
                                                  presser=str(press.user_id),
-                                                 value=decision.value, via=via)
+                                                 value=decision.value, via=via,
+                                                 pending=asked)
                 if answer:
                     decision.text = answer
                 record(press_mod.RUN, action=decision.action, target=decision.target)
@@ -5284,6 +5293,10 @@ class AgentChannel:
                                    decision.action, exc_info=True)
                     decision.text = f"{decision.text} (the note did not go out)"
             self._control_answer = decision.text
+            if pending is None:
+                # Nobody is delivering this answer on our behalf: the restart this press asked
+                # for has nowhere else to go, and the note above is already out (#442).
+                self.carry_out_restart(asked)
             return decision.text
         except ControlRefused as exc:
             record(press_mod.REFUSED, reason=press_mod.ACTION_REFUSED)
@@ -5356,7 +5369,9 @@ class AgentChannel:
         # What the page is told is what actually happened, from this press's own record -- never
         # a channel-wide slot two presses could share (review, #347).
         observed: Dict[str, Any] = {}
-        text = await self.handle_control_press(press, via="dashboard", observed=observed)
+        pending: Dict[str, Any] = {}
+        text = await self.handle_control_press(press, via="dashboard", observed=observed,
+                                               pending=pending)
         verdict = str(observed.get("verdict") or press_mod.REFUSED)
         answer: Dict[str, Any] = {"ok": verdict == press_mod.RUN, "verdict": verdict,
                                   "action": action or str(observed.get("action") or ""),
@@ -5368,10 +5383,12 @@ class AgentChannel:
         # The answer is this press's own and is about to be returned as the page's response:
         # only now may polling stop (#432 -- stopping before it closed the connection the
         # note and the answer ride, and a restart that worked was reported as a failed press).
-        self.carry_out_pending_restart()
+        self.carry_out_restart(pending)
         return answer
 
-    async def _handle_control_text(self, event: ChannelEvent) -> Optional[str]:
+    async def _handle_control_text(self, event: ChannelEvent, *,
+                                   pending: Optional[Dict[str, Any]] = None
+                                   ) -> Optional[str]:
         """A control typed into the chat: the press handler, fed by text instead of a callback.
 
         Admin only, and only for this module's own prefix: everyone else's message is left
@@ -5393,7 +5410,7 @@ class AgentChannel:
         except (TypeError, ValueError):
             return None
         press = press_mod.Press(user_id=user_id, data=text, at=time.time())
-        return await self.handle_control_press(press)
+        return await self.handle_control_press(press, pending=pending)
 
     # -- the lease: hand it over, and fail it back (issue #154) ---------------------------
     def named_coordinator(self) -> str:
@@ -5588,7 +5605,8 @@ class AgentChannel:
             line), silent=True, notice=True, allow_when_frozen=True)
 
     async def _run_control(self, action: str, target: str, *, presser: str = "",
-                           value: str = "", via: str = "") -> Optional[str]:
+                           value: str = "", via: str = "",
+                           pending: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Carry out one wired control, here and -- for a swarm-wide one -- everywhere else.
 
         Returns the words to answer the presser with when the control is one that *reports*
@@ -5649,7 +5667,7 @@ class AgentChannel:
             return
         # The launcher starts the transport again on a restart; nothing is left running when
         # it does, which is why that control asks for a second tap (#117).
-        self._run_control_now(action)
+        self._run_control_now(action, pending=pending)
 
     async def _nudge_item(self, key: str) -> None:
         """Send the owner of round item *key* a short "carry on" — it costs that bot a turn."""
@@ -9021,7 +9039,8 @@ class AgentChannel:
         # A typed control (`ctl:confirm:ab12`) means exactly what the button means. The words
         # under a pick or a confirm offer it, and handed to the adapter it is only prose -- so
         # the second tap never happened and nothing that stops could be confirmed (#153).
-        control_text = await self._handle_control_text(event)
+        pending: Dict[str, Any] = {}
+        control_text = await self._handle_control_text(event, pending=pending)
         if control_text is not None:
             self.stats.handled += 1
             try:
@@ -9032,7 +9051,7 @@ class AgentChannel:
                 # The answer is out -- or its send failed, which is not the presser's problem
                 # to fix by pressing again: either way this press is over, so a restart it
                 # asked for goes out now and never before (#432 review).
-                self.carry_out_pending_restart()
+                self.carry_out_restart(pending)
 
         if self._frozen:
             await self._lift_expired_freeze()
@@ -12282,19 +12301,22 @@ class AgentChannel:
         if self.dispatcher is not None:
             asyncio.ensure_future(self.dispatcher.stop_polling())
 
-    def carry_out_pending_restart(self) -> None:
-        """Run a restart a press asked for, once that press's answer has been delivered (#432).
+    def carry_out_restart(self, pending: MutableMapping[str, Any]) -> None:
+        """Run a restart **this** press asked for, once its answer has been delivered (#432).
 
         ``request_restart`` stops polling, and the shutdown takes the bot's connection with it.
         A press that restarted first left its CONTROL note failing and told the presser "the
-        press failed" while the restart went through -- what the admin saw live. So
-        ``_run_control_now`` only asks for the restart, and the caller that delivers the
-        press's answer calls this *after* sending it: the page's response, the chat answer or
-        the note is out before polling stops.
+        press failed" while the restart went through -- what the admin saw live. So the press
+        only asks -- ``_run_control_now`` writes the request into the value it was given -- and
+        the caller that delivers its answer calls this after sending it: the page's response,
+        the chat answer or the note is out before polling stops.
+
+        The value belongs to the press, never to the channel (#442): two presses at once each
+        carry out their own restart, and neither can cancel the other's.
         """
-        if not self._restart_pending:
+        if not pending.get("restart"):
             return
-        self._restart_pending = False
+        pending["restart"] = False
         self.request_restart()
 
     async def _group_member(self, user_id: int) -> Optional[Tuple[str, str, bool]]:
@@ -12547,7 +12569,8 @@ class AgentChannel:
         user = getattr(callback, "from_user", None)
         press = press_mod.Press(user_id=int(getattr(user, "id", 0) or 0), data=data,
                                 at=time.time())
-        text = await self.handle_control_press(press)
+        pending: Dict[str, Any] = {}
+        text = await self.handle_control_press(press, pending=pending)
         answer = getattr(callback, "answer", None)
         try:
             if answer is not None:
@@ -12560,7 +12583,7 @@ class AgentChannel:
             # Answered and redrawn -- or the answer or the redraw failed. The press is over
             # either way, so a restart it asked for goes out now, and never before: polling
             # stopping is what closes the connection these sends ride (#432 review).
-            self.carry_out_pending_restart()
+            self.carry_out_restart(pending)
 
     async def _on_aiogram_message(self, message: Any) -> None:
         # Pending updates are kept across a restart (a peer's request must still arrive), but

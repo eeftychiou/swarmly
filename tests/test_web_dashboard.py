@@ -18,6 +18,7 @@ import unittest
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
+from unittest import mock
 from urllib.parse import urlencode, urlsplit
 
 from swarmly.state import keys as K
@@ -960,8 +961,12 @@ class TestTheWritePath(unittest.TestCase):
 
         A refusal is answered without the body ever being looked at, and the server then closes.
         Closing a socket that still holds unread bytes sends a reset instead of a clean end, so
-        a client that sent its body on its own (the kernel keeps it) saw the connection aborted
-        rather than the 403 that was sent -- which is what the Windows CI run reported.
+        a client that sent its body on its own saw the connection aborted rather than the 403
+        that was sent -- what the Windows CI run reported.
+
+        **This only bites where the reset surfaces** (#442): on Linux the read of the 403 wins
+        the race, and every ``_drain()`` can be removed with this test still passing. It is the
+        Windows run, where the close is observed as ``WinError 10053``, that it guards.
         """
         server = self.server()
         try:
@@ -994,13 +999,36 @@ class TestTheWritePath(unittest.TestCase):
             server.stop()
         self.assertEqual(self.asked, [])                     # the refused write never ran
 
-    def test_a_stalled_client_cannot_hold_its_thread_for_good(self):
-        """#432 review: draining a body that never arrives must time out, not pin a thread."""
+    def test_a_stalled_client_is_answered_instead_of_holding_its_thread(self):
+        """#442: a body promised and never sent must be answered, not blocked on for good.
+
+        The refusal drains the body before it answers, so a client that stalls there holds the
+        handler's thread. With the window shortened to 0.2s this pins what matters: the 403
+        still arrives, and the connection ends, rather than the thread waiting forever.
+        """
         server = self.server()
         try:
-            self.assertEqual(server._handler().timeout, 5)
+            with mock.patch.object(webui, "DRAIN_TIMEOUT", 0.2):
+                url = server.start()
+                where = urlsplit(url.rstrip("/") + webui.ACTION_PATH)
+                head = ("POST %s HTTP/1.1\r\nHost: %s\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 500\r\n\r\n"
+                        % (where.path, where.netloc)).encode("utf-8")
+                started = time.time()
+                with socket.create_connection((where.hostname, where.port), timeout=5) as sock:
+                    sock.sendall(head)                     # the body it promises never comes
+                    got = b""
+                    while True:                            # until the server ends the exchange
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        got += chunk
+                    self.assertIn(b" 403 ", b" " + got.split(b"\r\n")[0] + b" ")
+                    self.assertLess(time.time() - started, 4)
         finally:
             server.stop()
+        self.assertEqual(self.asked, [])
 
     def test_a_login_that_is_not_the_admins_is_refused(self):
         server = self.server()
