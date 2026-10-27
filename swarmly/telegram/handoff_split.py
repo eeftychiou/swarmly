@@ -123,9 +123,40 @@ def requests(text: str, handles: Iterable[str]) -> List[str]:
     return asked
 
 
+#: A line that opens with a peer's handle, with or without a bullet: a hand-off line (#425).
+_OPENING_HANDLE = re.compile(r"^\s*(?:[-*•]|\d+[.)])?\s*@\w+[:,]?(?=\s|$)")
+#: A line that is only a handle (":", then nothing): its ask follows on the lines below.
+_HANDLE_ALONE = re.compile(r"^\s*(?:[-*•]|\d+[.)])?\s*@\w+[:,]?\s*$")
+
+
 def is_multi_recipient(text: str, handles: Iterable[str]) -> bool:
     """Two or more bots each asked something: the case that must never be refused."""
     return len(requests(text, handles)) >= 2
+
+
+def handoff_lines(text: str) -> str:
+    """The lines of a reply that hand work to a peer, as one block.
+
+    A line (bullet or not) that opens with an ``@handle`` is what
+    :meth:`AgentChannel.assigned_peers` reads as an assignment, and a line that is *only* a
+    handle carries its ask on the lines below it. Those lines are carried out of a place no
+    peer can see -- the admin's private chat (#425) -- into the work item's own topic; the
+    rest of the reply stays where it was written. "" when the reply hands nothing over.
+    """
+    out: List[str] = []
+    taking = False
+    for line in str(text or "").splitlines():
+        if _HANDLE_ALONE.match(line):
+            taking = True
+            out.append(line)
+        elif _OPENING_HANDLE.match(line):
+            taking = False          # the ask is on this line: the rest is not the hand-off
+            out.append(line)
+        elif taking and line.strip():
+            out.append(line)
+        elif taking:
+            taking = False
+    return "\n".join(out).strip()
 
 
 def own_brief(text: str, me: str, handles: Iterable[str]) -> str:

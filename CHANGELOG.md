@@ -24,6 +24,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A hand-off written in the admin's private chat reaches the peer, or says why not**
+  (`#425`). A turn from the admin's private chat got the group's turn rules — *"reply here, in
+  General … hand work to a bot with a line that starts with its @username"* — but no peer sees
+  a reply there, so the hand-off was lost (27 Oct: `@DeepSeek_dd_bot please take #424`,
+  answered in the private chat, never reached DeepSeek). Such a turn's rules now say it is the
+  admin's private chat, that peers cannot see it, and where a hand-off goes; they never say
+  "in General". The transport places the hand-off itself: when the item it names has a topic
+  linked to it (a `LINK` in the registry) the hand-off lines are posted there and mirrored to
+  the bus from that topic, and when it has none the hand-off is not delivered and the bot is
+  told, in the private chat, to take it to the item's topic. A private chat never opens a
+  topic (decided with the admin, 27 Oct), so it cannot create duplicate topics; the rest of
+  the reply stays in the private chat. `docs/telegram/PROTOCOL.md` (Rule 4a) describes it.
 - **A hand-off dropped by the General gate is said back, and the switch is documented**
   (`#327`). With `limits.general_turns: never`, General and Swarm pulse are transport-only: a
   peer's message that passed `should_respond` was then dropped by the gate with only a local

@@ -94,6 +94,21 @@ routes to the author of the message being replied to, regardless of body text.
 machinery needs usernames. Send both: `Codex, …` in the body (so the transport's alias gate
 fires) *and* the mention entity (so Telegram delivers).
 
+**Rule 4a (a private chat is nobody else's).** The admin's private chat with a bot is not a
+discussion: no peer sees a reply there, so a hand-off written there used to be lost (27 Oct:
+`@DeepSeek_dd_bot please take #424`, answered in the private chat, never reached DeepSeek).
+The turn rules of such a turn say where it is and that peers cannot see it, and never say
+"in General". A hand-off line — a line that opens with a peer's `@handle` (with the lines
+below it, when the line is only the handle) — is placed by the transport, not by the model:
+
+- **The item it names has a topic linked to it** (a `LINK` in the registry, §11.3): the
+  hand-off lines are posted in that topic, and mirrored to the bus from there, so the peer
+  reads them where the work lives.
+- **No linked topic:** the hand-off is **not delivered**; the transport answers in the
+  private chat with a notice telling the bot to take it to the item's own topic.
+- **A private chat never opens a topic.** Decided with the admin on 27 Oct, so private chats
+  cannot create duplicate topics. Everything else in the reply stays in the private chat.
+
 ---
 
 ## 4. Envelope

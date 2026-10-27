@@ -73,6 +73,9 @@ class IncomingMessage:
     context_id: Optional[str] = None               # the discussion (forum topic); None = General
     topic_name: Optional[str] = None               # that topic's name, when known
     general_is_for_setup: bool = False             # in General, with limits.work_in_topics on
+    #: Issue #425: the admin's private chat with this bot -- no peer sees a reply here, so a
+    #: hand-off written here goes to the item's linked topic, or nowhere.
+    private_chat: bool = False
     model: Optional[str] = None                    # the topic's /model choice; None = adapter.model
     effort: Optional[str] = None                   # the topic's /reasoning choice; None = adapter.effort
     role_brief: Optional[str] = None               # "reviewer: <description>", for the turn card
@@ -486,6 +489,8 @@ def channel_envelope(message: Any) -> str:
     elif getattr(message, "general_is_for_setup", False):
         parts.append("in General: setup and quick questions only; move real work to its own "
                      "topic with a first line NEW_TOPIC: <title>")
+    elif getattr(message, "private_chat", False):
+        parts.append("in the admin's private chat: no peer sees this")
     proj = plain(getattr(message, "project", None) or "")
     if proj:
         repo = plain(getattr(message, "project_repo", None) or "")
@@ -499,12 +504,22 @@ def turn_card(message: Any) -> str:
     the wrong topic and forgot the bus). The transport enforces placement and the bus
     itself; this keeps the model from fighting it."""
     role = plain(getattr(message, "role_brief", None) or "", limit=160)
-    where = ("this topic" if getattr(message, "context_id", None)
-             else "General (setup only; real work goes to a topic)")
     limit = getattr(message, "reply_chars", None) or DEFAULT_REPLY_CHARS
-    parts = [f"reply here, in {where}",
-             "hand work to a bot with a line that starts with its @username and the task "
-             "(the transport also records it on the bus)",
+    if getattr(message, "private_chat", False):
+        # #425: the admin's own chat with this bot. Peers never see a reply here, so a
+        # hand-off left here was lost (live, 27 Oct: an "@DeepSeek_dd_bot please take #424"
+        # answered in the private chat never reached DeepSeek). It is placed in the item's
+        # linked topic instead, and never opens one of its own.
+        where = "the admin's private chat with you: only the admin sees it, never a peer"
+        hand = ("hand work to a bot with a line that starts with its @username and the task; "
+                "a hand-off here is posted in that work item's own linked topic, or not "
+                "delivered when it has none -- a private chat never opens a topic")
+    else:
+        where = ("this topic" if getattr(message, "context_id", None)
+                 else "General (setup only; real work goes to a topic)")
+        hand = ("hand work to a bot with a line that starts with its @username and the task "
+                "(the transport also records it on the bus)")
+    parts = [f"reply here, in {where}", hand,
              f"under {limit} characters", f"{NO_REPLY} to stay silent"]
     if role:
         parts.insert(0, f"your role: {role}; stay within it")
