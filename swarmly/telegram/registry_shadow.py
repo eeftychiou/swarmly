@@ -304,11 +304,16 @@ class RegistryShadow:
                          + ("" if is_open else " closed")
                          + (f" — {links}" if links else "")
                          + ("".join(f"\n    {a}" for a in agents)))
-        if not lines:
-            return "Topic registry: empty so far (the lease holder fills it on its beat)."
         suffix = ""
         if closed:
-            suffix = "\n+N closed" if show_all else f"\n+{closed} closed (/topics all shows them)"
+            suffix = (f"\n+{closed} closed (listed above)" if show_all
+                      else f"\n+{closed} closed (/topics all shows them)")
+        if not lines:
+            # Every record closed by /cleanup: the registry still holds them, so "empty so
+            # far" would be a lie -- the count line says what is left out (#435 review).
+            if closed:
+                return "Topic registry: no open topics." + suffix
+            return "Topic registry: empty so far (the lease holder fills it on its beat)."
         return f"Topic registry{self._shadow_label()}:\n" + "\n".join(lines) + suffix
 
     def _shadow_label(self) -> str:
@@ -320,26 +325,60 @@ class RegistryShadow:
             return " (shadow)"
         return ""
 
+    def _canonical(self, alias: str, aliases) -> str:
+        """The alias this name belongs to: an agent's Telegram handle is one agent (#435).
+
+        An ``ASSIGN:`` line written with a ``@handle`` recorded ``<handle>`` beside the alias,
+        and a bot username is not always prefixed by its alias (``Claudebot`` / ``claude_obot``,
+        ``Antigravity`` / ``agy_dd_bot``), so the handle is resolved rather than prefix-matched:
+        the profile the agent published, then this bot's own ``peers`` map.
+        """
+        bare = K.norm(alias)
+        resolver = getattr(getattr(self.channel, "state_link", None), "agent_for_handle", None)
+        if callable(resolver):
+            try:
+                found = resolver(bare)
+            except Exception:                           # noqa: BLE001 - a listing never fails
+                found = None
+            if found:
+                return str(found)
+        config = getattr(self.channel, "config", None)
+        for name, handle in (getattr(config, "peers", None) or {}).items():
+            if K.norm(handle) == bare:
+                return str(name)
+        for other in aliases:
+            if other != alias and bare.endswith("_bot") and bare.startswith(K.norm(other)):
+                return other                            # a handle beside its own alias
+        return alias
+
     def _agent_rows(self, aliases, bindings: Dict[str, Any], store: Any,
                     thread: int) -> List[str]:
-        """The rows under one topic: no silence, and no stray handle alias (#423, #435).
+        """The rows under one topic: no silence, and no agent printed twice (#423, #435).
 
-        An agent with no binding and no turn in the topic is noise (``not linked … t=0``), and
-        an ``ASSIGN:`` line written with a handle recorded ``<handle>`` beside the alias: a row
-        that is only the longer spelling of another row is dropped.
+        An agent with no binding and no turn in the topic is noise (``not linked … t=0``). An
+        agent written under both its alias and its handle gets **one** row: the names are
+        grouped, and the binding and the busiest session of the group are what the row shows
+        -- dropping one name could drop the one carrying ``s=``/``t=``.
         """
-        rows = []
+        groups: Dict[str, List[str]] = {}
         for alias in aliases:
-            if alias.endswith("_bot") and any(
-                    other != alias and alias.startswith(other) for other in aliases):
-                continue                                # a handle beside its own alias
-            binding = bindings.get(alias) or {}
-            session = store.read(K.topic_agent(thread, alias)) or {}
-            turns = session.get("turns", 0)
+            groups.setdefault(K.norm(self._canonical(alias, aliases)), []).append(alias)
+        rows = []
+        for names in groups.values():
+            binding: Dict[str, Any] = {}
+            session: Dict[str, Any] = {}
+            turns = 0
+            for alias in names:
+                if not binding:
+                    binding = bindings.get(alias) or {}
+                found = store.read(K.topic_agent(thread, alias)) or {}
+                if int(found.get("turns") or 0) > turns:
+                    session, turns = found, int(found.get("turns") or 0)
             if not binding and not turns:
                 continue                                # linked to nothing, never spoke
+            name = self._canonical(names[0], aliases)
             sid = str(session.get("session_id") or "-")[:10]
             what = (f"{binding.get('role')} {binding.get('model')}/{binding.get('effort')}"
                     if binding else "not linked")
-            rows.append(f"{alias} {what} s={sid} t={turns}")
+            rows.append(f"{name} {what} s={sid} t={turns}")
         return rows

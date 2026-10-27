@@ -237,7 +237,71 @@ class RegistryShadowTests(unittest.TestCase):
 
         text = shadow.describe(a, show_all=True)
         self.assertIn("a topic that is gone (8) closed", text)
-        self.assertIn("+N closed", text)
+        # The count, not the placeholder -- `/topics all` printed a literal "+N closed".
+        self.assertIn("+1 closed (listed above)", text)
+        self.assertNotIn("+N", text)
+
+    def test_topics_on_an_all_closed_registry_counts_them_and_says_so(self):
+        """A registry whose every topic /cleanup closed is not "empty so far" (#435 review)."""
+        claude = channel_for("Claudebot", self.clock)
+        a = self._holding()
+        self._closed_topic(a, thread=8)
+        self._closed_topic(a, thread=9, title="another gone one")
+        shadow = RegistryShadow(claude, clock=self.clock)
+
+        text = shadow.describe(a)
+        self.assertIn("no open topics", text)
+        self.assertIn("+2 closed (/topics all shows them)", text)
+        self.assertNotIn("empty so far", text)
+
+    def test_an_agents_handle_and_its_alias_are_one_row(self):
+        """`ASSIGN: @claude_obot` records the handle beside the alias: one agent, one row.
+
+        The handle is not prefixed by the alias here (`Claudebot` / `claude_obot`), which is
+        the live shape from #423 -- the prefix rule alone printed both rows.
+        """
+        claude = channel_for("Claudebot", self.clock)
+        claude.config.peers = {"Claudebot": "claude_obot"}
+        a = self._holding()
+        record = {"topic_id": 11, "chat_id": HOME, "title": "quiet", "status": "open",
+                  "opened_at": "2026-10-27T00:00:00Z", "last_activity": "2026-10-27T00:00:00Z",
+                  "links": [],
+                  "agents": {"Claudebot": {"role": "coordinator", "model": "m", "effort": "high"},
+                             "claude_obot": {}}}
+        asyncio.run(a.write(K.topic(11), record))
+        # The session can sit under the handle: merging must keep it, not drop it. Only the
+        # agent's own store may write its key, so a second store shares the log here.
+        b = self.store("Claude_obot")
+        asyncio.run(b.write(K.topic_agent(11, "claude_obot"),
+                            {"turns": 3, "session_id": "sess-abcde"}))
+        asyncio.run(a.refresh())
+
+        text = RegistryShadow(claude, clock=self.clock).describe(a)
+        self.assertIn("Claudebot coordinator m/high s=sess-abcde t=3", text)
+        self.assertNotIn("claude_obot", text, "the handle is not a second agent")
+        self.assertEqual(text.count("• quiet (11)"), 1)
+
+    def test_the_topics_command_reaches_show_all_in_any_case(self):
+        """/topics@bot all (and ALL) must reach describe(show_all=True) (#435 review)."""
+        from swarmly.telegram.channel import AgentChannel, ChannelEvent
+
+        seen = []
+
+        class Recorder:
+            def describe(self, store, *, show_all=False):
+                seen.append(show_all)
+                return "Topic registry:\n• x (1)"
+
+        stub = SimpleNamespace(
+            _commands_enabled=lambda: True,
+            config=SimpleNamespace(identity=SimpleNamespace(name="Claudebot_bot")),
+            state_link=SimpleNamespace(store=None, registry=Recorder()))
+        for text in ("/topics@Claudebot_bot", "/topics@Claudebot_bot all",
+                     "/topics@Claudebot_bot ALL"):
+            reply = AgentChannel._handle_command(stub, ChannelEvent(text=text, chat_id=HOME,
+                                                                    thread_id=1))
+            self.assertIn("Topic registry", reply or "")
+        self.assertEqual(seen, [False, True, True])
 
     def test_no_agent_row_for_a_bot_that_never_spoke(self):
         """An agent with no binding and no turns is noise: no `not linked … t=0` row (#435).

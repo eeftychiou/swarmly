@@ -119,7 +119,9 @@ class TestRegistryAnswersAreMachineTraffic(unittest.TestCase):
                      # #435: the "(shadow)" label goes once no registry flag is in shadow, and
                      # a closed record is a count line, not a topic.
                      "[Claudebot] Topic registry:\n• Stability round (10134)",
-                     "[Claudebot] Topic registry:\n• a gone one (8) closed\n+N closed",
+                     "[Claudebot] Topic registry:\n• a gone one (8) closed"
+                     "\n+1 closed (listed above)",
+                     "[Claudebot] Topic registry: no open topics.\n+2 closed (listed above)",
                      "[Claudebot] SWARM bus: unknown\ncoordinator: Codex"):
             self.assertTrue(is_command_reply(text), text)
 
