@@ -744,6 +744,10 @@ class AgentChannel:
         # for ever, and a frozen one did not begin freezing when its quota comes back).
         self._state_since: Dict[str, float] = {}
         self._idle_since: float = self._lease_clock()
+        #: When the last *early* beat (a change asking for one, #450) was asked for, and the
+        #: task carrying it: a burst of changes becomes one pulse, not one each.
+        self._beat_soon_at: float = 0.0
+        self._beat_soon_task: Optional[asyncio.Task] = None
         self._last_reclaimed_term: int = 0
         self._boots = 1
         boots_path = _state_file(config, "boots")
@@ -2876,12 +2880,18 @@ class AgentChannel:
                     until: Optional[float] = None) -> None:
         self._note_state(frozen=frozen, ref=ref)
         """Apply and persist the freeze flag so a restart cannot silently release it."""
+        was = bool(self._frozen)
         self._frozen = frozen
         self._freeze_ref = ref if frozen else None
         self._freeze_until = until if frozen else None
         self._frozen_told.clear()
         if not frozen:
             self._quota_failures = 0
+        if was != bool(frozen):
+            # A pause or a resume somebody just applied (#450): beat now, so the peers' cards
+            # stop showing the state this bot has already left. Asked before the write, so a
+            # transport with no state file still beats.
+            self._beat_soon("paused" if frozen else "resumed")
         path = self._freeze_state_path()
         if path is None:
             return
@@ -4803,12 +4813,14 @@ class AgentChannel:
             return False
         return True
 
-    def _apply_remote_pick(self, action: str, value: str) -> bool:
+    def _apply_remote_pick(self, action: str, value: str) -> Any:
         """Apply a forwarded model or effort, through the typed command's own function (#373).
 
         True only when the setting really changed: a model this bot cannot run, or an effort
         it does not accept, is refused by ``/model``/``/reasoning`` themselves, and answering
-        the note with "applied" for that would tell the peer's page a lie (#133).
+        the note with "applied" for that would tell the peer's page a lie (#133). A value that
+        was already set answers *in words* (#450) -- "already high", never "applied" and never
+        a bare failure, because nothing was wrong with the press.
         """
         value = str(value or "").strip()
         if not value:
@@ -4828,11 +4840,23 @@ class AgentChannel:
             key = self._model_key(event)
             before = self._models.get(key)
             self._model_command(event)
-            return self._models.get(key) != before
-        key = self._model_key(event)
-        before = self._efforts.get(key)
-        self._reasoning_command(event)
-        return self._efforts.get(key) != before
+            changed = self._models.get(key) != before
+        else:
+            key = self._model_key(event)
+            before = self._efforts.get(key)
+            self._reasoning_command(event)
+            changed = self._efforts.get(key) != before
+        after = (self._models if action == "bot.model" else self._efforts).get(key)
+        if changed:
+            # A peer's press set something here (#450): beat now, so the presser's page shows
+            # the new value instead of waiting up to a whole heartbeat for it.
+            self._beat_soon("a picked setting from the dashboard")
+            return True
+        if str(after or "").strip().lower() == value.lower():
+            label = "model" if action == "bot.model" else "effort"
+            return (f"accepted: {action} -- {self.config.identity.alias} was already at "
+                    f"{label} {value}; nothing changed")
+        return False
 
     def _notice_soon(self, text: str) -> None:
         """Post a machine line from synchronous code (a control note), once the loop runs."""
@@ -4912,6 +4936,23 @@ class AgentChannel:
         if chat_id > 0:
             return None                        # a DM has no topics
         return getattr(settings, "topic_id", None)
+
+    def _pick_key(self) -> str:
+        """The key a dashboard pick is stored under, as the next turn reads it (#450).
+
+        ``/model`` and ``/reasoning`` store their choice per discussion token, and a control's
+        pick is stamped with :meth:`_pick_topic` (#374). A card that read General's key while
+        the pick sat under the control topic's showed an effort the bot never runs -- so this
+        is the *same* key, and General's when there is no control topic.
+        """
+        picked = self._pick_topic()
+        if picked is None:
+            return "general"
+        try:
+            return (self.topics.context(self.config.identity.home_channel_id or 0, picked)
+                    or "general")
+        except Exception:                      # noqa: BLE001 - no registry, General's
+            return "general"
 
     def _control_event(self, command: str, argument: str = "") -> ChannelEvent:
         """A synthetic event for a control: the admin, typing a bare command.
@@ -5126,6 +5167,77 @@ class AgentChannel:
             return snapshot_mod.DOWN if row.is_stale(self.presence_clock()) else row.state
         return ""
 
+    #: A peer's own STATUS intent, read as the state its card shows (#450). ``PULSE`` says
+    #: nothing about state -- a busy or idle bot pulses the same way -- so it maps to nothing.
+    _PEER_STATE_INTENTS = {"FROZEN": snapshot_mod.PAUSED, "RESUMED": snapshot_mod.IDLE,
+                           "ONLINE": snapshot_mod.IDLE, "OFFLINE": snapshot_mod.DOWN}
+
+    def peer_state_line(self, alias: str, intent: str, *,
+                        now: Optional[float] = None) -> bool:
+        """Take a peer's own ``STATUS`` line as what its row says, until its next beat (#450).
+
+        Live, 27 Oct: Antigravity posted ``intent=RESUMED`` and the dashboard still drew it
+        paused two minutes later, so the admin resumed it a second time. The beat is still the
+        authority -- this only moves the *row*, and only for the four intents that name a
+        state: the record keeps the peer's own ``at``, so the next real beat (whose stamp is
+        that or newer) replaces it, and a beat that arrives late can never be overwritten by
+        this. Returns whether the row changed.
+        """
+        state = self._PEER_STATE_INTENTS.get((intent or "").upper())
+        wanted = self.canonical_peer(alias).strip().lstrip("@").lower()
+        if not state or not wanted:
+            return False
+        try:
+            table = self.presence()
+        except Exception:                      # noqa: BLE001 - no table, nothing to move
+            return False
+        peer = None
+        for name, row in (table.peers or {}).items():
+            if self.canonical_peer(name).strip().lstrip("@").lower() == wanted:
+                peer = row
+                break
+        if peer is None:
+            return False                       # never heard from it: its first beat makes it
+        record = dict(getattr(peer, "snapshot", None) or {})
+        if (record.get("state") or "").strip().lower() == state:
+            return False                       # already drawn that way: nothing to say
+        moment = self.presence_clock() if now is None else float(now)
+        if record:
+            record["state"] = state
+            record["since"] = moment
+            record["every"] = record.get("every") or self.heartbeat_seconds()
+        else:
+            # A peer this bot has seen but whose beat carried no snapshot: a row with the
+            # state, and no number it did not report.
+            record = {"alias": peer.alias, "state": state, "since": moment,
+                      "at": float(peer.last_seen or moment),
+                      "every": self.heartbeat_seconds()}
+        peer.snapshot = record
+        self._save_presence()
+        logger.info("peer %s: %s from its own STATUS line, before its next beat",
+                    peer.alias, state)
+        return True
+
+    def peer_pick_value(self, alias: str, action: str) -> str:
+        """What a peer's own row says it runs for *action* -- ``bot.model`` or ``bot.effort``.
+
+        Read from the snapshot it published (#450): the same value its card shows, so a pick
+        that asks for the value already there can answer "already set" instead of sending a
+        press that changes nothing.
+        """
+        field = "effort" if action == "bot.effort" else "model"
+        wanted = self.canonical_peer(alias).strip().lstrip("@").lower()
+        if not wanted:
+            return ""
+        try:
+            for row in self.control_snapshots():
+                if self.canonical_peer(str(getattr(row, "alias", ""))).strip().lstrip(
+                        "@").lower() == wanted:
+                    return str(getattr(row, field, "") or "").strip()
+        except Exception:                      # noqa: BLE001 - no rows, no answer
+            return ""
+        return ""
+
     def _forward_pick(self, action: str, target: str, value: str) -> str:
         """Forward a model or effort pick to the bot it names (#373).
 
@@ -5147,6 +5259,13 @@ class AgentChannel:
             raise ControlRefused(
                 f"{alias} is {state}: nothing was sent -- {label} for it can be set once it is "
                 f"back, and guessing it as done would only mislead the page")
+        already = self.peer_pick_value(alias, action)
+        if already and already.strip().lower() == str(value or "").strip().lower():
+            # The admin's twice-pressed effort (#450): its card already says that value, so the
+            # press is answered in words instead of being sent again and logged as done.
+            raise ControlRefused(
+                f"{alias} is already set to {label} {already}: nothing was sent, and nothing "
+                f"changed")
         return (f"sent {label} {value} to {alias}: it applies that under its own rules, and its "
                 f"card shows the new value once its next beat reports it")
 
@@ -5163,18 +5282,23 @@ class AgentChannel:
             raise ControlRefused(said)
 
     async def _apply_pick(self, action: str, value: str, target: str = "",
-                          presser: str = "", via: str = "") -> str:
+                          presser: str = "", via: str = "",
+                          pending: Optional[Dict[str, Any]] = None) -> str:
         """Set what a picker chose -- through the same function the typed command runs.
 
         ``/model <name>`` and ``/reasoning <level>`` are the transport's own answers, so a
         picked value behaves exactly like a typed one: same validation, same limits, same
         words back.
+
+        *pending* is this press's own value (#442): a pick that changed nothing records
+        ``unchanged`` there, so the caller can answer "already set" and post no CONTROL note
+        for a press that did nothing (#450).
         """
         self._refuse_peer_self_only(action, target)
         if action == "bot.model":
-            return self._model_command(self._control_event("model", value))
+            return self._pick_through("model", value, self._models, "model", pending)
         if action == "bot.effort":
-            return self._reasoning_command(self._control_event("reasoning", value))
+            return self._pick_through("reasoning", value, self._efforts, "effort", pending)
         if action == "swarm.lease":
             # A hand-over posts its own CONTROL note, so the marker has to reach it (#347).
             return await self.hand_over_lease(value, presser=presser, via=via)
@@ -5187,6 +5311,32 @@ class AgentChannel:
                 raise ControlRefused(f"{who}: that role was refused")
             return f"{who} is now {value}"
         raise ControlRefused(f"{action}: this build cannot apply a picked value")
+
+    def _pick_through(self, command: str, value: str, store: Dict[str, str], label: str,
+                      pending: Optional[Dict[str, Any]] = None) -> str:
+        """Run a pick through the typed command, and say when it changed nothing (#450).
+
+        A press that asks for the effort already set used to answer ``state=done`` and leave a
+        CONTROL line on the bus saying something changed -- twice, for the same value, in the
+        admin's report. The command still decides what is allowed; this only reads the store
+        around it, and a value the command refused never reaches the "already" answer.
+        """
+        event = self._control_event(command, value)
+        key = self._model_key(event)
+        before = store.get(key)
+        said = (self._model_command(event) if command == "model"
+                else self._reasoning_command(event))
+        after = store.get(key)
+        asked = str(value or "").strip()
+        if after == before and str(after or "").strip().lower() == asked.lower() and asked:
+            if pending is not None:
+                pending["unchanged"] = True
+            return (f"{label} was already {asked}: nothing changed, so nothing was sent")
+        if after != before:
+            # The card shows the new value only once a beat carries it (#450): ask for that
+            # beat now rather than up to a whole interval later.
+            self._beat_soon(f"a picked {label}")
+        return said
 
     def control_report(self, action: str) -> Optional[str]:
         """What a report control answers, in code and costing no turn (None for the others)."""
@@ -5328,7 +5478,12 @@ class AgentChannel:
             # pressing bot), so a second, local note would double every press on the bus. That
             # note carries *via* itself (``_run_control``), so a page's press is marked on it
             # and gets no second line (review, #347).
-            if decision.log and decision.action not in self.CONTROL_BROADCASTS:
+            unchanged = bool((pending or {}).get("unchanged"))
+            # A pick that changed nothing is answered in words ("already high") and leaves no
+            # CONTROL line behind: a note saying something changed, for nothing, is what put
+            # two "state=done" lines on the bus for one effort (#450).
+            if decision.log and not unchanged \
+                    and decision.action not in self.CONTROL_BROADCASTS:
                 try:
                     await self._post_control_note(self._with_via(decision.log, via))
                 except Exception:          # noqa: BLE001 - the record failed, not the control
@@ -5679,7 +5834,8 @@ class AgentChannel:
             # is forwarded, and only the bot it names applies it.
             return self._forward_pick(action, target, value)
         if value:
-            return await self._apply_pick(action, value, target, presser=presser, via=via)
+            return await self._apply_pick(action, value, target, presser=presser, via=via,
+                                          pending=pending)
         if action == "swarm.failback":
             return await self.fail_back_lease(presser=presser, via=via)
         if action == "swarm.role" and target:
@@ -6135,6 +6291,55 @@ class AgentChannel:
                 logger.debug("heartbeat: pulse failure detail", exc_info=True)
             await asyncio.sleep(max(1.0, self.heartbeat_seconds()))
 
+    #: How long after an early beat another change may ask for one (#450). A pause, a pick and
+    #: the beat that carries them are one fact about this bot; a burst becomes one pulse.
+    BEAT_SOON_SECONDS = 5.0
+
+    def _beat_soon(self, reason: str = "") -> bool:
+        """Publish a beat now, at most one per :attr:`BEAT_SOON_SECONDS` (#450).
+
+        The interval is what makes a bot *alive*; it is not what makes it *readable*. A pause,
+        a resume or a picked model used to wait for the next interval -- two minutes by
+        default -- before any peer's page could show it, so the admin pressed again at what
+        looked like a stuck button. This asks for the beat the change deserves, and coalesces
+        a burst (a swarm-wide pause is one change, ten times over) into a single pulse.
+
+        The beat stays the authority: this only moves *when* it happens. Returns whether a
+        beat was actually asked for -- False without a loop (boot, a test), within the window,
+        or when one is already on its way.
+        """
+        moment = self._clock()
+        last = float(getattr(self, "_beat_soon_at", 0.0) or 0.0)
+        if last and moment - last < self.BEAT_SOON_SECONDS:
+            return False
+        task = getattr(self, "_beat_soon_task", None)
+        if task is not None and not task.done():
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:                       # no loop: there is nothing to beat on
+            return False
+        self._beat_soon_at = moment
+        self._beat_soon_task = loop.create_task(self._beat_soon_now(reason))
+        self._self_tasks.add(self._beat_soon_task)
+        logger.info("heartbeat: an early beat for %s", reason or "a change")
+        return True
+
+    async def _beat_soon_now(self, reason: str) -> None:
+        """The early beat itself: one pulse, and whatever judgement rides a beat.
+
+        A failure is logged and dropped, exactly like the interval's own: a beat that could not
+        be published must not take the transport, or the control that asked for it, with it.
+        """
+        try:
+            await self._heartbeat_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                   # noqa: BLE001 - the change already happened
+            logger.warning("heartbeat: the early beat for %s failed (%s: %s)",
+                           reason or "a change", type(exc).__name__, exc)
+            logger.debug("heartbeat: early beat detail", exc_info=True)
+
     # Machine-class envelope kinds recorded as state without waking the adapter (token
     # economy, issue #43). REQUEST/RESPONSE/BLOCKED are never machine-class.
     _MACHINE_STATUS_INTENTS = frozenset({"ONLINE", "OFFLINE", "FROZEN", "RESUMED", "PULSE"})
@@ -6169,6 +6374,12 @@ class AgentChannel:
         alias = self._alias_for(event)
         self._peer_last_seen[alias] = {"at": self._clock(), "kind": kind,
                                        "ref": envelope.ref, "rev": envelope.rev}
+        if envelope.type == MessageType.STATUS:
+            # A peer's own line about what it is doing, read as what its card shows (#450):
+            # a bot that said RESUMED must stop being drawn as paused at once, not at its
+            # next beat. Not a courtesy: this is the transport that holds the dashboard, and
+            # it is the one the admin is looking at when he presses again.
+            self.peer_state_line(alias, (envelope.intent or "").upper())
         self._machine_log.append({"at": self._clock(), "kind": kind, "type": envelope.type,
                                   "from": alias, "ref": envelope.ref,
                                   "intent": envelope.intent})
@@ -12188,12 +12399,21 @@ class AgentChannel:
                     await self._pace_group()    # the retry is a post too: gap and cap
 
     def running_model_and_effort(self) -> Tuple[Optional[str], Optional[str]]:
-        """The model and effort a General turn really runs at: /model and /reasoning, then
-        adapter.model and adapter.effort, then the CLI's own settings (cli_defaults.py), then
-        the model the CLI reported on its last turn. None where nothing names it."""
+        """The model and effort this bot's next turn really runs at.
+
+        A General turn's: /model and /reasoning, then adapter.model and adapter.effort, then
+        the CLI's own settings (cli_defaults.py), then the model the CLI reported on its last
+        turn. None where nothing names it.
+
+        Read from the key a dashboard pick is stored under (#450, :meth:`_pick_key`), not
+        General's: on a bot with a control topic, a picked effort is stored there (#374) and is
+        what the next turn runs, so a card reading General's showed an effort nobody uses.
+        """
         from swarmly.telegram.cli_defaults import cli_default
         adapter = self.config.adapter
-        model, effort = self._model_for(None), self._effort_for(None)
+        key = self._pick_key()
+        model = self._models.get(key) or self._models.get("general") or adapter.model
+        effort = self._efforts.get(key) or self._efforts.get("general") or adapter.effort
         if adapter.command:                    # a custom command line: no flag is known
             return model, effort
         if not (model and effort):

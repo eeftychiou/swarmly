@@ -1823,15 +1823,21 @@ def named_bot(alias: str, *, peers: Any = None, adapter: str = "echo",
 
 
 def live(channel: Any, alias: str, *, state: str = "idle", age: float = 0.0,
-         models: Any = ("sonnet", "opus"), efforts: Any = ("low", "high")) -> None:
-    """Record *alias*'s last beat on *channel*'s presence table, aged by *age* seconds."""
+         models: Any = ("sonnet", "opus"), efforts: Any = ("low", "high"),
+         model: str = "sonnet", effort: str = "high") -> None:
+    """Record *alias*'s last beat on *channel*'s presence table, aged by *age* seconds.
+
+    *model* and *effort* are what that beat says it runs: a pick for a value it already has
+    is a no-op the press refuses (#450), so a test that wants a real forward publishes
+    something else.
+    """
     from swarmly.telegram.presence import Pulse
     from swarmly.telegram.snapshot import Snapshot
     now = channel.presence_clock()
     at = now - age
     channel.presence().note(Pulse(
         alias=alias, at=at, frozen=(state == "frozen"), status=Snapshot(
-            alias=alias, state=state, at=at, every=60.0, model="sonnet", effort="high",
+            alias=alias, state=state, at=at, every=60.0, model=model, effort=effort,
             models=tuple(models), efforts=tuple(efforts)).to_dict()), seen_at=at)
 
 
@@ -1849,7 +1855,7 @@ class TestAPickForAnotherBot(unittest.TestCase):
 
     def test_an_effort_for_a_peer_is_sent_not_set_here(self):
         channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"}, adapter="echo")
-        live(channel, "Hermes")
+        live(channel, "Hermes", effort="low")     # a value it does not already have (#450)
         done = self.forward(channel, action="bot.effort", target="Hermes", value="high")
         self.assertTrue(done["ok"], done)
         self.assertIn("sent", done["text"])
@@ -1859,7 +1865,7 @@ class TestAPickForAnotherBot(unittest.TestCase):
 
     def test_exactly_one_forwarded_control_names_the_target_and_the_value(self):
         channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
-        live(channel, "Hermes")
+        live(channel, "Hermes", model="opus")     # a value it does not already have (#450)
         self.forward(channel, action="bot.model", target="Hermes", value="sonnet")
         notes = [entry["text"] for entry in channel._test_sender.sent
                  if "CONTROL bot.model" in entry["text"]]
@@ -1875,7 +1881,7 @@ class TestAPickForAnotherBot(unittest.TestCase):
         hermes = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"},
                            adapter="claude")     # an adapter that has an effort setting
         hunter = named_bot("Hunter", peers={"Claudebot": "ClaudebotBot"}, adapter="claude")
-        live(sender, "Hermes")
+        live(sender, "Hermes", effort="low")      # a value it does not already have (#450)
         self.forward(sender, action="bot.effort", target="Hermes", value="high")
         line = [entry["text"] for entry in sender._test_sender.sent
                 if "CONTROL bot.effort" in entry["text"]][0].split("\n")[-1]
@@ -1944,7 +1950,7 @@ class TestAPickForAnotherBot(unittest.TestCase):
         sender = sender or named_bot("Claudebot", peers={"Hermes": "HermesBot"})
         peer = named_bot("Hermes", peers={"Claudebot": "ClaudebotBot"}, adapter="claude",
                          control=peer_control)
-        live(sender, "Hermes")
+        live(sender, "Hermes", effort="low")      # a value it does not already have (#450)
         self.forward(sender, action="bot.effort", target="Hermes", value="high")
         line = [entry["text"] for entry in sender._test_sender.sent
                 if "CONTROL bot.effort" in entry["text"]][0].split("\n")[-1]
