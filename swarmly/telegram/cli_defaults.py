@@ -86,6 +86,43 @@ def _read_toml(path: Path) -> Dict[str, Any]:
 _TOML_STRING = re.compile(r'^\s*([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"')
 
 
+def _toml_header(line: str) -> List[str]:
+    """The dotted parts of a ``[table]`` / ``[[array]]`` header, comment and quotes removed.
+
+    ``"gemini-3.8-flash"`` is one model name, not two keys: a dot inside a quoted part does
+    not split it, and a ``#`` inside one does not start the comment (#407). Escapes in a
+    basic string are read only so that a ``\\"`` does not end the part.
+    """
+    parts: List[str] = []
+    current = ""
+    quote = ""
+    escaped = False
+    for char in line:
+        if quote:
+            if escaped:
+                current += char
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = ""
+            else:
+                current += char
+        elif char in "\"'":
+            quote = char
+        elif char == "#":
+            break                                     # the comment ends the header
+        elif char == ".":
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += char
+    parts.append(current.strip())
+    parts[0] = parts[0].lstrip("[")                   # the brackets belong to no key
+    parts[-1] = parts[-1].rstrip("]")
+    return [part for part in parts if part]           # ``[[providers]]`` is one part, not two
+
+
 def _top_level_toml(text: str) -> Dict[str, Any]:
     """``key = "value"`` lines, each ``[[providers]]`` table, and their nested tables.
 
@@ -105,10 +142,10 @@ def _top_level_toml(text: str) -> Dict[str, Any]:
         if stripped.startswith("["):
             # `[[providers]]  # the DeepSeek providers` and [providers.model_overrides."x"]
             # are both ordinary TOML: the comment ends the header, and a key may be quoted.
-            header = stripped.split("#", 1)[0].strip()
-            parts = [part.strip().strip('"').strip("'")
-                     for part in header.strip("[]").split(".")]
+            parts = _toml_header(stripped)
             current = None
+            if not parts:                             # ``[]`` is not a table: read nothing
+                continue
             if [p.lower() for p in parts] == ["providers"] and stripped.startswith("[["):
                 current = {}
                 providers.append(current)

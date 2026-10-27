@@ -266,6 +266,20 @@ class TestTheBackgroundLookup(unittest.TestCase):
         self.assertEqual(without.effort, "high")
         self.assertEqual(whole.effort, without.effort)      # the real parser agrees
 
+    def test_a_python_without_tomllib_keeps_a_dot_inside_a_quoted_key(self):
+        """#407: a dot inside a quoted key is part of the name, so ``"gemini-3.8-flash"`` is
+        one model -- split on it and the override was dropped, the effort read as the default."""
+        text = ('default_model = "gemini-3.8-flash"\n\n'
+                '[[providers]]\nname = "gemini-3.8-flash"\n\n'
+                '[providers.model_overrides."gemini-3.8-flash"]\ndefault_effort = "high"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                without = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+            whole = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+        self.assertEqual(without.effort, "high")
+        self.assertEqual(whole.effort, without.effort)      # the real parser agrees
+
     def test_the_loop_looks_up_once_before_it_sleeps(self):
         channel = make_channel(make_config(adapter={"type": "antigravity"}))
         beats = []
