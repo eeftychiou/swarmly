@@ -10743,7 +10743,7 @@ class AgentChannel:
             # Work in General: a substantial reply to a peer, or a long answer. It goes to the
             # topic already about the same issue or PR when there is one, else a new topic
             # (Efty: General is for setup, not development). Short answers stay.
-            known = self.topic_for_text(f"{event.text or ''}\n{body}")
+            known = self._topic_for_general_work(event, body)
             if known is not None:
                 return await self._post_in_known_topic(event, body, known)
             if (not event.author_is_bot or hands_off) and not _is_bus_echo(event):
@@ -11150,8 +11150,7 @@ class AgentChannel:
             # pulse transport-only, only a topic explicitly linked to the item does: the
             # numbers a brief names do not move it into a topic (admin, 25 Oct).
             about = f"{title}\n{brief}"
-            known = self._linked_topic(about) if self._transport_only_on() \
-                else self.topic_for_text(about)
+            known = self._topic_for_brief(about)
             if known is not None and known not in self._dead_topics:
                 sent = await self._continue_in_topic(event, brief, known)
                 if known not in self._dead_topics:
@@ -11229,6 +11228,26 @@ class AgentChannel:
             # A peer named further down (to confirm scope, say) still sees the brief.
             self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", home, thread_id, name)
         return sent
+
+    def _topic_for_brief(self, about: str) -> Optional[Tuple[int, int]]:
+        """Where a brief belongs when it names items a topic already has (#457).
+
+        The item's **explicit** link decides, always. The learned guess is the second answer
+        in `legacy` mode only, and it is never consulted in transport-only mode: there a reply
+        stays in the topic it was asked in, and only a link moves a brief (admin, 25 Oct).
+        """
+        if self._transport_only_on():
+            return self._linked_topic(about)
+        return self.topic_for_text(about)
+
+    def _topic_for_general_work(self, event: ChannelEvent,
+                                body: str) -> Optional[Tuple[int, int]]:
+        """Where a substantial reply in General belongs: the topic its items already have.
+
+        The message and the answer are read together -- an answer naming the item is about it
+        even when the hand-off did not (#457) -- through the same helper a brief uses.
+        """
+        return self.topic_for_text(f"{event.text or ''}\n{body}")
 
     def _transport_only_on(self) -> bool:
         """General and Swarm pulse are transport-only -- no model turn there, nothing from token
