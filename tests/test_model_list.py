@@ -280,7 +280,19 @@ class TestTheBackgroundLookup(unittest.TestCase):
         self.assertEqual(without.effort, "high")
         self.assertEqual(whole.effort, without.effort)      # the real parser agrees
 
-    def test_the_loop_looks_up_once_before_it_sleeps(self):
+    def test_a_python_without_tomllib_reads_brackets_with_spaces_inside(self):
+        """#407: `[[ providers ]]` is the same table as `[[providers]]` -- the spaces just
+        inside the brackets are not part of the key, so the provider table was dropped."""
+        text = ('default_model = "gemini-3.8-flash"\n\n'
+                '[[ providers ]]\n\n'
+                '[providers.model_overrides."gemini-3.8-flash"]\ndefault_effort = "high"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(text, encoding="utf-8")
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                without = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+            whole = cli_default("reasonix", tmp, env={}, home=Path(tmp))
+        self.assertEqual(without.effort, "high")
+        self.assertEqual(whole.effort, without.effort)      # the real parser agrees
         channel = make_channel(make_config(adapter={"type": "antigravity"}))
         beats = []
 

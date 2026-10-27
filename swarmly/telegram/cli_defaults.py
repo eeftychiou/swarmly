@@ -118,8 +118,8 @@ def _toml_header(line: str) -> List[str]:
         else:
             current += char
     parts.append(current.strip())
-    parts[0] = parts[0].lstrip("[")                   # the brackets belong to no key
-    parts[-1] = parts[-1].rstrip("]")
+    parts[0] = parts[0].lstrip("[").strip()           # the brackets belong to no key, nor do
+    parts[-1] = parts[-1].rstrip("]").strip()         # the spaces inside them: `[[ providers ]]`
     return [part for part in parts if part]           # ``[[providers]]`` is one part, not two
 
 
