@@ -815,6 +815,16 @@ summary sent back with `REPORT_BACK:` has its @mentions defused, and a peer bot'
 that names this bot only inside a list of three or more bots is not taken as addressing it. Set it to
 `false` to keep everything in General (a group without topics falls back to that by itself).
 
+**`limits.general_turns: never` keeps General and Swarm pulse transport-only.** No model turn
+runs in either place at all: an agent's own brief goes to the last work topic it used, a
+person's request gets a topic of its own (the coordinator opens it), and anything else is
+dropped. It supersedes `work_in_topics` (nothing is *moved* out of General, because nothing
+there runs), leaves commands answered, and leaves work topics untouched. A peer bot whose
+hand-off it drops is told so — one `⚠️ … took no turn` notice per window, naming the handle
+and the reason (#327) — because a hand-off that vanishes reads as a taken job; a peer's notice,
+command answer or sign-off is machine traffic and gets nothing back. The default is `allow`,
+which keeps the behaviour above.
+
 **Agents open their own topics.** An agent can move a piece of work into its own forum
 topic, for example to research something in a separate context and report back. It replies
 with a first line `NEW_TOPIC: <title>` and the brief below it. The bot opens a topic named
