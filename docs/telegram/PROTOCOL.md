@@ -570,9 +570,9 @@ machine line per write:
 ```
 
 Several writes made together go in one line as a JSON list (`ref=batch`), so a beat that changes
-ten keys is one message. An op's position is the message id times its index in the message, and
-its time the message's Telegram date, so every bot folds the same log the same way; the writer is
-whoever Telegram says sent it, not who the line claims.
+ten keys is one message. An op's position is the message id times `SLOTS` (64) plus its index in
+the message, and its time the message's Telegram date, so every bot folds the same log the same
+way; the writer is whoever Telegram says sent it, not who the line claims.
 
 The **snapshot** is a JSON file posted, pinned and re-pinned by the lease holder in that topic: a
 new message every 900 s or 25 ops — a fixed cadence of its own, **not** derived from
@@ -674,7 +674,7 @@ that drifts from the code fails the suite.
 |---|---|---|---|---|
 | `state.backend` | `off` | `off`, `telegram` | 1 | The shared state store: the op log and the pinned snapshot in Swarm pulse. |
 | `state.mode` | `shadow` | `shadow` | 1 | The store runs beside today's logic and nothing acts on it. |
-| `state.heartbeat_minutes` | `10` | minutes > 0 | 1 | How often each bot writes its heartbeat key, and the registry beat the lease holder runs. |
+| `state.heartbeat_minutes` | `10` | minutes > 0 | 1 | How often each bot writes its heartbeat key, and the registry sync every bot runs at that cadence. |
 | `state.dir` | `unset` | a path | 1 | Where this bot keeps its own state files (the store's cache, sessions, the topic map). |
 | `state.lease` | `shadow` | `shadow`, `store` | 3 | `store`: the store's lease is the coordinator lease (`bus.transport: telegram` made it possible). |
 | `state.owed` | `shadow` | `shadow`, `store` | 3 | `store`: the owed / `WAIT` table lives in the store, and nothing goes to gitbus. |
