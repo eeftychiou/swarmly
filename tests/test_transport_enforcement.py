@@ -200,6 +200,28 @@ class ChannelEnforcementTests(unittest.TestCase):
         self.assertIn("@AntigravityBot", posted)                    # quoted as written
         self.assertEqual(channel.drift.live(), [])
 
+    def test_a_plain_text_owed_close_handle_is_the_argument_not_an_address(self):
+        """#391: the argument half of #388 -- unquoted, the debtor's handle was still charged
+        as addressing a frozen peer, rewritten to its alias and counted as drift."""
+        channel, _ = self.channel("Run /owed close @AntigravityBot in its topic.")
+        run(channel.handle_event(event("@HermesBot how do I close it?", thread_id=9400,
+                                       message_id=42)))
+        posted = channel._test_sender.sent[-1]["text"]
+        self.assertNotIn("Not delivered", posted)
+        self.assertIn("@AntigravityBot", posted)                    # the argument, as written
+        self.assertEqual(channel.drift.live(), [])
+
+    def test_a_real_address_on_the_owed_close_line_is_still_charged(self):
+        """The exclusion is the one handle that is /owed's argument, not the whole line."""
+        channel, _ = self.channel("Run /owed close @AntigravityBot and tell @ReasonixBot.")
+        channel._peers_frozen["Reasonix"] = {"ref": "pause", "until": None}
+        run(channel.handle_event(event("@HermesBot how do I close it?", thread_id=9400,
+                                       message_id=43)))
+        posted = channel._test_sender.sent[-1]["text"]
+        self.assertIn("@AntigravityBot", posted)                    # the argument is left alone
+        self.assertIn("⛔ Not delivered to Reasonix", posted)         # the address is not
+        self.assertEqual([r.kind for r in channel.drift.live()], ["addressed_frozen_peer"])
+
     def test_the_sender_is_told_in_its_own_token_space_once(self):
         """Admin, 24 Oct: the refusal reaches the sender as a turn, and it takes corrective
         action -- but a sender that repeats itself is not woken in a loop."""

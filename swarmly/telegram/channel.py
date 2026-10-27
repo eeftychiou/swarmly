@@ -160,6 +160,17 @@ def _ref_state(state: Optional[str]) -> Optional[str]:
 #: addresses nobody.
 _CODE_SPAN = re.compile(r"(?is)<pre\b.*?</pre>|<code\b.*?</code>|```.*?```|`[^`\n]*`")
 
+#: The handle in ``/owed close @Name`` is the command's *argument* -- it names the debtor the
+#: close is scoped to -- so writing it addresses nobody, quoted in code or not (#391).
+_OWED_DEBTOR = re.compile(r"(?i)(?<![\w/])/owed(?:@\w+)?\s+close\s+(@\w+)")
+
+
+def _unaddressed_spans(text: str) -> List[Tuple[int, int]]:
+    """Where an ``@handle`` is written but nobody is addressed: inside code, or as /owed's
+    argument. A real address anywhere else on the line still counts (#388, #391)."""
+    return ([m.span() for m in _CODE_SPAN.finditer(text)]
+            + [m.span(1) for m in _OWED_DEBTOR.finditer(text)])
+
 
 def _closes_owed(text: str) -> bool:
     """Whether a ``/owed`` message asks to close rows -- ``/owed close …``, in any case.
@@ -1241,6 +1252,22 @@ class AgentChannel:
                             event.cooldown_left = min_cooldown - elapsed
                         return False, f"cooldown active ({elapsed:.1f}s < {min_cooldown}s)"
 
+        # A bare swarm-wide command from a person (/owed, /cleanup) is the coordinator's to
+        # answer, in code: without this gate it never reached the command on any bot, so a
+        # bare "/owed close" from the admin was dropped everywhere (live, 27 Oct). It runs
+        # before the reply check, so a reply to the named bot carrying "/owed close @X" gives
+        # that bot no turn either (#391): the command has one reader, the coordinator.
+        if (command is not None and not command[1] and command[0] in ("owed", "cleanup")
+                and not event.author_is_bot):
+            # In /owed an @name is an argument -- "/owed close @Codex" names the debtor -- so
+            # it must not send the command to that bot (live, 27 Oct: the coordinator dropped
+            # it as "addressed to another peer", and the named bot took it as a model turn).
+            if command[0] == "owed" or not self._peer_handles_named(text):
+                if self._answers_for_swarm():
+                    return True, "a bare swarm command; this bot coordinates"
+                if command[0] == "owed":
+                    return False, "a bare /owed: the coordinator answers it"
+
         if event.replies_to_bot:
             return True, "reply to this bot"
 
@@ -1260,20 +1287,6 @@ class AgentChannel:
             routed = self._registry_route(event, text)
             if routed is not None:
                 return routed
-
-        # A bare swarm-wide command from a person (/owed, /cleanup) is the coordinator's to
-        # answer, in code: without this gate it never reached the command on any bot, so a
-        # bare "/owed close" from the admin was dropped everywhere (live, 27 Oct).
-        if (command is not None and not command[1] and command[0] in ("owed", "cleanup")
-                and not event.author_is_bot):
-            # In /owed an @name is an argument -- "/owed close @Codex" names the debtor -- so
-            # it must not send the command to that bot (live, 27 Oct: the coordinator dropped
-            # it as "addressed to another peer", and the named bot took it as a model turn).
-            if command[0] == "owed" or not self._peer_handles_named(text):
-                if self._answers_for_swarm():
-                    return True, "a bare swarm command; this bot coordinates"
-                if command[0] == "owed":
-                    return False, "a bare /owed: the coordinator answers it"
 
         # If this agent is mentioned, ALWAYS DELIVER to current conversation!
         if self.mentions_me(text):
@@ -3092,10 +3105,11 @@ class AgentChannel:
                                  re.IGNORECASE)
             # A handle inside code is quoted, not addressed -- Telegram wakes nobody there --
             # so "<code>/owed close @Codex</code>" is neither rewritten nor charged (live,
-            # 27 Oct: three bots were reset for quoting that command).
-            code = [m.span() for m in _CODE_SPAN.finditer(body)]
+            # 27 Oct: three bots were reset for quoting that command). The handle in a plain
+            # "/owed close @Codex" is that command's argument, not an address either (#391).
+            unaddressed = _unaddressed_spans(body)
             hits = [m for m in pattern.finditer(body)
-                    if not any(start <= m.start() < end for start, end in code)]
+                    if not any(start <= m.start() < end for start, end in unaddressed)]
             if not hits:
                 continue
             for m in reversed(hits):                       # named, not woken
