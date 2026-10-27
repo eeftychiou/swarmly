@@ -1932,8 +1932,16 @@ line in `build_adapter` — the channel itself never changes.
 ## 8. Tests
 
 ```bash
-python -m unittest discover -s tests -t .        # no network, no aiogram needed for routing
+pip install -e ".[test]"                          # pytest, xdist, coverage
+python -m pytest -n auto tests                    # ~3,500 tests, one worker per core
+python -m pytest -n0 tests/test_general_gate.py   # one file, serially, when debugging
 ```
+
+`pytest -n auto` is what CI runs: the suite is one worker per core, and every worker keeps its
+transport state in a root of its own (`tests/__init__.py` sets `SWARMLY_STATE_ROOT` to a fresh
+temporary folder per process, which is also where the run lock lives — see
+`docs/TRANSPORTS.md`). `python -m unittest discover -s tests -t .` still works and needs no
+extra packages, but it runs the suite serially.
 
 The routing, loop-safety, pacing, escaping and adapter command construction are all exercised
 with an injected sender and a fake subprocess runner, so the suite makes no API calls and
