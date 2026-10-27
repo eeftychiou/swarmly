@@ -40,6 +40,10 @@ class Sent:
         self.message_id = message_id
 
 
+class RightsLost(Exception):
+    """What aiogram raises when the bot may not delete in this chat (#400)."""
+
+
 class Throttled(Exception):
     """What aiogram raises under flood control: the wait is on the exception (#398)."""
 
@@ -181,6 +185,72 @@ class SweepTests(Case):
         self.assertEqual(self.sweep(NOW), 0)
         self.assertEqual(self.bot.messages, [])
 
+    def test_a_sweep_that_deletes_nothing_backs_off_instead_of_thrashing(self):
+        # #400: a chat that keeps saying no -- throttled, offline, or a bot that lost the right
+        # to delete -- was asked once a minute for the whole 48-hour window.
+        self.ledger.note_notice(GROUP, 500, now=NOW - 2 * 60 * MINUTE)
+        self.bot.error = RightsLost()
+        self.assertEqual(self.sweep(NOW), 0)
+        self.assertEqual(self.ledger.notices(GROUP), [500])       # kept, not refused
+        self.bot.messages.clear()
+        self.assertEqual(self.sweep(NOW + 60), 0)                 # backing off: no call
+        self.assertEqual(self.bot.messages, [])
+        self.assertEqual(self.sweep(NOW + 120), 0)                # the wait doubled, then asked
+        self.assertEqual(len(self.bot.messages), 1)
+
+    def test_one_delete_resets_the_backoff(self):
+        for mid in (1, 2):
+            self.ledger.note_notice(GROUP, mid, now=NOW - 2 * 60 * MINUTE)
+        self.bot.error = RightsLost()
+        self.assertEqual(self.sweep(NOW), 0)
+        self.bot.error = None
+        self.assertEqual(self.sweep(NOW + 121), 2)                # asked again, both went
+        self.assertTrue(self.sweep(NOW + 122) == 0)               # and no backoff left over
+        self.assertEqual(self.channel._sweep_backoff, 0.0)
+
+    #: Telegram's own words for a refusal, written out here on purpose: the markers in the
+    #: channel are matched against *these*, so dropping or re-wording one turns this red
+    #: rather than silently changing what the sweep forgets (#400 nit).
+    TELEGRAM_REFUSALS = (
+        "Bad Request: message can't be deleted",
+        "Bad Request: message to delete not found",
+        "Bad Request: message not found",
+        "Bad Request: MESSAGE_ID_INVALID",
+    )
+
+    def test_each_refusal_wording_is_pinned(self):
+        from swarmly.telegram.channel import AgentChannel
+        for text in self.TELEGRAM_REFUSALS:
+            with self.subTest(text=text):
+                self.assertTrue(AgentChannel._delete_refused(RuntimeError(text)))
+                self.assertFalse(AgentChannel._delete_denied(RuntimeError(text)))
+
+    def test_a_refused_id_is_dropped_and_an_unpinned_wording_is_kept(self):
+        # One wording end to end: refused ids go. A wording nothing matches is kept, which is
+        # the safe way round -- it only lingers until the 48-hour prune.
+        from swarmly.telegram.channel import AgentChannel
+        self.ledger.note_notice(GROUP, 500, now=NOW - 2 * 60 * MINUTE)
+        self.bot.error = RuntimeError(self.TELEGRAM_REFUSALS[0])
+        self.assertEqual(self.sweep(NOW), 0)
+        self.assertEqual(self.ledger.notices(GROUP), [])          # refused: dropped
+        self.ledger.note_notice(GROUP, 501, now=NOW - 2 * 60 * MINUTE)
+        self.bot.error = RuntimeError("Bad Request: something Telegram may say one day")
+        self.assertEqual(self.sweep(NOW + 121), 0)
+        self.assertEqual(self.ledger.notices(GROUP), [501])       # not refused: kept
+        self.assertTrue(all(AgentChannel.DELETE_REFUSALS))
+
+    def test_a_lost_right_to_delete_is_not_a_refusal(self):
+        # #400: an admin can grant the right back, so the ids stay and the sweep slows down.
+        from swarmly.telegram.channel import AgentChannel
+        self.assertTrue(AgentChannel._delete_denied(
+            RuntimeError("Bad Request: not enough rights to delete a message")))
+        self.assertTrue(AgentChannel._delete_denied(
+            RuntimeError("Bad Request: CHAT_ADMIN_REQUIRED")))
+        self.assertFalse(AgentChannel._delete_refused(
+            RuntimeError("Bad Request: not enough rights to delete a message")))
+        self.assertFalse(AgentChannel._delete_denied(
+            RuntimeError("Bad Request: message can't be deleted")))
+
     def test_a_notice_past_the_delete_window_is_pruned_not_offered(self):
         self.ledger.note_notice(GROUP, 500, now=NOW - LEDGER_TTL_SECONDS - 60)
         self.assertEqual(self.ledger.notices(GROUP), [])
@@ -207,7 +277,7 @@ class SweepTests(Case):
         self.assertEqual(self.sweep(NOW), 0)
         self.assertEqual(self.ledger.notices(GROUP), [1, 2])
         self.bot.error = None
-        self.assertEqual(self.sweep(NOW), 2)
+        self.assertEqual(self.sweep(NOW + 121), 2)      # after the #400 backoff
         self.assertEqual(self.ledger.notices(GROUP), [])
 
     def test_a_network_error_is_not_a_refusal_either(self):
@@ -286,6 +356,20 @@ class SwarmPulseTests(Case):
         self.channel._note_general_message(GROUP, 900, self.PULSE, own=False)
         self.channel._note_general_message(GROUP, 901, self.PULSE)
         self.assertEqual(self.ledger.notices(GROUP), [901])
+
+    def test_the_sweep_paces_with_the_transports_own_sleeper(self):
+        # #400 nit: dropping `sleep=self._sleep` would leave the suite green while every
+        # single delete awaited a real 0.05s sleep.
+        self.assertIs(self.channel.cleanup._sleep, self.channel._sleep)
+        slept = []
+        self.channel._sleep = slept.append
+        self.channel.cleanup._sleep = slept.append
+        for mid in (10, 11, 12):
+            self.ledger.note_notice(GROUP, mid, now=NOW - 2 * 60 * MINUTE)
+        self.bot.refuse = {11}
+        self.assertEqual(self.sweep(NOW), 2)
+        self.assertEqual(len(slept), 2)          # a pause between the three singles
+        self.assertGreater(slept[0], 0)
 
     def test_a_post_in_the_pulse_topic_is_recorded(self):
         self.channel.note_pulse_post(GROUP, 900, self.PULSE)

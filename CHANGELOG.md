@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A sweep that can delete nothing waits instead of asking every minute (`#400`). A bot that
+  lost `can_delete_messages` — or a chat that answers "no" for any other reason — was re-asked
+  once a minute for the whole 48-hour delete window, where `#398`'s fix turned the old
+  stop-after-one-call into a steady thrash. A lost right is not a refusal (an admin can grant
+  it back), so those ids stay in the ledger and a tick that deleted *nothing* now backs off:
+  two minutes, doubling to thirty, reset by the first id that goes. The refusal markers were
+  also trimmed to the four wordings Telegram actually sends (`message is too old` was a guess)
+  and each is pinned by a test written with Telegram's own text, so a wording change shows up
+  as a red test; and a test now pins that the transport's own sleeper is the one pacing the
+  one-id-at-a-time fallback.
+
 - A throttled sweep no longer forgets what it could not delete (`#398`). Two follow-ups to
   `#395`: `deleteMessages` failing for a reason that is not a refusal — flood control's
   `retry_after`, a network blip, a server error — was read as "Telegram refused these", so the

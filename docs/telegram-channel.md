@@ -1705,8 +1705,10 @@ Telegram's 48-hour delete window. The sweep runs on its own one-minute timer, so
 disappears at most a minute after its limit. A batch Telegram refuses (an id that is not this
 bot's to delete, a message already gone) is asked about again one id at a time, paced and
 capped, so one such id never costs the batch beside it; a sweep Telegram does not answer at
-all — flood control, a network error — keeps its ids for the next tick instead of counting
-them as refused. What the transport cannot delete stays for `/cleanup` or the admin.
+all — flood control, a network error, a bot that lost the right to delete — keeps its ids for
+the next tick instead of counting them as refused, and a tick that deleted *nothing* backs off
+(two minutes, doubling up to thirty) rather than re-asking a chat that will keep saying no.
+What the transport cannot delete stays for `/cleanup` or the admin.
 
 ## 6. Durable bus poller (`bus-poll --once`) — scheduling per host, gates
 

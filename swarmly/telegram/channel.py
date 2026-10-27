@@ -255,6 +255,12 @@ PULSE_TOPIC_RETRY_SECONDS = 3600.0
 #: most this long past that.
 _EPHEMERAL_SWEEP_SECONDS = 60.0
 
+#: A sweep that could delete nothing -- throttled, offline, or a bot that lost the right to
+#: delete -- backs off instead of asking again every minute: this long at first, then double,
+#: up to :data:`_SWEEP_BACKOFF_MAX` (#400).
+_SWEEP_BACKOFF_FIRST = 120.0
+_SWEEP_BACKOFF_MAX = 1800.0
+
 # Retained ids in the gitbus seen-ledger; oldest are pruned first (insertion order).
 _GITBUS_SEEN_MAX = 5000
 
@@ -819,6 +825,10 @@ class AgentChannel:
         # transport could still delete (the Bot API cannot list a chat's history), and the
         # command deletes topics and messages only after one explicit confirmation.
         self.ledger = GeneralLedger(_state_file(config, "general"))
+        #: Issue #400: how long the notice sweep waits after a tick that deleted nothing, and
+        #: when it may try again. A chat that keeps refusing deletes is not asked every minute.
+        self._sweep_backoff = 0.0
+        self._sweep_backoff_until = 0.0
         self.cleanup = Cleanup(
             self, self.ledger, handle=config.identity.alias,
             keep=getattr(config.limits, "cleanup_keep", ()) or (), sleep=self._sleep)
@@ -2327,9 +2337,20 @@ class AgentChannel:
 
     #: Telegram's answer when one particular message cannot be deleted: a peer's post this bot
     #: never sent, one already gone. Everything else (flood control, network, a server error)
-    #: means the bot was not answered at all, so the ids must be kept (#398).
-    DELETE_REFUSALS = ("message can't be deleted", "message to delete not found",
-                       "message_id_invalid", "message not found", "message is too old")
+    #: means the bot was not answered at all, so the ids must be kept (#398). A wrong marker
+    #: only keeps an id until the 48-hour prune, never loses one, so each is pinned by a test
+    #: (`test_telegram_refusals_are_pinned`) rather than trusted (#400).
+    DELETE_REFUSALS = (
+        "message can't be deleted",         # the message exists but is not this bot's
+        "message to delete not found",      # already deleted (or never existed)
+        "message not found",                # the other wording of the same answer
+        "message_id_invalid",               # a malformed id
+    )
+    #: A refusal is per message, so it settles the ids for good. Losing the right to delete is
+    #: not: an admin can grant it back, so those ids are kept and the sweep backs off instead
+    #: of asking a chat that answers "no" every minute for the whole 48-hour window (#400).
+    DELETE_DENIALS = ("not enough rights", "chat_admin_required", "chatadminrequired",
+                      "have no rights to send")
 
     @classmethod
     def _delete_refused(cls, exc: Exception) -> bool:
@@ -2338,6 +2359,16 @@ class AgentChannel:
             return False                     # flood control: ask again later, keep the ids
         text = str(exc).lower()
         return any(marker in text for marker in cls.DELETE_REFUSALS)
+
+    @classmethod
+    def _delete_denied(cls, exc: Exception) -> bool:
+        """True when the bot has lost the right to delete in this chat (#400).
+
+        Kept apart from a refusal: the ids are not this message's problem, so they stay in
+        the ledger; the sweep slows down instead of re-asking a chat that keeps saying no.
+        """
+        text = str(exc).lower()
+        return any(marker in text for marker in cls.DELETE_DENIALS)
 
     async def cleanup_delete_messages(self, chat_id: int, ids: List[int]) -> int:
         """Delete message ids; returns how many went (all of them, or none).
@@ -2355,8 +2386,12 @@ class AgentChannel:
             await self.bot.delete_messages(chat_id=int(chat_id), message_ids=ids)
         except Exception as exc:                           # noqa: BLE001 - sorted below
             if not self._delete_refused(exc):
-                logger.warning("could not ask Telegram to delete %d message(s): %s",
-                               len(ids), exc)
+                if self._delete_denied(exc):
+                    logger.warning("this bot may not delete messages in chat %s (%s): keeping "
+                                   "%d id(s)", chat_id, exc, len(ids))
+                else:
+                    logger.warning("could not ask Telegram to delete %d message(s): %s",
+                                   len(ids), exc)
                 raise DeleteUnavailable(str(exc)) from exc
             logger.info("Telegram refused to delete %d message(s): %s", len(ids), exc)
             return 0
@@ -2419,6 +2454,11 @@ class AgentChannel:
         home = self.cleanup_home_chat()
         if minutes <= 0 or home is None:
             return 0
+        moment = float(now if now is not None else time.time())
+        if moment < self._sweep_backoff_until:
+            logger.debug("notice sweep backing off for another %.0fs",
+                         self._sweep_backoff_until - moment)
+            return 0
         keep = self._pulse_keep()
         due = [mid for mid in self.ledger.notices_due(home, minutes, now) if mid not in keep]
         if not due:
@@ -2433,6 +2473,18 @@ class AgentChannel:
         if unasked:
             logger.info("%d notice(s) kept for the next sweep: Telegram could not be asked",
                         len(unasked))
+        if unasked and not deleted and not refused:
+            # Nothing at all went: throttled, offline, or the bot may not delete here. Asking
+            # again every minute for a 48-hour window is a thrash, so wait -- longer each time
+            # -- while keeping the ids (#400). One id that goes resets the backoff.
+            self._sweep_backoff = min(max(_SWEEP_BACKOFF_FIRST, self._sweep_backoff * 2),
+                                      _SWEEP_BACKOFF_MAX)
+            self._sweep_backoff_until = moment + self._sweep_backoff
+            logger.warning("notice sweep deleted nothing; next attempt in %.0fs",
+                           self._sweep_backoff)
+        else:
+            self._sweep_backoff = 0.0
+            self._sweep_backoff_until = 0.0
         if deleted:
             logger.info("deleted %d expired notice(s) in chat %s", len(deleted), home)
         return len(deleted)
