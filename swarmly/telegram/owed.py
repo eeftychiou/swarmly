@@ -532,7 +532,9 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
     if fact.kind == "merge":
         # The merge answers every debt bound to that item: the result, the verdicts, the fix
         # and the merge itself.
-        if same_item and row.kind in ("ci", "verdict", "fix", "merge", "progress"):
+        # A hand-off is bound to the item it names (#428): the peer it asked for an answer owes
+        # nothing once that work has landed.
+        if same_item and row.kind in ("ci", "verdict", "fix", "merge", "progress", "handoff"):
             return f"merged ({head or item})" if head else "merged"
         return None
     if fact.kind == "head":
@@ -574,7 +576,7 @@ def closes(row: Row, fact: Fact) -> Optional[str]:
             return "the admin answered"
         return None
     if fact.kind == "close":
-        if same_item and row.kind in ("progress", "verdict"):
+        if same_item and row.kind in ("progress", "verdict", "handoff"):
             return f"{item} closed"
         return None
     here = (item or "").lower()

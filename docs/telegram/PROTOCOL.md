@@ -331,6 +331,14 @@ increments `machine=<n>` in its `/status` reply.
 **Rule 7 (silence is a state, not an absence).** A participant that has not posted a HELLO, a
 heartbeat or a reply within its `ttl` is *unknown*, not *fine* — the ladder applies.
 
+**Rule 7a (when a hand-off counts as answered).** A hand-off is answered by the peer posting
+in the discussion it was made in — and, since #428, by the **item it names** merging or
+closing: the row carries the first `#N` of the hand-off line, and a merge or a close of that
+item settles it. A hand-off naming no item is answered only by the peer's reply. **No hand-off
+is kept against the admin's private chat** (a peer can never post there, so the row could never
+be answered and every reminder would land where the peer cannot read it): rows written there
+before #427 are closed on load, and a reminder for an item that is already done is not sent.
+
 ---
 
 ## 7. Records and mirroring
