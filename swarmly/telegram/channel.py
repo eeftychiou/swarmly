@@ -10561,7 +10561,7 @@ class AgentChannel:
             # Work in General: a substantial reply to a peer, or a long answer. It goes to the
             # topic already about the same issue or PR when there is one, else a new topic
             # (Efty: General is for setup, not development). Short answers stay.
-            known = self._topic_for_refs(f"{event.text or ''}\n{body}")
+            known = self.topic_for_text(f"{event.text or ''}\n{body}")
             if known is not None:
                 return await self._post_in_known_topic(event, body, known)
             if (not event.author_is_bot or hands_off) and not _is_bus_echo(event):
@@ -10715,13 +10715,20 @@ class AgentChannel:
         transport sees the group), so later work on it goes there, not to a new topic.
         An entry not seen for REF_TOPIC_SECONDS is let go: the item has moved on.
         ``pin``: the admin's ``/topic #N`` -- this topic takes the item, whoever spoke first.
-        Nothing is learned in Swarm pulse: bots' chatter there is not work about an item."""
+        Nothing is learned in Swarm pulse: bots' chatter there is not work about an item.
+
+        With ``state.links: registry`` **text is not learned** (#457, design §6 phase 5): the
+        registry's links are the explicit ones -- ``LINK:``/``ASSIGN:`` lines, ``/link`` and a
+        GitHub event on an item already linked -- and a mention in a message is not a link. The
+        admin's own ``/topic``/``/link`` still pin (`pin=True`): a person said so."""
         if not self._work_topic((int(chat_id), int(thread_id))):
             return
+        if not pin and self.state_link.links_mode != "legacy":
+            return                          # the registry's explicit links decide; text does not
         now = time.time()
         changed = False
         topic = (int(chat_id), int(thread_id))
-        for ref in issue_refs(text):
+        for ref in issue_refs(text, topic_ids=self._topic_ids(chat_id)):
             known = self._ref_topics.get(ref)
             if known is None or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS \
                     or (pin and known != topic):
@@ -10735,9 +10742,29 @@ class AgentChannel:
         if changed:
             self._save_ref_topics()
 
+    def _topic_ids(self, chat_id: Optional[int] = None) -> Tuple[int, ...]:
+        """The thread ids of the topics this bot knows -- in *chat_id* when it is given.
+
+        A forum thread id reads exactly like an issue number, and one was learned as a ref
+        (#457: `#13221`, a topic). Naming a topic is not naming an issue.
+        """
+        try:
+            entries = self.topics.entries()
+        except Exception:                               # noqa: BLE001 - a map that will not read
+            return ()
+        return tuple(int(thread) for chat, thread, _name in entries
+                     if chat_id is None or int(chat) == int(chat_id))
+
     def _topic_for_refs(self, text: str) -> Optional[Tuple[int, int]]:
+        if self.state_link.links_mode != "legacy":
+            # Phase 5 (#457): a topic move *by guess* is off with the registry's links on.
+            # `topic_for_text` still follows the topics' explicit links.
+            return None
         now = time.time()
-        for ref in issue_refs(text):
+        # Only the legacy half needs the thread ids (the registry returned above): a thread id
+        # is not an issue number (#457).
+        topic_ids = self._topic_ids()
+        for ref in issue_refs(text, topic_ids=topic_ids):
             if ref in self._ref_topics \
                     and now - self._ref_seen.get(ref, now) < REF_TOPIC_SECONDS \
                     and self._work_topic(self._ref_topics[ref]):
@@ -10877,6 +10904,16 @@ class AgentChannel:
         now = time.time()
         targets = set()
         for ref in refs:
+            # The item's **explicit** link decides first, whatever the routing flag says
+            # (#457 review): with `state.links: registry` the registry's links are the only
+            # ones there are, and reading the learned map here left a reply where it did not
+            # belong -- or moved it nowhere.
+            linked = self._linked_topic(ref)
+            if linked is not None:
+                targets.add(linked)
+                continue
+            if self.state_link.links_mode != "legacy":
+                continue                    # no learned refs under the registry's links
             if ref not in self._ref_topics \
                     or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS:
                 # A number no topic has talked about yet (an issue filed this hour) neither
@@ -10932,7 +10969,7 @@ class AgentChannel:
             # numbers a brief names do not move it into a topic (admin, 25 Oct).
             about = f"{title}\n{brief}"
             known = self._linked_topic(about) if self._transport_only_on() \
-                else self._topic_for_refs(about)
+                else self.topic_for_text(about)
             if known is not None and known not in self._dead_topics:
                 sent = await self._continue_in_topic(event, brief, known)
                 if known not in self._dead_topics:
