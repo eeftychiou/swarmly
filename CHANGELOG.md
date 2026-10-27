@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`audit-public` asks the other question** (`#1`, item 4): the redactor stops the maintainer's
+  handle, chat ids and absolute paths leaving a host, but nothing could say what is *already*
+  public — which is what a publication incident needs first. `swarmly-telegram --config
+  config.yaml audit-public owner/repo` scans **every ref of a mirror clone** (`refs/pull/*`
+  included, so a leak on a pull-request head or an abandoned branch counts), every file
+  reachable from those refs, commit and tag messages, and — through `gh` — issue and PR bodies,
+  issue comments and review comments. The needles are the ones the config already redacts, plus
+  two backstops (a `-100…` chat id, an absolute path under a home directory) that need no
+  config entry. It exits `0` clean, `1` on a hit and `2` when something could not be scanned
+  (never silently clean — an unreadable `gh` answer or a 404 is a problem, not a pass), redacts
+  every excerpt before printing it (an empty `public_redactions` replacement labels its needle
+  `<redacted>`, never the value), and reuses a clone given with `--clone`. Pull-request reviews
+  are scanned as well as inline review comments. `docs/telegram-channel.md` documents it.
+
 ### Fixed
 
 - **A hand-off dropped by the General gate is said back, and the switch is documented**

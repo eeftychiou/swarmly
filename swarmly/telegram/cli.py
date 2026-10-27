@@ -148,6 +148,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="emit the status as JSON (path, age, interval, threshold, counters)",
     )
 
+    audit = sub.add_parser(
+        "audit-public",
+        help=("scan a public repository for the values that must not be public -- every ref "
+              "of a mirror clone (refs/pull/* included) and the issue/PR text; exit 1 on a "
+              "hit, 2 when something could not be scanned (#1)"),
+    )
+    audit.add_argument("repo", help="owner/name of the public repository")
+    audit.add_argument(
+        "--clone",
+        type=Path,
+        help="a mirror clone to reuse (default: clone into a temporary folder, then remove it)",
+    )
+    audit.add_argument(
+        "--no-github",
+        action="store_true",
+        help="scan the git side only, and not issue/PR bodies, comments or review comments",
+    )
+    audit.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="reuse --clone exactly as it stands (no fetch: an offline audit)",
+    )
+    audit.add_argument(
+        "--keep",
+        action="store_true",
+        help="keep the temporary clone (so a hit can be looked up by hand)",
+    )
+    audit.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the report as JSON instead of lines",
+    )
+
     gh_poll = sub.add_parser(
         "gh-poll", aliases=["github-poll"],
         help="run one GitHub notifications backstop cycle (no Telegram token or transport required)",
@@ -882,6 +915,39 @@ def _heartbeat_check(config: AgentConfig, args) -> int:
     return 3
 
 
+def _audit_public(config: AgentConfig, args) -> int:
+    """Pre-publication audit of a public repository (issue #1, item 4).
+
+    Exit 0 = no configured value found, 1 = at least one hit (do not publish until it is
+    purged), 2 = something could not be scanned (never read that as clean). The values are
+    the ones this agent's config already redacts on the way out, so the audit asks the same
+    question the redactor answers, about what is already public.
+    """
+    from swarmly.telegram import audit as audit_mod
+    from swarmly.telegram.redact import Redactor
+    redactor = Redactor.from_config(config)
+    needles = audit_mod.needles_from(config)
+    report = audit_mod.audit(args.repo, needles, clone=args.clone, github=not args.no_github,
+                             fetch=not args.no_fetch, redactor=redactor, keep=args.keep)
+    if args.json:
+        print(json.dumps({"repo": report.repo, "refs": report.refs,
+                          "commits": report.commits, "blobs": report.blobs,
+                          "items": report.items, "clean": not report.hits,
+                          "hits": [{"where": hit.where, "needle": hit.needle,
+                                    "excerpt": hit.excerpt} for hit in report.hits],
+                          "problems": report.problems}, indent=2))
+    else:
+        for line in audit_mod.render(report):
+            print(line)
+    if report.hits:
+        print(f"audit-public: {len(report.hits)} hit(s) in {args.repo}: do not publish, or "
+              f"purge and re-run", file=sys.stderr)
+    elif report.problems:
+        print("audit-public: the scan was incomplete, so this is not a clean result",
+              file=sys.stderr)
+    return report.status
+
+
 def _describe_bus(config: AgentConfig, problems: list, notes: Optional[list] = None) -> str:
     """One line naming the durable-plane transport; adds a problem when it cannot work here
     and a note when it works but probably not as meant."""
@@ -985,6 +1051,8 @@ def main(argv: Optional[list] = None) -> int:
             return asyncio.run(_gh_poll(config, args))
         if args.command == "heartbeat-check":
             return _heartbeat_check(config, args)
+        if args.command == "audit-public":
+            return _audit_public(config, args)
         if args.command == "check":
             return asyncio.run(_check(config, live=not args.offline))
         return asyncio.run(handlers[args.command](config))
