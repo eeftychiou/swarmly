@@ -156,6 +156,16 @@ def _ref_state(state: Optional[str]) -> Optional[str]:
     return word if word in ("open", "closed", "merged") else None
 
 
+def _closes_owed(text: str) -> bool:
+    """Whether a ``/owed`` message asks to close rows -- ``/owed close …``, in any case.
+
+    One reader for both the gate that decides who answers and the dispatch that acts, so
+    ``/owed CLOSE`` cannot be honoured by one and ignored by the other (bug #382).
+    """
+    words = command_args(text, keep_handles=True)
+    return bool(words) and words[0].lower() == "close"
+
+
 def _local_revision() -> str:
     """Best-effort short git revision of the checkout this process runs from.
 
@@ -1810,7 +1820,7 @@ class AgentChannel:
         if target:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
                 return None
-        elif command == "owed" and command_args(event.text or "")[:1] == ["close"]:
+        elif command == "owed" and _closes_owed(event.text or ""):
             if not self.is_coordinator():
                 return None                         # one bot answers a bare /owed close
         elif not (self.mentions_me(event.text or "") or event.replies_to_bot
@@ -6515,8 +6525,10 @@ class AgentChannel:
         Read-only, like ``/round``: it reports, it changes nothing, and it costs no turn --
         except ``/owed close [alias]``, the admin's answer to the stall ladder's last rung.
         """
-        args = [word.lower() for word in command_args(event.text or "")] if event else []
-        if args[:1] == ["close"]:
+        # The ``@`` in ``/owed close @Codex`` names the *debtor*, so it is kept (bug #382),
+        # and the word is compared in any case: ``/owed CLOSE`` is the same command.
+        args = command_args(event.text or "", keep_handles=True) if event else []
+        if args and args[0].lower() == "close":
             return self._owed_close_command(event, args[1:])
         try:
             return self.owed_store().summary()

@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `/owed close @Codex` closes that bot's rows in the topic again, not every row in it (`#382`).
+  `command_args` drops every `@word` — the peers a message *names* — and in this one command an
+  `@name` is the argument, so the name came out empty and the close fell through to "every row
+  here". `/owed` now reads its words with the handles kept (`command_args(…, keep_handles=True)`),
+  the bare-word and `@` forms do the same thing, and `/owed close` with no name keeps its
+  meaning. `/owed CLOSE` is honoured in any case too: one reader (`_closes_owed`) answers for
+  both the gate that decides who replies and the dispatch that acts.
+
 - A hand-off nobody can answer any more closes. A hand-off closed only on the peer's own reply
   in that topic, so one about work that ended elsewhere ("Codex owes an answer" on the QA of a
   PR merged the night before) climbed the stall ladder to "the admin should decide" and stayed

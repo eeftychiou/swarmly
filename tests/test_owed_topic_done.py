@@ -124,6 +124,47 @@ class TestTheAdminClosesARow(unittest.TestCase):
         self.assertIn("Closed 1", reply)
         self.assertEqual(open_ids(store), [other.id])
 
+    def test_an_at_named_debtor_closes_only_their_rows(self):
+        """Bug #382: ``command_args`` drops ``@words``, so the name came out empty and every
+        row in the topic closed."""
+        other = handoff(debtor="Reasonix")
+        channel, store = channel_with([handoff(), other], {})
+        reply = channel._handle_command(self.admin("/owed@HermesBot close @Codex"))
+        self.assertIn("Closed 1", reply)
+        self.assertIn("Codex", reply)
+        self.assertNotIn("Reasonix", reply)
+        self.assertEqual(open_ids(store), [other.id])
+
+    def test_the_at_form_and_the_bare_word_form_do_the_same_thing(self):
+        for command in ("/owed@HermesBot close @Codex", "/owed@HermesBot close Codex"):
+            other = handoff(debtor="Reasonix")
+            channel, store = channel_with([handoff(), other], {})
+            self.assertIn("Closed 1", channel._handle_command(self.admin(command)))
+            self.assertEqual(open_ids(store), [other.id], command)
+
+    def test_the_close_word_is_read_in_any_case(self):
+        other = handoff(debtor="Reasonix")
+        channel, store = channel_with([handoff(), other], {})
+        reply = channel._handle_command(self.admin("/owed@HermesBot CLOSE Codex"))
+        self.assertIn("Closed 1", reply)
+        self.assertEqual(open_ids(store), [other.id])
+        summary = channel._handle_command(self.admin("/owed@HermesBot"))
+        self.assertIn("Reasonix", summary)                   # the one row left open
+        self.assertNotIn("Codex", summary)
+
+    def test_a_bare_uppercase_owed_close_is_the_coordinators_too(self):
+        channel, store = channel_with([handoff()], {}, coordinating=False)
+        self.assertIsNone(channel._handle_command(self.admin("/owed CLOSE")))
+        self.assertEqual(len(open_ids(store)), 1)
+        channel.is_coordinator = lambda now=None: True
+        self.assertIn("Closed 1", channel._handle_command(self.admin("/owed CLOSE")))
+
+    def test_a_close_that_names_nobody_still_closes_every_row_here(self):
+        other = handoff(debtor="Reasonix")
+        channel, store = channel_with([handoff(), other], {})
+        self.assertIn("Closed 2", channel._handle_command(self.admin("/owed@HermesBot close")))
+        self.assertEqual(open_ids(store), [])
+
     def test_a_bare_owed_close_is_the_coordinators(self):
         channel, store = channel_with([handoff()], {}, coordinating=False)
         self.assertIsNone(channel._handle_command(self.admin("/owed close")))
