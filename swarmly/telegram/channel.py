@@ -5313,14 +5313,25 @@ class AgentChannel:
         A peer's list and its current value come from its own beat (#373, #450), so a peer's
         form offers that bot's runtime, never this one's -- and a bot that has not reported
         its list offers none, rather than a guess.
+
+        This bot's own prefill is the value the *card* shows (`running_model_and_effort`, #450),
+        not just what `/model` stored: a bot running its adapter's model has a value even
+        though nothing was picked, and a form that prefilled empty would leave the first
+        choice in the dropdown and look like a change the admin never made (review, #451).
         """
         alias = str(target or "").strip().lstrip("@")
         mine = not alias or alias.lower() == str(self.config.identity.alias).strip().lower()
         out: List[Dict[str, Any]] = []
+        mine_model, mine_effort = ("", "")
+        if mine:
+            try:
+                model, effort = self.running_model_and_effort()
+                mine_model, mine_effort = str(model or ""), str(effort or "")
+            except Exception:                  # noqa: BLE001 - a form without a guess
+                logger.debug("dashboard: this bot's own model is not resolvable", exc_info=True)
         for key, action in control_mod.SETTING_ACTIONS:
             if mine:
-                value = (self._models.get(self._pick_key()) if key == "model"
-                         else self._efforts.get(self._pick_key())) or ""
+                value = mine_model if key == "model" else mine_effort
                 choices = self.control_choices(action)
             else:
                 value = self.peer_pick_value(alias, action)
@@ -5381,8 +5392,11 @@ class AgentChannel:
                 continue
             store = self._models if key == "model" else self._efforts
             before = store.get(self._pick_key())
+            # No *pending* here: a field that was already set is this form's business, not the
+            # press's. Letting the per-field path mark the press "unchanged" silenced the
+            # CONTROL line for a form where another field really did change (review, #451).
             said = self._pick_through("model" if key == "model" else "reasoning", wanted, store,
-                                      key, pending)
+                                      key, None)
             after = store.get(self._pick_key())
             if after != before:
                 changed.append(f"{key} → {after}")

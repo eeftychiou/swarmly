@@ -15,6 +15,7 @@ it takes effect.
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from typing import Any
 
 from swarmly.telegram import config as config_mod
@@ -64,6 +65,22 @@ class TestTheSettingsTable(unittest.TestCase):
         self.assertNotIn("cwd", ct.SETTING_KEYS)
         self.assertNotIn("permissions", ct.SETTING_KEYS)
 
+    def test_the_docs_table_names_every_adapter_and_no_ghost(self):
+        """The per-adapter table is the issue's list; a row for an adapter that does not
+        exist is exactly the kind of documentation that reads true and is not."""
+        doc = (Path(__file__).resolve().parent.parent
+               / "docs" / "telegram" / "COMMANDS.md").read_text(encoding="utf-8")
+        table = doc.split("### The settings form", 1)[1].split("\n## ", 1)[0]
+        for adapter in config_mod.MODEL_TYPES:
+            self.assertIn(f"`{adapter}`", table, f"{adapter} is not in the settings table")
+        self.assertNotIn("`deepseek`", table)     # there is no deepseek adapter type
+        # And every adapter the table names is one the code really has: the reverse ghost.
+        named = {word.strip().strip("`") for line in table.splitlines() if line.startswith("| `")
+                 for word in line.split("|")[1].split(",")}
+        for adapter in named:
+            self.assertTrue(adapter in config_mod.MODEL_TYPES
+                            or adapter.startswith("echo"), adapter)
+
     def test_a_value_carries_only_the_pairs_it_was_given(self):
         self.assertEqual(ct.settings_value([("model", "opus"), ("effort", "high")]),
                          "model=opus;effort=high")
@@ -102,23 +119,40 @@ class TestTheFormOnThePage(unittest.TestCase):
         self.assertEqual([field["key"] for field in fields], ["effort"])
         self.assertEqual(fields[0]["choices"], [])
 
+    def test_an_untouched_field_is_never_sent(self):
+        """Review #451: the form opened on the first choice and sent it for an untouched field."""
+        page = self.page()
+        # The bot's own value is the first option and carries no choice of its own.
+        self.assertIn('const now = el("option", "", field.value || "not set");', page)
+        self.assertIn("now.value = \"\";", page)
+        # And Apply sends only what the admin actually picked, from the kept value.
+        self.assertIn("const kept = pendingGet(read.key);", page)
+        self.assertIn("if (kept && kept !== read.field.value) changed.push(", page)
+        self.assertNotIn("if (value && value !== read.field.value) changed.push(", page)
+
+    def test_the_form_replaces_the_two_pickers_it_carries(self):
+        page = self.page()
+        self.assertIn('const form = (view.controls || []).find((row) => row.settings);', page)
+        self.assertIn('.map((field) => "bot." + field.key)', page)
+        self.assertIn(".filter((row) => !carried.includes(row.action))", page)
+
     def test_the_card_draws_one_form_with_a_dropdown_per_field(self):
         page = self.page()
         self.assertIn("function settingsForm(button, target, fields, box) {", page)
         self.assertIn("(button.settings || {})[target || \"\"]", page)
         self.assertIn('select.dataset.for = button.action + ":" + field.key;', page)
         # Prefilled with what that bot runs now, and never blank when it has said.
-        self.assertIn("const chosen = kept === null ? field.value : kept;", page)
-        self.assertIn("if (chosen) select.value = chosen;", page)
+        self.assertIn('const now = el("option", "", field.value || "not set");', page)
+        self.assertIn("if (kept !== null) select.value = kept;", page)
         # One Apply, and it is the same press path everything else uses.
         self.assertIn('press(button.action, target || "", changed.join(";"));', page)
         self.assertIn('toast("nothing changed: pick a new value first", "bad");', page)
 
     def test_only_the_changed_field_is_sent(self):
         page = self.page()
-        # The value that goes out is built from the fields that differ from what the bot runs.
-        self.assertIn("if (value && value !== read.field.value) changed.push("
-                      "read.field.key + \"=\" + value);", page)
+        # The value that goes out is built from the fields the admin actually picked.
+        self.assertIn("if (kept && kept !== read.field.value) changed.push("
+                      "read.field.key + \"=\" + kept);", page)
         # And an untouched form sends nothing at all.
         self.assertIn("if (!changed.length) {", page)
 
@@ -162,6 +196,17 @@ class TestOnePressOneLine(unittest.TestCase):
         self.assertIn("already", again["text"])
         # Nothing changed, so nothing is recorded: no second CONTROL line (#450).
         self.assertEqual(len(self.notes(channel)), 1)
+
+    def test_a_field_that_was_already_set_does_not_silence_the_line_for_one_that_changed(self):
+        """Review #451: the per-field "already" used to mark the whole press unchanged."""
+        channel = named_bot("DeepSeek", adapter="claude")
+        apply_once(channel, action="bot.settings", value="effort=high")
+        self.assertEqual(len(self.notes(channel)), 1)
+        answer = apply_once(channel, action="bot.settings", value="model=opus;effort=high")
+        self.assertTrue(answer["ok"], answer)
+        self.assertIn("model → opus", answer["text"])
+        self.assertIn("already", answer["text"])          # the effort, said plainly
+        self.assertEqual(len(self.notes(channel)), 2)     # and the press is still recorded
 
     def test_the_answer_names_the_fields_that_changed_and_the_ones_refused(self):
         channel = named_bot("DeepSeek", adapter="claude")
@@ -255,6 +300,26 @@ class TestTheFormForAPeer(unittest.TestCase):
         again = peer._run_control_now("bot.settings", "effort=high")
         self.assertIsInstance(again, str)
         self.assertIn("already", again)
+
+
+class TestThePrefill(unittest.TestCase):
+    """Review #451: an untouched form sent the first choice because its prefill was empty."""
+
+    def test_this_bots_prefill_is_the_value_its_card_shows(self):
+        channel = make_channel(make_config(agent={"alias": "DeepSeek", "name": "DeepSeekBot"},
+                                           adapter={"type": "claude", "model": "opus"},
+                                           control={"chat_id": -100, "topic_id": 307}))
+        fields = {row["key"]: row for row in channel.settings_fields()}
+        # The adapter's own model, not only what /model stored: the card says opus, so the
+        # form must open on opus and send nothing until the admin picks something else.
+        self.assertEqual(fields["model"]["value"], "opus")
+        self.assertEqual(channel.status_snapshot(NOW).model, fields["model"]["value"])
+
+    def test_a_picked_value_still_wins_over_the_adapters(self):
+        channel = named_bot("DeepSeek", adapter="claude")
+        channel._models[channel._pick_key()] = "sonnet"
+        fields = {row["key"]: row for row in channel.settings_fields()}
+        self.assertEqual(fields["model"]["value"], "sonnet")
 
 
 class TestTheSettingsViewOnThePage(unittest.TestCase):

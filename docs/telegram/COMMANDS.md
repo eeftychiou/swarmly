@@ -149,7 +149,6 @@ A setting is offered when the adapter maps it to a flag for a **turn**:
 | `codex` | yes (`-m`) | yes (`-c model_reasoning_effort=…`), not `max` | Same: the rest of `adapter` is launch-time. Codex has no `max`, and the command says so rather than the form hiding it. |
 | `antigravity` | yes, an engine name as `agy models` prints it | yes (`--effort`) | Same. An engine name carries its tier (`Gemini 3.1 Pro (High)`), so the model also sets the effort. |
 | `reasonix` | yes (`--model`) | yes (`--effort`) | Same. |
-| `deepseek` | yes (`--model`) | yes (`--effort`) | Same. |
 | `echo` and the other test adapters | no list | no list | It reports no runtime settings, so the form offers none: an empty dropdown, not a guess. |
 
 What is *not* on the form, and why: `adapter.command`, `adapter.cwd`, `adapter.permissions`,

@@ -1685,6 +1685,12 @@ function settingsForm(button, target, fields, box) {
     select.dataset.pending = key;
     select.setAttribute("aria-label", field.label + " for " + (target || "this bot"));
     select.disabled = !ADMIN;
+    // The bot's own value stands first, and it is not a choice: a dropdown that opened on the
+    // first available model looked like a pick nobody made -- and Apply on an untouched form
+    // then sent it (review, #451). The blank carries what the bot runs now.
+    const now = el("option", "", field.value || "not set");
+    now.value = "";
+    select.append(now);
     (field.choices || []).forEach((choice) => {
       const option = el("option", "", choice.label);
       option.value = choice.value;
@@ -1694,8 +1700,7 @@ function settingsForm(button, target, fields, box) {
     if (kept !== null && kept === field.value) kept = null;
     if (kept !== null) pendingSet(key, kept);
     else pendingSet(key, "");            // the bot runs it now: nothing left to send
-    const chosen = kept === null ? field.value : kept;
-    if (chosen) select.value = chosen;
+    if (kept !== null) select.value = kept;
     select.addEventListener("change", () => {
       pendingSet(key, select.value);
       rememberFocus(key);
@@ -1710,10 +1715,12 @@ function settingsForm(button, target, fields, box) {
   go.disabled = !ADMIN;
   if (button.note) go.title = button.note;
   go.addEventListener("click", () => {
+    // Only a field the admin actually picked a new value for is sent: what the dropdown shows
+    // untouched is the bot's own value, not a choice (#451).
     const changed = [];
     reads.forEach((read) => {
-      const value = read.select.value;
-      if (value && value !== read.field.value) changed.push(read.field.key + "=" + value);
+      const kept = pendingGet(read.key);
+      if (kept && kept !== read.field.value) changed.push(read.field.key + "=" + kept);
     });
     if (!changed.length) {
       toast("nothing changed: pick a new value first", "bad");
@@ -1808,10 +1815,16 @@ function controlsFor(state, where, target) {
   const view = state.controls;
   if (view && view.ready) {
     const mine = !target || target === view.self;
+    // What the card's one form already carries is not drawn beside it (#451): a Model picker
+    // next to a Model dropdown is the two-step the admin asked to be rid of.
+    const form = (view.controls || []).find((row) => row.settings);
+    const carried = form ? (form.settings[target || ""] || []).map((field) => "bot." + field.key)
+      : [];
     (view.controls || [])
       // Model, effort, CLI and memory are this bot's own: drawn on its card, never on a
       // peer's, because a pick is applied by the bot the press lands on (review, #345).
       .filter((row) => row.where === where && (mine || !row.self_only))
+      .filter((row) => !carried.includes(row.action))
       .forEach((row) => box.append(controlNode(row, target)));
   }
   return box;
