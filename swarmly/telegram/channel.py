@@ -3897,6 +3897,30 @@ class AgentChannel:
             models = ()
         efforts = tuple(level for level in EFFORT_LEVELS
                         if not effort_problem(adapter.type, level))
+        drift_score = None
+        drift_hard = None
+        drift_resets_today = None
+        drift_standing = None
+        drift_kind = None
+        drift_age = None
+        try:
+            self.drift.fold_inbox()
+            decision = self.drift.decide()
+            drift_score = int(getattr(decision, "score", 0) or 0)
+            drift_hard = int(getattr(decision, "hard", 0) or 0)
+            drift_resets_today = int(getattr(decision, "resets_today", 0) or 0)
+            drift_standing = ("a reset is due" if getattr(decision, "reset", False)
+                              else ("a reminder rides the next turn"
+                                    if getattr(decision, "remind", False)
+                                    else "nothing due"))
+            live = self.drift.live()
+            if live:
+                newest = live[-1]
+                drift_kind = str(getattr(newest, "kind", "") or "") or None
+                at = float(getattr(newest, "at", 0.0) or 0.0)
+                drift_age = max(0.0, moment - at) if at else None
+        except Exception:
+            logger.debug("snapshot: no drift ledger this beat", exc_info=True)
         return snapshot_mod.Snapshot(
             alias=self.config.identity.alias, state=state, since=since, at=moment,
             every=every, topic=str(topic), turn_elapsed=elapsed, turn_timeout=turn_timeout,
@@ -3906,7 +3930,10 @@ class AgentChannel:
             models=models, efforts=efforts,
             rev=str(self._running_revision or ""),
             uptime=max(0.0, self._clock() - self._booted_at), restarts=max(0, self._boots - 1),
-            term=term, lease_ends=lease_ends)
+            term=term, lease_ends=lease_ends,
+            drift_score=drift_score, drift_hard=drift_hard,
+            drift_resets_today=drift_resets_today, drift_standing=drift_standing,
+            drift_kind=drift_kind, drift_age=drift_age)
 
     def _silent_seconds(self, key: Any, elapsed: float) -> float:
         """How long the CLI behind a running turn has been silent (#161).

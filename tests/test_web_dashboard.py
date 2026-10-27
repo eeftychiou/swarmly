@@ -1257,6 +1257,63 @@ class TestTheReadCommandViews(unittest.TestCase):
         # A bot with no store at all says so with a null, not a false "broken".
         self.assertIsNone(webui.state_view(backend="off", enabled=False)["ready"])
 
+    def test_drift_table_has_one_row_per_bot_across_the_swarm(self):
+        snaps = [
+            snap("Claudebot", state=IDLE, drift_score=1, drift_hard=0, drift_resets_today=0, drift_standing="nothing due"),
+            snap("DeepSeek", state=IDLE, drift_score=4, drift_hard=2, drift_resets_today=1,
+                 drift_standing="a reset is due", drift_kind="rule_break", drift_age=30.0),
+            snap("Reasonix", state=IDLE, drift_score=None),
+        ]
+        serving_drift = {
+            "ready": True, "alias": "Claudebot", "score": 2, "hard": 1,
+            "remind": False, "reset": True, "resets_today": 0,
+            "recent": [{"kind": "deploy_instruction", "severity": 2, "age": 45.0}],
+        }
+        st = self.state(snapshots=snaps, drift=serving_drift)
+        drift = st["drift"]
+        self.assertTrue(drift["ready"])
+        self.assertIn("bots", drift)
+        bots = {b["alias"]: b for b in drift["bots"]}
+        self.assertEqual(sorted(bots.keys()), ["Claudebot", "DeepSeek", "Reasonix"])
+
+        # Serving bot uses its own ledger
+        claudebot = bots["Claudebot"]
+        self.assertTrue(claudebot["reported"])
+        self.assertEqual(claudebot["score"], 2)
+        self.assertEqual(claudebot["hard"], 1)
+        self.assertEqual(claudebot["standing"], "a reset is due")
+        self.assertEqual(claudebot["newest_kind"], "deploy_instruction")
+        self.assertEqual(claudebot["newest_age"], 45.0)
+
+        # Peer with drift reported from beat snapshot
+        deepseek = bots["DeepSeek"]
+        self.assertTrue(deepseek["reported"])
+        self.assertEqual(deepseek["score"], 4)
+        self.assertEqual(deepseek["hard"], 2)
+        self.assertEqual(deepseek["resets_today"], 1)
+        self.assertEqual(deepseek["standing"], "a reset is due")
+        self.assertEqual(deepseek["newest_kind"], "rule_break")
+        self.assertEqual(deepseek["newest_age"], 30.0)
+
+        # Peer with un-reported drift shows reported=False and nulls
+        reasonix = bots["Reasonix"]
+        self.assertFalse(reasonix["reported"])
+        self.assertIsNone(reasonix["score"])
+        self.assertIsNone(reasonix["hard"])
+        self.assertIsNone(reasonix["standing"])
+        self.assertIsNone(reasonix["newest_kind"])
+        self.assertIsNone(reasonix["newest_age"])
+
+    def test_usage_and_settings_have_one_row_per_bot(self):
+        snaps = [
+            snap("Claudebot", state=IDLE),
+            snap("DeepSeek", state=IDLE, model="deepseek", effort="high"),
+            snap("Reasonix", state=IDLE, model="reasonix", effort="low"),
+        ]
+        st = self.state(snapshots=snaps)
+        self.assertEqual([b["alias"] for b in st["bots"]], ["Claudebot", "DeepSeek", "Reasonix"])
+        self.assertEqual([b["alias"] for b in st["settings"]["bots"]], ["Claudebot", "DeepSeek", "Reasonix"])
+
     def test_settings_show_the_bot_default_and_the_topic_override(self):
         view = self.state(registry={"ready": True, "topics": [
             {"topic": "Dashboard", "bindings": [{"agent": "DeepSeek", "role": "developer",
@@ -1393,6 +1450,28 @@ class TestTheReadViewsOnThePage(unittest.TestCase):
         page = self.page()
         self.assertNotIn("setInterval(memory, EVERY)", page)
         self.assertIn('location.hash === "#memory"', page)
+
+    def test_no_id_appears_twice_in_page_html(self):
+        page = self.page()
+        ids = re.findall(r'\bid="([^"]+)"', page)
+        self.assertTrue(ids, "no ids found in page_html")
+        seen = set()
+        duplicates = set()
+        for i in ids:
+            if i in seen:
+                duplicates.add(i)
+            seen.add(i)
+        self.assertEqual(duplicates, set(), f"Duplicate IDs found in page_html: {duplicates}")
+
+    def test_every_section_keeps_its_heading_and_has_distinct_inner_container(self):
+        page = self.page()
+        for sec, inner in (("usage", "usage-rows"),
+                           ("settings", "settings-rows"),
+                           ("drift", "drift-table"),
+                           ("state", "state-rows"),
+                           ("memory", "memory-rows")):
+            pattern = rf'<section class="panel" id="{sec}">\s*<h2>[^<]+</h2>\s*<div id="{inner}"></div>\s*</section>'
+            self.assertTrue(re.search(pattern, page), f"Section {sec} does not keep its heading or inner {inner}")
 
 class TestTheControlCentre(unittest.TestCase):
     """#345: every wired control on the page, with its confirm step and its off state."""

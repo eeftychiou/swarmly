@@ -268,8 +268,102 @@ def roster_view(*, cards: Sequence[Mapping[str, Any]] = (),
             "bots": rows, "peers": seen}
 
 
+def _drift_bots(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
+                recent: Sequence[Mapping[str, Any]] = (),
+                snapshots: Sequence[Snapshot] = (),
+                cards: Sequence[Mapping[str, Any]] = (),
+                now: float = 0.0) -> List[Dict[str, Any]]:
+    """One row per bot for the Drift table across the swarm (#452).
+
+    Peers' rows come from their beats (via snapshot: drift_score, drift_hard, drift_resets_today,
+    drift_standing, drift_kind, drift_age). The serving bot uses its own ledger. A bot that
+    has not reported shows reported=False.
+    """
+    by_alias: Dict[str, Dict[str, Any]] = {}
+    serving_alias = str(alias or "").strip()
+    if serving_alias:
+        if decided is not None:
+            newest = recent[-1] if recent else None
+            by_alias[serving_alias.lower()] = {
+                "alias": serving_alias,
+                "reported": True,
+                "score": int(_num(decided.get("score"))),
+                "hard": int(_num(decided.get("hard"))),
+                "resets_today": int(_num(decided.get("resets_today"))),
+                "standing": ("a reset is due" if decided.get("reset")
+                             else ("a reminder rides the next turn" if decided.get("remind")
+                                   else "nothing due")),
+                "newest_kind": (newest.get("kind") if newest else None),
+                "newest_age": (newest.get("age") if newest else None),
+            }
+        else:
+            by_alias[serving_alias.lower()] = {
+                "alias": serving_alias,
+                "reported": False,
+                "score": None,
+                "hard": None,
+                "resets_today": None,
+                "standing": None,
+                "newest_kind": None,
+                "newest_age": None,
+            }
+
+    for card in cards:
+        name = str(card.get("alias") or "").strip()
+        if name and name.lower() not in by_alias:
+            by_alias[name.lower()] = {
+                "alias": name,
+                "reported": False,
+                "score": None,
+                "hard": None,
+                "resets_today": None,
+                "standing": None,
+                "newest_kind": None,
+                "newest_age": None,
+            }
+
+    newest_snaps: Dict[str, Snapshot] = {}
+    for snap in snapshots:
+        name = str(snap.alias or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key not in newest_snaps or snap.at >= newest_snaps[key].at:
+            newest_snaps[key] = snap
+
+    for key, snap in newest_snaps.items():
+        if key == serving_alias.lower() and serving_alias and decided is not None:
+            continue
+        name = str(snap.alias or "").strip()
+        if snap.drift_score is not None or snap.drift_standing is not None:
+            by_alias[key] = {
+                "alias": name,
+                "reported": True,
+                "score": snap.drift_score,
+                "hard": snap.drift_hard if snap.drift_hard is not None else 0,
+                "resets_today": snap.drift_resets_today if snap.drift_resets_today is not None else 0,
+                "standing": snap.drift_standing or "nothing due",
+                "newest_kind": snap.drift_kind,
+                "newest_age": snap.drift_age,
+            }
+        elif key not in by_alias:
+            by_alias[key] = {
+                "alias": name,
+                "reported": False,
+                "score": None,
+                "hard": None,
+                "resets_today": None,
+                "standing": None,
+                "newest_kind": None,
+                "newest_age": None,
+            }
+
+    return [by_alias[k] for k in sorted(by_alias)]
+
+
 def drift_view(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
-               live: Sequence[Any] = (), now: float = 0.0,
+               live: Sequence[Any] = (), snapshots: Sequence[Snapshot] = (),
+               cards: Sequence[Mapping[str, Any]] = (), now: float = 0.0,
                limit: int = 10) -> Dict[str, Any]:
     """``/drift``: the score, where it stands, and the latest violations behind it.
 
@@ -286,16 +380,19 @@ def drift_view(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
         rows.append({"kind": str(getattr(row, "kind", "") or "") or None,
                      "severity": int(_num(getattr(row, "severity", 0))),
                      "age": (max(0.0, moment - at) if at else None)})
-    decided = dict(decided or {})
+    decided_dict = dict(decided or {}) if decided is not None else None
+    bots = _drift_bots(alias=alias, decided=decided_dict, recent=rows,
+                       snapshots=snapshots, cards=cards, now=moment)
     return {
         "ready": True,
         "alias": str(alias or "") or None,
-        "score": int(_num(decided.get("score"))),
-        "hard": int(_num(decided.get("hard"))),
-        "remind": bool(decided.get("remind")),
-        "reset": bool(decided.get("reset")),
-        "resets_today": int(_num(decided.get("resets_today"))),
+        "score": int(_num(decided_dict.get("score"))) if decided_dict else 0,
+        "hard": int(_num(decided_dict.get("hard"))) if decided_dict else 0,
+        "remind": bool(decided_dict.get("remind")) if decided_dict else False,
+        "reset": bool(decided_dict.get("reset")) if decided_dict else False,
+        "resets_today": int(_num(decided_dict.get("resets_today"))) if decided_dict else 0,
         "recent": rows,
+        "bots": bots,
     }
 
 
@@ -630,6 +727,17 @@ def registry_panel(*, now: float, store: Any = None,
                                   stall_seconds=stall_seconds)}
 
 
+def _enrich_drift(drift: Dict[str, Any], *, snapshots: Sequence[Snapshot] = (),
+                  cards: Sequence[Mapping[str, Any]] = (),
+                  now: float = 0.0) -> Dict[str, Any]:
+    if not drift.get("ready"):
+        return drift
+    alias = str(drift.get("alias") or "")
+    drift["bots"] = _drift_bots(alias=alias, decided=drift, recent=drift.get("recent") or (),
+                                snapshots=snapshots, cards=cards, now=now)
+    return drift
+
+
 def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
                 usage: Optional[Mapping[str, Mapping[str, Any]]] = None,
                 roles: Optional[Mapping[str, str]] = None, coordinator: str = "",
@@ -679,7 +787,7 @@ def watch_state(*, now: float, snapshots: Sequence[Snapshot] = (),
         # The read commands' own views (#344). Each is ``None`` when the caller did not collect
         # it -- a view nobody read is not an empty one.
         "roster": roster_view(cards=cards, peers=peers or (), coordinator=holder),
-        "drift": (None if drift is None else dict(drift)),
+        "drift": (None if drift is None else _enrich_drift(dict(drift), snapshots=snapshots, cards=cards, now=moment)),
         "store": (None if store is None else dict(store)),
         # The controls the page may press (#345). ``None`` when the caller did not collect
         # them, exactly like the views above: a page nobody wired must not draw buttons.
@@ -993,27 +1101,27 @@ body[data-admin="0"] .controls input { opacity: .55; cursor: not-allowed; }
 
   <section class="panel" id="usage">
     <h2>Usage</h2>
-    <div id="usage"></div>
+    <div id="usage-rows"></div>
   </section>
 
   <section class="panel" id="settings">
     <h2>Settings</h2>
-    <div id="settings"></div>
+    <div id="settings-rows"></div>
   </section>
 
   <section class="panel" id="drift">
     <h2>Drift</h2>
-    <div id="drift"></div>
+    <div id="drift-table"></div>
   </section>
 
   <section class="panel" id="state">
     <h2>State</h2>
-    <div id="state"></div>
+    <div id="state-rows"></div>
   </section>
 
   <section class="panel" id="memory">
     <h2>Memory</h2>
-    <div id="memory"></div>
+    <div id="memory-rows"></div>
   </section>
 
   <section class="panel" id="controls">
@@ -1178,7 +1286,7 @@ function topicCard(topic) {
 
 // What the swarm spent today, a row per bot and a total: the /usage answer, on the page.
 function usage(state) {
-  const box = document.getElementById("usage");
+  const box = document.getElementById("usage-rows");
   box.replaceChildren();
   const bots = state.bots || [];
   if (!bots.length) {
@@ -1252,7 +1360,7 @@ function roundBoard(state) {
 
 // /model, /reasoning and /role: what each bot runs, and what a topic overrides (slice 3).
 function settings(state) {
-  const box = document.getElementById("settings");
+  const box = document.getElementById("settings-rows");
   box.replaceChildren();
   const view = state.settings;
   if (!view || !view.ready) {
@@ -1282,38 +1390,70 @@ function settings(state) {
     box.append(el("p", "note", "no bot has reported a setting yet"));
 }
 
-// /drift: the score, and the newest rule breaks behind it -- kinds and weights, never evidence.
+// /drift: a table of all bots -- score, hard, resets today, standing, newest violation kind and age (#452).
 function drift(state) {
-  const box = document.getElementById("drift");
+  const box = document.getElementById("drift-table");
   box.replaceChildren();
   const view = state.drift;
   if (!view || !view.ready) {
     box.append(el("p", "note", (view && view.text) || "the drift ledger is not read here"));
     return;
   }
-  const head = el("div", "health");
-  head.append(pill("score", num(view.score)));
-  head.append(pill("hard", num(view.hard)));
-  head.append(pill("resets today", num(view.resets_today)));
-  head.append(pill("standing", view.reset ? "a reset is due"
-    : (view.remind ? "a reminder rides the next turn" : "nothing due")));
-  box.append(head);
-  if (!(view.recent || []).length) {
-    box.append(el("p", "note", "no live violations"));
+  let bots = view.bots || [];
+  if (!bots.length && view.score !== undefined) {
+    bots = [{
+      alias: view.alias || "serving",
+      reported: true,
+      score: view.score,
+      hard: view.hard,
+      resets_today: view.resets_today,
+      standing: view.reset ? "a reset is due"
+        : (view.remind ? "a reminder rides the next turn" : "nothing due"),
+      newest_kind: (view.recent && view.recent.length ? view.recent[view.recent.length - 1].kind : null),
+      newest_age: (view.recent && view.recent.length ? view.recent[view.recent.length - 1].age : null),
+    }];
+  }
+  if (!bots.length) {
+    box.append(el("p", "note", "no bot has reported drift yet"));
     return;
   }
-  view.recent.forEach((row) => {
-    const line = el("div", "line");
-    line.append(el("span", "ref", row.kind || "?"));
-    line.append(el("span", "sub", "+" + num(row.severity)));
-    line.append(el("span", "sub", ago(row.age) + " ago"));
-    box.append(line);
+  const table = el("table", "");
+  const head = el("thead", "");
+  const headRow = el("tr", "");
+  ["Bot", "Score", "Hard", "Resets today", "Standing", "Newest violation"].forEach((name) => {
+    headRow.append(el("th", "", name));
   });
+  head.append(headRow);
+  table.append(head);
+  const body = el("tbody", "");
+  bots.forEach((bot) => {
+    const row = el("tr", "");
+    row.append(el("td", "", bot.alias || "?"));
+    if (!bot.reported) {
+      const cell = el("td", "sub", "not reported");
+      cell.colSpan = 5;
+      row.append(cell);
+    } else {
+      row.append(el("td", "", num(bot.score)));
+      row.append(el("td", "", num(bot.hard)));
+      row.append(el("td", "", num(bot.resets_today)));
+      row.append(el("td", "", bot.standing || "nothing due"));
+      let newest = "none";
+      if (bot.newest_kind) {
+        newest = bot.newest_kind + (bot.newest_age !== null && bot.newest_age !== undefined
+          ? " (" + ago(bot.newest_age) + " ago)" : "");
+      }
+      row.append(el("td", "", newest));
+    }
+    body.append(row);
+  });
+  table.append(body);
+  box.append(table);
 }
 
 // /state: which backend, which mode, and whether it is readable.
 function storeState(state) {
-  const box = document.getElementById("state");
+  const box = document.getElementById("state-rows");
   box.replaceChildren();
   const view = state.store;
   if (!view) {
@@ -1334,7 +1474,7 @@ function storeState(state) {
 // /memory: this bot's own notes. It is a separate, admin-only request -- opened without the
 // Mini App's login it says so instead of showing anything.
 async function memory() {
-  const box = document.getElementById("memory");
+  const box = document.getElementById("memory-rows");
   box.replaceChildren();
   if (!INIT) {
     box.append(el("p", "note", "the admin's login is needed to read a bot's memory"));

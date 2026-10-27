@@ -83,6 +83,13 @@ class Snapshot:
     #: The coordinator lease, when this bot holds it (#83).
     term: int = 0
     lease_ends: float = 0.0
+    #: Drift metrics for the dashboard's table (#452). None when not reported.
+    drift_score: Optional[int] = None
+    drift_hard: Optional[int] = None
+    drift_resets_today: Optional[int] = None
+    drift_standing: Optional[str] = None
+    drift_kind: Optional[str] = None
+    drift_age: Optional[float] = None
 
     # -- serialisation ---------------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
@@ -96,6 +103,12 @@ class Snapshot:
             "models": list(self.models), "efforts": list(self.efforts),
             "uptime": self.uptime, "restarts": int(self.restarts),
             "term": int(self.term), "lease_ends": self.lease_ends,
+            "drift_score": self.drift_score,
+            "drift_hard": self.drift_hard,
+            "drift_resets_today": self.drift_resets_today,
+            "drift_standing": self.drift_standing,
+            "drift_kind": self.drift_kind,
+            "drift_age": self.drift_age,
         }
 
     @classmethod
@@ -116,6 +129,18 @@ class Snapshot:
                     wakes.append((str(row[0]), float(row[1])))
                 except (TypeError, ValueError):
                     continue
+        drift_score = (int(_num(data["drift_score"]))
+                       if data.get("drift_score") is not None else None)
+        drift_hard = (int(_num(data["drift_hard"]))
+                      if data.get("drift_hard") is not None else None)
+        drift_resets_today = (int(_num(data["drift_resets_today"]))
+                              if data.get("drift_resets_today") is not None else None)
+        drift_standing = (str(data["drift_standing"])
+                          if data.get("drift_standing") is not None else None)
+        drift_kind = (str(data["drift_kind"])
+                      if data.get("drift_kind") is not None else None)
+        drift_age = (_num(data["drift_age"])
+                     if data.get("drift_age") is not None else None)
         return cls(
             alias=alias.strip(), state=str(state),
             since=_num(data.get("since")), at=_num(data.get("at")),
@@ -128,6 +153,9 @@ class Snapshot:
             rev=str(data.get("rev") or ""), uptime=_num(data.get("uptime")),
             restarts=int(_num(data.get("restarts"))), term=int(_num(data.get("term"))),
             lease_ends=_num(data.get("lease_ends")),
+            drift_score=drift_score, drift_hard=drift_hard,
+            drift_resets_today=drift_resets_today, drift_standing=drift_standing,
+            drift_kind=drift_kind, drift_age=drift_age,
         )
 
     # -- reading it ------------------------------------------------------------------
