@@ -102,8 +102,8 @@ same things with lines in its replies: `LINK: …`, `ASSIGN: @bot <ref|L1> as <r
 
 With `control:` set, the coordinator keeps a pinned dashboard in the chat it names (or in
 📡 Swarm pulse). Its buttons are admin only, and some ask for a second tap. A per-bot button
-names its bot: Pause, Resume, Stop turn and Restart travel as the `CONTROL` note that bot applies
-to itself, and Model and Effort are forwarded to it as well — it applies them under its own rules,
+names its bot: Pause, Resume, Stop turn, Restart and Stop travel as the `CONTROL` note that bot
+applies to itself, and Model and Effort are forwarded to it as well — it applies them under its own rules,
 and its card shows the new value once its own beat reports it. CLI and Memory act on the
 coordinator only. A typed `ctl:` code reaches every bot, so the others answer that the
 coordinator has the dashboard: pressing the button is quieter.
@@ -113,6 +113,7 @@ coordinator has the dashboard: pressing the button is quieter.
 | Pause, Resume | Pause is `/pause@bot` for the coordinator: a turn already running finishes and posts, then it holds, and its "paused" line goes out. Resume lifts it. |
 | Stop turn | Stops the coordinator's turns and drops its queue, like `/stop@bot all`. |
 | Restart | Restarts the coordinator now; a turn it cuts off is replayed when it starts again. The `swarmly --cli` launcher starts it again; `swarmly-telegram run` just exits. |
+| Stop | Stops the bot for good, after a second tap: it yields the coordinator lease (so a peer takes over at once, not after `limits.takeover_minutes`), posts its OFFLINE line, and exits **0**. A pause is not this — a paused bot stays online and keeps the lease. Starting it again is the admin's job on the host: a unit with `Restart=always` brings it back after `RestartSec`, one with `Restart=on-failure` leaves it down ([`SETUP-ADMIN.md`](SETUP-ADMIN.md#stopping-a-bot-from-the-dashboard)). Its card then goes DOWN, because the bot's pulse has stopped. |
 | Model, Effort | Picks the coordinator's model or effort, for the dashboard's own topic only. |
 | CLI | Lists the `/cli` commands the coordinator may run; it runs nothing. |
 | Memory | `clear`: empties the coordinator's own `memory.md`, after a second tap. It is that bot's own file, so a press aimed at another bot's card is refused. |

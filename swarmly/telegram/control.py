@@ -97,6 +97,12 @@ CONTROLS: Tuple[Control, ...] = (
     Control("bot.stop_turn", "Stop turn", confirm=True, note="keeps the message for replay"),
     Control("bot.restart", "Restart", confirm=True,
             note="waits for the queue to empty and no reply to be unsent"),
+    # #437: the failover drill needs a bot that is really *off*, and a pause is not that --
+    # a paused bot stays online and keeps the lease. This one gives the lease away, says
+    # OFFLINE and exits; starting it again is the admin's job on the host.
+    Control("bot.offline", "Stop", confirm=True,
+            note="yields the lease, posts OFFLINE and exits; a unit with Restart=always "
+                 "brings it back, so start it on the host"),
     Control("bot.model", "Model", report=True),
     Control("bot.effort", "Effort", report=True),
     Control("bot.cli", "CLI", note="read-only commands only", report=True),
