@@ -1821,8 +1821,10 @@ class AgentChannel:
             if target.lstrip("@").lower() != self.config.identity.name.lstrip("@").lower():
                 return None
         elif command == "owed" and _closes_owed(event.text or ""):
-            if not self.is_coordinator():
-                return None                         # one bot answers a bare /owed close
+            # One bot answers a bare /owed close: the same one `should_respond` routes it to,
+            # which is the coordinator the admin named even while no lease is live (#385).
+            if not self._answers_for_swarm():
+                return None
         elif not (self.mentions_me(event.text or "") or event.replies_to_bot
                   or self._direct_chat(event)
                   or (command == "owed" and self._answers_for_swarm())):
