@@ -30,7 +30,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 logger = logging.getLogger("swarmly.telegram.cli_defaults")
 
@@ -96,6 +96,40 @@ def _top_level_toml(text: str) -> Dict[str, Any]:
         if match:
             found[match.group(1)] = match.group(2)
     return found
+
+
+def reasonix_provider_names(cwd: Optional[str] = None, *, env: Optional[Mapping[str, str]] = None,
+                            home: Optional[Path] = None) -> List[str]:
+    """The provider names ``reasonix.toml`` already lists, without running the CLI (#393).
+
+    ``/model`` on the Reasonix adapter takes a provider name, so the names the settings file
+    declares are the switchable set: the ``[[providers]]`` entries' ``name`` plus the models
+    each one overrides, and the file's own ``default_model`` first. Read here so a bot whose
+    ``reasonix doctor`` cannot answer still has a list to publish.
+    """
+    env = os.environ if env is None else env
+    home = Path.home() if home is None else home
+    layers = [_read_toml(_reasonix_global(env, home))]
+    if cwd:
+        layers.append(_read_toml(Path(cwd) / "reasonix.toml"))
+    merged: Dict[str, Any] = {}
+    for layer in layers:                                 # the project file wins
+        merged.update(layer)
+    tables = [merged] + [p for p in merged.get("providers") or [] if isinstance(p, dict)]
+    names: List[str] = []
+
+    def add(name: Any) -> None:
+        word = _text(name)
+        if word and word not in names:
+            names.append(word)
+
+    add(merged.get("default_model"))
+    for table in tables:
+        add(table.get("name"))
+        overrides = table.get("model_overrides")
+        for model in (overrides if isinstance(overrides, dict) else {}):
+            add(model)
+    return names
 
 
 def _codex(env: Mapping[str, str], home: Path) -> CliDefault:

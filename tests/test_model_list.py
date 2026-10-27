@@ -1,5 +1,6 @@
 """/model with no name lists the models the bot's CLI can switch to."""
 
+import asyncio
 import json
 import os
 import tempfile
@@ -161,6 +162,79 @@ class TestModelCommandLists(unittest.TestCase):
             run(channel.handle_event(event("/model@CodexBot", author_id=ADMIN_ID,
                                            username="alice", is_bot=False)))
         self.assertEqual(calls, [])
+
+
+class TestTheBackgroundLookup(unittest.TestCase):
+    """#393: a bot that was never sent /model still publishes what it can run.
+
+    The dashboard greys a Model pick out when the card's list is empty, and a card was empty
+    until someone asked the bot ``/model`` with no name, so every peer but the one with a
+    built-in list showed a dead button. The list is now looked up in the background.
+    """
+
+    def setUp(self):
+        model_list._cache.clear()
+        self.addCleanup(model_list._cache.clear)
+
+    def beat(self, channel):
+        """One wake of the background loop, as it runs at start."""
+        return run(channel._refresh_models())
+
+    def test_antigravity_publishes_its_models_after_one_beat(self):
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        with mock.patch.object(model_list, "_spawn", spawner(FakeProcess())):
+            self.beat(channel)
+        self.assertIn("gemini-3.8-flash-medium (Gemini 3.8 Flash (Medium))",
+                      channel.status_snapshot().models)
+
+    def test_codex_publishes_its_models_after_one_beat(self):
+        channel = make_channel(make_config(adapter={"type": "codex"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "models_cache.json").write_text(CODEX_CACHE, encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                self.beat(channel)
+        self.assertIn("gpt-6-luna", channel.status_snapshot().models)
+
+    def test_reasonix_publishes_its_models_after_one_beat(self):
+        channel = make_channel(make_config(adapter={"type": "reasonix"}))
+        with mock.patch.object(model_list, "_spawn", spawner(FakeProcess(REASONIX_OUTPUT))):
+            self.beat(channel)
+        self.assertIn("deepseek-v4-pro", channel.status_snapshot().models)
+
+    def test_a_reasonix_bot_whose_doctor_fails_reads_its_own_settings_file(self):
+        """The DeepSeek bots run this adapter; its settings file names the providers even
+        when the CLI cannot list them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "reasonix.toml").write_text(
+                'default_model = "deepseek-flash"\n\n'
+                '[[providers]]\nname = "deepseek-pro"\n', encoding="utf-8")
+            channel = make_channel(make_config(adapter={"type": "reasonix", "cwd": tmp}))
+            with mock.patch.object(model_list, "_spawn",
+                                   spawner(FakeProcess(returncode=1))):
+                names = self.beat(channel)
+            self.assertEqual(list(channel.status_snapshot().models),
+                             ["deepseek-flash", "deepseek-pro"])
+        self.assertEqual(names, ["deepseek-flash", "deepseek-pro"])
+
+    def test_a_lookup_that_fails_still_publishes_an_empty_list(self):
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        with mock.patch.object(model_list, "_spawn", spawner(FakeProcess(returncode=1))):
+            self.assertIsNone(self.beat(channel))
+        self.assertEqual(channel.status_snapshot().models, ())    # nothing invented
+
+    def test_the_loop_looks_up_once_before_it_sleeps(self):
+        channel = make_channel(make_config(adapter={"type": "antigravity"}))
+        beats = []
+
+        async def one_wake():
+            beats.append(1)
+            raise asyncio.CancelledError
+
+        channel._refresh_models = one_wake
+        with mock.patch.object(asyncio, "sleep", mock.AsyncMock()):
+            with self.assertRaises(asyncio.CancelledError):
+                run(channel._models_loop())
+        self.assertEqual(beats, [1])
 
 
 if __name__ == "__main__":

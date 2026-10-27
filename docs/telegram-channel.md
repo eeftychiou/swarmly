@@ -338,8 +338,12 @@ bot's model at runtime, per topic:
 - `/model@<bot>` shows the model the bot runs in this topic, and the models it can switch to:
   Claude Code's aliases; what `agy models` prints for Antigravity (id and engine name); the
   models Codex's own picker shows (from `~/.codex/models_cache.json`); every provider model
-  `reasonix doctor --json` reports for Reasonix. The CLI is asked once and its answer kept
-  for an hour. Switch with the exact id from that list, such as
+  `reasonix doctor --json` reports for Reasonix, or the provider names its `reasonix.toml`
+  declares when the CLI cannot answer. The CLI is asked once and its answer kept
+  for an hour — and a bot looks its list up in the background at start and on every retry
+  beat, so its dashboard card offers a Model pick without anyone sending it `/model` first.
+  A bot whose lookup fails publishes an empty list, and its card says it has nothing to pick
+  from yet rather than offering a dead control. Switch with the exact id from that list, such as
   `/model@<bot> gemini-3.8-flash-medium` for Antigravity.
 - `/model@<bot> <name>` (admin only) switches it from the next turn. The conversation carries
   on: the next turn resumes the same session on the new model.
@@ -358,8 +362,9 @@ A bot only switches within its own CLI: Antigravity takes a model id from `agy m
 Claude Code takes `opus`, `sonnet`, `haiku`, `best`,
 `opusplan` (optionally with `[1m]`) or a `claude-*` name; Codex takes `gpt-*`, `o3`/`o4-*` or
 `codex-*` names; Reasonix takes a lowercase provider name from its `reasonix.toml`, such as
-`deepseek-flash` or `deepseek-pro` (swarmly cannot see that file, so a name it lacks fails the
-turn; switch back with `/model` and the right name). Anything else is refused, except the name
+`deepseek-flash` or `deepseek-pro` (swarmly lists the names that file declares but does not
+validate against it, so a name it lacks fails the turn; switch back with `/model` and the right
+name). Anything else is refused, except the name
 in `adapter.model`. Choices are kept
 in `.agents/state/models-<alias>.json`, so they survive a restart, and `/status` shows the
 topic's `model=`. An explicit `adapter.command` sets its own command line, so `/model` cannot

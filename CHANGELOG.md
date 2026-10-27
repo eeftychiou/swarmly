@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A bot publishes what its Model pick can offer without anyone sending it `/model` first
+  (`#393`). The dashboard greys the pick out when a card's list is empty, and a card only
+  filled after a bare `/model` — so every peer but the one with a built-in list showed a dead
+  control. The list is now looked up in the background: once at start, then on a retry beat,
+  with the cache answering instantly while a list is fresh, so a beat never waits on a CLI.
+  The Reasonix adapter (the DeepSeek bots) also gained a source for when `reasonix doctor`
+  cannot answer: the provider names its own `reasonix.toml` declares. A lookup that fails still
+  publishes an empty list, and the card still says it has nothing to pick yet.
+
 - `/owed close @Name` reaches the coordinator even as a reply, and the debtor's handle is never
   charged as an address (`#391`). Two holes left after `#388`: the bare-command gate sat below
   the reply check in `should_respond`, so a reply to the bot the command names still opened a
