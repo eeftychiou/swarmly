@@ -238,6 +238,25 @@ class TestTheAiogramCallback(unittest.TestCase):
         self.assertEqual(answered, [])
         self.assertEqual(channel.bot.sent, [])
 
+    def test_a_failed_answer_or_redraw_still_carries_the_restart_out(self):
+        """#432 review: an answer or a redraw that raises must not swallow the restart."""
+        async def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("the chat is gone")
+
+        for broken in ("answer", "refresh"):
+            channel = self.channel()
+            run(channel.handle_control_press(press("ctl:bot.restart")))
+            code = channel.control_policy().pending()[0].code
+            callback = self.callback("ctl:confirm:" + code, [])
+            if broken == "answer":
+                callback.answer = boom            # the press logs this one and carries on
+                run(channel._on_aiogram_callback(callback))
+            else:
+                channel.refresh_control_center = boom   # this one still reaches the caller
+                with self.assertRaises(RuntimeError):
+                    run(channel._on_aiogram_callback(callback))
+            self.assertTrue(channel.restart_requested, broken)
+
     def test_the_press_answers_before_the_restart_stops_polling(self):
         """#432 review: the button's answer went out after the restart had stopped polling."""
         channel = self.channel()
@@ -913,6 +932,20 @@ class TestTheSecondTapIsDeliverable(unittest.TestCase):
                       message_id=9))), text)
 
     # -- the record --------------------------------------------------------------------
+    def test_a_typed_restart_whose_answer_fails_still_stops_polling(self):
+        """#432 review: a send that raises must not swallow the restart it was asked for."""
+        channel = self.channel()
+        run(channel.handle_control_press(press("ctl:bot.restart")))
+        code = channel.control_policy().pending()[0].code
+
+        async def boom(text, **kwargs):
+            raise RuntimeError("the chat is gone")
+
+        channel.send = boom
+        with self.assertRaises(RuntimeError):
+            self.typed(channel, "ctl:confirm:" + code)
+        self.assertTrue(channel.restart_requested)
+
     def test_a_typed_restart_answers_before_polling_stops(self):
         """#432 review: the typed form carried the restart out before its answer went out."""
         channel = self.channel()

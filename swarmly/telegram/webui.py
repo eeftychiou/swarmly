@@ -1819,6 +1819,10 @@ class DashboardServer:
         class Handler(BaseHTTPRequestHandler):
             server_version = "swarmly-dashboard"
             sys_version = ""
+            # A stalled client must not hold its thread for good: the body a refusal drains is
+            # read from the socket, and a request that promises more than it sends would block
+            # here until the socket times out (#432 review).
+            timeout = 5
 
             def log_message(self, fmt: str, *args: Any) -> None:   # never on stderr
                 return

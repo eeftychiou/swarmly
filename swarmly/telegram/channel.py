@@ -8956,12 +8956,15 @@ class AgentChannel:
         control_text = await self._handle_control_text(event)
         if control_text is not None:
             self.stats.handled += 1
-            sent = await self.send(control_text, reply_to_message_id=event.message_id,
-                                   chat_id=event.chat_id, thread_id=event.thread_id,
-                                   allow_when_frozen=True)
-            # A typed control's answer is out: a restart it asked for goes out now (#432).
-            self.carry_out_pending_restart()
-            return sent
+            try:
+                return await self.send(control_text, reply_to_message_id=event.message_id,
+                                       chat_id=event.chat_id, thread_id=event.thread_id,
+                                       allow_when_frozen=True)
+            finally:
+                # The answer is out -- or its send failed, which is not the presser's problem
+                # to fix by pressing again: either way this press is over, so a restart it
+                # asked for goes out now and never before (#432 review).
+                self.carry_out_pending_restart()
 
         if self._frozen:
             await self._lift_expired_freeze()
@@ -12478,15 +12481,18 @@ class AgentChannel:
                                 at=time.time())
         text = await self.handle_control_press(press)
         answer = getattr(callback, "answer", None)
-        if answer is not None:
-            try:
-                await answer(text[:200])
-            except Exception:               # noqa: BLE001 - the press already happened
-                logger.warning("control centre: could not answer the press", exc_info=True)
-        await self.refresh_control_center()
-        # The press has answered in the chat and the dashboard is redrawn: a restart it asked
-        # for goes out now, never before (#432).
-        self.carry_out_pending_restart()
+        try:
+            if answer is not None:
+                try:
+                    await answer(text[:200])
+                except Exception:           # noqa: BLE001 - the press already happened
+                    logger.warning("control centre: could not answer the press", exc_info=True)
+            await self.refresh_control_center()
+        finally:
+            # Answered and redrawn -- or the answer or the redraw failed. The press is over
+            # either way, so a restart it asked for goes out now, and never before: polling
+            # stopping is what closes the connection these sends ride (#432 review).
+            self.carry_out_pending_restart()
 
     async def _on_aiogram_message(self, message: Any) -> None:
         # Pending updates are kept across a restart (a peer's request must still arrive), but

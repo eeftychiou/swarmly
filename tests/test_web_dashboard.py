@@ -994,6 +994,14 @@ class TestTheWritePath(unittest.TestCase):
             server.stop()
         self.assertEqual(self.asked, [])                     # the refused write never ran
 
+    def test_a_stalled_client_cannot_hold_its_thread_for_good(self):
+        """#432 review: draining a body that never arrives must time out, not pin a thread."""
+        server = self.server()
+        try:
+            self.assertEqual(server._handler().timeout, 5)
+        finally:
+            server.stop()
+
     def test_a_login_that_is_not_the_admins_is_refused(self):
         server = self.server()
         try:
