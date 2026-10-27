@@ -90,6 +90,22 @@ class RotateCommandTests(unittest.TestCase):
         self.assertEqual(reasonix.topic_mode(CONTEXT), "fresh",
                          "the next turn starts a new session, not the retired one")
 
+    def test_a_second_rotate_before_the_next_turn_says_already_rotated(self):
+        """Review (#436): Claude's rotate refuses a second handover, and the answer used to
+        claim "no handover came" — false, and the admin re-running check 6 would hit it."""
+        channel, claude = self.channel(runs=2)          # the first turn, then the handover
+        with tempfile.TemporaryDirectory() as tmp:
+            claude.use_state_file(f"{tmp}/claude-sessions-hermes.json")
+            asyncio.run(claude.respond(message("remember 42", context_id=CONTEXT)))
+            first = asyncio.run(channel.handle_event(admin("/rotate@HermesBot")))
+            self.assertIn("rotated on the admin's request", first or "")
+            calls_after_first = len(claude._runner.calls)
+            again = asyncio.run(channel.handle_event(admin("/rotate@HermesBot")))
+            self.assertEqual(len(claude._runner.calls), calls_after_first,
+                             "no second handover turn is spent")
+        self.assertIn("already rotated", again or "")
+        self.assertNotIn("no handover came", again or "")
+
     def test_a_rotate_for_another_bot_gets_no_answer(self):
         channel, _ = self.channel(runs=0)
         self.assertIsNone(asyncio.run(channel.handle_event(admin("/rotate@SomeOtherBot"))))
