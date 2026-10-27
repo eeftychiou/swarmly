@@ -40,6 +40,14 @@ class Sent:
         self.message_id = message_id
 
 
+class Throttled(Exception):
+    """What aiogram raises under flood control: the wait is on the exception (#398)."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__(f"Flood control exceeded. Retry in {retry_after} seconds")
+        self.retry_after = retry_after
+
+
 class FakeBot:
     """The aiogram seam: records the delete calls the sweep makes.
 
@@ -47,14 +55,18 @@ class FakeBot:
     gone). ``deleteMessages`` is all-or-nothing: any refused id in the call fails the call.
     """
 
-    def __init__(self, fail: bool = False, refuse=()) -> None:
+    def __init__(self, fail: bool = False, refuse=(), error=None) -> None:
         self.messages = []
         self.fail = fail
         self.refuse = {int(i) for i in refuse}
+        #: When set, every call raises this instead: Telegram never answered (#398).
+        self.error = error
 
     async def delete_messages(self, chat_id=None, message_ids=None):
         ids = [int(i) for i in (message_ids or [])]
         self.messages.append((chat_id, ids))
+        if self.error is not None:
+            raise self.error
         if self.fail:
             raise RuntimeError("Bad Request: message can't be deleted")
         if any(mid in self.refuse for mid in ids):
@@ -185,6 +197,24 @@ class SweepTests(Case):
         self.assertEqual(self.bot.messages[0], (GROUP, [1, 2, 3]))
         self.assertEqual([call[1] for call in self.bot.messages[1:]], [[1], [2], [3]])
         self.assertEqual(self.ledger.notices(GROUP), [])     # the refused one is not retried
+
+    def test_a_throttled_delete_keeps_the_notices_for_the_next_sweep(self):
+        # #398: a 429 is not a refusal. The ids must not be forgotten -- they are still
+        # perfectly deletable once Telegram answers again.
+        for mid in (1, 2):
+            self.ledger.note_notice(GROUP, mid, now=NOW - 2 * 60 * MINUTE)
+        self.bot.error = Throttled(retry_after=30)
+        self.assertEqual(self.sweep(NOW), 0)
+        self.assertEqual(self.ledger.notices(GROUP), [1, 2])
+        self.bot.error = None
+        self.assertEqual(self.sweep(NOW), 2)
+        self.assertEqual(self.ledger.notices(GROUP), [])
+
+    def test_a_network_error_is_not_a_refusal_either(self):
+        self.ledger.note_notice(GROUP, 500, now=NOW - 2 * 60 * MINUTE)
+        self.bot.error = OSError("connection reset")
+        self.assertEqual(self.sweep(NOW), 0)
+        self.assertEqual(self.ledger.notices(GROUP), [500])
 
     def test_many_notices_go_in_batches(self):
         self.ledger.note_notice(GROUP, 1, now=NOW - 2 * 60 * MINUTE)

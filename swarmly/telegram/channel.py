@@ -50,7 +50,7 @@ from swarmly.telegram.adapters import AgentAdapter, IncomingMessage, build_adapt
 from swarmly.telegram.adapters.base import (AdapterReply, drop_stray_silence, is_silent_reply,
                                             load_state, save_state, topic_mode)
 from swarmly.telegram.children import reap_orphans
-from swarmly.telegram.cleanup import (DELETE_BATCH, Cleanup, GeneralLedger, TopicInfo,
+from swarmly.telegram.cleanup import (Cleanup, DeleteUnavailable, GeneralLedger, TopicInfo,
                                      delete_message_ids)
 from swarmly.telegram.commands import (
     DIAG_COMMANDS,
@@ -821,7 +821,7 @@ class AgentChannel:
         self.ledger = GeneralLedger(_state_file(config, "general"))
         self.cleanup = Cleanup(
             self, self.ledger, handle=config.identity.alias,
-            keep=getattr(config.limits, "cleanup_keep", ()) or ())
+            keep=getattr(config.limits, "cleanup_keep", ()) or (), sleep=self._sleep)
         self._gh_client: Any = None
         self._github_task: Optional[asyncio.Task] = None
         self._github_last_poll: Optional[str] = None
@@ -2325,18 +2325,40 @@ class AgentChannel:
         logger.info("deleted topic %s in chat %s", thread_id, chat_id)
         return True
 
+    #: Telegram's answer when one particular message cannot be deleted: a peer's post this bot
+    #: never sent, one already gone. Everything else (flood control, network, a server error)
+    #: means the bot was not answered at all, so the ids must be kept (#398).
+    DELETE_REFUSALS = ("message can't be deleted", "message to delete not found",
+                       "message_id_invalid", "message not found", "message is too old")
+
+    @classmethod
+    def _delete_refused(cls, exc: Exception) -> bool:
+        """True when Telegram refused these ids; False when it could not be asked at all."""
+        if getattr(exc, "retry_after", None) is not None:
+            return False                     # flood control: ask again later, keep the ids
+        text = str(exc).lower()
+        return any(marker in text for marker in cls.DELETE_REFUSALS)
+
     async def cleanup_delete_messages(self, chat_id: int, ids: List[int]) -> int:
-        """Delete General message ids; returns how many went (all of them, or none)."""
+        """Delete message ids; returns how many went (all of them, or none).
+
+        Raises :class:`~swarmly.telegram.cleanup.DeleteUnavailable` when Telegram could not be
+        asked -- a flood-control wait, a network error, a server error -- so the caller keeps
+        the ids for the next sweep instead of counting them as refused (#398).
+        """
         ids = [int(i) for i in ids]
         if not ids:
             return 0
         if self.bot is None:
-            logger.warning("cannot delete messages %s: no Telegram bot attached", ids)
-            return 0
+            raise DeleteUnavailable(f"no Telegram bot attached to delete {len(ids)} message(s)")
         try:
             await self.bot.delete_messages(chat_id=int(chat_id), message_ids=ids)
-        except Exception as exc:                           # noqa: BLE001 - report it
-            logger.warning("could not delete %d message(s): %s", len(ids), exc)
+        except Exception as exc:                           # noqa: BLE001 - sorted below
+            if not self._delete_refused(exc):
+                logger.warning("could not ask Telegram to delete %d message(s): %s",
+                               len(ids), exc)
+                raise DeleteUnavailable(str(exc)) from exc
+            logger.info("Telegram refused to delete %d message(s): %s", len(ids), exc)
             return 0
         logger.info("deleted %d General message(s) in chat %s", len(ids), chat_id)
         return len(ids)
@@ -2403,9 +2425,14 @@ class AgentChannel:
             return 0
         # One refused id must not cost the batch beside it (#395): the helper asks again one
         # at a time, so the good deletes still go and only the refused ids are forgotten.
-        deleted, refused = await delete_message_ids(self, home, due)
+        # What Telegram could not be asked about stays in the ledger for the next tick (#398).
+        deleted, refused, unasked = await delete_message_ids(self, home, due,
+                                                            sleep=self._sleep)
         if deleted or refused:
             self.ledger.drop(home, deleted + refused)
+        if unasked:
+            logger.info("%d notice(s) kept for the next sweep: Telegram could not be asked",
+                        len(unasked))
         if deleted:
             logger.info("deleted %d expired notice(s) in chat %s", len(deleted), home)
         return len(deleted)

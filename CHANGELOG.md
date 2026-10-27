@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A throttled sweep no longer forgets what it could not delete (`#398`). Two follow-ups to
+  `#395`: `deleteMessages` failing for a reason that is not a refusal — flood control's
+  `retry_after`, a network blip, a server error — was read as "Telegram refused these", so the
+  ids were dropped from the ledger for good, and the first sweep after the deploy would have
+  made every poisoned pulse id look refused at once. A non-refusal error now keeps those ids
+  for the next tick (`DeleteUnavailable`), and only what Telegram actually refused is
+  forgotten. The one-id-at-a-time fallback is also paced (`SINGLE_DELETE_PAUSE`, 0.05s —
+  Telegram takes about 30 messages a second) and capped (`SINGLE_DELETE_MAX`, 200 per sweep,
+  the rest waiting), instead of firing a hundred unpaced calls into the rate limit.
+  `/cleanup general` separates "Telegram refused" from "could not be asked" in its answer.
+
 - A bot publishes what its Model pick can offer without anyone sending it `/model` first
   (`#393`). The dashboard greys the pick out when a card's list is empty, and a card only
   filled after a bare `/model` — so every peer but the one with a built-in list showed a dead
