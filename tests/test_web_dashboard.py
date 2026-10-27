@@ -1658,7 +1658,11 @@ class TestAPickSurvivesTheRefresh(unittest.TestCase):
         self.assertIn('typed.dataset.pending = pendingKey(target, button.action + ":typed");',
                       page)
         self.assertIn('typed.value = pendingGet(typed.dataset.pending) || "";', page)
-        self.assertIn("pendingSet(typed.dataset.pending, typed.value.trim());", page)
+        # Kept as typed and trimmed only by the press, so a trailing space is not eaten and the
+        # caret does not jump to the end on the next render (review, #449).
+        self.assertIn("pendingSet(typed.dataset.pending, typed.value);", page)
+        self.assertNotIn("pendingSet(typed.dataset.pending, typed.value.trim());", page)
+        self.assertIn("else if (typed) value = typed.value.trim();", page)
 
     def test_a_pick_is_keyed_by_its_card_and_its_control(self):
         """Two cards offering an effort are two controls: one card's pick is not the other's."""
@@ -1693,6 +1697,18 @@ class TestAPickSurvivesTheRefresh(unittest.TestCase):
                         page.index("restoreFocus();", page.index("function render(state)")))
         # A tap outside every control is the page's own: no redraw pulls the focus back.
         self.assertIn('target.closest("[data-pending]")', page)
+
+    def test_a_redraw_never_traps_a_keyboard_user_in_a_pick(self):
+        """Review #449: clearing FOCUS only on a pointer left tab-out pulled back every 3 s."""
+        page = self.page()
+        # The restore gives up when something other than a control holds the keyboard.
+        self.assertIn("const active = document.activeElement;", page)
+        self.assertIn('if (active && active !== document.body', page)
+        self.assertIn('!(active.closest && active.closest("[data-pending]"))) {', page)
+        # And a keyboard move out of the controls clears it as a tap would.
+        self.assertIn('document.addEventListener("focusin", (event) => {', page)
+        self.assertLess(page.index('document.addEventListener("focusin"'),
+                        page.index("function tick()"))
 
 
 if __name__ == "__main__":  # pragma: no cover

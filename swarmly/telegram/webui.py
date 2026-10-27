@@ -1537,6 +1537,16 @@ function rememberFocus(key) {
 
 function restoreFocus() {
   if (!FOCUS) return;
+  // Only when the page itself lost the keyboard -- which is what a redraw does, by replacing
+  // the node that had it. If something else holds it now -- the Set button, the memory box,
+  // anywhere a *keyboard* user tabbed to -- that is their choice, and a page that pulled the
+  // keyboard back every 3 s would be a trap (review, #449).
+  const active = document.activeElement;
+  if (active && active !== document.body
+      && !(active.closest && active.closest("[data-pending]"))) {
+    FOCUS = "";
+    return;
+  }
   const nodes = document.querySelectorAll("[data-pending]");
   for (let at = 0; at < nodes.length; at += 1) {
     if (nodes[at].dataset.pending !== FOCUS) continue;
@@ -1604,7 +1614,9 @@ function controlNode(button, target) {
     typed.disabled = !ADMIN;
     typed.value = pendingGet(typed.dataset.pending) || "";
     typed.addEventListener("input", () => {
-      pendingSet(typed.dataset.pending, typed.value.trim());
+      // Kept raw, trimmed only when the press reads it: a trailing space eaten every 3 s, or a
+      // caret that jumps to the end mid-edit, is the redraw showing through (review, #449).
+      pendingSet(typed.dataset.pending, typed.value);
       rememberFocus(typed.dataset.pending);
     });
     typed.addEventListener("focus", () => rememberFocus(typed.dataset.pending));
@@ -1789,6 +1801,14 @@ function render(state) {
 // A tap anywhere that is not a control is the page's own: the keyboard went there on purpose,
 // and the next redraw must not pull it back.
 document.addEventListener("pointerdown", (event) => {
+  const target = event.target;
+  if (!target || !target.closest || !target.closest("[data-pending]")) FOCUS = "";
+});
+
+// And the same for the keyboard: a focus that moved to something that is not a control -- the
+// Set button, the memory box, the page around them -- is the reader's move, not a redraw's
+// loss, so the next render must not take the keyboard back (review, #449).
+document.addEventListener("focusin", (event) => {
   const target = event.target;
   if (!target || !target.closest || !target.closest("[data-pending]")) FOCUS = "";
 });
