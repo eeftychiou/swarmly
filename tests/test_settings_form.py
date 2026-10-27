@@ -330,6 +330,10 @@ class TestTheNitsFromTheReviewOf458(unittest.TestCase):
         page = webui.page_html()
         self.assertIn("if (!(field.choices || []).length) {", page)
         self.assertIn('box.append(el("span", "note", "not reported yet"));', page)
+        # What the bot *runs* is still shown: the missing thing is the list of choices, not
+        # the setting (review, #461).
+        self.assertIn('if (field.value) box.append(el("span", "sub", "runs " + field.value));',
+                      page)
         # And the field draws nothing to read from: the reads that carry a select are the ones
         # Apply looks at, so a no-choice field cannot be sent.
         self.assertIn(".filter((read) => read);", page)

@@ -1685,7 +1685,10 @@ function settingsForm(button, target, fields, box) {
       // A bot that has not reported what it can run gets no dropdown for it (#461): a select
       // with only its own value in it looks usable and cannot be used. Said plainly, the way
       // the Drift table says "not reported", rather than drawn as a choice that is not there.
+      // What it *runs* is still shown, because that is a fact its beat did report: it is the
+      // list of choices that is missing, not the setting (review, #461).
       box.append(el("span", "note", "not reported yet"));
+      if (field.value) box.append(el("span", "sub", "runs " + field.value));
       return null;
     }
     const select = el("select", "");
