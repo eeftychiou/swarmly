@@ -20,6 +20,7 @@ from pathlib import Path
 from swarmly.telegram import audit as au
 from swarmly.telegram.cli import _audit_public
 from swarmly.telegram.redact import CHAT, HANDLE, PATH, Redactor
+from tests.gitenv import git_env, git_out
 from tests.test_redact import ADMIN_ID, GROUP, SecretSandbox, config
 
 #: A bot handle that is not anybody's (fake, like every other value here).
@@ -33,10 +34,8 @@ def cfg(**overrides):
 
 
 def git(root, *args):
-    done = subprocess.run(["git", "-C", str(root), *args], stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
-    assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
-    return done.stdout.decode("utf-8", "replace")
+    """One scrubbed ``git`` call (``tests.gitenv``): no runner's guard or identity leaks in."""
+    return git_out(root, *args)
 
 
 def commit(root, message, files):
@@ -46,9 +45,8 @@ def commit(root, message, files):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
     git(root, "add", "-A")
-    git(root, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-        "commit", "-q", "-m", message)
-    return git(root, "rev-parse", "HEAD").strip()
+    git(root, "commit", "-q", "-m", message)      # gitenv supplies the identity
+    return git(root, "rev-parse", "HEAD")
 
 
 class Repo:
@@ -66,8 +64,8 @@ class Repo:
     def publish(self):
         """The mirror clone: every ref, ``refs/pull/*`` included (as ``--mirror`` fetches)."""
         done = subprocess.run(["git", "clone", "--mirror", "--quiet", str(self.root),
-                               str(self.mirror)], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
+                               str(self.mirror)], env=git_env(),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
         return self.mirror
 
