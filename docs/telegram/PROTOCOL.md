@@ -658,9 +658,10 @@ PHASE: <ref|L1> <phase>
 
 The admin does the same with `/topic #N`, `/link`, `/unlink` and `/phase`; `/topics` and the
 dashboard show each item and its phase ([COMMANDS.md](COMMANDS.md)). `ref-learning` is switched
-off by `state.links: registry`, and so is the topic move that went with it: a number seen in a
-message's text never adds a link and never moves a reply — the explicit `LINK:`/`ASSIGN:` lines,
-`/link` and a GitHub event on an item already linked are what link a topic (#457). The links an
+off by `state.links: registry`: a number seen in a message's text never adds a link, and it is
+never what moves work — the explicit `LINK:`/`ASSIGN:` lines, `/link` and a GitHub event on an
+item already linked are what link a topic, and **the item's explicit link is what moves a reply
+or a brief into the topic that owns it** (#457, #460). The links an
 earlier build learned from text are dropped from the record the next time it is written, which
 is what took `#42` (a truncated title) and `#13221` (a topic id) off `/topics`; a number cut off
 by a truncated title, and a forum thread's own id, are not refs in either mode. GitHub moves what
