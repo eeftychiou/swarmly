@@ -552,19 +552,35 @@ routes from that record instead of from mention heuristics. The design is
 [`docs/design/topic-registry.md`](../design/topic-registry.md) §1–4; this section is what a
 conforming transport does, and the flag each part is switched by.
 
-**Every behaviour below ships behind its flag, and the legacy path is still the default today.**
+**Most of what is below ships behind its flag, and the legacy path is still the default today.**
 A config that sets none of the flags behaves exactly as it did before §11 existed. Phase 9 (§6
-of the design) makes the `on` values the defaults and removes the legacy code.
+of the design) makes the `on` values the defaults and removes the legacy code. Two parts are
+already live with no flag at all: the per-topic session every adapter keeps (§11.5) and the
+session-scoped drift score (§11.6).
 
 ### 11.1 The shared state store
 
-`state.backend: telegram` turns the store on. The op log is the **📡 Swarm pulse** topic — one
-`STATE <key> v<base>→v<new> t<term> <change>` line per write — and the snapshot is a JSON file
-attached to a pinned message there, re-posted and re-pinned at least every
-`state.heartbeat_minutes`. A bot that starts or rejoins reads the snapshot first and applies the
-`STATE` lines after it, and acts on nothing until that read succeeds. Each bot also keeps its own
-copy on disk (`state.dir`) as a cache and a backup, never as the truth. `/state@bot` shows the
-store as that bot sees it, and whether every bot's state hash agrees.
+`state.backend: telegram` turns the store on. The op log is the **📡 Swarm pulse** topic, one
+machine line per write:
+
+```
+[A2A v1.1] NOTE to=* intent=STATE ref=<key>
+
+{"k":"<key>","b":<base>,"t":<term>,"w":"<alias>","v":{…}}
+```
+
+Several writes made together go in one line as a JSON list (`ref=batch`), so a beat that changes
+ten keys is one message. An op's position is the message id times its index in the message, and
+its time the message's Telegram date, so every bot folds the same log the same way; the writer is
+whoever Telegram says sent it, not who the line claims.
+
+The **snapshot** is a JSON file posted, pinned and re-pinned by the lease holder in that topic: a
+new message every 900 s or 25 ops — a fixed cadence of its own, **not** derived from
+`state.heartbeat_minutes` — covering only lines older than a short settle window, so none still
+in flight lands behind it. A bot that starts or rejoins reads the pin, then the lines after it,
+and acts on nothing until that read succeeds. Each bot also keeps its own copy on disk
+(`state.dir`) as a cache and a backup, never as the truth. `/state@bot` shows the store as that
+bot sees it, and whether every bot's state hash agrees.
 
 Consistency without a server is design §1b: one owner per field, every write a compare-and-set
 stamped with the lease term, stale terms dropped on read, fail closed when the store cannot be
@@ -602,8 +618,10 @@ PHASE: <ref|L1> <phase>
 
 The admin does the same with `/topic #N`, `/link`, `/unlink` and `/phase`; `/topics` and the
 dashboard show each item and its phase ([COMMANDS.md](COMMANDS.md)). `ref-learning` is switched
-off by `state.links: registry`. GitHub keeps driving what it knows: a PR opened from an item
-moves it to `review`, green checks and an approval to `qa`, a merge or a close to `done`.
+off by `state.links: registry`. GitHub moves what it can see, and only that: a PR opened from an
+item moves it to `review`, a merge — or an issue closing — to `done` / `closed`, and a PR closed
+without a merge only marks the link `closed` and keeps its phase. Green checks plus an approval
+promoting an item to `qa` is **not** implemented yet; that stays the coordinator's `PHASE:` line.
 
 ### 11.4 General and Swarm pulse are transport-only
 
@@ -626,22 +644,25 @@ topic's recap is only the **seed** of a new session (first turn, or after a rota
 
 ### 11.6 Drift and rotation
 
-The drift ledger moves from each bot's local `drift-<alias>.json` into `agent/<alias>/stats` in
-the store, so the coordinator and the dashboard can read it. A violation is scored against the
-**session it happened in** and keeps counting for that session's life — there is no 6-hour
-window — and `resets_24h` only counts resets, so an agent that keeps drifting after one is flagged
-to the admin (3 or more a day). Other transports detect outcome kinds (a PR pushed for review
-while red, closed unmerged, changes requested and ignored, an assignment idle for two hours) and
-send a `DRIFT <alias> <kind> <evidence>` line in Swarm pulse; the agent's own transport records
-it. `/drift@bot` shows the ledger.
+The ledger stays local to each bot (`drift-<alias>.json`, plus the role guard's inbox), and each
+bot publishes `agent/<alias>/stats` — the score of every live session, `resets_24h`, the latest
+violations — so the coordinator and the dashboard can read every bot's. A violation is scored
+against the **session it happened in** and keeps counting for that session's life; the 6-hour
+window now covers only a row with no topic (the role guard's). `resets_24h` is only a count: an
+agent that keeps drifting after a reset is reported to the admin (3 or more a day).
 
-A **drift reset is a handover rotation**: the old session writes its handover, the transport puts
-the registry's facts (links, phases, assignments, the lease) on top of it — they win over the
-handover's own claims — and the new session starts from the rulebook, the rules it broke, those
-facts and the handover. If no handover comes, the transport builds one from the registry and the
-topic's recent messages. A session is also rotated at the profile's **age and turn limits**
-(`max_age_hours`, `max_turns`, published from `adapter.session_turn_limit`), planned between
-turns, never mid-task, and the admin can force one with `/rotate@bot`.
+A **drift reset is a handover rotation** — score ≥ 6, or two hard violations: the transport asks
+the adapter to rotate that topic's session, the old one writes the handover, and the new one
+starts from its rulebook, the rules it broke and the registry's facts about the topic. An adapter
+that cannot rotate has the session forgotten instead, and the next turn re-reads the rulebook
+from the topic's recap. Session **turn and token limits** are the adapters' own
+(`adapter.session_turn_limit`, `adapter.session_token_limit`), not the transport's.
+
+Still to come, and not to be relied on today: age rotation from `max_age_hours` (nothing
+publishes it to the profile, so only the dashboard's rotation-due badge reads it), the outcome
+kinds (`claimed_ready_while_red`, `pr_closed_unmerged`, `review_ignored`, `stalled_assignment`),
+the `DRIFT` line another transport sends, and `/rotate@bot`. The kinds the ledger records today
+are the ones the transport itself checks, and `/drift@bot` shows them.
 
 ### 11.7 The flags
 
@@ -653,7 +674,7 @@ that drifts from the code fails the suite.
 |---|---|---|---|---|
 | `state.backend` | `off` | `off`, `telegram` | 1 | The shared state store: the op log and the pinned snapshot in Swarm pulse. |
 | `state.mode` | `shadow` | `shadow` | 1 | The store runs beside today's logic and nothing acts on it. |
-| `state.heartbeat_minutes` | `10` | seconds > 0 | 1 | How often each bot writes its heartbeat key, and the snapshot's ceiling. |
+| `state.heartbeat_minutes` | `10` | minutes > 0 | 1 | How often each bot writes its heartbeat key, and the registry beat the lease holder runs. |
 | `state.dir` | `unset` | a path | 1 | Where this bot keeps its own state files (the store's cache, sessions, the topic map). |
 | `state.lease` | `shadow` | `shadow`, `store` | 3 | `store`: the store's lease is the coordinator lease (`bus.transport: telegram` made it possible). |
 | `state.owed` | `shadow` | `shadow`, `store` | 3 | `store`: the owed / `WAIT` table lives in the store, and nothing goes to gitbus. |
@@ -662,8 +683,10 @@ that drifts from the code fails the suite.
 | `state.links` | `legacy` | `legacy`, `registry` | 5 | `registry`: a notification's topic comes from the item's links, not from ref-learning. |
 | `state.routing` | `legacy` | `legacy`, `registry` | 6 | `registry`: the transport routes from the registry (§11.2), not each bot's mention rules. |
 | `adapter.type` | `echo` | any adapter, `claude_thread` for Claude | 7 | `claude_thread`: one resumable session per topic, like the other adapters. |
-| `adapter.session_turn_limit` | `unset` | turns > 0 | 7 | Turns a topic's session may run before it hands over to a new one. |
+| `adapter.session_turn_limit` | `unset` | turns > 0 | 7 | Turns a topic's session may run before the adapter hands over to a new one. |
 | `adapter.session_token_limit` | `unset` | tokens > 0 | 7 | Input tokens a resumed session may reach before the next turn starts a new one. |
+
+The snapshot's own cadence (900 s, or 25 ops) is a constant in the code, not a setting.
 
 ## Peer liveness: pulse and DOWN (issue #82)
 
