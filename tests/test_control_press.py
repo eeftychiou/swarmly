@@ -1602,12 +1602,14 @@ class TestTheControlsThatChangeTheSwarm(unittest.TestCase):
         self.assertTrue(channel.lessons.clear.called)
 
     def test_memory_cannot_be_cleared_from_another_bots_card(self):
+        """#351: refused at the first press, so no confirm code is minted for a dead press."""
         channel = self.channel()
         channel.lessons = mock.Mock()
-        done = self.confirm(channel, action="bot.memory", target="Codex")
-        self.assertFalse(done["ok"])
-        self.assertEqual(done["refused"], cp.ACTION_REFUSED)
-        self.assertIn("own", done["text"])               # the one SELF_ONLY refusal
+        asked = self.ask(channel, action="bot.memory", target="Codex")
+        self.assertFalse(asked["ok"])
+        self.assertEqual(asked["refused"], cp.ACTION_REFUSED)
+        self.assertIn("own", asked["text"])               # the one SELF_ONLY refusal
+        self.assertNotIn("confirm", asked)                # and nothing to tap
         self.assertFalse(channel.lessons.clear.called)
 
 
@@ -1799,9 +1801,29 @@ class TestAPickForAnotherBot(unittest.TestCase):
         self.assertEqual(answer["refused"], cp.ACTION_REFUSED)
         channel.lessons = mock.Mock()
         asked = self.ask(channel, action="bot.memory", target="Hermes")
-        self.assertEqual(self.ask(channel, code=asked["confirm"])["refused"],
-                         cp.ACTION_REFUSED)
+        self.assertEqual(asked["refused"], cp.ACTION_REFUSED)   # before a code is minted (#351)
+        self.assertNotIn("confirm", asked)
         self.assertFalse(channel.lessons.clear.called)
+
+    def test_a_bare_memory_press_for_a_peer_never_mints_a_code(self):
+        """#351: a hand-typed ``ctl:bot.memory:<peer>`` was answered with a second-tap code.
+
+        The clear never ran for a peer, so the code was a dead end: the press is refused by
+        the policy now, before anything is pending, and this bot's own file is untouched.
+        """
+        channel = named_bot("Claudebot", peers={"Hermes": "HermesBot"})
+        live(channel, "Hermes")
+        channel.lessons = mock.Mock()
+        text = run(channel.handle_control_press(press("ctl:bot.memory:Hermes")))
+        self.assertIn("own", text)
+        self.assertIn("Hermes", text)
+        policy = channel.control_policy()
+        self.assertEqual(policy._pending, {})              # nothing to tap twice
+        self.assertFalse(channel.lessons.clear.called)
+        # This bot's own file still clears, so the guard refuses the peer and not the action.
+        own = run(channel.handle_control_press(press("ctl:bot.memory:Claudebot")))
+        self.assertNotIn("own", own)
+        self.assertTrue(policy._pending)                   # the second tap is offered, as before
 
 
 class TestEveryConfirmingControlAsksTwice(unittest.TestCase):

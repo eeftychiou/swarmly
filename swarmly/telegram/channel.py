@@ -4848,8 +4848,7 @@ class AgentChannel:
 
     def own_target(self, target: str) -> bool:
         """Whether a press names this bot (or nobody): the only bot its own picks can change."""
-        who = str(target or "").strip().lstrip("@").lower()
-        return who in ("", "self", str(self.config.identity.alias).strip().lower())
+        return control_mod.names_self(target, self.config.identity.alias)
 
     def peer_state(self, alias: str) -> str:
         """One known bot's state as its own beat last reported it, or ``""`` when unknown.
@@ -4909,13 +4908,9 @@ class AgentChannel:
         then write a note naming Codex. The note path is value-blind, so no re-route could put
         it right: the press is refused, in words, before anything changes.
         """
-        if not control_mod.self_only(action) or self.own_target(target):
-            return
-        found = control_mod.control(action)
-        label = found.label if found else action
-        raise ControlRefused(
-            f"{label} is {self.config.identity.alias}'s own: a press for {target} would change "
-            f"the bot that answers, not that one")
+        said = control_mod.peer_self_only(action, target, self.config.identity.alias)
+        if said:
+            raise ControlRefused(said)
 
     async def _apply_pick(self, action: str, value: str, target: str = "",
                           presser: str = "", via: str = "") -> str:
@@ -4990,6 +4985,7 @@ class AgentChannel:
             return existing
         policy = PressPolicy(admin_id=self.config.identity.admin_user_id,
                              available=self.control_actions(),
+                             alias=self.config.identity.alias,
                              code=lambda: secrets.token_hex(2))
         self._control_policy = policy
         return policy

@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from swarmly.telegram.control import control as lookup, is_picker
+from swarmly.telegram.control import control as lookup, is_picker, peer_self_only
 
 #: The callback-data prefix. Every button this module handles starts with it, so a callback
 #: from anything else on the bot's keyboard is ignored rather than parsed.
@@ -224,6 +224,10 @@ class PressPolicy:
     #: The controls this build can actually carry out. Anything else is refused as unknown,
     #: so a button is never shown (or run) for an action the transport cannot perform.
     available: Tuple[str, ...] = ()
+    #: This bot's own alias, so a press naming a *peer* can be refused while the press is
+    #: still being decided -- before a confirm code is minted for something that cannot run
+    #: (#351). Empty when the caller names nobody, and then no target counts as a peer's.
+    alias: str = ""
     _pending: Dict[str, _Pending] = field(default_factory=dict)
 
     # -- the policy --------------------------------------------------------------------
@@ -246,6 +250,13 @@ class PressPolicy:
             return Decision(REFUSED, command=command, reason=UNKNOWN,
                             text=f"There is no control {command.action!r} here.",
                             action=command.action)
+        said = peer_self_only(command.action, command.target, self.alias)
+        if said:
+            # This bot's own runtime, aimed at a peer: refused *here*, before a code is minted
+            # (#351). It is refused again where the control runs, so a code minted before this
+            # rule still cannot carry it out -- but the page is never handed a dead code.
+            return Decision(REFUSED, command=command, reason=ACTION_REFUSED,
+                            action=command.action, target=command.target, text=said)
         if command.value:
             # A picked value *changes* something (a model, an effort, a role), so it always
             # asks for the second tap, whatever the bare control's own rule is (#153).

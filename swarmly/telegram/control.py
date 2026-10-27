@@ -159,6 +159,28 @@ def self_only(action: str) -> bool:
     return str(action) in SELF_ONLY
 
 
+def names_self(target: str, alias: str) -> bool:
+    """Whether a press's *target* names the bot it lands on (or nobody at all)."""
+    who = str(target or "").strip().lstrip("@").lower()
+    return who in ("", "self", str(alias or "").strip().lower())
+
+
+def peer_self_only(action: str, target: str, alias: str) -> str:
+    """The words refusing a self-only press that names a peer, or ``""`` when it may run (#351).
+
+    One place says it, because two do: the press *policy* refuses it before a confirm code is
+    minted (#351 -- a bare ``ctl:bot.memory:<peer>`` used to reach the second tap and be refused
+    only there, so the page was handed a code for something that could never run), and the
+    transport refuses it again where it runs, for a code that was minted before this rule.
+    """
+    if not self_only(action) or not str(target or "").strip() or names_self(target, alias):
+        return ""
+    found = control(action)
+    label = found.label if found else action
+    return (f"{label} is {alias}'s own: a press for {target} would change the bot that "
+            f"answers, not that one")
+
+
 #: The controls the page may aim at **another bot**: its model and its reasoning effort (#373).
 #: The press does not change anything where it lands -- it travels as one ``CONTROL`` note
 #: naming that bot and the value, and only that bot applies it, through its own ``/model`` and
