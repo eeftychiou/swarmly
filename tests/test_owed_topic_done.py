@@ -224,6 +224,39 @@ class TestTheAdminClosesARow(unittest.TestCase):
         self.assertEqual(len(open_ids(store)), 1)
 
 
+class TestABareOwedCloseIsRouted(unittest.TestCase):
+    """Through ``should_respond``, as the bots receive it: a handler test alone passed while
+    every bot dropped "/owed close @Codex" as addressed to Codex (live, 27 Oct)."""
+
+    def admin(self, text, thread_id=307):
+        return event(text, author_id=ADMIN_ID, username="admin", is_bot=False,
+                     thread_id=thread_id)
+
+    def deliver(self, channel, text):
+        routed, _why = channel.should_respond(self.admin(text))
+        return channel._handle_command(self.admin(text)) if routed else None
+
+    def test_the_coordinator_answers_a_close_that_names_a_debtor(self):
+        for text in ("/owed close @Codex", "/owed close @CodexBot", "/owed close Codex",
+                     "/owed CLOSE @Codex"):
+            other = handoff(debtor="Antigravity")
+            channel, store = channel_with([handoff(), other], {})
+            channel._answers_for_swarm = lambda: True
+            reply = self.deliver(channel, text)
+            self.assertIn("Closed 1", reply or "", text)
+            self.assertEqual(open_ids(store), [other.id], text)
+
+    def test_the_bot_it_names_does_not_take_it_as_a_turn(self):
+        channel, store = channel_with([handoff()], {})
+        channel._answers_for_swarm = lambda: False
+        channel.config.identity.name = "CodexBot"
+        channel.config.identity.alias = "Codex"
+        channel.config.peers = {"Hermes": "HermesBot", "Antigravity": "AntigravityBot"}
+        routed, why = channel.should_respond(self.admin("/owed close @CodexBot"))
+        self.assertFalse(routed, why)
+        self.assertEqual(len(open_ids(store)), 1)
+
+
 class TestTheFacts(unittest.TestCase):
 
     def test_finished_needs_a_time_and_the_place(self):

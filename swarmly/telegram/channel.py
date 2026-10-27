@@ -166,6 +166,17 @@ def _closes_owed(text: str) -> bool:
     return bool(words) and words[0].lower() == "close"
 
 
+#: Text quoted rather than said: a code span or fence, or a slash command's arguments to the
+#: end of its line.
+_QUOTED = re.compile(r"```.*?```|`[^`\n]*`|(?:^|(?<=\s))/[a-z_]+(?:@\w+)?[^\n]*",
+                     re.DOTALL | re.IGNORECASE)
+
+
+def _quoted_spans(text: str) -> List[Tuple[int, int]]:
+    """``(start, end)`` of each quoted stretch of *text*: an @name there is not an address."""
+    return [match.span() for match in _QUOTED.finditer(text or "")]
+
+
 def _local_revision() -> str:
     """Best-effort short git revision of the checkout this process runs from.
 
@@ -1236,6 +1247,15 @@ class AgentChannel:
                             event.cooldown_left = min_cooldown - elapsed
                         return False, f"cooldown active ({elapsed:.1f}s < {min_cooldown}s)"
 
+        # "/owed close @Codex" names the debtor, not a bot to ask: the @name is an argument. So
+        # the coordinator answers it and the bot it names does not take it as a turn (live,
+        # 27 Oct: every bot read it as addressed to Codex, so nobody closed anything).
+        if (command is not None and command[0] == "owed" and not command[1]
+                and not event.author_is_bot and _closes_owed(text)):
+            if self._answers_for_swarm():
+                return True, "a bare /owed close; this bot coordinates"
+            return False, "a bare /owed close is the coordinator's"
+
         if event.replies_to_bot:
             return True, "reply to this bot"
 
@@ -1893,12 +1913,6 @@ class AgentChannel:
             command_args(event.text or ""),
             is_admin=self.config.is_admin(event.author_id), chat_id=event.chat_id,
             thread_id=event.thread_id, author_id=event.author_id)
-
-    def _answers_for_swarm(self) -> bool:
-        """A bare swarm-wide command (``/cleanup``) is answered by one bot: the store's
-        lease holder -- the coordinator."""
-        store = self.state_link.store
-        return bool(store is not None and store.ready and store.holds_lease())
 
     async def _transport_command(self, event: ChannelEvent) -> Optional[str]:
         """A command answered by the transport: /cleanup first (it awaits), then the rest."""
@@ -3073,15 +3087,23 @@ class AgentChannel:
             return body
         covers = self.stand_ins()
         notes: List[str] = []
+        quoted = _quoted_spans(body)
         for alias in sorted(unreachable):
             handle = str(self.config.peers.get(alias, "") or "").lstrip("@")
             if not handle or alias == self.config.identity.alias:
                 continue
             pattern = re.compile(rf"@(?:{re.escape(handle)}|{re.escape(alias)})\b",
                                  re.IGNORECASE)
-            if not pattern.search(body):
+            # A name inside code or as a command's argument ("/owed close @Codex") is quoted,
+            # not addressed (live, 27 Oct: discussing that command cost every bot two hard
+            # violations and a session reset, and rewrote the quoted command).
+            hits = [m for m in pattern.finditer(body)
+                    if not any(start <= m.start() < end for start, end in quoted)]
+            if not hits:
                 continue
-            body = pattern.sub(alias, body)                # named, not woken
+            for m in reversed(hits):                       # named, not woken
+                body = body[:m.start()] + alias + body[m.end():]
+            quoted = _quoted_spans(body)
             why = blocked[str(alias).strip().lower()]
             line = f"⛔ Not delivered to {alias}: {why}."
             cover = covers.get(alias)

@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A bare `/owed close @Codex` from the admin is answered by the coordinator (`#388`). Every bot
+  read the `@Codex` as an address, so the coordinator left it to Codex and Codex left it to the
+  coordinator, and nothing closed. The coordinator now answers it, and the bot it names does
+  not take it as a turn. The same-named method that shadowed `_answers_for_swarm` is gone.
+- Quoting a frozen peer's name is not addressing it (`#388`). A `@name` inside code, or as a
+  slash command's argument, is no longer taken out of the reply or charged as
+  `addressed_frozen_peer`. Discussing `/owed close @Codex` while Codex was out of quota cost
+  each bot two hard violations and a session reset, and rewrote the quoted command.
 - `/owed close` says what it does with a second name (`#384`). `/owed close @A @B` scoped to the
   first name and said nothing about the rest, so the close read as if both had been used; the
   reply now adds "only the first name is used; ignored: @B". `docs/telegram/COMMANDS.md` shows

@@ -190,6 +190,27 @@ class ChannelEnforcementTests(unittest.TestCase):
         self.assertIn("@ReasonixBot", posted)                       # the stand-in is
         self.assertEqual([r.kind for r in channel.drift.live()], ["addressed_frozen_peer"])
 
+    def test_a_quoted_name_is_not_an_address(self):
+        """Live, 27 Oct: bots discussing "/owed close @Codex" while Codex was frozen were each
+        charged hard violations and reset, and the quoted command lost its @."""
+        channel, _ = self.channel("Use `@AntigravityBot` here, or send\n"
+                                  "/owed close @AntigravityBot")
+        run(channel.handle_event(event("@HermesBot how do I clear it?", thread_id=9400,
+                                       message_id=41)))
+        posted = channel._test_sender.sent[-1]["text"]
+        self.assertIn("/owed close @AntigravityBot", posted)
+        self.assertNotIn("Not delivered", posted)
+        self.assertEqual(channel.drift.live(), [])
+
+    def test_an_address_beside_a_quote_is_still_refused(self):
+        channel, _ = self.channel("@AntigravityBot please QA it: `/owed close @AntigravityBot`")
+        run(channel.handle_event(event("@HermesBot go", thread_id=9400, message_id=42)))
+        posted = channel._test_sender.sent[-1]["text"]
+        self.assertIn("Antigravity please QA", posted)               # the address: refused
+        self.assertNotIn("@AntigravityBot please", posted)
+        self.assertIn("/owed close @AntigravityBot", posted)          # the quote: kept
+        self.assertEqual([r.kind for r in channel.drift.live()], ["addressed_frozen_peer"])
+
     def test_the_sender_is_told_in_its_own_token_space_once(self):
         """Admin, 24 Oct: the refusal reaches the sender as a turn, and it takes corrective
         action -- but a sender that repeats itself is not woken in a loop."""
