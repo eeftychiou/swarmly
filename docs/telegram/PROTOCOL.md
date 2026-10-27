@@ -542,6 +542,129 @@ A participant conforms to v1.1 if it:
 - [ ] carries its round state as a `ROUND_STATE` block that is stripped before posting (§7)
 - [ ] turns a promise to act later into a `WAIT` line in the same turn (§8)
 
+---
+
+## 11. The topic registry (phases 3–8, landed behind flags)
+
+The transport keeps a **registry**: one record per topic, holding its links, its work items with
+their phases and assignees, and the agents linked to it with their role, model and session. It
+routes from that record instead of from mention heuristics. The design is
+[`docs/design/topic-registry.md`](../design/topic-registry.md) §1–4; this section is what a
+conforming transport does, and the flag each part is switched by.
+
+**Every behaviour below ships behind its flag, and the legacy path is still the default today.**
+A config that sets none of the flags behaves exactly as it did before §11 existed. Phase 9 (§6
+of the design) makes the `on` values the defaults and removes the legacy code.
+
+### 11.1 The shared state store
+
+`state.backend: telegram` turns the store on. The op log is the **📡 Swarm pulse** topic — one
+`STATE <key> v<base>→v<new> t<term> <change>` line per write — and the snapshot is a JSON file
+attached to a pinned message there, re-posted and re-pinned at least every
+`state.heartbeat_minutes`. A bot that starts or rejoins reads the snapshot first and applies the
+`STATE` lines after it, and acts on nothing until that read succeeds. Each bot also keeps its own
+copy on disk (`state.dir`) as a cache and a backup, never as the truth. `/state@bot` shows the
+store as that bot sees it, and whether every bot's state hash agrees.
+
+Consistency without a server is design §1b: one owner per field, every write a compare-and-set
+stamped with the lease term, stale terms dropped on read, fail closed when the store cannot be
+reached. The store replaces gitbus for the lease (`state.lease: store`) and the owed / `WAIT`
+table (`state.owed: store`), and `bus.transport: telegram` drops gitbus altogether — the durable
+plane is then the store, and it needs `state.backend: telegram`.
+
+### 11.2 Routing from the registry
+
+With `state.routing: registry` (default `legacy`) the transport, not each bot's mention rules,
+decides who takes a message in a work topic: the **coordinator** (the lease holder) takes every
+message that is not addressed only to other agents; another **linked** agent takes one only when
+it names it, replies to it, or hands it work (an `ASSIGN:` line); a mention of an **unlinked**
+agent links it when the author is the coordinator or the admin, and is refused with a transport
+notice otherwise. A peer bot's unaddressed post does not wake the coordinator (that would
+ping-pong); it stays out of a message addressed to agents that will take it; a reply to a bot
+addresses that bot; `@all` reaches linked agents only. Each recipient's turn runs in **that
+agent's session for this topic**, queued when busy (§8). Swarm pulse and closed topics are never
+routed from the registry, and a mention alone never opens a topic record.
+
+### 11.3 Work items, links and phases
+
+A **link** is a pointer to wherever the work lives — GitHub, GitLab, Google Drive or another
+cloud, a local path, or nothing at all (`provider: topic`: the topic is its own work item) — with
+a `role` (`tracking`, `work`, `reference`) and, for `work`, a `status`, a `phase`, and its
+assignees. A link is added explicitly, never guessed from what was said in the chat; that is what
+replaces ref-learning. The coordinator writes it with lines in its reply, the transport records
+them in the registry and does not post them:
+
+```
+LINK: <ref> [as work|reference|tracking] [— title]
+ASSIGN: @bot <ref|L1> as <role>
+PHASE: <ref|L1> <phase>
+```
+
+The admin does the same with `/topic #N`, `/link`, `/unlink` and `/phase`; `/topics` and the
+dashboard show each item and its phase ([COMMANDS.md](COMMANDS.md)). `ref-learning` is switched
+off by `state.links: registry`. GitHub keeps driving what it knows: a PR opened from an item
+moves it to `review`, green checks and an approval to `qa`, a merge or a close to `done`.
+
+### 11.4 General and Swarm pulse are transport-only
+
+With `limits.general_turns: never` **no model turn ever runs in General or 📡 Swarm pulse**.
+Work a person types in General gets a topic of its own: the transport creates the record, links
+the coordinator, delivers the request there and answers in General with one line. A reply is
+always posted in the topic of its turn and is never moved by the items it names. Transport posts
+(status, online and deploy notices, refusals, admin command answers) and admin commands stay in
+General, as do pulses and the pinned dashboard in Swarm pulse; nothing from token space — a
+reply, a brief, a report-back, a peer's answer — is posted there. That is why a work exchange
+that starts in General moves to its topic first.
+
+### 11.5 One session per (topic, agent)
+
+Every adapter keeps **one session per topic**, keyed by the topic's context id, and its id lives
+in the registry's binding for that agent: Reasonix and Antigravity as before, Codex's thread as
+before, and Claude on `claude_thread` (one resumable `--resume` session per topic) instead of a
+fresh `claude -p` per turn. A session is retired when its topic closes and when it is rotated; the
+topic's recap is only the **seed** of a new session (first turn, or after a rotation).
+
+### 11.6 Drift and rotation
+
+The drift ledger moves from each bot's local `drift-<alias>.json` into `agent/<alias>/stats` in
+the store, so the coordinator and the dashboard can read it. A violation is scored against the
+**session it happened in** and keeps counting for that session's life — there is no 6-hour
+window — and `resets_24h` only counts resets, so an agent that keeps drifting after one is flagged
+to the admin (3 or more a day). Other transports detect outcome kinds (a PR pushed for review
+while red, closed unmerged, changes requested and ignored, an assignment idle for two hours) and
+send a `DRIFT <alias> <kind> <evidence>` line in Swarm pulse; the agent's own transport records
+it. `/drift@bot` shows the ledger.
+
+A **drift reset is a handover rotation**: the old session writes its handover, the transport puts
+the registry's facts (links, phases, assignments, the lease) on top of it — they win over the
+handover's own claims — and the new session starts from the rulebook, the rules it broke, those
+facts and the handover. If no handover comes, the transport builds one from the registry and the
+topic's recent messages. A session is also rotated at the profile's **age and turn limits**
+(`max_age_hours`, `max_turns`, published from `adapter.session_turn_limit`), planned between
+turns, never mid-task, and the admin can force one with `/rotate@bot`.
+
+### 11.7 The flags
+
+Every flag named in this section, as it stands today. `tests/test_docs_registry_flags.py` reads
+this table and checks each default against `swarmly/telegram/config.py`, so a documented default
+that drifts from the code fails the suite.
+
+| Setting | Default today | Values | Phase | What it switches |
+|---|---|---|---|---|
+| `state.backend` | `off` | `off`, `telegram` | 1 | The shared state store: the op log and the pinned snapshot in Swarm pulse. |
+| `state.mode` | `shadow` | `shadow` | 1 | The store runs beside today's logic and nothing acts on it. |
+| `state.heartbeat_minutes` | `10` | seconds > 0 | 1 | How often each bot writes its heartbeat key, and the snapshot's ceiling. |
+| `state.dir` | `unset` | a path | 1 | Where this bot keeps its own state files (the store's cache, sessions, the topic map). |
+| `state.lease` | `shadow` | `shadow`, `store` | 3 | `store`: the store's lease is the coordinator lease (`bus.transport: telegram` made it possible). |
+| `state.owed` | `shadow` | `shadow`, `store` | 3 | `store`: the owed / `WAIT` table lives in the store, and nothing goes to gitbus. |
+| `bus.transport` | `git` | `git`, `folder`, `gdrive`, `telegram` | 3 | `telegram`: gitbus is off; the store is the durable plane (needs `state.backend: telegram`). |
+| `limits.general_turns` | `allow` | `allow`, `never` | 4 | `never`: no model turn in General or Swarm pulse; work typed there gets its own topic. |
+| `state.links` | `legacy` | `legacy`, `registry` | 5 | `registry`: a notification's topic comes from the item's links, not from ref-learning. |
+| `state.routing` | `legacy` | `legacy`, `registry` | 6 | `registry`: the transport routes from the registry (§11.2), not each bot's mention rules. |
+| `adapter.type` | `echo` | any adapter, `claude_thread` for Claude | 7 | `claude_thread`: one resumable session per topic, like the other adapters. |
+| `adapter.session_turn_limit` | `unset` | turns > 0 | 7 | Turns a topic's session may run before it hands over to a new one. |
+| `adapter.session_token_limit` | `unset` | tokens > 0 | 7 | Input tokens a resumed session may reach before the next turn starts a new one. |
+
 ## Peer liveness: pulse and DOWN (issue #82)
 
 Every transport publishes a heartbeat every `limits.heartbeat_minutes` (default 2). By default

@@ -55,9 +55,18 @@ Telegram remains for direct, low-latency coordination.
 gitbus in its own repository (`.agents/inbox/` on that repository's default branch — the ref
 transports actually read; default `origin/main`). This
 repository's bus carries Swarmly development only — other projects consume the Swarmly
-*library* and operate their own bus. Every transport must set `bus.repo` (or the older
-`fallback.gitbus_root`) to the repository whose bus it reads: there is no default, and
-without it nothing is polled.
+*library* and operate their own bus. Where a gitbus is used, every transport must set
+`bus.repo` (or the older `fallback.gitbus_root`) to the repository whose bus it reads: there is
+no default, and without it nothing is polled.
+
+**gitbus is optional (`bus.transport: telegram`).** The transport's own registry — topics, links,
+work items and phases, the lease and the owed table — can live in the Telegram state store
+instead, so a swarm needs no bus repository. That takes `state.backend: telegram` (the op log and
+the pinned snapshot in 📡 Swarm pulse) plus `bus.transport: telegram`; `state.lease: store` and
+`state.owed: store` move the lease and the owed / `WAIT` table there, and `state.dir` names the
+folder where each bot keeps its own copy (unset: beside `config.yaml`). `bus.repo` is then unset
+and nothing is polled on git. No flag is on by default yet; the list, with each default today,
+is [`docs/telegram/PROTOCOL.md` §11](docs/telegram/PROTOCOL.md#117-the-flags).
 
 **Topic-to-project routing.** Agents configure `projects:` in `config.yaml` to bind
 Telegram forum topics (by numeric topic id) to project repositories and checkouts (with
