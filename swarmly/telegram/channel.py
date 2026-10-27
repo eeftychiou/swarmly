@@ -332,6 +332,13 @@ _NO_DROP_NOTICE_REASONS = frozenset({
     "built-in command reply from peer bot (machine traffic)",
     "terminal acknowledgment/sign-off from peer bot (no reply needed)",
 })
+#: Why a peer's message in General or Swarm pulse got no turn when the place is transport-only
+#: (#327). It reads as the middle of the drop notice's sentence, and it is deliberately *not* in
+#: `_NO_DROP_NOTICE_REASONS`: a hand-off dropped by the gate is exactly the silence that reads
+#: as a taken job, so the sender hears it like any other dropped mention (#27).
+GENERAL_GATE_REASON = ("this bot takes no turns in General or Swarm pulse on this host "
+                       "(limits.general_turns: never)")
+
 #: One drop notice per reason per topic per window: a peer that keeps naming this bot in the
 #: same dropped shape hears it once, not once per message.
 DROP_NOTICE_SECONDS = 600.0
@@ -931,6 +938,20 @@ class AgentChannel:
         if username and re.search(rf"(?i)@{re.escape(username)}\b", text):
             return True
         return False
+
+    def _machine_traffic(self, event: ChannelEvent) -> bool:
+        """A peer's notice, command answer or sign-off: it never asked for a turn (#27).
+
+        The same three shapes `should_respond` filters -- read here as well, because a gate
+        that drops a message before that decision would otherwise answer machine traffic with
+        a drop notice of its own (#327).
+        """
+        text = event.text or ""
+        if not text:
+            return True
+        prose = machine_prose(text)
+        return (prose.startswith(_NOTICE_PREFIXES) or is_command_reply(text)
+                or is_terminal_peer_ack(prose))
 
     def _dropped_handles(self, text: str) -> List[str]:
         """The handles in *text* by which its author named this bot (issue #27).
@@ -10495,6 +10516,12 @@ class AgentChannel:
         if event.author_is_bot:
             logger.info("general gate: no turn for @%s's message in %s",
                         event.author_username, where)
+            # #327: the drop is said to the sender, like any other dropped mention (#27). The
+            # gate used to return "" here, so a peer's hand-off that passed `should_respond`
+            # vanished with only a log line its author cannot read -- and a lost hand-off that
+            # looks taken is what the notice exists to prevent.
+            if not self._machine_traffic(event):
+                await self._mention_drop_notice(event, GENERAL_GATE_REASON)
             return ""
         if where != "General":
             logger.info("general gate: no turn in %s", where)
