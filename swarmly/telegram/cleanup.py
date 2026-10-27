@@ -32,6 +32,7 @@ choices, pending hand-offs, the name cache) and posts one machine
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from dataclasses import dataclass
@@ -50,26 +51,58 @@ DELETE_BATCH = 100
 FINISHED_IDLE_SECONDS = 3600.0
 #: Bound on the ledger: a chat's recorded ids are trimmed to the newest of these.
 LEDGER_MAX_PER_CHAT = 2000
+#: The one-at-a-time fallback is one Bot API call per id: Telegram takes about 30 messages a
+#: second, so it pauses between calls (#398).
+SINGLE_DELETE_PAUSE = 0.05
+#: And it asks about at most this many ids per sweep, so one call never blocks for a minute;
+#: the rest waits for the next tick (or the next /cleanup).
+SINGLE_DELETE_MAX = 200
 
 
-async def delete_message_ids(host: Any, chat_id: int,
-                             ids: Sequence[int]) -> Tuple[List[int], List[int]]:
-    """Delete ``ids`` in Telegram's 100-per-call batches: (deleted, refused).
+class DeleteUnavailable(Exception):
+    """Telegram could not be asked about the ids at all -- flood control, a network blip, a
+    server error -- so they are neither deleted nor refused: they must stay offered for the
+    next sweep instead of being forgotten as though Telegram had refused them (#398)."""
+
+
+async def delete_message_ids(host: Any, chat_id: int, ids: Sequence[int], *,
+                             sleep: Optional[Callable[[float], Any]] = None,
+                             pause: Optional[float] = None,
+                             limit: Optional[int] = None
+                             ) -> Tuple[List[int], List[int], List[int]]:
+    """Delete ``ids`` in Telegram's 100-per-call batches: (deleted, refused, unasked).
 
     ``deleteMessages`` is all-or-nothing: one id the bot cannot touch -- a peer's post in
     Swarm pulse, a message already gone -- refuses the whole call (#395, live 27 Oct: one
     such id in each batch meant the batch was dropped and the pulse kept growing). So a batch
     that does not fully go is asked again one id at a time, and only the ids Telegram really
     refused come back as refused: they are the ones to stop offering.
+
+    The fallback is one Bot API call per id, so it is paced (``pause``, default
+    :data:`SINGLE_DELETE_PAUSE`) and capped (``limit``, default :data:`SINGLE_DELETE_MAX`);
+    what it did not get to comes back as ``unasked`` and waits for the next sweep. A host
+    that raises :class:`DeleteUnavailable` was not answered by Telegram at all: that id and
+    everything after it are ``unasked`` too, never ``refused`` (#398).
     """
+    sleep = asyncio.sleep if sleep is None else sleep
+    pause = SINGLE_DELETE_PAUSE if pause is None else max(0.0, float(pause))
+    limit = SINGLE_DELETE_MAX if limit is None else max(0, int(limit))
+    ids = [int(i) for i in ids]
     deleted: List[int] = []
     refused: List[int] = []
+    unasked: List[int] = []
+    singles = 0
     for start in range(0, len(ids), DELETE_BATCH):
-        batch = [int(i) for i in ids[start:start + DELETE_BATCH]]
+        batch = ids[start:start + DELETE_BATCH]
         if not batch:
             continue
         try:
             got = int(await host.cleanup_delete_messages(chat_id, batch) or 0)
+        except DeleteUnavailable as exc:
+            logger.warning("could not ask Telegram to delete %d message(s) (%s); keeping them "
+                           "for the next sweep", len(ids) - start, exc)
+            unasked.extend(ids[start:])
+            return deleted, refused, unasked
         except Exception:                                  # noqa: BLE001 - ask per id below
             logger.exception("could not delete %d message(s)", len(batch))
             got = 0
@@ -79,14 +112,30 @@ async def delete_message_ids(host: Any, chat_id: int,
         if got > 0:                                        # a host that reports a prefix
             deleted.extend(batch[:got])
             batch = batch[got:]
-        for message_id in batch:
+        for position, message_id in enumerate(batch):
+            if singles >= limit:
+                # Capped, not refused: the rest waits for the next sweep.
+                unasked.extend(batch[position:])
+                unasked.extend(ids[start + DELETE_BATCH:])
+                return deleted, refused, unasked
+            if singles:
+                waited = sleep(pause)                      # one at a time: stay under ~30/s
+                if inspect.isawaitable(waited):
+                    await waited
+            singles += 1
             try:
                 ok = int(await host.cleanup_delete_messages(chat_id, [message_id]) or 0) > 0
+            except DeleteUnavailable as exc:
+                logger.warning("could not ask Telegram to delete message %s (%s); keeping it "
+                               "and the rest for the next sweep", message_id, exc)
+                unasked.extend(batch[position:])
+                unasked.extend(ids[start + DELETE_BATCH:])
+                return deleted, refused, unasked
             except Exception:                              # noqa: BLE001 - report, go on
                 logger.exception("could not delete message %s", message_id)
                 ok = False
             (deleted if ok else refused).append(message_id)
-    return deleted, refused
+    return deleted, refused, unasked
 
 
 @dataclass
@@ -312,13 +361,17 @@ class Cleanup:
 
     def __init__(self, host: Any, ledger: GeneralLedger, *, handle: str = "",
                  keep: Sequence[int] = (), clock: Callable[[], float] = time.time,
-                 idle_seconds: float = FINISHED_IDLE_SECONDS) -> None:
+                 idle_seconds: float = FINISHED_IDLE_SECONDS,
+                 sleep: Optional[Callable[[float], Any]] = None) -> None:
         self.host = host
         self.ledger = ledger
         self.handle = handle
         self.keep = {int(t) for t in keep if isinstance(t, int) and not isinstance(t, bool)}
         self._clock = clock
         self.idle_seconds = float(idle_seconds)
+        #: The pause between the one-at-a-time deletes (the transport's own sleeper, so a test
+        #: costs no wall time).
+        self._sleep = sleep
 
     # -- the command ---------------------------------------------------------------------
 
@@ -438,16 +491,21 @@ class Cleanup:
         if not ids:
             return (f"{self._me()}: no General message this bot can still delete (it reaches "
                     "only its last 48h).")
-        deleted, refused = await delete_message_ids(self.host, chat_id, ids)
-        # Both are settled: what went is gone, what Telegram refused can never be this bot's
-        # to delete, so neither is offered again (#395).
+        deleted, refused, unasked = await delete_message_ids(self.host, chat_id, ids,
+                                                             sleep=self._sleep)
+        # What went is gone and what Telegram refused can never be this bot's to delete: both
+        # are settled and neither is offered again (#395). What could not be *asked* about --
+        # throttled, offline -- is kept for the next /cleanup (#398).
         self.ledger.drop(chat_id, deleted + refused)
         said = (f"{self._me()}: deleted {len(deleted)} General message(s). Messages older "
                 "than 48h stay yours to remove by hand.")
         if refused:
-            said += (f" {len(refused)} the bot cannot delete (not its own, or already gone): "
+            said += (f" Telegram refused {len(refused)} (not this bot's, or already gone): "
                      + ", ".join(str(i) for i in refused[:10])
                      + ("…" if len(refused) > 10 else ""))
+        if unasked:
+            said += (f" {len(unasked)} could not be asked about (Telegram throttled or "
+                     "unreachable); they stay for the next /cleanup.")
         return said
 
     # -- helpers -------------------------------------------------------------------------

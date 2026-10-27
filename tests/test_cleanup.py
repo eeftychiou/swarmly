@@ -18,7 +18,8 @@ from tempfile import TemporaryDirectory
 from swarmly.telegram.adapters.base import load_state
 from tests.aio import run
 from swarmly.telegram.channel import AgentChannel, ChannelEvent
-from swarmly.telegram.cleanup import (FINISHED_IDLE_SECONDS, LEDGER_TTL_SECONDS, Cleanup,
+from swarmly.telegram.cleanup import (FINISHED_IDLE_SECONDS, LEDGER_TTL_SECONDS,
+                                      SINGLE_DELETE_MAX, Cleanup, DeleteUnavailable,
                                       GeneralLedger, TopicInfo)
 from swarmly.telegram.config import AgentConfig
 from swarmly.telegram.topics import TopicMap
@@ -43,6 +44,8 @@ class FakeHost:
         self.message_batches = message_batches      # None: every id goes; else per-batch count
         #: Ids Telegram will not delete: a whole batch holding one is refused (#395).
         self.refuse_messages = {int(i) for i in refuse_messages}
+        #: When set, every call raises as though Telegram never answered (#398).
+        self.unavailable = None
         self.protected = set(protected)
         self.deleted_topics = []
         self.deleted_messages = []
@@ -64,6 +67,8 @@ class FakeHost:
     async def cleanup_delete_messages(self, chat_id, ids):
         batch = [int(i) for i in ids]
         self.deleted_messages.append(batch)
+        if self.unavailable:
+            raise DeleteUnavailable(self.unavailable)
         if self.message_batches is not None:
             return self.message_batches.pop(0) if self.message_batches else 0
         if any(mid in self.refuse_messages for mid in batch):
@@ -87,9 +92,12 @@ class CleanupCase(unittest.TestCase):
         self.ledger_path = self.root / "state" / "general-hermes.json"
         self.ledger = GeneralLedger(self.ledger_path)
         self.now = NOW
+        #: The pauses between one-at-a-time deletes: recorded, never waited.
+        self.slept: list = []
 
     def cleanup(self, host, **kwargs) -> Cleanup:
         kwargs.setdefault("handle", "Hermes")
+        kwargs.setdefault("sleep", self.slept.append)
         return Cleanup(host, self.ledger, clock=lambda: self.now, **kwargs)
 
     def ask(self, cleanup, *words, is_admin=True):
@@ -181,12 +189,14 @@ class OtherFormTests(CleanupCase):
         self.assertIn("deleted 3 General message(s)", reply)
         self.assertEqual(self.ledger.recent(GROUP, NOW), [])
 
-    def test_general_stops_when_telegram_refuses_the_rest(self):
+    def test_a_batch_that_only_partly_goes_is_finished_one_id_at_a_time(self):
+        # The 100 are asked first; the 40 a prefix-reporting host took are kept, and the 70
+        # left are asked again one at a time (#398 nit: the old name said "stops").
         from swarmly.telegram.cleanup import DELETE_BATCH
         self.ledger.note(GROUP, list(range(1, DELETE_BATCH + 11)), now=NOW - HOUR)
         host = FakeHost(message_batches=[40])
         self.ask(self.cleanup(host), "general")
-        self.assertEqual(len(host.deleted_messages), 72)   # the 100 asked, then one by one
+        self.assertEqual(len(host.deleted_messages), 72)
 
     def test_one_undelatable_id_does_not_cost_the_others(self):
         # #395, live 27 Oct: the pulse recorded peers' posts as its own notices, and one id
@@ -196,9 +206,44 @@ class OtherFormTests(CleanupCase):
         reply = self.ask(self.cleanup(host), "general")
         self.assertEqual(host.deleted_messages[0], [5, 6, 7, 8])   # the batch first
         self.assertIn("deleted 3 General message(s)", reply)
-        self.assertIn("1 the bot cannot delete", reply)
+        self.assertIn("Telegram refused 1 (not this bot's, or already gone): 6", reply)
         # What went and what Telegram refused are both settled: neither is offered again.
         self.assertEqual(self.ledger.recent(GROUP, NOW), [])
+
+    def test_what_telegram_never_answered_is_kept_for_the_next_cleanup(self):
+        # #398: a 429 or a network blip is not a refusal -- dropping those ids would forget
+        # messages that are still perfectly deletable.
+        self.ledger.note(GROUP, [5, 6], now=NOW - HOUR)
+        host = FakeHost()
+        host.unavailable = "Flood control exceeded, retry in 30"
+        reply = self.ask(self.cleanup(host), "general")
+        self.assertIn("deleted 0 General message(s)", reply)
+        self.assertIn("2 could not be asked about", reply)
+        self.assertEqual(self.ledger.recent(GROUP, NOW), [5, 6])     # still offered
+        host.unavailable = None
+        self.assertIn("deleted 2 General message(s)", self.ask(self.cleanup(host), "general"))
+        self.assertEqual(self.ledger.recent(GROUP, NOW), [])
+
+    def test_the_one_at_a_time_fallback_pauses_between_calls(self):
+        # #398: the fallback is one Bot API call per id; unpaced it walked into ~30/s.
+        self.ledger.note(GROUP, [5, 6, 7], now=NOW - HOUR)
+        host = FakeHost(refuse_messages={6})
+        self.ask(self.cleanup(host), "general")
+        self.assertEqual(len(host.deleted_messages), 4)      # the batch, then one per id
+        self.assertEqual(len(self.slept), 2)                 # a pause between the three
+        self.assertTrue(all(pause > 0 for pause in self.slept))
+
+    def test_the_one_at_a_time_fallback_is_capped_and_the_rest_is_kept(self):
+        from swarmly.telegram.cleanup import DELETE_BATCH
+        # Three whole batches refused: the fallback would need 300 single calls, the cap
+        # stops it at SINGLE_DELETE_MAX and keeps the rest for the next /cleanup (#398).
+        ids = list(range(1, 3 * DELETE_BATCH + 6))
+        self.ledger.note(GROUP, ids, now=NOW - HOUR)
+        host = FakeHost(refuse_messages={mid for mid in ids if mid % DELETE_BATCH == 2})
+        reply = self.ask(self.cleanup(host), "general")
+        self.assertIn("could not be asked about", reply)     # capped, not refused
+        self.assertEqual(len(host.deleted_messages), 3 + SINGLE_DELETE_MAX)
+        self.assertEqual(len(self.ledger.recent(GROUP, NOW)), len(ids) - SINGLE_DELETE_MAX)
 
     def test_a_non_admin_gets_a_refusal_and_nothing_else(self):
         host = FakeHost([topic(10)])
