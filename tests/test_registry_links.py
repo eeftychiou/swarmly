@@ -283,11 +283,13 @@ class RoutingAndGitHubTests(unittest.TestCase):
             self.assertEqual(channel.topic_for_text("CI went red on #12"), (-100, 55), named)
             self.assertIsNone(channel.topic_for_text("CI went red on #99"), named)
 
-    def test_registry_links_need_the_store(self):
-        from swarmly.telegram.config import ConfigError
+    def test_the_links_flag_is_gone_and_never_an_error(self):
+        """#472: `state.links` no longer switches anything, so it cannot be a config error."""
         from tests.test_telegram_channel import make_config
-        with self.assertRaises(ConfigError):
-            make_config(state={"links": "registry"})
+        with self.assertLogs("swarmly.telegram.config", level="WARNING") as said:
+            config = make_config(state={"links": "registry"})
+        self.assertEqual(sum("state.links" in line for line in said.output), 1, said.output)
+        self.assertFalse(hasattr(config.state, "links"))
 
 
 class ReviewFixesTests(unittest.TestCase):

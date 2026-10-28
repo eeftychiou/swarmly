@@ -155,19 +155,11 @@ class StateLink:
         self.backend = str(getattr(settings, "backend", "off") or "off").lower()
         self.mode = str(getattr(settings, "mode", "shadow") or "shadow").lower()
         self.beat_seconds = 60.0 * float(getattr(settings, "heartbeat_minutes", 10) or 10)
-        #: Phase 3: "shadow" mirrors today's lease into the store and compares; "store" makes
-        #: the store's lease the coordinator lease (check_lease claims it; nothing mirrors).
-        self.lease_mode = str(getattr(settings, "lease", "shadow") or "shadow").lower() \
-            if self.backend == "telegram" else "off"
-        #: Phase 5: "registry" lets GitHub notices follow the topics' explicit links.
-        self.links_mode = str(getattr(settings, "links", "legacy") or "legacy").lower() \
-            if self.backend == "telegram" else "legacy"
-        #: Phase 6: "registry" lets the topic registry decide who takes a topic's messages.
-        routing = str(getattr(settings, "routing", "legacy") or "legacy").lower()
-        self.routing_mode = routing if self.backend == "telegram" else "legacy"
-        #: Phase 3: "store" makes the store the owed table (no gitbus documents).
-        owed = str(getattr(settings, "owed", "shadow") or "shadow").lower()
-        self.owed_mode = owed if self.backend == "telegram" else "off"
+        #: #472 (phase 9c): the store's lease, its owed table, the topics' links and the
+        #: registry's routing are the only behaviour -- there is no shadow or legacy side
+        #: left to name, so these are facts about the backend, not settings.
+        self.lease_mode = "store" if self.backend == "telegram" else "off"
+        self.owed_mode = "store" if self.backend == "telegram" else "off"
         self._last_github = float("-inf")
         #: When each work link (by its URL) was last asked about: the check's cap goes to the
         #: links asked about longest ago, so no link waits behind 30 that never close (review).
@@ -247,34 +239,17 @@ class StateLink:
         done = []
         try:
             await store.refresh()
-            holder_beat, refused = False, False
-            if self.lease_mode == "shadow" and self.channel.is_coordinator():
-                # Shadow: today's lease decides; the store's mirrors it.
-                holder_beat = True
-                lease = store.lease()
-                mine = K.norm(lease.holder or "") == store.alias
-                server = store.server_now()             # leases run on the log's clock
-                gitbus_term = int(getattr(self._cached_gitbus(), "term", 0) or 0)
-                if not mine or lease.expires_at - server < LEASE_TTL_SECONDS / 2 \
-                        or gitbus_term > lease.term:
-                    # The mirror follows gitbus's term, so a later switch to the store lease
-                    # carries on above the terms the round files already fence on.
-                    result = await store.claim_lease(LEASE_TTL_SECONDS, confirm=False,
-                                                     at_least=gitbus_term)
-                    refused = not result.applied
-                    done.append(f"lease {'refused' if refused else 'claimed'} "
-                                f"(term {store.lease().term})")
-            elif self.lease_mode == "store" and store.holds_lease():
+            holder_beat = False
+            if self.lease_mode == "store" and store.holds_lease():
                 holder_beat = True                      # check_lease renews the lease itself
             if holder_beat:
                 fresh = sum(1 for o in store.log.ops if o.pos > store.snapshot_pos)
                 due = (moment - self._last_snapshot >= SNAPSHOT_EVERY_SECONDS
                        or fresh >= SNAPSHOT_AFTER_OPS)
-                # A beat whose lease write was refused publishes nothing (review, #263).
-                if due and not refused and await store.publish_snapshot():
+                if due and await store.publish_snapshot():
                     self._last_snapshot = moment
                     done.append(f"snapshot to p{store.snapshot_pos}")
-                elif not refused and store.snapshot_message is None \
+                elif store.snapshot_message is None \
                         and await store.restore_from_cache():
                     self._last_snapshot = moment
                     done.append("snapshot restored")
@@ -303,18 +278,15 @@ class StateLink:
                         done.append("stats")
                 except Exception as exc:               # noqa: BLE001 - shadow: never fatal
                     logger.warning("state: stats sync failed: %s", exc, exc_info=True)
-                if self.owed_mode != "store":
-                    await self._owed_beat(store, moment, done)
                 rev = str(getattr(self.channel, "_running_revision", "") or "")
                 await store.write(K.probe(store.alias, "beat"),
                                   {"at": round(moment), "rev": rev[:12],
                                    "pos": store.log.last_pos, "hash": store.state_hash()})
                 self._last_beat = moment
                 done.append("beat")
-            if self.owed_mode == "store":
-                # The table itself: published every heartbeat, as gitbus pushed each row at
-                # once -- a debt must not wait out the state cadence to be seen.
-                await self._owed_beat(store, moment, done)
+            # The table itself: published every heartbeat, as gitbus pushed each row at once
+            # -- a debt must not wait out the state cadence to be seen.
+            await self._owed_beat(store, moment, done)
             self.error = ""
         except Exception as exc:                       # noqa: BLE001 - shadow: never fatal
             self.error = f"{type(exc).__name__}: {exc}"[:200]
@@ -886,32 +858,27 @@ class StateLink:
                        open_elsewhere: Optional[set] = None) -> list:
         """The rows this bot publishes under ``agent/<alias>/owed``.
 
-        Shadow: the rows it wrote, as it reads them today (a mirror for /state to compare).
-        Store: every row it *holds* -- its state directory, whoever wrote the row, so a close
+        Every row it *holds* -- its state directory, whoever wrote the row, so a close
         or a stall it records on a peer's row reaches everyone -- folded with what it published
         before, so a lost state directory never empties the table (review). Closed rows go
-        after a day, unless another key still holds them open."""
+        after a day, unless another key still holds them open. #472: the store is the only
+        table, so there is no mirror branch left."""
         from swarmly.telegram.owed import Row, fold
         store = self.channel.owed_store()
-        if self.owed_mode != "store":
-            me = K.norm(self.channel.config.identity.alias)
-            rows = [row for row in store.load() if K.norm(row.writer) == me and (
-                row.is_open or now - float(row.updated_at) <= self.OWED_KEEP_CLOSED_SECONDS)]
-        else:
-            before = []
-            for data in published or []:
-                try:
-                    before.append(Row.from_dict(data))
-                except Exception:                      # noqa: BLE001 - one bad row
-                    logger.warning("state: an owed row this bot published is unreadable")
-            held = store.held()
-            ids = {row.id for row in held}
-            # The directory is the truth for the ids it holds (a re-opened id replaces its
-            # closed copy); what was published before only fills in ids it lost (review).
-            rows = [row for row in fold(held + [r for r in before if r.id not in ids])
-                    if row.is_open
-                    or now - float(row.updated_at) <= self.OWED_KEEP_CLOSED_SECONDS
-                    or row.id in (open_elsewhere or set())]
+        before = []
+        for data in published or []:
+            try:
+                before.append(Row.from_dict(data))
+            except Exception:                      # noqa: BLE001 - one bad row
+                logger.warning("state: an owed row this bot published is unreadable")
+        held = store.held()
+        ids = {row.id for row in held}
+        # The directory is the truth for the ids it holds (a re-opened id replaces its
+        # closed copy); what was published before only fills in ids it lost (review).
+        rows = [row for row in fold(held + [r for r in before if r.id not in ids])
+                if row.is_open
+                or now - float(row.updated_at) <= self.OWED_KEEP_CLOSED_SECONDS
+                or row.id in (open_elsewhere or set())]
         return sorted((row.to_dict() for row in rows), key=lambda row: str(row.get("kind", ""))
                       + str(row.get("item", "")) + str(row.get("debtor", ""))
                       + str(row.get("head", "")) + str(row.get("key_extra", "")))
@@ -992,12 +959,10 @@ class StateLink:
         # A malformed own key is replaced, never a reason to stop publishing (#298 review).
         published = [r for r in (own.get("rows") if isinstance(own, dict) else None) or []
                      if isinstance(r, dict)]
-        open_elsewhere: set = set()
-        if self.owed_mode == "store":
-            self._owed_snapshot = self._owed_dicts(store)
-            open_elsewhere = {row.id for row in self._rows_of(self._owed_snapshot,
-                                                              lambda other: other != key)
-                              if row.is_open}
+        self._owed_snapshot = self._owed_dicts(store)
+        open_elsewhere = {row.id for row in self._rows_of(self._owed_snapshot,
+                                                          lambda other: other != key)
+                          if row.is_open}
         rows = await asyncio.to_thread(self._own_owed_rows, now, published, open_elsewhere)
         value = {"rows": rows}
         if store.read(key) == value or (not rows and store.read(key) is None):
@@ -1022,23 +987,12 @@ class StateLink:
         return fold(rows)
 
     def _owed_compare(self) -> str:
-        """Shadow: the open rows the store holds, against the ones this bot reads today."""
-        if self.owed_mode == "store":
-            try:
-                rows = [row for row in self.channel.owed_store().load() if row.is_open]
-            except Exception:                          # noqa: BLE001 - a summary only
-                return ""
-            return f"owed: the store holds the table ({len(rows)} open row(s))"
+        """The open rows the store holds: the only table there is since #472."""
         try:
-            mine = {row.id for row in self.channel.owed_store().load() if row.is_open}
-        except Exception:                              # noqa: BLE001 - a comparison only
+            rows = [row for row in self.channel.owed_store().load() if row.is_open]
+        except Exception:                              # noqa: BLE001 - a summary only
             return ""
-        theirs = {row.id for row in self.owed_from_store() if row.is_open}
-        if not mine and not theirs:
-            return "owed: no open rows (store and gitbus agree)"
-        missing = len(mine - theirs)
-        return (f"owed: {len(theirs)} open row(s) in the store, {len(mine)} here"
-                + (f" ({missing} not in the store yet)" if missing else " (agree)"))
+        return f"owed: the store holds the table ({len(rows)} open row(s))"
 
     # -- /state ----------------------------------------------------------------------------
     def describe(self) -> str:
@@ -1063,23 +1017,9 @@ class StateLink:
             lines.append(f"{len(store.log.rejected)} write(s) refused since the snapshot")
         return "\n".join(lines)
 
-    def _cached_gitbus(self) -> Any:
-        """Today's lease as the transport last read it -- never a git call from here (this
-        runs on the event loop)."""
-        cached = self.channel.__dict__.get("_cached_lease_state")
-        return cached[1] if cached else None
-
     def _lease_compare(self) -> str:
-        """Shadow (phase 3): does the store's lease name the same holder as today's?"""
-        if self.lease_mode == "store":
-            return " -- the coordinator lease (state.lease: store)"
-        gitbus = self._cached_gitbus()
-        if gitbus is None:
-            return ""
-        theirs = str(getattr(gitbus, "holder", "") or "")
-        mine = str(self.store.lease().holder or "") if self.store is not None else ""
-        same = K.norm(theirs) == K.norm(mine)
-        return f"; gitbus lease: {theirs or 'nobody'} ({'agrees' if same else 'DIFFERS'})"
+        """Which lease this is: the store's -- #472 removed the gitbus side."""
+        return " -- the coordinator lease"
 
     def agreement(self) -> list:
         """For each bot's last beat: does this bot's state at that position hash the same?"""

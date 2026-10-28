@@ -1247,10 +1247,12 @@ class TestTheReadCommandViews(unittest.TestCase):
         self.assertTrue(any(str(GROUP) in key for key in channel.drift.sessions()))
 
     def test_state_says_which_backend_and_whether_it_is_ready(self):
-        view = webui.state_view(backend="telegram", mode="live", enabled=True, ready=True,
-                                routing="registry", owed="store")
+        view = webui.state_view(backend="telegram", mode="live", enabled=True, ready=True)
         self.assertEqual((view["backend"], view["mode"], view["ready"]),
                          ("telegram", "live", True))
+        # #472: the routing and owed pills went with the flags that fed them.
+        self.assertNotIn("routing", view)
+        self.assertNotIn("owed", view)
         not_ready = webui.state_view(backend="telegram", mode="live", enabled=True, ready=False)
         self.assertFalse(not_ready["ready"])
         self.assertEqual(not_ready["note"], webui.NOT_READY)

@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 from swarmly.telegram.config import (
-    STATE_REGISTRY_DEFAULTS,
+    REMOVED_STATE_FLAGS,
     AdapterSettings,
     BusSettings,
     ChannelLimits,
@@ -38,14 +38,14 @@ SECTIONS = {
 #: The flags the phases of #260 ship behind. A row that disappears from the table is a flag the
 #: docs no longer explain, so the set is asserted, not just each row.
 EXPECTED = {
-    "state.backend", "state.mode", "state.heartbeat_minutes", "state.dir", "state.lease",
-    "state.owed", "state.links", "state.routing", "bus.transport", "limits.general_turns",
+    "state.backend", "state.mode", "state.heartbeat_minutes", "state.dir",
+    "bus.transport", "limits.general_turns",
     "adapter.type", "adapter.session_turn_limit", "adapter.session_token_limit",
 }
 
-#: Rows whose default depends on the backend (#424): the cell is the default with the store off,
-#: the dagger says the registry side is the default on it, and the footnote states both.
-DAGGERED = {"state.lease", "state.owed", "state.links", "state.routing"}
+#: #472: the four registry flags are gone, so the table has no row for them and none is
+#: daggered any more -- the footnote that explained the two defaults is gone with them.
+DAGGERED: set = set()
 
 
 def table_rows(text: str = None) -> dict:
@@ -172,29 +172,22 @@ class TheFlagsTableTests(unittest.TestCase):
     def test_a_wrong_default_in_the_table_is_caught(self):
         """DISCRIMINATING: the same check, over a copy of §11.7 with one default flipped."""
         text = PAGE.read_text(encoding="utf-8")
-        mutated = text.replace("| `state.links` | `legacy` † |",
-                               "| `state.links` | `registry` † |", 1)
+        mutated = text.replace("| `state.mode` | `shadow` |",
+                               "| `state.mode` | `store` |", 1)
         self.assertNotEqual(text, mutated, "the row this test flips is no longer in the table")
         self.assertEqual(wrong_defaults(mutated),
-                         {"state.links": ("registry", "legacy")})
+                         {"state.mode": ("store", "shadow")})
 
     def test_the_rows_whose_default_depends_on_the_backend_carry_the_dagger(self):
         """#424: the four registry flags say so in the table, and no other row does."""
         self.assertEqual(daggered_rows(), DAGGERED)
 
-    def test_the_footnote_states_the_defaults_config_uses(self):
-        """#424: the on-the-store default in the prose is the one in config.py."""
-        self.assertEqual(footnote_defaults(), STATE_REGISTRY_DEFAULTS)
-
-    def test_a_wrong_footnote_is_caught(self):
-        """DISCRIMINATING: the same check, over a copy whose footnote flips one default."""
-        text = PAGE.read_text(encoding="utf-8")
-        mutated = text.replace("an omitted `state.lease`/`state.owed` is `store`",
-                               "an omitted `state.lease`/`state.owed` is `shadow`", 1)
-        self.assertNotEqual(text, mutated, "the footnote no longer reads that way")
-        wrong = footnote_defaults(mutated)
-        self.assertEqual(wrong.get("lease"), "shadow")
-        self.assertNotEqual(wrong, STATE_REGISTRY_DEFAULTS)
+    def test_the_removed_flags_have_no_row_left(self):
+        """#472: a row for a flag that no longer exists would tell an operator to set it."""
+        rows = table_rows()
+        for flag in REMOVED_STATE_FLAGS:
+            self.assertNotIn(f"state.{flag}", rows)
+        self.assertEqual(footnote_defaults(), {}, "the dagger footnote went with the rows")
 
     def test_a_later_subsection_is_not_read_as_flag_rows(self):
         """The section stops at the next heading: `### 11.8` cannot smuggle a row in."""
@@ -220,12 +213,12 @@ class ThePagesThatStatedTheOldDefaultTests(unittest.TestCase):
         self.assertNotEqual(text, mutated, "the sentence this test mutates is gone")
         self.assertEqual(stale_statements(mutated), ["No flag is on by default yet"])
 
-    def test_the_section_intro_names_where_the_default_flips(self):
-        """The replacement sentence says which backend the registry default belongs to."""
+    def test_the_section_intro_says_the_registry_paths_are_what_run(self):
+        """#472: no legacy side is left to be the default, and the intro says so."""
         intro = PAGE.read_text(encoding="utf-8").split("### 11.1", 1)[0]
-        paragraph = intro.split("**Most of what is below ships behind its flag.**", 1)[1]
+        paragraph = intro.split("**The registry paths are what run.**", 1)[1]
         paragraph = paragraph.split("### ", 1)[0]
-        for needle in ("With the store off", "`state.backend: telegram`", "#424", "§11.7"):
+        for needle in ("Phase 9c", "#472", "no legacy branch", "§11.7"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, paragraph)
 

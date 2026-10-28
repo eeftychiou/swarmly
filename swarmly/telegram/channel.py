@@ -4491,9 +4491,7 @@ class AgentChannel:
             return webui.state_view(backend=getattr(link, "backend", ""),
                                     mode=getattr(link, "mode", ""),
                                     enabled=getattr(link, "enabled", False),
-                                    ready=getattr(store, "ready", None),
-                                    routing=getattr(link, "routing_mode", ""),
-                                    owed=getattr(link, "owed_mode", ""))
+                                    ready=getattr(store, "ready", None))
         except Exception:                          # noqa: BLE001 - a page without a store
             logger.warning("web dashboard: the state store is not readable", exc_info=True)
             return {"ready": False, "text": webui.NOT_READY}
@@ -6796,9 +6794,9 @@ class AgentChannel:
     # -- durable round state (issue #86) ------------------------------------------------
 
     def store_lease_on(self) -> bool:
-        """Topic registry, phase 3: the shared state store holds the coordinator lease (even
-        before the store has started: its lease then reads "unreadable", never gitbus)."""
-        return getattr(self.state_link, "lease_mode", "off") == "store"
+        """The shared state store holds the coordinator lease -- the only lease since #472
+        (even before the store has started: it then reads "unreadable", never gitbus)."""
+        return self.state_link.lease_mode == "store"
 
     def lease_store(self) -> Any:
         from swarmly.telegram.lease import LeaseStore, succession_order
@@ -7487,30 +7485,31 @@ class AgentChannel:
         return done
 
     def owed_store(self) -> Any:
-        """This bot's expectations table: rows in its state, documents on the bus (#162).
+        """This bot's expectations table: its own copy, and every bot's rows (#162).
 
-        The state copy is this bot's own, like ``.agents/wakes/<alias>/``; the document under
-        the checkout is the swarm's, and :meth:`OwedStore.documents` is how a successor reads
-        it. A fresh store per call, like ``round_store``: a cached one keeps the ref it first
-        fetched, and ``/owed`` on a bot that has just started must see what the bus holds now.
+        The state copy is this bot's own, like ``.agents/wakes/<alias>/``; the rows other bots
+        publish come from the state store, and ``OwedStore.documents`` is how a successor
+        reads what a predecessor left. A fresh store per call, like ``round_store``: a cached
+        one keeps the ref it first fetched, and ``/owed`` on a bot that has just started must
+        see what the store holds now.
+
+        #472 (phase 9c): the store is the only table. The gitbus documents in a checkout are
+        still *read* -- rows and closures from before the switch must not reopen or vanish
+        (review) -- and never written; with no checkout, ``root=None`` is this bot's state
+        directory, where no document exists either.
         """
         from swarmly.telegram.owed import OwedStore
         from swarmly.telegram.wake import wake_dir_for
         root = self._gitbus_root()
-        if getattr(self.state_link, "owed_mode", "") == "store":
-            # Phase 3 (state.owed: store): this bot's own copy, and every bot's rows from the
-            # state store; nothing is pushed to gitbus. The bus documents already in the
-            # checkout are still read, never written: rows and closures from before the switch
-            # must not reopen or vanish (review). Switch every bot at once: a bot still on
-            # shadow reads gitbus only and would not see what the others now publish.
-            # No checkout: root=None, which OwedStore reads as its state directory, where no
-            # bus document is ever written -- so no document is read either.
-            has_checkout = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+        has_checkout = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+        if self.state_link.backend == "telegram":
             return OwedStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
                              transport=None, root=root if has_checkout else None,
                              clock=time.time, shared=self.state_link.shared_owed_rows,
                              published=self.state_link.published_owed_rows)
-        has_bus = bool(self.config.bus.repo or self.config.fallback.gitbus_root)
+        # A bot with no store keeps the older table: its own copy, and the documents on the
+        # bus it polls -- there is no store here to read the swarm's rows from.
+        has_bus = has_checkout
         return OwedStore(self.config.identity.alias, state_dir=wake_dir_for(self.config),
                          transport=self.bus_transport(root) if has_bus else None, root=root,
                          clock=time.time)

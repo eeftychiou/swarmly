@@ -339,16 +339,7 @@ class RegistryShadow:
             if closed:
                 return "Topic registry: no open topics." + suffix
             return "Topic registry: empty so far (the lease holder fills it on its beat)."
-        return f"Topic registry{self._shadow_label()}:\n" + "\n".join(lines) + suffix
-
-    def _shadow_label(self) -> str:
-        """``" (shadow)"`` while any registry flag still runs the legacy path (#435)."""
-        link = getattr(self.channel, "state_link", None)
-        modes = {getattr(link, name, None) for name in
-                 ("lease_mode", "owed_mode", "links_mode", "routing_mode")}
-        if not modes or None in modes or modes & {"shadow", "legacy", "off"}:
-            return " (shadow)"
-        return ""
+        return f"Topic registry:\n" + "\n".join(lines) + suffix
 
     def _canonical(self, alias: str, aliases) -> str:
         """The alias this name belongs to: an agent's Telegram handle is one agent (#435).
