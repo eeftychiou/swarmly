@@ -141,6 +141,29 @@ class TestThePanelFilters(unittest.TestCase):
         cards = self.cards(record(11, "mixed", [ISSUE_LINK, PR_LINK]))
         self.assertEqual([link["type"] for link in cards[0]["links"]], ["issue", "pr"])
 
+    def test_a_card_reads_as_its_record_does_on_a_tracking_link(self):
+        """Review of #469: the panel filters *cards*, `/topics` filters records, and
+        ``link_cards`` publishes no status for a non-work link. The rule reads the role
+        alone, so the two readers cannot disagree -- pinned on a tracking link that carries
+        a state the card does not publish (the shape that made the panel keep it for ever).
+        """
+        tracking = dict(DONE_LINK, id="L9", ref="https://github.com/o/r/issues/423",
+                        title="#423", role="tracking", status="open", phase=None)
+        reference = dict(tracking, id="L10", kind="doc", ref="drive:/notes",
+                         role="reference")
+        for links in ([DONE_LINK, tracking],
+                      [DONE_LINK, dict(tracking, status="closed", phase="done")],
+                      [DONE_LINK, reference]):
+            card_links = webui.link_cards(links, now=1_800_000_000.0)
+            self.assertEqual(tf.DEFAULT.topic_ok("open", card_links),
+                             tf.DEFAULT.topic_ok("open", links),
+                             "the card must not read differently from the record")
+        self.assertEqual([card["topic"] for card in self.cards(
+            record(11, "finished but tracked", [DONE_LINK, tracking]),
+            record(12, "truly done", [DONE_LINK]),
+            record(13, "reference only", [DONE_LINK, reference]))],
+            ["finished but tracked"])
+
     def test_a_closed_record_draws_as_closed(self):
         """`state=closed` lists closed records, and a card must not draw one as open."""
         cards = self.cards(record(13, "gone", [DONE_LINK], status="closed"),
