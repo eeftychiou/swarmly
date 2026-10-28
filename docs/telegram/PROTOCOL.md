@@ -609,7 +609,9 @@ in flight lands behind it. A bot that starts or rejoins reads the pin, then the 
 and acts on nothing until that read succeeds. Each bot also keeps its own copy on disk
 (`state.dir`) as a cache and a backup, never as the truth. `/state@bot` shows the store as that
 bot sees it -- its running `rev:` first of all, which is how a deploy is verified, since a bot
-cannot read its own online notice from its workspace -- and whether every bot's state hash agrees.
+cannot read its own online notice from its workspace -- and whether every bot's state hash agrees,
+plus, once it has happened, `last resync at <hh:mm UTC>: diverged: rebuilt from the pin at p<pos>`,
+the receipt that a bot which disagreed with a peer has healed (#477).
 
 Consistency without a server is design §1b: one owner per field, every write a compare-and-set
 stamped with the lease term, stale terms dropped on read, fail closed when the store cannot be
