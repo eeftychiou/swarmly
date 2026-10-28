@@ -142,11 +142,23 @@ class Filters:
 
         A topic with no items stays unless a *type* or *stage* was asked for: "none" is the
         type of an empty topic, so ``type=none`` is how an admin asks for exactly those.
+
+        A **tracking** link keeps the topic listed even when every work item in it is done
+        (#468, acceptance as amended): a topic whose slices have all landed still has its
+        tracking issue, and hiding it lost the live one from ``/topics`` entirely. No state
+        is read on that link -- a tracking link cannot carry one (``records.Link``), so a
+        finished round leaves the default view by closing its topic or unlinking its
+        tracking issue. A *reference* link is a pointer and never keeps a topic in.
         """
         if str(status or "open").strip().lower() not in self.topic_states:
             return False
-        items = [link for link in links
-                 if str(dict(link or {}).get("role") or "work").strip().lower() == "work"]
+        items, tracked = [], []
+        for link in links:
+            role = str(dict(link or {}).get("role") or "work").strip().lower()
+            if role == "work":
+                items.append(link)
+            elif role == "tracking":
+                tracked.append(link)
         if not items:
             if self.types and "none" not in self.types:
                 return False
@@ -154,7 +166,10 @@ class Filters:
         passed = [link for link in items if self.item_ok(link)]
         if self.types or self.stages or self.states:
             return bool(passed)
-        # The default view: open, and still something to do in it.
+        # The default view: open, and still something to do in it -- or a tracking issue of
+        # its own, which is the topic's last live item once every slice has landed.
+        if tracked:
+            return True
         return bool(passed) or not any(item_stage(link) in DONE_STAGES for link in items)
 
     # -- the words -------------------------------------------------------------------

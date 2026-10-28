@@ -74,6 +74,26 @@ class TestSlashTopicsFilters(unittest.TestCase):
         self.assertIn("gone (13) closed", closed)
         self.assertNotIn("a pr (12)", closed)
 
+    def test_a_finished_topic_with_a_tracking_link_stays(self):
+        """#468 as the live registry had it, and the amendment: every slice done and a
+        tracking issue linked -- listed; only a reference link -- hidden.
+
+        `/topics` counted the first in "hidden by the filters", so the topic the admin was
+        reading was not in its own list.
+        """
+        tracking = dict(DONE_LINK, id="L9", ref="https://github.com/o/r/issues/423",
+                        title="#423", role="tracking", status=None, phase=None)
+        reference = dict(tracking, id="L10", kind="doc", ref="drive:/notes",
+                         title="notes", role="reference")
+        store = self.store(record(11, "finished but tracked", [DONE_LINK, tracking]),
+                           record(12, "truly done", [DONE_LINK]),
+                           record(13, "finished, reference only", [DONE_LINK, reference]))
+        text = self.shadow.describe(store)
+        self.assertIn("finished but tracked (11)", text)
+        self.assertNotIn("truly done (12)", text)
+        self.assertNotIn("finished, reference only (13)", text)
+        self.assertIn("2 hidden by the filters", text)
+
     def test_the_default_view_hides_a_topic_whose_work_is_done(self):
         store = self.store(record(11, "finished", [DONE_LINK]),
                            record(12, "moving", [ISSUE_LINK]))
@@ -120,6 +140,29 @@ class TestThePanelFilters(unittest.TestCase):
     def test_a_card_says_what_type_each_link_is(self):
         cards = self.cards(record(11, "mixed", [ISSUE_LINK, PR_LINK]))
         self.assertEqual([link["type"] for link in cards[0]["links"]], ["issue", "pr"])
+
+    def test_a_card_reads_as_its_record_does_on_a_tracking_link(self):
+        """Review of #469: the panel filters *cards*, `/topics` filters records, and
+        ``link_cards`` publishes no status for a non-work link. The rule reads the role
+        alone, so the two readers cannot disagree -- pinned on a tracking link that carries
+        a state the card does not publish (the shape that made the panel keep it for ever).
+        """
+        tracking = dict(DONE_LINK, id="L9", ref="https://github.com/o/r/issues/423",
+                        title="#423", role="tracking", status="open", phase=None)
+        reference = dict(tracking, id="L10", kind="doc", ref="drive:/notes",
+                         role="reference")
+        for links in ([DONE_LINK, tracking],
+                      [DONE_LINK, dict(tracking, status="closed", phase="done")],
+                      [DONE_LINK, reference]):
+            card_links = webui.link_cards(links, now=1_800_000_000.0)
+            self.assertEqual(tf.DEFAULT.topic_ok("open", card_links),
+                             tf.DEFAULT.topic_ok("open", links),
+                             "the card must not read differently from the record")
+        self.assertEqual([card["topic"] for card in self.cards(
+            record(11, "finished but tracked", [DONE_LINK, tracking]),
+            record(12, "truly done", [DONE_LINK]),
+            record(13, "reference only", [DONE_LINK, reference]))],
+            ["finished but tracked"])
 
     def test_a_closed_record_draws_as_closed(self):
         """`state=closed` lists closed records, and a card must not draw one as open."""
