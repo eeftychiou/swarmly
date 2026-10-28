@@ -608,7 +608,8 @@ new message every 900 s or 25 ops — a fixed cadence of its own, **not** derive
 in flight lands behind it. A bot that starts or rejoins reads the pin, then the lines after it,
 and acts on nothing until that read succeeds. Each bot also keeps its own copy on disk
 (`state.dir`) as a cache and a backup, never as the truth. `/state@bot` shows the store as that
-bot sees it, and whether every bot's state hash agrees.
+bot sees it -- its running `rev:` first of all, which is how a deploy is verified, since a bot
+cannot read its own online notice from its workspace -- and whether every bot's state hash agrees.
 
 Consistency without a server is design §1b: one owner per field, every write a compare-and-set
 stamped with the lease term, stale terms dropped on read, fail closed when the store cannot be
@@ -725,7 +726,7 @@ that drifts from the code fails the suite.
 | Setting | Default today | Values | Phase | What it switches |
 |---|---|---|---|---|
 | `state.backend` | `off` | `off`, `telegram` | 1 | The shared state store: the op log and the pinned snapshot in Swarm pulse. |
-| `state.mode` | `shadow` | `shadow` | 1 | The store runs beside today's logic and nothing acts on it. |
+| `state.mode` | `shadow` | `shadow` | 1 | Accepted for config compatibility and nothing else: the store is the record, and `/state` no longer prints a mode (#475). |
 | `state.heartbeat_minutes` | `10` | minutes > 0 | 1 | How often each bot writes its heartbeat key, and the registry sync every bot runs at that cadence. |
 | `state.dir` | `unset` | a path | 1 | Where this bot keeps its own state files (the store's cache, sessions, the topic map). |
 | `bus.transport` | `git` | `git`, `folder`, `gdrive`, `telegram` | 3 | `telegram`: gitbus is off; the store is the durable plane (needs `state.backend: telegram`). |

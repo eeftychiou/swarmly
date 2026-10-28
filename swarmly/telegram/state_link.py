@@ -1002,9 +1002,13 @@ class StateLink:
         if store is None:
             return "State store: not started."
         lease = store.lease()
-        lines = [f"State store ({self.backend}, {self.mode}): "
+        # #475: no mode in the header -- `state.mode` has one value and nothing runs beside the
+        # store any more -- and the running rev, so a deploy can be verified from /state (a bot
+        # cannot read its own online notice from its workspace).
+        lines = [f"State store ({self.backend}): "
                  + ("ready" if store.ready else "not ready")
                  + (f" -- last error: {self.error}" if self.error else ""),
+                 f"rev: {self.running_revision() or 'unknown'}",
                  f"position {store.log.last_pos}, {len(store.keys())} key(s), "
                  f"hash {store.state_hash()}",
                  f"lease: {lease.holder or 'nobody'} (term {lease.term}){self._lease_compare()}",
@@ -1016,6 +1020,14 @@ class StateLink:
         if store.log.rejected:
             lines.append(f"{len(store.log.rejected)} write(s) refused since the snapshot")
         return "\n".join(lines)
+
+    def running_revision(self) -> str:
+        """The revision this transport runs -- the same one its online notice carries (#475).
+
+        Read from the channel, which resolves it once at start; a channel without one answers
+        "" and ``/state`` says "unknown" rather than inventing a rev.
+        """
+        return str(getattr(self.channel, "_running_revision", "") or "")
 
     def _lease_compare(self) -> str:
         """Which lease this is: the store's -- #472 removed the gitbus side."""

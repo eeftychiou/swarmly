@@ -1,4 +1,4 @@
-"""The transport's link to the shared state store, in shadow (topic registry, phase 1)."""
+"""The transport's link to the shared state store: /state, the beat, the lease, the owed table."""
 
 import asyncio
 import tempfile
@@ -30,6 +30,36 @@ def link_for(group, alias, clock, coordinator=False, backend="telegram"):
         link.store.CONFIRM_SECONDS = 0.0
         group.stores[alias] = link.store
     return link
+
+
+class StateHeaderTests(unittest.TestCase):
+    """#475: the header names the backend only, and `/state` carries the running rev."""
+
+    def started(self, revision="abc123"):
+        clock = Clock()
+        link = link_for(FakeGroup(clock), "Claudebot", clock)
+        link.channel._running_revision = revision
+        asyncio.run(link.store.start())
+        return link
+
+    def test_the_header_shows_no_mode(self):
+        text = self.started().describe()
+        self.assertTrue(text.startswith("State store (telegram): ready"), text)
+        self.assertNotIn("shadow", text)
+
+    def test_it_shows_the_running_rev(self):
+        """The same value the online notice carries -- that is how a deploy is verified."""
+        self.assertIn("rev: abc123", self.started("abc123").describe())
+
+    def test_a_channel_with_no_revision_says_unknown(self):
+        self.assertIn("rev: unknown", self.started("").describe())
+
+    def test_the_rev_is_read_every_time_it_is_asked_for(self):
+        """DISCRIMINATING: a cached rev would pass the first assertion and fail this one."""
+        link = self.started("abc123")
+        self.assertIn("rev: abc123", link.describe())
+        link.channel._running_revision = "def456"
+        self.assertIn("rev: def456", link.describe())
 
 
 class StateLinkTests(unittest.TestCase):
