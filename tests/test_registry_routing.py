@@ -239,6 +239,19 @@ class RecordedLinkTests(unittest.TestCase):
             await asyncio.gather(*list(link._tasks))
         asyncio.run(go())
 
+    def test_the_removed_routing_switch_decides_nothing(self):
+        """#472: the flag is read nowhere, so an old config cannot bring the mention rules back.
+
+        The switch the transport used to read is set to its off value here; the record
+        decides anyway.
+        """
+        link = self.link()
+        link.routing_mode = "legacy"
+        self.opened(link)
+        facts = link.route_facts(-100, 55)
+        self.assertIsNotNone(facts, "the registry decides whatever the config names")
+        self.assertEqual(facts.coordinator, "claudebot")
+
     def test_the_coordinators_reply_links_the_peers_it_names(self):
         link = self.link()
         self.opened(link)
