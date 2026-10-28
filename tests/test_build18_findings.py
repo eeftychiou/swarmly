@@ -89,10 +89,11 @@ class TestARegistryReplyIsNeverMovedToGeneral(unittest.TestCase):
     drew its General cooldown notice. With registry routing a reply stays in its topic."""
 
     def test_the_post_is_dropped(self):
+        """#472: a bot on the registry drops it; there is no legacy side left to reroute to."""
         channel = make_channel()
         channel._sender = None
         channel.bot = DeadTopicBot()
-        channel.state_link.routing_mode = "registry"
+        channel.state_link.backend = "telegram"
         run(channel.send("@reasonix_dd_bot thanks", thread_id=307))
         self.assertEqual(channel.bot.accepted, [])
 

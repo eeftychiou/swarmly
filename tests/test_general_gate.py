@@ -205,8 +205,10 @@ class RegistryRoutingMakesThemTransportOnlyTests(unittest.TestCase):
     Swarm pulse -- live, bots took turns in both and a reply was moved into the pulse."""
 
     def channel(self):
+        """On the registry, General and the pulse are transport-only whatever the limit says
+        (#472: ``state.routing``'s ``legacy`` side is gone)."""
         channel, adapter, opened = channel_for(general_turns="allow")
-        channel.state_link.routing_mode = "registry"
+        channel.state_link.backend = "telegram"
         return channel, adapter, opened
 
     def test_no_turn_in_general_or_the_pulse(self):
@@ -256,7 +258,7 @@ class RepliesStayInTheirTopicTests(unittest.TestCase):
             async def respond(self, message):
                 return AdapterReply(text="Reviewing #300 now; verdict to follow.")
         channel = make_channel(make_config(), adapter=Fixed("Hermes"))
-        channel.state_link.routing_mode = "registry"
+        channel.state_link.backend = "telegram"
         channel._topic_elsewhere = lambda ev, body: (GROUP, 9500)     # what refs would pick
         run(channel.handle_event(event("@HermesBot please review #300", thread_id=9400)))
         texts = [s["text"] for s in channel._test_sender.sent]

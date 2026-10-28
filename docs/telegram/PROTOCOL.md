@@ -619,8 +619,8 @@ plane is then the store, and it needs `state.backend: telegram`.
 
 ### 11.2 Routing from the registry
 
-With `state.routing: registry` (default `legacy`, `registry` once the store is on) the transport,
-not each bot's mention rules, decides who takes a message in a work topic: the **coordinator** (the lease holder) takes every
+The transport, not each bot's mention rules, decides who takes a message in a work topic: the
+**coordinator** (the lease holder) takes every
 message that is not addressed only to other agents; another **linked** agent takes one only when
 it names it, replies to it, or hands it work (an `ASSIGN:` line); a mention of an **unlinked**
 agent links it when the author is the coordinator or the admin, and is refused with a transport
@@ -657,14 +657,14 @@ PHASE: <ref|L1> <phase>
 ```
 
 The admin does the same with `/topic #N`, `/link`, `/unlink` and `/phase`; `/topics` and the
-dashboard show each item and its phase ([COMMANDS.md](COMMANDS.md)). `ref-learning` is switched
-off by `state.links: registry`: a number seen in a message's text never adds a link, and it is
-never what moves work — the explicit `LINK:`/`ASSIGN:` lines, `/link` and a GitHub event on an
-item already linked are what link a topic, and **the item's explicit link is what moves a reply
-or a brief into the topic that owns it** (#457, #460). The links an earlier build learned from
-text are dropped from the record the next time it is written, which is what took `#42` (a
-truncated title) and `#13221` (a topic id) off `/topics`; a number cut off by a truncated
-title, and a forum thread's own id, are not refs in either mode. GitHub moves what it can see,
+dashboard show each item and its phase ([COMMANDS.md](COMMANDS.md)). **Ref-learning is gone**
+(#472, phase 9c): a number seen in a message's text never adds a link, and it is never what
+moves work — the explicit `LINK:`/`ASSIGN:` lines, `/link` and a GitHub event on an item already
+linked are what link a topic, and **the item's explicit link is what moves a reply or a brief
+into the topic that owns it** (#457, #460). The links an earlier build learned from text are
+dropped from the record the next time it is written, which is what took `#42` (a truncated
+title) and `#13221` (a topic id) off `/topics`; a number cut off by a truncated title, and a
+forum thread's own id, are not refs. GitHub moves what it can see,
 and only that: a PR opened from an item moves it to `review`, a merge — or an issue closing — to
 `done` / `closed`, and a PR closed without a merge only marks the link `closed` and keeps its
 phase. Green checks plus an approval promoting an item to `qa` is **not** implemented yet; that
@@ -733,8 +733,8 @@ that drifts from the code fails the suite.
 | `state.owed` | `shadow` † | `shadow`, `store` | 3 | `store`: the owed / `WAIT` table lives in the store, and nothing goes to gitbus. |
 | `bus.transport` | `git` | `git`, `folder`, `gdrive`, `telegram` | 3 | `telegram`: gitbus is off; the store is the durable plane (needs `state.backend: telegram`). |
 | `limits.general_turns` | `allow` | `allow`, `never` | 4 | `never`: no model turn in General or Swarm pulse; work typed there gets its own topic. |
-| `state.links` | `legacy` † | `legacy`, `registry` | 5 | `registry`: a notification's topic comes from the item's links, not from ref-learning — and ref-learning is off, with the topic move it drove (#457). |
-| `state.routing` | `legacy` † | `legacy`, `registry` | 6 | `registry`: the transport routes from the registry (§11.2), not each bot's mention rules. |
+| `state.links` | `legacy` † | `legacy`, `registry` | 5 | Accepted and ignored (#472): a notification's topic comes from the item's links, and ref-learning — with the topic move it drove — is gone (#457). |
+| `state.routing` | `legacy` † | `legacy`, `registry` | 6 | Accepted and ignored (#472): the transport routes from the registry (§11.2), not each bot's mention rules. |
 | `adapter.type` | `echo` | any adapter, `claude_thread` for Claude | 7 | `claude_thread`: one resumable session per topic, like the other adapters. |
 | `adapter.session_turn_limit` | `unset` | turns > 0 | 7 | Turns a topic's session may run before the adapter hands over to a new one. |
 | `adapter.session_token_limit` | `unset` | tokens > 0 | 7 | Input tokens a resumed session may reach before the next turn starts a new one. |

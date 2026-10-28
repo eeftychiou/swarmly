@@ -2380,11 +2380,14 @@ class AgentChannel:
         if token and token in owed:
             return "open: " + owed[token]
         store = self.state_link.store
-        if store is None or not store.ready:
-            if self.state_link.routing_mode == "registry" or \
-                    self.state_link.links_mode == "registry":
-                return "the topic registry is not readable yet"   # never guess: keep it
-            return None
+        if store is None:
+            # A bot with no registry keeps the older answer: nothing is claimed, and /cleanup
+            # works as it did. One that *has* a registry but cannot read it never guesses.
+            if str(getattr(self.state_link, "backend", "off") or "off") != "telegram":
+                return None
+            return "the topic registry is not readable yet"
+        if not store.ready:
+            return "the topic registry is not readable yet"       # never guess: keep it
         from swarmly.state import keys as K
         record = store.read(K.topic(thread_id))
         for link in (record.get("links") if isinstance(record, dict) else None) or []:
@@ -11153,10 +11156,13 @@ class AgentChannel:
 
     def _transport_only_on(self) -> bool:
         """General and Swarm pulse are transport-only -- no model turn there, nothing from token
-        space posted there -- with ``limits.general_turns: never``, and always with registry
-        routing (admin, 25 Oct: "a block on posting token space posts in General, pulse")."""
-        return (getattr(self.config.limits, "general_turns", "allow") == "never"
-                or getattr(self.state_link, "routing_mode", "legacy") == "registry")
+        space posted there -- with ``limits.general_turns: never``, and always on a bot that
+        runs the topic registry: the registry decides every work topic, so the two places are
+        the one kind of place it never takes (admin, 25 Oct: "a block on posting token space
+        posts in General, pulse"). ``state.routing``'s ``legacy`` side is what went (#472)."""
+        if str(getattr(self.config.limits, "general_turns", "allow") or "allow") == "never":
+            return True
+        return str(getattr(self.state_link, "backend", "off") or "off") == "telegram"
 
     def _transport_only_place(self, event: ChannelEvent) -> Optional[str]:
         """"General" or "Swarm pulse" when ``event`` is in one of them, else None."""
@@ -12473,12 +12479,12 @@ class AgentChannel:
                                            silent)
 
     def _drop_gone_topic_posts(self) -> bool:
-        """With registry routing or ``limits.general_turns: never`` a post for a topic that
-        has gone is dropped, not moved to General (docs/design/topic-registry.md §3)."""
-        if not self.reroute_gone_topics:
-            return False                       # the caller wants the refusal raised
-        never = str(getattr(self.config.limits, "general_turns", "allow") or "allow") == "never"
-        return never or getattr(self.state_link, "routing_mode", "legacy") == "registry"
+        """A post for a topic that has gone is dropped, not moved to General
+        (docs/design/topic-registry.md §3) when ``limits.general_turns: never`` makes General
+        no place for it; otherwise ``reroute_gone_topics`` decides, as the transport says."""
+        if str(getattr(self.config.limits, "general_turns", "allow") or "allow") == "never":
+            return True
+        return str(getattr(self.state_link, "backend", "off") or "off") == "telegram"
 
     async def _post_in_general(self, payload: str, entities: Optional[List[Dict[str, Any]]],
                                plain: bool, destination: int, thread_id: int,

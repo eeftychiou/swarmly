@@ -82,9 +82,10 @@ class TheSendPathRefusesTokenTextTests(unittest.TestCase):
         run(channel.send("a reply", chat_id=GROUP, token=True))
         self.assertEqual(len(channel._test_sender.sent), 1)
 
-    def test_registry_routing_turns_it_on(self):
+    def test_the_registry_turns_it_on(self):
+        """#472: a bot on the topic registry never posts token text in General or the pulse."""
         channel = channel_for(general_turns="allow")
-        channel.state_link.routing_mode = "registry"
+        channel.state_link.backend = "telegram"
         self.assertEqual(channel.token_barred(GROUP, None), "General")
         self.assertEqual(channel.token_barred(GROUP, PULSE), "Swarm pulse")
         self.assertIsNone(channel.token_barred(GROUP, 9400))

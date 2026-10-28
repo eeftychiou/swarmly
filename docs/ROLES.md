@@ -51,8 +51,8 @@ registry from its own reply, and the transport records the lines without posting
 `LINK: <ref> [as work|reference|tracking] [— title]` adds an item to the topic,
 `ASSIGN: @bot <ref|L1> as <role>` gives one to an agent, and `PHASE: <ref|L1> <phase>` says where
 it stands (`research`, `design`, `development`, `review`, `qa`, `done`, `blocked`). A link is
-added explicitly and never guessed from what was said in the chat, which is what replaces
-ref-learning. Only the coordinator writes these lines; the admin does the same with `/topic #N`,
+added explicitly and never guessed from what was said in the chat: ref-learning is gone
+(#472), and nothing a message merely mentions becomes a link. Only the coordinator writes these lines; the admin does the same with `/topic #N`,
 `/link`, `/unlink` and `/phase`, and a developer whose PR opens from the topic asks the
 coordinator to link it rather than linking it itself; no other role writes the registry.
 The section is [`telegram/PROTOCOL.md` §11](telegram/PROTOCOL.md#11-the-topic-registry-phases-38-landed-behind-flags).

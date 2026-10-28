@@ -445,7 +445,7 @@ class ChannelCase(unittest.TestCase):
         self.channel.state_link.store = store
         self.assertEqual(self.channel._open_work_in(GROUP, 42, {}), "open work item L1 #37")
         self.channel.state_link.store = None
-        self.channel.state_link.routing_mode = "registry"
+        self.channel.state_link.backend = "telegram"      # a registry that cannot be read
         self.assertIn("not readable", self.channel._open_work_in(GROUP, 42, {}))
         del aio
 

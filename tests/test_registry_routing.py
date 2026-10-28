@@ -297,12 +297,6 @@ class RecordedLinkTests(unittest.TestCase):
         asyncio.run(go())
         self.assertIn("codex", link.route_facts(-100, 77).linked)
 
-    def test_with_routing_legacy_nothing_is_linked_or_routed(self):
-        link = LinkFlowTests.link(self)
-        link.note_admin_mentions(-100, 55, ["codexbot"], 1)
-        self.assertFalse(getattr(link, "_tasks", None))
-        self.assertIsNone(link.route_facts(-100, 55))
-
     def test_a_closed_topic_and_swarm_pulse_are_not_routed(self):
         link = self.link()
         self.opened(link)
@@ -324,11 +318,12 @@ class RecordedLinkTests(unittest.TestCase):
                                                             if k.startswith(prefix)]
         link.store.read = lambda key: held.get(key) or read(key)
 
-    def test_an_agent_that_already_worked_here_counts_as_linked(self):
+    def test_an_agent_that_already_worked_here_is_not_linked_by_that(self):
+        """#472: turns in a topic were a stand-in for a link until phase 9; they are not one."""
         link = self.link()
         self.opened(link)
         self._worked(link, "deepseek")
-        self.assertIn("deepseek", link.route_facts(-100, 55).linked)
+        self.assertNotIn("deepseek", link.route_facts(-100, 55).linked)
 
     def test_unlink_outranks_having_worked_here(self):
         """Review: /unlink could not take off an agent that had turns in the topic."""
