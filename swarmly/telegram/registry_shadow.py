@@ -1,12 +1,13 @@
-"""The topic registry, filled in shadow from today's logic (topic registry, phase 2).
+"""The topic registry: what each bot publishes, and what ``/topics`` reads back.
 
-Nothing reads the registry yet: this proves the data. Each beat of the state store
-(``state_link.py``) calls :meth:`RegistryShadow.sync`:
+The registry *is* the record now (the phases of #260 landed): ``/topics``, the dashboard and the
+routing read it, and the shadow mode that only proved the data is gone (#472). Each beat of the
+state store (``state_link.py``) calls :meth:`RegistryShadow.sync`:
 
 * **The lease holder** writes ``topic/<id>`` for every forum topic its transport knows: the
   title, the coordinator's binding (runtime, model, effort, where they come from), and the
-  links today's ref-learning found -- marked ``added_by: legacy`` so they are easy to tell
-  from the explicit links of phase 5.
+  topic's links -- the explicit ones; the guesses an earlier build learned from text are
+  dropped here (``added_by: legacy``).
 * **Every bot** writes its own ``topic/<id>/agent/<alias>`` (the CLI session its adapter keeps
   for that topic, the turns since that session began, how often it was replaced) and its
   ``agent/<alias>/profile`` from ``config.yaml``.

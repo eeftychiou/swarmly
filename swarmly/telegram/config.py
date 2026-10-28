@@ -213,7 +213,9 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     # issue #240: the local read-only web page, off unless the operator turns it on
     "web": ("enabled", "port", "public_host", "init_max_age"),
     "swarm": ("succession",),
-    # topic registry, phase 1: the shared state store, in shadow unless the operator says
+    # topic registry, phase 1: the shared state store, off unless the operator says.
+    # #472: `lease`, `owed`, `links` and `routing` are accepted-and-ignored, so they stay listed
+    # here rather than counting as unknown keys (config.py warns about each one it sees).
     "state": ("backend", "mode", "heartbeat_minutes", "lease", "links", "routing", "owed",
               "dir"),
 }
@@ -1005,9 +1007,10 @@ class StateSettings:
 
     #: ``off`` or ``telegram`` (the op log in Swarm pulse, the snapshot pinned there).
     backend: str = "off"
-    #: ``shadow``: the store runs beside today's logic and nothing reads it (phase 1).
+    #: ``shadow``, the only value: phase 1's name for the store, kept because configs carry it.
+    #: The store is the record now -- /topics, the dashboard, routing and the lease read it.
     mode: str = "shadow"
-    #: How often each bot writes its heartbeat key in shadow.
+    #: How often each bot writes its heartbeat key, and the registry sync's cadence.
     heartbeat_minutes: float = 10.0
     #: Where this bot keeps its own state files (``<dir>/.agents/state``): the store's cache,
     #: sessions, the topic map, its owed rows. Unset: the bus checkout when there is one, else

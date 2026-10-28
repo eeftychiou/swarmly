@@ -60,7 +60,7 @@ What replaces `bus.repo`:
 | `bus.repo` (the checkout whose `.agents/inbox/` is read) | nothing — leave it unset | Nothing is polled on git; with `bus.transport: telegram` no bus repository is needed. |
 | — | `bus.transport: telegram` | The store is the durable plane; it needs `state.backend: telegram`. |
 | — | `state.backend: telegram` | The op log in 📡 Swarm pulse and the pinned snapshot: topics, links, lease, owed rows. |
-| — | `state.lease: store`, `state.owed: store` | The lease and the owed / `WAIT` table live in the store instead of on gitbus. |
+| — | nothing — the lease and the owed / `WAIT` table | With `state.backend: telegram` they live in the store; the flags that used to switch them are gone (#472). |
 | — | `state.dir` | Where this bot keeps its own copy (cache, sessions, topic map); unset means beside `config.yaml`. |
 
 `bus.repo` still decides where a **project's** role files and this bot's state files were looked

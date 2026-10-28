@@ -1,17 +1,17 @@
-"""The transport's link to the shared state store (topic registry, phase 1: shadow).
+"""The transport's link to the shared state store (topic registry).
 
-``state.backend: telegram`` in ``config.yaml`` turns it on. In ``state.mode: shadow`` (the
-only mode in phase 1) the store runs beside today's logic and nothing reads it:
+``state.backend: telegram`` in ``config.yaml`` turns it on, and the store is then the swarm's
+record -- the lease, the owed table, the topics and their links (#472 removed the flags that
+used to keep a shadow side of each):
 
 * each bot writes a heartbeat key (``probe/<alias>/beat``) every ``state.heartbeat_minutes``,
   carrying its revision and the state hash it sees;
-* the bot that holds today's (gitbus) lease also claims and renews the store's lease, and
-  publishes the pinned snapshot -- so the lease rules and the snapshot run on the live swarm
-  long before phase 3 lets anything depend on them;
+* the lease holder renews the store's lease and publishes the pinned snapshot;
 * ``/state@bot`` shows what the store looks like from that bot, and the hashes of every bot's
   last heartbeat, which must agree.
 
-Every failure is logged and swallowed: in shadow, the store must never stop the transport.
+A failure is logged and swallowed: the store must never stop the transport. A bot with no store
+at all keeps the gitbus paths, which is what ``state.backend: off`` means.
 """
 
 from __future__ import annotations
