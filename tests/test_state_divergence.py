@@ -109,13 +109,8 @@ class MissedLineTests(unittest.TestCase):
         self.assertEqual(blind.state_hash(), holder.state_hash())
 
 
-class BeatResyncTests(unittest.TestCase):
-    """The wiring the store tests cannot see: a beat that sees a divergence rebuilds (#477).
-
-    `resync()` can be right and still never run -- the repair is only worth anything if the
-    beat calls it, and only safe if it cannot stampede: a peer stays disagrees until the pin
-    moves past the divergence, so every beat inside the cooldown would rebuild again.
-    """
+class _PinnedPair(unittest.TestCase):
+    """Two bots on one store: a holder that published a real pin, and a reader ("mine")."""
 
     def setUp(self):
         self.clock = Clock()
@@ -131,6 +126,15 @@ class BeatResyncTests(unittest.TestCase):
             await self.holder.store.publish_snapshot(force=True)
         asyncio.run(pin())
         self.assertGreater(self.holder.store.snapshot_pos, 0, "the pin is a real fold")
+
+
+class BeatResyncTests(_PinnedPair):
+    """The wiring the store tests cannot see: a beat that sees a divergence rebuilds (#477).
+
+    `resync()` can be right and still never run -- the repair is only worth anything if the
+    beat calls it, and only safe if it cannot stampede: a peer stays disagrees until the pin
+    moves past the divergence, so every beat inside the cooldown would rebuild again.
+    """
 
     def peer_disagrees(self):
         """A peer's beat folded at this bot's position with another hash: the live shape."""
@@ -175,6 +179,40 @@ class BeatResyncTests(unittest.TestCase):
         self.clock.t += StateLink.RESYNC_SECONDS  # past the cooldown: it heals again
         self.peer_disagrees()
         self.assertIn("diverged: rebuilt from the pin at p", asyncio.run(self.mine.beat()))
+
+
+class PinnedMetadataKeptTests(_PinnedPair):
+    """#477 QA: a pin that cannot be adopted must not cost the bot the snapshot it holds.
+
+    `resync()` threw the local fold away to take the pin; clearing the *metadata* first meant
+    a bot that could not take the pin -- none pinned, a pin that is not a snapshot, one its own
+    term or position already outruns -- was left reporting `snapshot: message none` while still
+    folding the snapshot it had, which reads as "this bot has no pin to compare with".
+    """
+
+    def setUp(self):
+        super().setUp()
+        asyncio.run(self.mine.store.resync())        # the reader takes the pin, as it would
+        self.pin = self.mine.store.snapshot_message
+        self.assertIsNotNone(self.pin, "the reader adopted the holder's pin")
+        self.covered = self.mine.store.snapshot_pos
+
+    def assert_still_holding(self):
+        self.assertEqual(self.mine.store.snapshot_message, self.pin)
+        self.assertEqual(self.mine.store.snapshot_pos, self.covered)
+        self.assertIn(f"snapshot: message {self.pin}", self.mine.describe())
+
+    def test_a_resync_with_no_pin_pinned_keeps_the_metadata(self):
+        """DISCRIMINATING: clearing it up front made `/state` say `snapshot: message none`."""
+        self.group.pins.clear()
+        self.assertFalse(asyncio.run(self.mine.store.resync()))
+        self.assert_still_holding()
+
+    def test_a_pin_that_is_not_a_snapshot_keeps_the_metadata(self):
+        self.group.files[999999] = ("dashboard", b"")     # pinned, but not a SNAPSHOT line
+        self.group.pins.append(999999)
+        self.assertFalse(asyncio.run(self.mine.store.resync()))
+        self.assert_still_holding()
 
 
 if __name__ == "__main__":

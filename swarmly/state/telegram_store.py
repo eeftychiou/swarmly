@@ -231,11 +231,15 @@ class TelegramStore(StateStore):
         self._snapshot_pos = self.log.base_pos
 
     def _want_pinned(self) -> None:
-        """#477: a resync must read the pin again, not keep the snapshot it already holds."""
-        self.snapshot_message = None
-        self._snapshot_pos = 0
-        self._pin_tries = 0
+        """#477: the next read must take the pin again, not keep the snapshot it holds.
+
+        The metadata is *not* dropped here. `_load_snapshot` reads the pin on every call, so
+        there is nothing to forget -- and a pin that cannot be adopted (none pinned, one that
+        is not a snapshot, one this bot's term or position already outruns) leaves this bot
+        holding the snapshot it had, which `/state` must keep naming (#477 QA).
+        """
         self._want_pin = 0
+        self._pin_tries = 0
 
     async def refresh(self) -> None:
         await super().refresh()
