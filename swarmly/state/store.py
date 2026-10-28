@@ -123,6 +123,27 @@ class StateStore:
         await self.refresh()
         self.ready = True
 
+    async def resync(self) -> bool:
+        """Throw the local fold away and rebuild it from the pinned snapshot (#477).
+
+        A bot that missed a STATE line while it was down cannot get it back: Telegram keeps no
+        backlog a bot may re-read, and the fold it built without that line is wrong for ever --
+        a write it rejected stays rejected, a key it never saw stays unset. The snapshot is the
+        holder's fold of everything up to a position, so loading it again is the one repair
+        there is. True when it rebuilt; the ops after the pin arrive as usual.
+
+        A divergence at a position *above* the pin cannot be repaired this way: the pin is the
+        newest fold there is, so the caller is told (False) and says so rather than pretending.
+        """
+        before = self.log.state_hash()
+        self._want_pinned()
+        await self._load_snapshot()
+        await self.refresh()
+        return self.log.state_hash() != before
+
+    def _want_pinned(self) -> None:
+        """Backend hook: forget the snapshot this bot held, so the next read takes the pin."""
+
     async def refresh(self) -> None:
         ops = await self._pull()
         self.log.add_all(ops)

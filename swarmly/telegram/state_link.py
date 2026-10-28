@@ -173,6 +173,8 @@ class StateLink:
         self.store: Optional[TelegramStore] = None
         self.error = ""
         self._last_beat = float("-inf")
+        #: When this bot last rebuilt itself from the pin because a peer disagreed (#477).
+        self._last_resync = float("-inf")
         self._last_snapshot = float("-inf")
         self._starting: Optional[asyncio.Task] = None
         from swarmly.telegram.registry_shadow import RegistryShadow
@@ -226,6 +228,10 @@ class StateLink:
                                  text=event.text or "", read_file=read)
 
     # -- the beat --------------------------------------------------------------------------
+    #: How often a diverged bot may rebuild from the pin (#477): a beat is a minute apart, and
+    #: the repair is a snapshot read plus a poll -- often enough to heal, never a stampede.
+    RESYNC_SECONDS = 600.0
+
     async def beat(self, *, now: Optional[float] = None) -> str:
         """Called from the heartbeat. Returns what it did, for the log and a test."""
         store = self.store
@@ -284,6 +290,9 @@ class StateLink:
                                    "pos": store.log.last_pos, "hash": store.state_hash()})
                 self._last_beat = moment
                 done.append("beat")
+                healed = await self._resync_if_diverged(store, moment)
+                if healed:
+                    done.append(healed)
             # The table itself: published every heartbeat, as gitbus pushed each row at once
             # -- a debt must not wait out the state cadence to be seen.
             await self._owed_beat(store, moment, done)
@@ -293,6 +302,33 @@ class StateLink:
             logger.warning("state: beat failed: %s", self.error)
             return "failed"
         return ", ".join(done) or "nothing to do"
+
+    async def _resync_if_diverged(self, store: Any, moment: float) -> str:
+        """Rebuild from the pin when another bot's beat says our state is not theirs (#477).
+
+        A bot that missed a STATE line -- down while it was posted -- keeps a fold that is
+        wrong for ever: a write it rejected stays rejected, and nothing in the log says so. The
+        only repair is the snapshot, which is the holder's fold up to a position. Divergence
+        *above* the pin cannot be repaired that way, so it is reported, not hidden.
+        """
+        try:
+            verdicts = self.agreement()
+        except Exception:                              # noqa: BLE001 - a check, not a beat
+            return ""
+        differs = [line for line in verdicts if " DIFFERS " in line]
+        if not differs:
+            return ""
+        if moment - self._last_resync < self.RESYNC_SECONDS:
+            return "diverged (a resync is cooling down)"
+        self._last_resync = moment
+        before = store.log.last_pos
+        changed = await store.resync()
+        logger.warning("state: state hash diverged from a peer (%s); rebuilt from the pin "
+                       "at p%s (was p%s)", "; ".join(differs), store.log.last_pos, before)
+        if store.log.base_pos < before:
+            return ("diverged: rebuilt from the pin at p%s (a divergence above it is not "
+                    "repairable here)" % store.log.base_pos)
+        return f"diverged: rebuilt from the pin at p{store.log.base_pos}" if changed             else "diverged: the pin did not change this bot's state"
 
     # -- links and work items (phase 5) -------------------------------------------------------
     def _ops(self) -> Any:

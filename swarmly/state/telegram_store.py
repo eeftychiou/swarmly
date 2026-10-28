@@ -230,6 +230,13 @@ class TelegramStore(StateStore):
         self.snapshot_message = pinned.message_id
         self._snapshot_pos = self.log.base_pos
 
+    def _want_pinned(self) -> None:
+        """#477: a resync must read the pin again, not keep the snapshot it already holds."""
+        self.snapshot_message = None
+        self._snapshot_pos = 0
+        self._pin_tries = 0
+        self._want_pin = 0
+
     async def refresh(self) -> None:
         await super().refresh()
         if self._want_pin > int(self.snapshot_message or 0) and self._pin_tries < 3:
