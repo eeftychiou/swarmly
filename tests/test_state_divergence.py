@@ -18,9 +18,13 @@ import asyncio
 import unittest
 
 from swarmly.state import keys as K
+from swarmly.state.log import Op
 from swarmly.state.store import MemoryLog, MemoryStore
+from swarmly.telegram.state_link import StateLink
 
 from tests.test_registry_shadow import Clock
+from tests.test_state_link import link_for
+from tests.test_state_store import FakeGroup
 
 
 class MissedLineTests(unittest.TestCase):
@@ -103,6 +107,74 @@ class MissedLineTests(unittest.TestCase):
         asyncio.run(blind.resync())
         self.assertGreaterEqual(blind.log.base_pos, after)
         self.assertEqual(blind.state_hash(), holder.state_hash())
+
+
+class BeatResyncTests(unittest.TestCase):
+    """The wiring the store tests cannot see: a beat that sees a divergence rebuilds (#477).
+
+    `resync()` can be right and still never run -- the repair is only worth anything if the
+    beat calls it, and only safe if it cannot stampede: a peer stays disagrees until the pin
+    moves past the divergence, so every beat inside the cooldown would rebuild again.
+    """
+
+    def setUp(self):
+        self.clock = Clock()
+        self.group = FakeGroup(self.clock)
+        self.holder = link_for(self.group, "Claudebot", self.clock, coordinator=True)
+        self.mine = link_for(self.group, "DeepSeek", self.clock)
+        asyncio.run(self.holder.store.start())
+        asyncio.run(self.mine.store.start())
+
+        async def pin():
+            await self.holder.store.claim_lease(600)
+            self.clock.t += 60          # a snapshot covers ops that have settled (15 s)
+            await self.holder.store.publish_snapshot(force=True)
+        asyncio.run(pin())
+        self.assertGreater(self.holder.store.snapshot_pos, 0, "the pin is a real fold")
+
+    def peer_disagrees(self):
+        """A peer's beat folded at this bot's position with another hash: the live shape."""
+        log = self.mine.store.log
+        pos = log.last_pos + 1
+        log.add(Op(pos=pos, key=K.probe("Codex", "beat"), base=0, term=0, writer="codex",
+                   value={"at": round(self.clock()), "rev": "abc123", "pos": pos,
+                          "hash": "000000000000"}, at=self.clock()))
+        self.assertIn("DIFFERS", "; ".join(self.mine.agreement()))
+
+    def test_a_beat_that_sees_a_divergence_rebuilds_from_the_pin(self):
+        """DISCRIMINATING: drop the call from `beat()` and this beat says nothing of it."""
+        self.peer_disagrees()
+        said = asyncio.run(self.mine.beat())
+        self.assertIn("diverged: rebuilt from the pin at p", said)
+
+    def test_the_rebuild_is_shown_in_state_as_well_as_logged(self):
+        """The deploy is verified from `/state`: a receipt only in the log cannot be read."""
+        self.peer_disagrees()
+        asyncio.run(self.mine.beat())
+        text = self.mine.describe()
+        self.assertIn("last resync at ", text)
+        self.assertIn("diverged: rebuilt from the pin at p", text)
+
+    def test_a_second_divergence_inside_the_cooldown_waits_and_then_rebuilds_again(self):
+        """DISCRIMINATING: without the 600 s guard the second beat rebuilds too.
+
+        A swarm beat once a minute (`state.heartbeat_minutes: 1`) reaches the check every
+        minute, and the peer stays DIFFERS until the pin moves past the divergence -- so
+        without the guard every beat would rebuild and re-read the pin.
+        """
+        self.mine.beat_seconds = 60.0
+        self.peer_disagrees()
+        self.assertIn("diverged: rebuilt", asyncio.run(self.mine.beat()))
+
+        self.clock.t += 60                       # a minute later: the peer still disagrees
+        self.peer_disagrees()
+        said = asyncio.run(self.mine.beat())
+        self.assertIn("a resync is cooling down", said)
+        self.assertNotIn("rebuilt", said)
+
+        self.clock.t += StateLink.RESYNC_SECONDS  # past the cooldown: it heals again
+        self.peer_disagrees()
+        self.assertIn("diverged: rebuilt from the pin at p", asyncio.run(self.mine.beat()))
 
 
 if __name__ == "__main__":

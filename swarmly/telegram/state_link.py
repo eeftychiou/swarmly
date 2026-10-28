@@ -175,6 +175,10 @@ class StateLink:
         self._last_beat = float("-inf")
         #: When this bot last rebuilt itself from the pin because a peer disagreed (#477).
         self._last_resync = float("-inf")
+        #: The last such rebuild, as the beat said it, and when: `/state` shows the receipt a
+        #: deploy is checked with -- a log line nobody reads is not a receipt (review).
+        self._last_divergence = ""
+        self._last_divergence_at = float("-inf")
         self._last_snapshot = float("-inf")
         self._starting: Optional[asyncio.Task] = None
         from swarmly.telegram.registry_shadow import RegistryShadow
@@ -326,9 +330,14 @@ class StateLink:
         logger.warning("state: state hash diverged from a peer (%s); rebuilt from the pin "
                        "at p%s (was p%s)", "; ".join(differs), store.log.last_pos, before)
         if store.log.base_pos < before:
-            return ("diverged: rebuilt from the pin at p%s (a divergence above it is not "
+            said = ("diverged: rebuilt from the pin at p%s (a divergence above it is not "
                     "repairable here)" % store.log.base_pos)
-        return f"diverged: rebuilt from the pin at p{store.log.base_pos}" if changed             else "diverged: the pin did not change this bot's state"
+        elif changed:
+            said = f"diverged: rebuilt from the pin at p{store.log.base_pos}"
+        else:
+            said = "diverged: the pin did not change this bot's state"
+        self._last_divergence, self._last_divergence_at = said, moment
+        return said
 
     # -- links and work items (phase 5) -------------------------------------------------------
     def _ops(self) -> Any:
@@ -1049,6 +1058,11 @@ class StateLink:
                  f"hash {store.state_hash()}",
                  f"lease: {lease.holder or 'nobody'} (term {lease.term}){self._lease_compare()}",
                  f"snapshot: message {store.snapshot_message or 'none'}"]
+        if self._last_divergence:
+            # The receipt #477 is verified with: a bot that healed says when and where, so a
+            # deploy can be checked from `/state` alone (review).
+            when = time.strftime("%H:%M UTC", time.gmtime(self._last_divergence_at))
+            lines.append(f"last resync at {when}: {self._last_divergence}")
         lines.extend(self.agreement())
         owed = self._owed_compare()
         if owed:
