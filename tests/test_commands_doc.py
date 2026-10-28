@@ -30,6 +30,16 @@ class TheCommandsPageTests(unittest.TestCase):
                   "wakes", "rotate"}                    # answered, but not in the menu
         self.assertEqual(sorted(hidden - written), [])
 
+    def test_a_row_leaves_no_unbalanced_parenthesis(self):
+        """#470: a sentence rewritten in the ``/topics`` row kept the old closing ``)`` after
+        its opening one had gone -- visible in the chat, invisible to every other test."""
+        rows = [line for line in PAGE.read_text(encoding="utf-8").splitlines()
+                if line.startswith("|")]
+        self.assertTrue(rows)
+        unbalanced = [row.split("|")[1].strip() for row in rows
+                      if row.count("(") != row.count(")")]
+        self.assertEqual(unbalanced, [], "these rows' parentheses do not pair up")
+
     def test_every_dashboard_button_is_in_the_table(self):
         """Every button the dashboard offers (a control this build has wired; the rest of
         ``CONTROLS`` is never shown) has a row."""
