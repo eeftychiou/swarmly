@@ -143,13 +143,12 @@ class Filters:
         A topic with no items stays unless a *type* or *stage* was asked for: "none" is the
         type of an empty topic, so ``type=none`` is how an admin asks for exactly those.
 
-        A **tracking** link that is still open keeps the topic listed even when every work
-        item in it is done (#468): a topic whose slices have all landed still has its
-        tracking issue, and hiding it lost the live one from ``/topics`` entirely. Only a
-        tracking link counts here -- it is the one non-work link that carries a status
-        (``records.Link``), so it is the one that can ever close and stop keeping the topic.
-        A reference link never carries a status, and a topic full of them stays listed as
-        long as it is open.
+        A **tracking** link keeps the topic listed even when every work item in it is done
+        (#468, acceptance as amended): a topic whose slices have all landed still has its
+        tracking issue, and hiding it lost the live one from ``/topics`` entirely. No state
+        is read on that link -- a tracking link cannot carry one (``records.Link``), so a
+        finished round leaves the default view by closing its topic or unlinking its
+        tracking issue. A *reference* link is a pointer and never keeps a topic in.
         """
         if str(status or "open").strip().lower() not in self.topic_states:
             return False
@@ -168,9 +167,8 @@ class Filters:
         if self.types or self.stages or self.states:
             return bool(passed)
         # The default view: open, and still something to do in it -- or a tracking issue of
-        # its own still open, which is the topic's last live item once every slice landed.
-        if any(item_state(link) != "closed" and item_stage(link) not in DONE_STAGES
-               for link in tracked):
+        # its own, which is the topic's last live item once every slice has landed.
+        if tracked:
             return True
         return bool(passed) or not any(item_stage(link) in DONE_STAGES for link in items)
 

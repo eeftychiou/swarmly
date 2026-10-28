@@ -116,34 +116,33 @@ class TestTheDefaultView(unittest.TestCase):
         asked = tf.parse(["stage=done"])
         self.assertTrue(asked.topic_ok("open", [DONE]))
 
-    def test_an_open_tracking_link_keeps_a_finished_topic(self):
-        """#468: the slices are all done, the tracking issue is open, and the topic must stay.
+    def test_a_tracking_link_keeps_a_finished_topic(self):
+        """#468, acceptance as amended: the slices are all done and the tracking link is what
+        keeps the topic listed. No state is read on it -- a tracking link cannot carry one.
 
-        Live (tg-28784): every work item done, only #423 -- the tracking issue -- open, and the
-        default view hid the topic the admin was looking at.
+        Live (tg-28784): every work item done, only #423 -- the tracking issue -- left, and
+        the default view hid the topic the admin was looking at.
         """
         tracking = {"id": "T1", "provider": "github", "kind": "issue",
                     "ref": "https://github.com/o/r/issues/423", "role": "tracking",
-                    "title": "#423", "status": "open", "phase": ""}
+                    "title": "#423"}
         self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE]),
-                         "the work item is done and nothing else is open")
+                         "the work item is done and nothing else is there")
         self.assertTrue(tf.DEFAULT.topic_ok("open", [DONE, tracking]))
+        self.assertTrue(tf.DEFAULT.topic_ok("open", [DONE, dict(tracking, status="open")]),
+                        "an unstated state and a stated one read the same: it is not read")
+        self.assertFalse(tf.DEFAULT.topic_ok("closed", [DONE, tracking]),
+                         "a closed topic leaves the view, tracking link or not")
 
     def test_a_reference_link_does_not_keep_it(self):
-        """Review of #469: a reference link carries no status and so can never close; letting
-        it keep the topic would list that topic forever. It is a pointer, not an item."""
+        """The amendment's other case: only a *tracking* link counts. A reference link is a
+        pointer, and a topic full of them would otherwise never leave the default view."""
         reference = {"id": "R1", "provider": "gdrive", "kind": "doc", "ref": "drive:/x",
                      "role": "reference", "title": "notes"}
         self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE, reference]))
-
-    def test_a_closed_or_done_tracking_link_does_not(self):
-        """Reachable because a tracking link now carries a status, and the GitHub check sets
-        it (``state_link.reconcile_github``)."""
-        tracking = {"id": "T1", "provider": "github", "kind": "issue",
-                    "ref": "https://github.com/o/r/issues/423", "role": "tracking",
-                    "title": "#423", "status": "open", "phase": ""}
-        self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE, dict(tracking, status="closed")]))
-        self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE, dict(tracking, phase="done")]))
+        self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE, dict(reference, role="work",
+                                                                 status="closed",
+                                                                 phase="done")]))
 
     def test_an_asked_filter_still_ignores_the_tracking_link(self):
         """The issue says the asked filters behave as they do: they read work items."""

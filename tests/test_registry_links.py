@@ -272,41 +272,6 @@ class RoutingAndGitHubTests(unittest.TestCase):
                                lambda self, repo, number: states.get(number)):
             self.assertEqual(asyncio.run(link.reconcile_github(link.store)), 0, "settled")
 
-    def test_a_closed_tracking_issue_is_moved_like_a_work_item(self):
-        """Review of #469: the tracking link's status is only reachable if this check writes
-        it, so the "its issue closed hides the topic" half of #468 lives here."""
-        from unittest import mock
-
-        from swarmly.github.client import GitHubClient
-        from swarmly.telegram import topic_filter as tf
-        flow = LinkFlowTests()
-        link = flow.link()
-
-        def command(text, thread):
-            return asyncio.run(link.registry_command(SimpleNamespace(
-                text=text, author_id=1, author_is_bot=False, chat_id=-100, thread_id=thread)))
-        self.assertIn("Recorded", command("/link #423 as tracking", 55))
-        command("/link #7 as work", 55)
-        command("/phase #7 done", 55)
-        topic = Topic.from_dict(link.store.read("topic/55"))
-        self.assertEqual(topic.link("L1").role, "tracking")
-        self.assertIsNone(topic.link("L1").status, "a tracking link starts unstated")
-        links = [item.to_dict() for item in topic.links]
-        self.assertTrue(tf.DEFAULT.topic_ok("open", links), "unstated reads as open")
-
-        def check(states):
-            with mock.patch.object(GitHubClient, "ref_kind_state",
-                                   lambda self, repo, number: states.get(number)):
-                return asyncio.run(link.reconcile_github(link.store))
-
-        self.assertEqual(check({423: ("open", False)}), 0, "still open: nothing to write")
-        self.assertEqual(check({423: ("closed", False)}), 1)
-        topic = Topic.from_dict(link.store.read("topic/55"))
-        self.assertEqual((topic.link("L1").phase, topic.link("L1").status), ("done", "closed"))
-        self.assertEqual(topic.history[-1].by, "github")
-        self.assertFalse(tf.DEFAULT.topic_ok("open", [item.to_dict() for item in topic.links]),
-                         "its only live item closed: the topic is finished")
-
     def test_the_channel_asks_the_registry_only_when_told_to(self):
         from tests.test_telegram_channel import make_channel, make_config
         channel = make_channel(make_config(state={"backend": "telegram", "links": "registry"}))

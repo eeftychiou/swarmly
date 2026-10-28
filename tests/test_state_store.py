@@ -90,21 +90,6 @@ class RecordTests(unittest.TestCase):
                             "role": "reference", "added_by": "a", "added_at": "t",
                             "status": "open"})
 
-    def test_a_tracking_link_may_carry_a_status_but_not_assignees(self):
-        """#468 review: whether the tracking issue is still open is what keeps a finished
-        topic listed, so the record has to be able to say it. Assignees stay with the work."""
-        tracking = Link.from_dict({"id": "L1", "provider": "github", "kind": "issue",
-                                   "ref": "https://x/issues/423", "role": "tracking",
-                                   "added_by": "a", "added_at": "t",
-                                   "status": "closed", "phase": "done"})
-        self.assertEqual((tracking.status, tracking.phase), ("closed", "done"))
-        with self.assertRaises(RecordError):
-            Link.from_dict({"id": "L1", "provider": "github", "kind": "issue",
-                            "ref": "https://x/issues/423", "role": "tracking",
-                            "added_by": "a", "added_at": "t",
-                            "assignees": [{"agent": "DeepSeek", "role": "developer",
-                                           "assigned_by": "a", "assigned_at": "t"}]})
-
     def test_a_work_item_needs_status_and_phase(self):
         with self.assertRaises(RecordError):
             Link.from_dict({"id": "L1", "provider": "topic", "kind": "task", "ref": "T-1-1",

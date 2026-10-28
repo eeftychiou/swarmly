@@ -645,10 +645,8 @@ it in that topic is delivered rather than refused (`/unlink` takes it off again)
 
 A **link** is a pointer to wherever the work lives — GitHub, GitLab, Google Drive or another
 cloud, a local path, or nothing at all (`provider: topic`: the topic is its own work item) — with
-a `role` (`tracking`, `work`, `reference`) and, for `work` and `tracking`, a `status` and a
-`phase`; the assignees belong to the `work` item alone. A `tracking` link's status is what
-GitHub says about its issue, so a finished topic whose tracking issue is still open stays in
-the default `/topics` view (#468). A `reference` link carries neither: it is a pointer. A link is added explicitly, never guessed from what was said in the chat; that is what
+a `role` (`tracking`, `work`, `reference`) and, for `work`, a `status`, a `phase`, and its
+assignees. A link is added explicitly, never guessed from what was said in the chat; that is what
 replaces ref-learning. The coordinator writes it with lines in its reply, the transport records
 them in the registry and does not post them:
 
