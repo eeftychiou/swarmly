@@ -12482,6 +12482,8 @@ class AgentChannel:
         """A post for a topic that has gone is dropped, not moved to General
         (docs/design/topic-registry.md §3) when ``limits.general_turns: never`` makes General
         no place for it; otherwise ``reroute_gone_topics`` decides, as the transport says."""
+        if not self.reroute_gone_topics:
+            return False                       # the caller wants the refusal raised
         if str(getattr(self.config.limits, "general_turns", "allow") or "allow") == "never":
             return True
         return str(getattr(self.state_link, "backend", "off") or "off") == "telegram"
