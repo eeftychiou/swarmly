@@ -116,6 +116,40 @@ class TestTheDefaultView(unittest.TestCase):
         asked = tf.parse(["stage=done"])
         self.assertTrue(asked.topic_ok("open", [DONE]))
 
+    def test_an_open_tracking_link_keeps_a_finished_topic(self):
+        """#468: the slices are all done, the tracking issue is open, and the topic must stay.
+
+        Live (tg-28784): every work item done, only #423 -- the tracking issue -- open, and the
+        default view hid the topic the admin was looking at.
+        """
+        tracking = {"id": "T1", "provider": "github", "kind": "issue",
+                    "ref": "https://github.com/o/r/issues/423", "role": "tracking",
+                    "title": "#423", "status": "open", "phase": ""}
+        self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE]),
+                         "the work item is done and nothing else is open")
+        self.assertTrue(tf.DEFAULT.topic_ok("open", [DONE, tracking]))
+        reference = dict(tracking, role="reference", phase="")
+        self.assertTrue(tf.DEFAULT.topic_ok("open", [DONE, reference]),
+                        "a reference link with no phase is open work too")
+
+    def test_a_closed_or_done_tracking_link_does_not(self):
+        tracking = {"id": "T1", "provider": "github", "kind": "issue",
+                    "ref": "https://github.com/o/r/issues/423", "role": "tracking",
+                    "title": "#423", "status": "open", "phase": "review"}
+        self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE, dict(tracking, status="closed")]))
+        self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE, dict(tracking, phase="done")]))
+
+    def test_an_asked_filter_still_ignores_the_tracking_link(self):
+        """The issue says the asked filters behave as they do: they read work items."""
+        tracking = {"id": "T1", "provider": "github", "kind": "issue",
+                    "ref": "https://github.com/o/r/issues/423", "role": "tracking",
+                    "title": "#423", "status": "open", "phase": "review",
+                    "type": "issue"}
+        self.assertTrue(tf.parse(["type=issue"]).topic_ok("open", [DONE, tracking]),
+                        "DONE is an issue too, so the asked type still matches it")
+        self.assertFalse(tf.parse(["stage=review"]).topic_ok("open", [DONE, tracking]),
+                         "a work item at review is what the asked stage reads")
+
     def test_all_lists_the_closed_records_too(self):
         everything = tf.parse(["all"])
         self.assertEqual(everything.topic_states, ("open", "closed"))

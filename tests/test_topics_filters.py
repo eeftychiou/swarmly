@@ -74,6 +74,21 @@ class TestSlashTopicsFilters(unittest.TestCase):
         self.assertIn("gone (13) closed", closed)
         self.assertNotIn("a pr (12)", closed)
 
+    def test_a_finished_topic_with_an_open_tracking_issue_stays(self):
+        """#468, as the live registry had it: every slice done, the tracking issue open.
+
+        `/topics` counted this one in "hidden by the filters", so the topic the admin was
+        reading was not in its own list.
+        """
+        tracking = dict(DONE_LINK, id="L9", ref="https://github.com/o/r/issues/423",
+                        title="#423", role="tracking", status="open", phase=None)
+        store = self.store(record(11, "finished but tracked", [DONE_LINK, tracking]),
+                           record(12, "truly done", [DONE_LINK]))
+        text = self.shadow.describe(store)
+        self.assertIn("finished but tracked (11)", text)
+        self.assertNotIn("truly done (12)", text)
+        self.assertIn("1 hidden by the filters", text)
+
     def test_the_default_view_hides_a_topic_whose_work_is_done(self):
         store = self.store(record(11, "finished", [DONE_LINK]),
                            record(12, "moving", [ISSUE_LINK]))

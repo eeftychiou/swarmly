@@ -142,11 +142,18 @@ class Filters:
 
         A topic with no items stays unless a *type* or *stage* was asked for: "none" is the
         type of an empty topic, so ``type=none`` is how an admin asks for exactly those.
+
+        In the default view a **tracking or reference link that is still open** keeps the
+        topic listed even when every work item in it is done (#468): a topic whose slices have
+        all landed still has its tracking issue, and hiding it lost the live one from
+        ``/topics`` entirely.
         """
         if str(status or "open").strip().lower() not in self.topic_states:
             return False
-        items = [link for link in links
-                 if str(dict(link or {}).get("role") or "work").strip().lower() == "work"]
+        items, others = [], []
+        for link in links:
+            role = str(dict(link or {}).get("role") or "work").strip().lower()
+            (items if role == "work" else others).append(link)
         if not items:
             if self.types and "none" not in self.types:
                 return False
@@ -155,6 +162,9 @@ class Filters:
         if self.types or self.stages or self.states:
             return bool(passed)
         # The default view: open, and still something to do in it.
+        if any(item_state(link) != "closed" and item_stage(link) not in DONE_STAGES
+               for link in others):
+            return True
         return bool(passed) or not any(item_stage(link) in DONE_STAGES for link in items)
 
     # -- the words -------------------------------------------------------------------
