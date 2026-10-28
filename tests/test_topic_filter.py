@@ -128,14 +128,20 @@ class TestTheDefaultView(unittest.TestCase):
         self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE]),
                          "the work item is done and nothing else is open")
         self.assertTrue(tf.DEFAULT.topic_ok("open", [DONE, tracking]))
-        reference = dict(tracking, role="reference", phase="")
-        self.assertTrue(tf.DEFAULT.topic_ok("open", [DONE, reference]),
-                        "a reference link with no phase is open work too")
+
+    def test_a_reference_link_does_not_keep_it(self):
+        """Review of #469: a reference link carries no status and so can never close; letting
+        it keep the topic would list that topic forever. It is a pointer, not an item."""
+        reference = {"id": "R1", "provider": "gdrive", "kind": "doc", "ref": "drive:/x",
+                     "role": "reference", "title": "notes"}
+        self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE, reference]))
 
     def test_a_closed_or_done_tracking_link_does_not(self):
+        """Reachable because a tracking link now carries a status, and the GitHub check sets
+        it (``state_link.reconcile_github``)."""
         tracking = {"id": "T1", "provider": "github", "kind": "issue",
                     "ref": "https://github.com/o/r/issues/423", "role": "tracking",
-                    "title": "#423", "status": "open", "phase": "review"}
+                    "title": "#423", "status": "open", "phase": ""}
         self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE, dict(tracking, status="closed")]))
         self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE, dict(tracking, phase="done")]))
 

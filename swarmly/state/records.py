@@ -144,9 +144,14 @@ class Link(Record):
         _check("role", self.role, LINK_ROLES, optional=False)
         _check("status", self.status, LINK_STATUS)
         _check("phase", self.phase, PHASES)
-        if self.role != "work" and (self.status or self.phase or self.assignees):
-            raise RecordError(f"link {self.id}: only a work item has status, phase or "
-                              "assignees")
+        # A tracking link carries GitHub's state too (#468): whether its issue is still open
+        # is what keeps a finished topic listed, so it has to be recordable. A reference link
+        # is a pointer and carries neither; assignees follow the work alone.
+        if self.assignees and self.role != "work":
+            raise RecordError(f"link {self.id}: only a work item has assignees")
+        if self.role not in ("work", "tracking") and (self.status or self.phase):
+            raise RecordError(f"link {self.id}: only a work item or its tracking issue has "
+                              "a status or a phase")
         if self.role == "work" and (self.status is None or self.phase is None):
             raise RecordError(f"link {self.id}: a work item needs a status and a phase (§1a)")
 

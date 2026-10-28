@@ -657,7 +657,9 @@ class StateLink:
     async def reconcile_github(self, store: Any) -> int:
         """Move linked GitHub work items by where GitHub says they stand (the lease holder):
         merged or a closed issue -> done and closed; a closed, unmerged PR -> closed; an open
-        PR still before review -> review. Returns how many items moved.
+        PR still before review -> review. A *tracking* link moves by the same rule (#468): its
+        issue closed is ``done`` and closed, which is what hides a finished topic from the
+        default view. Returns how many items moved.
 
         At most :attr:`GITHUB_MAX_ITEMS` calls a check, spent on the links asked about longest
         ago (never asked first): items that stay open for weeks do not keep the rest from ever
@@ -674,8 +676,13 @@ class StateLink:
             if data.get("status") == "closed" or int(topic_id) in self._gone:
                 continue
             for link in data.get("links") or []:
-                if link.get("provider") != "github" or link.get("role") != "work" \
-                        or link.get("status") != "open":
+                # A work item moves by its GitHub state, and so does a tracking link (#468):
+                # its issue closing is what says the topic is finished. A reference link
+                # carries no state at all, so it is never asked about.
+                if link.get("provider") != "github" \
+                        or link.get("role") not in ("work", "tracking") \
+                        or link.get("status") not in (None, "open") \
+                        or link.get("phase") == "done":
                     continue
                 ref = str(link.get("ref") or "")
                 found = re.match(r"https://github\.com/([^/]+/[^/]+)/(?:issues|pull)/(\d+)",
@@ -707,7 +714,8 @@ class StateLink:
                 changed = relabels = 0
                 for link in topic.links:
                     answer = states.get(link.id)
-                    if answer is None or link.status != "open":
+                    if answer is None or link.role not in ("work", "tracking") \
+                            or link.status not in (None, "open") or link.phase == "done":
                         continue
                     state, is_pr = answer
                     relabelled = bool(is_pr and link.kind != "pr")
