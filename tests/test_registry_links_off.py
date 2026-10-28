@@ -17,7 +17,8 @@ from swarmly.state import keys as K
 from swarmly.telegram.registry_shadow import RegistryShadow
 from swarmly.telegram.topic_open import issue_refs
 from tests.test_registry_shadow import HOME, Clock, channel_for, seen
-from tests.test_telegram_channel import make_channel, make_config
+from tests.test_telegram_channel import make_channel, make_config, run
+from tests.test_topic_open import ask
 
 
 class TestWhatIsNotARef(unittest.TestCase):
@@ -42,46 +43,36 @@ class TestWhatIsNotARef(unittest.TestCase):
         self.assertEqual(issue_refs("#12 twice, #12 again"), ["#12"])
 
 
-class TestLearningUnderTheFlag(unittest.TestCase):
-    def channel(self, links="registry"):
+class NothingIsLearnedFromText(unittest.TestCase):
+    """#472, design §6 phase 9c: the learned map is gone. A number in a message links nothing,
+    and only an explicit link -- ``LINK:``/``/link``, or the admin's ``/topic`` -- does."""
+
+    def channel(self):
         channel = make_channel(make_config())
-        channel.state_link.links_mode = links
+        channel.state_link = FakeLink()
         return channel
 
-    def test_registry_mode_learns_nothing_from_message_text(self):
-        channel = self.channel("registry")
-        channel._learn_topic_refs(channel.config.identity.home_channel_id, 28784,
-                                  "we should look at #123 and #456")
-        self.assertEqual(channel._ref_topics, {})
-        self.assertIsNone(channel._topic_for_refs("about #123"))
+    def test_a_mention_in_text_moves_nothing(self):
+        channel = self.channel()
+        self.assertIsNone(channel.topic_for_text("we should look at #123 and #456"))
+        self.assertIsNone(channel._topic_for_brief("a brief about #123"))
 
-    def test_legacy_mode_is_unchanged(self):
-        channel = self.channel("legacy")
-        channel._learn_topic_refs(channel.config.identity.home_channel_id, 28784,
-                                  "we should look at #123")
-        self.assertIn("#123", channel._ref_topics)
-        self.assertEqual(channel._topic_for_refs("about #123"),
-                         (channel.config.identity.home_channel_id, 28784))
+    def test_the_admins_topic_command_still_pins_the_item(self):
+        """The one thing the learned map carried that had to be replaced: the pin."""
+        channel = make_channel(make_config())
+        channel.topics.remember(HOME, 28784, "a round")
+        pins = []
+        channel.state_link.note_pin = lambda chat, thread, refs, who: pins.append(
+            (int(chat), int(thread), tuple(refs)))
+        run(channel.handle_event(ask("/topic #123", thread_id=28784, message_id=3)))
+        self.assertEqual(pins, [(HOME, 28784, ("#123",))])
 
-    def test_the_admins_own_pin_still_works(self):
-        """/topic #N is a person saying where the item lives, not text being guessed at."""
-        channel = self.channel("registry")
-        channel._learn_topic_refs(channel.config.identity.home_channel_id, 28784,
-                                  "#123", pin=True)
-        self.assertIn("#123", channel._ref_topics)
-
-    def test_a_topic_id_in_the_text_is_not_learned(self):
-        channel = self.channel("legacy")
-        channel.topics.remember(channel.config.identity.home_channel_id, 13221, "elsewhere")
-        channel._learn_topic_refs(channel.config.identity.home_channel_id, 28784,
-                                  "see #13221 and #77")
-        self.assertEqual(sorted(channel._ref_topics), ["#77"])
+    def test_a_topic_id_in_the_text_is_not_a_ref(self):
+        self.assertEqual(issue_refs("see #13221 and #77", topic_ids=(13221,)), ["#77"])
 
 
 class FakeLink:
     """A state link whose registry says `#12` lives in topic 55."""
-
-    links_mode = "registry"
 
     def __init__(self, topic=(HOME, 55)):
         self.topic = topic
@@ -90,34 +81,22 @@ class FakeLink:
         return self.topic if "#12" in list(refs or ()) else None
 
 
-class TestTheExplicitLinkStillMoves(unittest.TestCase):
-    """The flag turns off the *guess*; the item's explicit link still decides (#457 review).
+class TestTheExplicitLinkMoves(unittest.TestCase):
+    """The item's explicit link decides, and nothing else (#472)."""
 
-    Phase 5 lands before phase 6, so `state.links: registry` with `state.routing: legacy`
-    is a real configuration -- and there the learned map is empty, so every reader that
-    looked only at it lost the link the admin had made.
-    """
-
-    def channel(self, links="registry"):
+    def channel(self):
         config = make_config()
         config.limits.work_in_topics = True
         channel = make_channel(config)
         channel.state_link = FakeLink()
-        channel.state_link.links_mode = links
         return channel
 
     def test_the_text_helper_finds_the_explicit_link(self):
-        channel = self.channel("registry")
-        self.assertEqual(channel.topic_for_text("please look at #12"),
-                         (HOME, 55))
+        self.assertEqual(self.channel().topic_for_text("please look at #12"), (HOME, 55))
+        self.assertIsNone(self.channel().topic_for_text("please look at #999"))
 
-    def test_legacy_mode_ignores_the_explicit_link_and_guesses(self):
-        channel = self.channel("legacy")
-        channel._learn_topic_refs(HOME, 55, "#12")
-        self.assertEqual(channel.topic_for_text("please look at #12"), (HOME, 55))
-
-    def test_the_explicit_link_moves_a_reply_and_the_guess_does_not(self):
-        channel = self.channel("registry")
+    def test_the_link_moves_a_reply_and_a_guess_does_not(self):
+        channel = self.channel()
         moved = channel._topic_elsewhere(self.reply_in(28784, "answer here"), "about #12")
         self.assertEqual(moved, (HOME, 55))
         nothing = channel._topic_elsewhere(self.reply_in(28784, "answer here"), "about #999")
@@ -125,55 +104,32 @@ class TestTheExplicitLinkStillMoves(unittest.TestCase):
 
     def test_a_brief_goes_to_the_topic_its_item_is_linked_in(self):
         """The decision `_open_topic` takes, driven: not a string match on the source (#457)."""
-        channel = self.channel("registry")
+        channel = self.channel()
         self.assertEqual(channel._topic_for_brief("re-review PR #12"), (HOME, 55))
         self.assertIsNone(channel._topic_for_brief("a brief about #999"))
 
-    def test_a_brief_falls_back_to_the_learned_topic_when_no_link_exists(self):
-        """The `else` of `_topic_for_brief`: with no explicit link, `legacy` mode still moves.
-
-        Without this, replacing the body with only `_linked_topic(about)` left all the other
-        tests green (#462 review).
-        """
-        channel = self.channel("legacy")            # FakeLink answers nothing in this mode
-        self.assertFalse(channel._transport_only_on())
-        channel._learn_topic_refs(HOME, 55, "#12")
-        self.assertEqual(channel._topic_for_brief("#12"), (HOME, 55))
-        self.assertIsNone(channel._topic_for_brief("#999"), "nothing learned, nothing moves")
-
     def test_a_general_reply_goes_where_its_item_lives(self):
         """The decision the General move takes, message and answer read together."""
-        channel = self.channel("registry")
+        channel = self.channel()
         event = self.reply_in(None, "handing the review over")
         self.assertEqual(channel._topic_for_general_work(event, "reviewed #12"), (HOME, 55))
         self.assertIsNone(channel._topic_for_general_work(event, "reviewed #999"))
 
     def test_a_general_handoff_moves_by_the_item_it_names(self):
-        """The other half of `_topic_for_general_work`: the ref is in the hand-off, not the answer.
-
-        The docstring says the message and the answer are read together, and only the answer
-        side was pinned: replacing the body with `topic_for_text(body)` left every test green
-        (#462 nit).
-        """
-        channel = self.channel("registry")
+        """The other half of `_topic_for_general_work`: the ref is in the hand-off, not the
+        answer (a body-only version left every test green, #462 nit)."""
+        channel = self.channel()
         handoff = self.reply_in(None, "handing #12 over, please take it")
         self.assertEqual(channel._topic_for_general_work(handoff, "taking it"), (HOME, 55))
         unknown = self.reply_in(None, "handing #999 over, please take it")
         self.assertIsNone(channel._topic_for_general_work(unknown, "taking it"),
                           "a hand-off naming an item nobody linked stays in General")
 
-    def test_transport_only_moves_a_brief_on_a_link_never_on_a_guess(self):
-        """With General and pulse transport-only only a link moves a brief (admin, 25 Oct)."""
-        linked = self.channel("registry")
-        linked.config.limits.general_turns = "never"
-        self.assertEqual(linked._topic_for_brief("#12"), (HOME, 55))
-
-        guessed = self.channel("legacy")
-        guessed.config.limits.general_turns = "never"
-        guessed._learn_topic_refs(HOME, 55, "#12")     # a learned ref, the legacy way
-        self.assertIn("#12", guessed._ref_topics)
-        self.assertIsNone(guessed._topic_for_brief("#12"),
-                          "a guess does not move a brief: it stays where it was asked")
+    def test_transport_only_still_moves_a_brief_on_a_link(self):
+        """With General and pulse transport-only, a link still moves a brief (admin, 25 Oct)."""
+        channel = self.channel()
+        channel.config.limits.general_turns = "never"
+        self.assertEqual(channel._topic_for_brief("#12"), (HOME, 55))
 
     def reply_in(self, thread, text):
         from swarmly.telegram.channel import ChannelEvent
@@ -195,16 +151,15 @@ class TestTheRegistrysLinks(unittest.TestCase):
         asyncio.run(store.claim_lease(10 ** 6))
         return store
 
-    def sync(self, store, links_mode):
-        self.channel.state_link = SimpleNamespace(links_mode=links_mode)
-        channel = self.channel
-        channel._ref_topics = {"#42": (HOME, 10134), "#13221": (HOME, 10134)}
-        seen(channel, 10134, "Stability round")
-        asyncio.run(RegistryShadow(channel, clock=self.clock).sync(store))
+    def sync(self, store):
+        self.channel.state_link = SimpleNamespace()
+        seen(self.channel, 10134, "Stability round")
+        asyncio.run(RegistryShadow(self.channel, clock=self.clock).sync(store))
         return (store.read(K.topic(10134)) or {}).get("links") or []
 
-    def test_registry_mode_writes_no_learned_link(self):
-        links = self.sync(self.store(), "registry")
+    def test_a_sync_writes_no_guessed_link(self):
+        """Nothing is learned, so a sync writes no ``added_by: legacy`` link at all (#472)."""
+        links = self.sync(self.store())
         self.assertEqual([link for link in links if link.get("added_by") == "legacy"], [])
 
     def test_registry_mode_drops_the_guesses_an_earlier_build_wrote(self):
@@ -226,16 +181,9 @@ class TestTheRegistrysLinks(unittest.TestCase):
                        "added_by": "admin", "added_at": "2026-10-27T00:00:00Z"},
                   ], "agents": {}}
         asyncio.run(store.write(K.topic(10134), record))
-        links = self.sync(store, "registry")
+        links = self.sync(store)
         self.assertEqual([link.get("title") for link in links], ["#7"])
         self.assertEqual([link.get("added_by") for link in links], ["admin"])
-
-    def test_legacy_mode_still_learns(self):
-        links = self.sync(self.store(), "legacy")
-        titles = sorted(link.get("title") for link in links)
-        self.assertEqual(titles, ["#13221", "#42"])
-        self.assertTrue(all(link.get("added_by") == "legacy" for link in links))
-
 
 if __name__ == "__main__":
     unittest.main()
