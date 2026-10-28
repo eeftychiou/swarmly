@@ -647,18 +647,6 @@ class AgentChannel:
         #: a silent drop is exactly the bug this item fixes. Its own window, so the first drop
         #: after any hold is always reported.
         self._queue_refused_noticed = float("-inf")
-        self._ref_topics: Dict[str, Tuple[int, int]] = {}     # "#12" -> the topic about it
-        # Kept across restarts (round 2 export: two restarts emptied it, and #34 and #37 each
-        # got a new topic though one was already about them). "#12" -> wall-clock last seen.
-        self._ref_seen: Dict[str, float] = {}
-        self._refs_path = _state_file(config, "topic-refs")
-        now = time.time()
-        for ref, item in load_state(self._refs_path, "issue topics").get("refs", {}).items():
-            if isinstance(ref, str) and isinstance(item, list) and len(item) == 3 \
-                    and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                            for v in item) and now - item[2] < REF_TOPIC_SECONDS:
-                self._ref_topics[ref] = (int(item[0]), int(item[1]))
-                self._ref_seen[ref] = float(item[2])
         self._topics_reported: Set[Tuple[int, Optional[int]]] = set()   # sent REPORT_BACK
         self._report_asked: Set[Tuple[int, Optional[int]]] = set()      # REPORT_NOTE sent
         self._self_tasks: Set[asyncio.Task] = set()
@@ -2392,11 +2380,14 @@ class AgentChannel:
         if token and token in owed:
             return "open: " + owed[token]
         store = self.state_link.store
-        if store is None or not store.ready:
-            if self.state_link.routing_mode == "registry" or \
-                    self.state_link.links_mode == "registry":
-                return "the topic registry is not readable yet"   # never guess: keep it
-            return None
+        if store is None:
+            # A bot with no registry keeps the older answer: nothing is claimed, and /cleanup
+            # works as it did. One that *has* a registry but cannot read it never guesses.
+            if str(getattr(self.state_link, "backend", "off") or "off") != "telegram":
+                return None
+            return "the topic registry is not readable yet"
+        if not store.ready:
+            return "the topic registry is not readable yet"       # never guess: keep it
         from swarmly.state import keys as K
         record = store.read(K.topic(thread_id))
         for link in (record.get("links") if isinstance(record, dict) else None) or []:
@@ -2751,7 +2742,6 @@ class AgentChannel:
         self.close_owed_for_gone_topic(chat_id, thread_id, context)
         self.topics.forget(chat_id, thread_id)
         self._topic_memory.forget(chat_id, thread_id)
-        self._forget_topic_refs(chat_id, thread_id)
         if int(chat_id) == int(self.config.identity.home_channel_id or 0):
             self.state_link.topic_gone(thread_id, deleted=True)
         if context:
@@ -9380,8 +9370,6 @@ class AgentChannel:
                 and "still paused here" in machine_prose(event.text or "")[:40]:
             # The same for the reminder: one per topic per window, whichever bot posts it.
             self._pause_reminded[(event.chat_id, event.thread_id)] = self._clock()
-        if event.thread_id is not None:
-            self._learn_topic_refs(event.chat_id, event.thread_id, event.text or "")
         if event.author_is_bot:
             self._handoff_answered(event)
         if self.config.is_member(event.author_id, event.author_username, event.author_is_bot) \
@@ -10905,68 +10893,6 @@ class AgentChannel:
             reply_to_message_id=event.message_id, chat_id=event.chat_id, silent=True,
             notice=True)
 
-    def _learn_topic_refs(self, chat_id: int, thread_id: int, text: str,
-                          pin: bool = False) -> None:
-        """Remember which topic first talked about each issue or PR (any bot's topic: every
-        transport sees the group), so later work on it goes there, not to a new topic.
-        An entry not seen for REF_TOPIC_SECONDS is let go: the item has moved on.
-        ``pin``: the admin's ``/topic #N`` -- this topic takes the item, whoever spoke first.
-        Nothing is learned in Swarm pulse: bots' chatter there is not work about an item.
-
-        With ``state.links: registry`` **text is not learned** (#457, design §6 phase 5): the
-        registry's links are the explicit ones -- ``LINK:``/``ASSIGN:`` lines, ``/link`` and a
-        GitHub event on an item already linked -- and a mention in a message is not a link. The
-        admin's own ``/topic``/``/link`` still pin (`pin=True`): a person said so."""
-        if not self._work_topic((int(chat_id), int(thread_id))):
-            return
-        if not pin and self.state_link.links_mode != "legacy":
-            return                          # the registry's explicit links decide; text does not
-        now = time.time()
-        changed = False
-        topic = (int(chat_id), int(thread_id))
-        for ref in issue_refs(text, topic_ids=self._topic_ids(chat_id)):
-            known = self._ref_topics.get(ref)
-            if known is None or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS \
-                    or (pin and known != topic):
-                self._ref_topics[ref] = topic
-                changed = True
-            elif known != topic:
-                continue
-            elif now - self._ref_seen.get(ref, now) >= 3600:
-                changed = True                  # on disk at most hourly per item
-            self._ref_seen[ref] = now
-        if changed:
-            self._save_ref_topics()
-
-    def _topic_ids(self, chat_id: Optional[int] = None) -> Tuple[int, ...]:
-        """The thread ids of the topics this bot knows -- in *chat_id* when it is given.
-
-        A forum thread id reads exactly like an issue number, and one was learned as a ref
-        (#457: `#13221`, a topic). Naming a topic is not naming an issue.
-        """
-        try:
-            entries = self.topics.entries()
-        except Exception:                               # noqa: BLE001 - a map that will not read
-            return ()
-        return tuple(int(thread) for chat, thread, _name in entries
-                     if chat_id is None or int(chat) == int(chat_id))
-
-    def _topic_for_refs(self, text: str) -> Optional[Tuple[int, int]]:
-        if self.state_link.links_mode != "legacy":
-            # Phase 5 (#457): a topic move *by guess* is off with the registry's links on.
-            # `topic_for_text` still follows the topics' explicit links.
-            return None
-        now = time.time()
-        # Only the legacy half needs the thread ids (the registry returned above): a thread id
-        # is not an issue number (#457).
-        topic_ids = self._topic_ids()
-        for ref in issue_refs(text, topic_ids=topic_ids):
-            if ref in self._ref_topics \
-                    and now - self._ref_seen.get(ref, now) < REF_TOPIC_SECONDS \
-                    and self._work_topic(self._ref_topics[ref]):
-                return self._ref_topics[ref]
-        return None
-
     def _work_topic(self, place: Optional[Tuple[int, int]]) -> bool:
         """A topic work may be moved into: not Swarm pulse (live, 25 Oct: refs learned from
         bots' chatter there moved a reply into it), not one found gone."""
@@ -11001,32 +10927,15 @@ class AgentChannel:
 
     def topic_for_text(self, text: str) -> Optional[Tuple[int, int]]:
         """The topic already about an issue or PR *text* names, if any (the GitHub watch: a
-        notice or turn about #N goes there). With ``state.links: registry`` the topics'
-        explicit links decide first; today's ref-learning is only the fallback."""
-        return self._linked_topic(text) or self._topic_for_refs(text)
+        notice or turn about #N goes there): the topics' **explicit** links, and nothing
+        guessed from what was said in the chat (#472, design §6 phase 9c)."""
+        return self._linked_topic(text)
 
     def _linked_topic(self, text: str) -> Optional[Tuple[int, int]]:
-        """The work topic explicitly linked to an issue or PR *text* names, with
-        ``state.links: registry``; never one guessed from what was said in the chat."""
-        if self.state_link.links_mode != "registry":
-            return None
+        """The work topic explicitly linked to an issue or PR *text* names; never one guessed
+        from what was said in the chat."""
         found = self.state_link.topic_for_refs(issue_refs(text or ""))
         return found if found is not None and self._work_topic(found) else None
-
-    def _forget_topic_refs(self, chat_id: Optional[int], thread_id: Optional[int]) -> None:
-        """A topic was closed or deleted: work on its items no longer goes there."""
-        gone = [ref for ref, topic in self._ref_topics.items()
-                if topic == (chat_id, thread_id)]
-        for ref in gone:
-            del self._ref_topics[ref]
-            self._ref_seen.pop(ref, None)
-        if gone:
-            self._save_ref_topics()
-
-    def _save_ref_topics(self) -> None:
-        save_state(self._refs_path, {"refs": {
-            ref: [chat, thread, self._ref_seen.get(ref, time.time())]
-            for ref, (chat, thread) in self._ref_topics.items()}}, "issue topics")
 
     def _handle_topic_pin(self, event: ChannelEvent) -> Optional[str]:
         """``/topic #164 #165``, from the admin inside a topic: those items live here. Every
@@ -11048,9 +10957,8 @@ class AgentChannel:
                 or not self._work_topic((int(event.chat_id), int(event.thread_id))):
             return ("📌 /topic works inside a work topic, with the items that live there: "
                     "/topic #164 #165") if speaks else ""
-        self._learn_topic_refs(event.chat_id, event.thread_id, " ".join(refs), pin=True)
-        # With registry routing the topics' explicit links decide first: the lease holder
-        # records the admin's link here, and it outranks every other topic's (review, #279).
+        # The topics' explicit links decide: the lease holder records the admin's link here,
+        # and it outranks every other topic's (review, #279).
         self.state_link.note_pin(event.chat_id, event.thread_id, refs, event.author_id)
         # Transport-only: a reply stays in its turn's topic, so only notices follow the pin.
         what = "notices" if self._transport_only_on() else "replies"
@@ -11059,8 +10967,8 @@ class AgentChannel:
 
     def _pin_linked_item(self, event: ChannelEvent) -> List[str]:
         """The admin's ``/link #N`` (as work) says what ``/topic #N`` says: the item lives in
-        this topic, for today's routing too. Every bot applies it to its own topic map, as it
-        does /topic; the registry answer stays the lease holder's. Returns the items pinned."""
+        this topic. The pin goes to the registry, as ``/topic``'s does (#472); who answers is
+        the lease holder's business. Returns the items pinned."""
         args = command_args(event.text or "")
         if event.author_is_bot or not self.config.is_admin(event.author_id) \
                 or event.thread_id is None or not args:
@@ -11070,7 +10978,7 @@ class AgentChannel:
                 if isinstance(line, LinkLine) and line.role == "work"
                 for ref in issue_refs(line.ref)]
         if refs:
-            self._learn_topic_refs(event.chat_id, event.thread_id, " ".join(refs), pin=True)
+            self.state_link.note_pin(event.chat_id, event.thread_id, refs, event.author_id)
         return refs
 
     def _topic_elsewhere(self, event: ChannelEvent, body: str) -> Optional[Tuple[int, int]]:
@@ -11097,26 +11005,14 @@ class AgentChannel:
         refs = issue_refs(body)
         if not refs:
             return None
-        now = time.time()
         targets = set()
         for ref in refs:
-            # The item's **explicit** link decides first, whatever the routing flag says
-            # (#457 review): with `state.links: registry` the registry's links are the only
-            # ones there are, and reading the learned map here left a reply where it did not
-            # belong -- or moved it nowhere.
+            # The item's **explicit** link decides, and only it (#472): a mention in a message
+            # is not a link, so a number no topic has linked neither holds the reply nor moves
+            # it (live, one new #181 kept a post about four round 5.5 items in Round 5).
             linked = self._linked_topic(ref)
             if linked is not None:
                 targets.add(linked)
-                continue
-            if self.state_link.links_mode != "legacy":
-                continue                    # no learned refs under the registry's links
-            if ref not in self._ref_topics \
-                    or now - self._ref_seen.get(ref, now) >= REF_TOPIC_SECONDS:
-                # A number no topic has talked about yet (an issue filed this hour) neither
-                # holds the reply nor moves it: live, one new #181 kept a post about four
-                # round 5.5 items in Round 5, and the answer followed it there.
-                continue
-            targets.add(self._ref_topics[ref])
         if len(targets) != 1:
             return None
         target = targets.pop()
@@ -11133,7 +11029,6 @@ class AgentChannel:
         await self.send(body, chat_id=chat_id, thread_id=thread_id, token=True)
         # A bot never receives its own posts: the new items the reply names are learned here,
         # in the topic it went to, as every peer learns them from seeing it there.
-        self._learn_topic_refs(chat_id, thread_id, body)
         self._log_topic(chat_id, thread_id, self.config.identity.alias, body,
                         self.last_first_message_id)
         # The moved reply may be the hand-off that matters (live test: it had no bus copy).
@@ -11213,7 +11108,6 @@ class AgentChannel:
         self._topics_opened.append(now)
         self.topics.remember(home, thread_id, name, current=True)
         self.topics.touch(home, thread_id)       # opened now: active, never "finished"
-        self._learn_topic_refs(home, thread_id, f"{title}\n{brief}\n{event.text or ''}")
         self._topic_origins[(home, thread_id)] = (event.chat_id, event.thread_id)
         logger.info("opened topic %r (thread %s) for message %s", name, thread_id,
                     event.message_id)
@@ -11244,15 +11138,12 @@ class AgentChannel:
         return sent
 
     def _topic_for_brief(self, about: str) -> Optional[Tuple[int, int]]:
-        """Where a brief belongs when it names items a topic already has (#457).
+        """Where a brief belongs when it names items a topic already has (#457, #472).
 
-        The item's **explicit** link decides, always. The learned guess is the second answer
-        in `legacy` mode only, and it is never consulted in transport-only mode: there a reply
-        stays in the topic it was asked in, and only a link moves a brief (admin, 25 Oct).
+        The item's **explicit** link decides, and only it: a reply stays in the topic it was
+        asked in, and only a link moves a brief (admin, 25 Oct).
         """
-        if self._transport_only_on():
-            return self._linked_topic(about)
-        return self.topic_for_text(about)
+        return self._linked_topic(about)
 
     def _topic_for_general_work(self, event: ChannelEvent,
                                 body: str) -> Optional[Tuple[int, int]]:
@@ -11265,10 +11156,13 @@ class AgentChannel:
 
     def _transport_only_on(self) -> bool:
         """General and Swarm pulse are transport-only -- no model turn there, nothing from token
-        space posted there -- with ``limits.general_turns: never``, and always with registry
-        routing (admin, 25 Oct: "a block on posting token space posts in General, pulse")."""
-        return (getattr(self.config.limits, "general_turns", "allow") == "never"
-                or getattr(self.state_link, "routing_mode", "legacy") == "registry")
+        space posted there -- with ``limits.general_turns: never``, and always on a bot that
+        runs the topic registry: the registry decides every work topic, so the two places are
+        the one kind of place it never takes (admin, 25 Oct: "a block on posting token space
+        posts in General, pulse"). ``state.routing``'s ``legacy`` side is what went (#472)."""
+        if str(getattr(self.config.limits, "general_turns", "allow") or "allow") == "never":
+            return True
+        return str(getattr(self.state_link, "backend", "off") or "off") == "telegram"
 
     def _transport_only_place(self, event: ChannelEvent) -> Optional[str]:
         """"General" or "Swarm pulse" when ``event`` is in one of them, else None."""
@@ -12572,7 +12466,6 @@ class AgentChannel:
                            "; posting in General" if self.reroute_gone_topics else "")
             self.stats.errors += 1      # not last_error: the reply still lands, no blocker
             self._gone_topics.add((destination, thread_id))
-            self._forget_topic_refs(destination, thread_id)
             if int(destination) == int(self.config.identity.home_channel_id or 0):
                 deleted = _is_topic_deleted(gone.__cause__)
                 self.state_link.topic_gone(thread_id, deleted=deleted)
@@ -12586,12 +12479,14 @@ class AgentChannel:
                                            silent)
 
     def _drop_gone_topic_posts(self) -> bool:
-        """With registry routing or ``limits.general_turns: never`` a post for a topic that
-        has gone is dropped, not moved to General (docs/design/topic-registry.md §3)."""
+        """A post for a topic that has gone is dropped, not moved to General
+        (docs/design/topic-registry.md §3) when ``limits.general_turns: never`` makes General
+        no place for it; otherwise ``reroute_gone_topics`` decides, as the transport says."""
         if not self.reroute_gone_topics:
             return False                       # the caller wants the refusal raised
-        never = str(getattr(self.config.limits, "general_turns", "allow") or "allow") == "never"
-        return never or getattr(self.state_link, "routing_mode", "legacy") == "registry"
+        if str(getattr(self.config.limits, "general_turns", "allow") or "allow") == "never":
+            return True
+        return str(getattr(self.state_link, "backend", "off") or "off") == "telegram"
 
     async def _post_in_general(self, payload: str, entities: Optional[List[Dict[str, Any]]],
                                plain: bool, destination: int, thread_id: int,
@@ -13328,8 +13223,6 @@ ATTACHMENTS_DIRNAME = ".a2a-attachments"
 GROUP_MESSAGES_PER_MINUTE = 18
 #: How long a bot left waiting by a person's multi-bot message expects the hand-off.
 HANDOFF_NOTE_SECONDS = 1800.0
-# How long a topic stays the place for an issue or PR nobody mentions there any more.
-REF_TOPIC_SECONDS = 7 * 24 * 3600.0
 
 
 def _is_bus_echo(event: "ChannelEvent") -> bool:

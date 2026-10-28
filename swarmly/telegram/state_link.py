@@ -332,20 +332,20 @@ class StateLink:
     def note_reply(self, chat_id: int, thread_id: Optional[int], text: str,
                    named: Optional[list] = None) -> None:
         """The coordinator's reply in a topic: record its LINK/ASSIGN/PHASE lines (the lease
-        holder only -- it alone writes topic records). With ``routing: registry`` the peers it
-        names (``named``: their Telegram handles) are linked too: the coordinator's mention is
-        how an agent joins a topic."""
+        holder only -- it alone writes topic records). The peers it names (``named``: their
+        Telegram handles) are linked too: the coordinator's mention is how an agent joins a
+        topic."""
         from swarmly.state.links import parse_lines
         lines = parse_lines(text) if text else []
-        handles = list(named or []) if self.routing_mode == "registry" else []
+        handles = list(named or [])
         self._record_in_topic(chat_id, thread_id, lines, handles,
                               K.norm(self.channel.config.identity.alias))
 
     def note_admin_mentions(self, chat_id: int, thread_id: Optional[int],
                             named: list, author_id: Optional[int]) -> None:
-        """The admin named peers (their handles) in a topic: with ``routing: registry`` the
-        holder links them (the admin's mention links an agent, as the coordinator's does)."""
-        if self.routing_mode != "registry" or not named:
+        """The admin named peers (their handles) in a topic: the holder links them (the
+        admin's mention links an agent, as the coordinator's does)."""
+        if not named:
             return
         by = f"admin:{author_id}" if author_id is not None else "admin"
         self._record_in_topic(chat_id, thread_id, [], list(named), by)
@@ -421,15 +421,15 @@ class StateLink:
 
     def route_facts(self, chat_id: int, thread_id: Optional[int]) -> Optional[Any]:
         """The registry's facts for routing a message in this topic, or None when routing
-        stays with the mention rules: the flag is off, the store is not ready, there is no
-        coordinator (lease lapsed), the topic's record is closed, or it is Swarm pulse. A topic
-        with no record yet routes as a new one: the coordinator is linked.
+        stays with the mention rules: the store is not ready, there is no coordinator (lease
+        lapsed), the topic's record is closed, or it is Swarm pulse. A topic with no record
+        yet routes as a new one: the coordinator is linked.
 
         Agents are named by alias *and* handle in ``linked``, so a peer's own spelling of an
         alias never decides a match (review)."""
         from swarmly.telegram.routing import Facts
         store = self.store
-        if self.routing_mode != "registry" or store is None or not store.ready:
+        if store is None or not store.ready:
             return None
         if thread_id is None or int(chat_id) != int(
                 self.channel.config.identity.home_channel_id or 0):
@@ -449,13 +449,6 @@ class StateLink:
         linked: Set[str] = set()
         for alias in data.get("agents") or {}:
             linked |= self._handles_of(alias)
-        # Until phase 9, an agent that has already worked here counts as linked (topics opened
-        # before the flag have only their coordinator in ``agents``) -- unless /unlink took it
-        # off since.
-        for key in store.keys(f"topic/{int(thread_id)}/agent/"):
-            alias = key.rsplit("/", 1)[1]
-            if int((store.read(key) or {}).get("turns") or 0) > 0 and alias not in unlinked:
-                linked |= self._handles_of(alias)
         holder_handle = self._bare((store.read(K.agent(holder, "profile")) or {}).get("handle"))
         identity = self.channel.config.identity
         return Facts(me=K.norm(identity.alias), coordinator=K.norm(holder),

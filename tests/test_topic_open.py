@@ -200,10 +200,11 @@ class TestWorkInTopics(unittest.TestCase):
         self.assertNotIn("@AntigravityBot", quote)              # no second turn for the peer
         self.assertEqual(len(adapter.seen), 1)                  # nothing more is run
 
-    def test_a_peer_reply_about_a_known_pr_goes_to_its_topic(self):
+    def test_a_peer_reply_about_a_linked_pr_goes_to_its_topic(self):
+        """#472: the topic is the one the item is **linked** in, not the one that named it."""
         channel = make_channel(adapter=Scripted("@CodexBot QA notes on the change: " + "x " * 250))
         channel.bot = TopicBot()
-        run(channel.handle_event(event("PR #6 is up for review", thread_id=77, message_id=3)))
+        channel.state_link.topic_for_refs = lambda refs: (GROUP, 77) if "#6" in refs else None
         run(channel.handle_event(event("@HermesBot please QA #6", message_id=4)))
         self.assertEqual(channel.bot.created, [])
         sent = channel._test_sender.sent

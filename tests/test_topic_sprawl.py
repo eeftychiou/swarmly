@@ -1,16 +1,17 @@
 """Round 2 export: one PR was discussed in five topics. Work on an item stays in the topic
-already about it, across restarts, and a hand-off is answered once."""
+that has it **linked**, and a hand-off is answered once.
+
+The learned map these tests once drove is gone (#472, design §6 phase 9c): a number seen in a
+message is not a link, so the topic is the one the registry links the item to."""
 
 from __future__ import annotations
 
 import asyncio
-import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from swarmly.telegram.channel import REF_TOPIC_SECONDS
 from swarmly.telegram.poll import _echo_reply, bus_poll_once
 from tests.test_bus_live_fixes import channel_for
 from tests.test_handoff_mirror import mirror
@@ -18,31 +19,10 @@ from tests.test_telegram_channel import GROUP, event, make_channel, make_config,
 from tests.test_topic_open import Scripted, TopicBot, ask, drain
 
 
-class TestTheTopicMapSurvivesARestart(unittest.TestCase):
-
-    def test_a_restarted_bot_still_knows_the_topic_about_a_pr(self):
-        with TemporaryDirectory() as tmp:
-            config = make_config()
-            config.source_path = Path(tmp) / "config.yaml"
-            channel = make_channel(config)
-            run(channel.handle_event(event("QA on PR 37 starts here", thread_id=77)))
-            again = make_channel(config)
-            self.assertEqual(again.topic_for_text("re-review #37"), (GROUP, 77))
-            self.assertIsNone(again.topic_for_text("#38"))
-
-    def test_an_item_nobody_mentioned_for_a_week_is_let_go(self):
-        channel = make_channel()
-        channel._learn_topic_refs(GROUP, 77, "#37")
-        channel._ref_seen["#37"] = time.time() - REF_TOPIC_SECONDS - 1
-        self.assertIsNone(channel.topic_for_text("#37"))
-        channel._learn_topic_refs(GROUP, 90, "#37")
-        self.assertEqual(channel.topic_for_text("#37"), (GROUP, 90))
-
-    def test_a_closed_topic_is_forgotten(self):
-        channel = make_channel()
-        channel._learn_topic_refs(GROUP, 77, "#37 and #34")
-        channel._forget_topic_refs(GROUP, 77)
-        self.assertIsNone(channel.topic_for_text("#37 #34"))
+def linked(thread, *refs):
+    """The registry's explicit links as the channel reads them (#472): a ref -> its topic."""
+    table = {ref: (GROUP, thread) for ref in refs}
+    return lambda refs: next((table[ref] for ref in refs if ref in table), None)
 
 
 class TestNewTopicChecksKnownTopics(unittest.TestCase):
@@ -51,7 +31,7 @@ class TestNewTopicChecksKnownTopics(unittest.TestCase):
         adapter = Scripted("NEW_TOPIC: PR #37 re-review\n@CodexBot please re-review #37.")
         channel = make_channel(adapter=adapter)
         channel.bot = TopicBot()
-        run(channel.handle_event(event("QA on #37 failed", thread_id=77, message_id=3)))
+        channel.state_link.topic_for_refs = linked(77, "#37")
         run(channel.handle_event(ask("@HermesBot get #37 reviewed again", message_id=4)))
         self.assertEqual(channel.bot.created, [])
         sent = channel._test_sender.sent
@@ -62,9 +42,9 @@ class TestNewTopicChecksKnownTopics(unittest.TestCase):
         adapter = Scripted("NEW_TOPIC: QA #37\nRe-run the suite on #37.", "done")
         channel = make_channel(adapter=adapter)
         channel.bot = TopicBot()
+        channel.state_link.topic_for_refs = linked(77, "#37")
 
         async def scenario():
-            await channel.handle_event(event("#37 is up", thread_id=77, message_id=3))
             await channel.handle_event(ask("@HermesBot QA #37", message_id=4))
             await drain(channel)
         run(scenario())
@@ -75,7 +55,7 @@ class TestNewTopicChecksKnownTopics(unittest.TestCase):
         adapter = Scripted("NEW_TOPIC: research\n@CodexBot compare the two APIs.")
         channel = make_channel(adapter=adapter)
         channel.bot = TopicBot()
-        run(channel.handle_event(event("#37 is up", thread_id=77, message_id=3)))
+        channel.state_link.topic_for_refs = linked(77, "#37")
         run(channel.handle_event(ask("@HermesBot look into the APIs", message_id=4)))
         self.assertEqual(len(channel.bot.created), 1)
 
@@ -100,7 +80,7 @@ class TestABusEchoOpensNoTopic(unittest.TestCase):
     def test_it_still_goes_to_the_topic_about_its_item(self):
         channel = make_channel(adapter=Scripted("@CodexBot " + "next step " * 60))
         channel.bot = TopicBot()
-        run(channel.handle_event(event("#37 is up", thread_id=77, message_id=3)))
+        channel.state_link.topic_for_refs = linked(77, "#37")
         run(channel.handle_event(event("[Codex] [gitbus ← hermes] @HermesBot QA on #37 passed",
                                        message_id=4)))
         self.assertEqual(channel.bot.created, [])
@@ -113,7 +93,7 @@ class TestBusRepliesGoToTheirTopic(unittest.TestCase):
     def test_an_echo_with_no_topic_goes_to_the_topic_about_its_pr(self):
         channel = make_channel()
         channel.bot = object()
-        channel._learn_topic_refs(GROUP, 77, "#37")
+        channel.state_link.topic_for_refs = linked(77, "#37")
         channel._sender = None
         channel.send = mock.AsyncMock()
         reply = mock.Mock(text="QA on #37 passed")
@@ -177,8 +157,10 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
     def _channel(self, reply):
         channel = make_channel(adapter=Scripted(reply))
         channel.bot = TopicBot()
-        channel._learn_topic_refs(GROUP, 77, "#37 tracking")       # the item's own topic
-        channel._learn_topic_refs(GROUP, 88, "#41 tracking")       # another round's topic
+        # The item's own topic links it; another round's topic links its own (#472).
+        table = {"#37": (GROUP, 77), "#41": (GROUP, 88)}
+        channel.state_link.topic_for_refs = lambda refs: next(
+            (table[ref] for ref in refs if ref in table), None)
         channel.sent_where = []
         send = channel.send
 
@@ -219,16 +201,7 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
         channel = self._channel("#37 passed QA; @CodexBot take #99 next.")
         run(channel.handle_event(peer("@HermesBot status?", thread_id=88, message_id=5)))
         self.assertTrue(any("take #99 next" in t for t in self._sent_in(channel, 77)))
-        self.assertEqual(channel.topic_for_text("#99"), (GROUP, 77))   # learned where it went
-
-    def test_a_moved_reply_never_takes_another_topics_live_item(self):
-        # Learning where a reply went must not re-point an item a third topic is about.
-        channel = self._channel("#37 passed QA; #41 waits; @CodexBot take #99 next.")
-        channel._learn_topic_refs(GROUP, 99, "#55 tracking")
-        run(channel._post_in_known_topic(ask("x", thread_id=99, message_id=5),
-                                         "#37 and #55 and #99", (GROUP, 77)))
-        self.assertEqual(channel.topic_for_text("#55"), (GROUP, 99))
-        self.assertEqual(channel.topic_for_text("#99"), (GROUP, 77))
+        self.assertIsNone(channel.topic_for_text("#99"), "an unlinked number moves nothing")
 
     def test_a_reply_with_only_unknown_or_no_numbers_stays(self):
         for reply in ("#98 and #99 are done.", "All quiet here."):
@@ -244,28 +217,32 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
         self.assertTrue(any("#37 passed QA." in t for t in here), here)
         self.assertFalse(any(t.startswith("↪") for t in here), here)
 
-    def test_the_admins_topic_command_moves_an_item_learned_in_the_wrong_topic(self):
+    def test_the_admins_topic_command_pins_the_item_where_they_said(self):
+        """``/topic #N`` from the admin outranks the topic that had the item (#472: the pin
+        is the registry's, so there is no second map to disagree with it)."""
         channel = self._channel("@CodexBot #37 passed QA.")
+        pins = []
+        channel.state_link.note_pin = lambda chat, thread, refs, who: pins.append(
+            (int(chat), int(thread), tuple(refs)))
         run(channel.handle_event(ask("/topic@HermesBot #37", thread_id=88, message_id=4)))
-        self.assertEqual(channel.topic_for_text("#37"), (GROUP, 88))
+        self.assertEqual(pins, [(GROUP, 88, ("#37",))])
         self.assertTrue(any(t.startswith("📌 #37 live in this topic")
                             for t in self._sent_in(channel, 88)))
-        run(channel.handle_event(peer("@HermesBot status?", thread_id=77, message_id=5)))
-        self.assertTrue(any("#37 passed QA." in t for t in self._sent_in(channel, 88)))
 
-    def test_the_admins_link_as_work_moves_an_item_like_topic_does(self):
-        """``/link #N`` is ``/topic #N`` (the admin, 25 Oct): every bot applies it to its own
-        topic map, whoever answers for the registry. ``as reference`` moves nothing."""
+    def test_only_the_admins_link_as_work_pins_it(self):
+        """``/link #N`` is ``/topic #N`` (the admin, 25 Oct): the lease holder records the
+        link. ``as reference`` pins nothing, and a bot's own ``/link`` is not the admin's."""
         channel = self._channel("unused")
-        channel._learn_topic_refs(GROUP, 77, "#52 tracking")
+        pins = []
+        channel.state_link.note_pin = lambda chat, thread, refs, who: pins.append(
+            (int(chat), int(thread), tuple(refs)))
         run(channel.handle_event(ask("/link #52 as reference", thread_id=88, message_id=3)))
-        self.assertEqual(channel.topic_for_text("#52"), (GROUP, 77))
-        run(channel.handle_event(event("/link #52", thread_id=88, message_id=4,
+        self.assertEqual(pins, [], "a reference link is not work")
+        run(channel.handle_event(ask("/link #52", thread_id=88, message_id=4)))
+        self.assertEqual(pins, [(GROUP, 88, ("#52",))])
+        run(channel.handle_event(event("/link #53", thread_id=88, message_id=5,
                                        username="CodexBot", is_bot=True)))
-        self.assertEqual(channel.topic_for_text("#52"), (GROUP, 77))     # a bot's moves nothing
-        run(channel.handle_event(ask("/link@CodexBot #37", thread_id=88, message_id=5)))
-        self.assertEqual(channel.topic_for_text("#37"), (GROUP, 88))
-        self.assertEqual(self._sent_in(channel, 88), [])            # Codex's to answer
+        self.assertEqual(pins, [(GROUP, 88, ("#52",))], "a bot's link moves nothing")
 
     def test_a_bare_link_with_the_store_off_is_still_answered_once(self):
         """No store, so no lease holder answers; the coordinator says the item moved."""
@@ -273,8 +250,11 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
             with self.subTest(coordinator=coordinator):
                 channel = self._channel("unused")
                 channel.is_coordinator = lambda **_: coordinator
+                pins = []
+                channel.state_link.note_pin = lambda chat, thread, refs, who: pins.append(
+                    (int(chat), int(thread), tuple(refs)))
                 run(channel.handle_event(ask("/link #37", thread_id=88, message_id=4)))
-                self.assertEqual(channel.topic_for_text("#37"), (GROUP, 88))
+                self.assertEqual(pins, [(GROUP, 88, ("#37",))])
                 said = self._sent_in(channel, 88)
                 if coordinator:
                     self.assertEqual(len(said), 1, said)
@@ -285,9 +265,14 @@ class TestWorkFollowsItsTopic(unittest.TestCase):
 
     def test_only_the_admin_moves_items_and_other_bots_apply_it_silently(self):
         channel = self._channel("unused")
+        pins = []
+        channel.state_link.note_pin = lambda chat, thread, refs, who: pins.append(
+            (int(chat), int(thread), tuple(refs)))
         run(channel.handle_event(event("/topic #37", thread_id=88, message_id=4,
                                        username="CodexBot", is_bot=True)))
-        self.assertEqual(channel.topic_for_text("#37"), (GROUP, 77))
-        run(channel.handle_event(ask("/topic@CodexBot #37", thread_id=88, message_id=5)))
-        self.assertEqual(channel.topic_for_text("#37"), (GROUP, 88))
+        self.assertEqual(pins, [], "only the admin moves items")
+        run(channel.handle_event(ask("/topic #37", thread_id=88, message_id=5)))
+        self.assertEqual(pins, [(GROUP, 88, ("#37",))])
         self.assertEqual(self._sent_in(channel, 88), [])
+
+

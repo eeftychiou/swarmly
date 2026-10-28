@@ -272,15 +272,16 @@ class RoutingAndGitHubTests(unittest.TestCase):
                                lambda self, repo, number: states.get(number)):
             self.assertEqual(asyncio.run(link.reconcile_github(link.store)), 0, "settled")
 
-    def test_the_channel_asks_the_registry_only_when_told_to(self):
+    def test_the_channel_asks_the_registry_and_nothing_else(self):
+        """#472: there is no second answer, so a config still naming ``links: legacy`` reads
+        the registry like every other one."""
         from tests.test_telegram_channel import make_channel, make_config
-        channel = make_channel(make_config(state={"backend": "telegram", "links": "registry"}))
-        channel.state_link.topic_for_refs = lambda refs: (-100, 55) if "#12" in refs else None
-        self.assertEqual(channel.topic_for_text("CI went red on #12"), (-100, 55))
-        # #424: the default is the registry side on the store, so legacy is asked for.
-        legacy = make_channel(make_config(state={"backend": "telegram", "links": "legacy"}))
-        legacy.state_link.topic_for_refs = lambda refs: (-100, 55)
-        self.assertIsNone(legacy.topic_for_text("CI went red on #12"))
+        for named in ("registry", "legacy"):
+            channel = make_channel(make_config(state={"backend": "telegram",
+                                                      "links": named}))
+            channel.state_link.topic_for_refs =                 lambda refs: (-100, 55) if "#12" in refs else None
+            self.assertEqual(channel.topic_for_text("CI went red on #12"), (-100, 55), named)
+            self.assertIsNone(channel.topic_for_text("CI went red on #99"), named)
 
     def test_registry_links_need_the_store(self):
         from swarmly.telegram.config import ConfigError

@@ -109,15 +109,6 @@ class RegistryShadow:
                 return str(repo)
         return None
 
-    def _links_mode(self) -> str:
-        """``state.links`` as this bot reads it: ``registry`` or ``legacy`` (#457).
-
-        Read through ``state_link`` when there is one -- a test's channel may have none, and a
-        channel without a state link has never learned a link from anything but text.
-        """
-        link = getattr(self.channel, "state_link", None)
-        return str(getattr(link, "links_mode", "legacy") or "legacy").lower()
-
     def _topics(self) -> List[tuple]:
         """(thread id, name, context id, last seen) of the forum topics this bot knows."""
         topics = self.channel.topics
@@ -245,41 +236,17 @@ class RegistryShadow:
         topic.agents = {alias: b for alias, b in topic.agents.items()
                         if b.role != "coordinator" or alias == holder}
         topic.agents[holder] = binding
-        self._legacy_links(topic, thread)
+        self._drop_guessed_links(topic)
         return topic.to_dict()
 
-    def _legacy_links(self, topic: Topic, thread: int) -> None:
-        """The links today's ref-learning found, marked ``added_by: legacy`` (phase 2).
-
-        With ``state.links: registry`` this half is **off** (#457, design §6 phase 5): a
-        topic's links are the explicit ones -- ``LINK:``/``ASSIGN:`` lines, ``/link`` and a
-        GitHub event on an item already linked -- and a number seen in message text is not a
-        link. The guesses an earlier build wrote are dropped from the record here, which is
+    def _drop_guessed_links(self, topic: Topic) -> None:
+        """``added_by: legacy`` links are the guesses an earlier build learned from message
+        text; they are dropped here (#472, design §6 phase 9c). A topic's links are the
+        explicit ones -- ``LINK:``/``ASSIGN:`` lines, ``/link`` and a GitHub event on an
+        item already linked -- and a number seen in text is not a link. Keeping the drop is
         what took the live phantom links (`#42`, a topic id, a truncated title) off `/topics`.
         """
-        if self._links_mode() != "legacy":
-            topic.links = [link for link in topic.links if link.added_by != "legacy"]
-            return
-        repo = self._repo()
-        if repo is None:
-            return
-        known = {link.ref for link in topic.links} | \
-            {link.title for link in topic.links if link.provider == "github" and link.title}
-        for ref, place in sorted((getattr(self.channel, "_ref_topics", {}) or {}).items()):
-            if place[0] != self._home() or place[1] != thread:
-                continue
-            number = str(ref).lstrip("#")
-            if not number.isdigit():
-                continue
-            url = f"https://github.com/{repo}/issues/{number}"
-            if url in known or f"#{number}" in known:
-                continue
-            # A guess from a mention is a pointer, not a work item: phase 5's explicit links
-            # carry the status, phase and assignees a work item needs.
-            topic.links.append(Link(id=topic.next_link_id(), provider="github", kind="issue",
-                                    ref=url, role="reference", title=f"#{number}",
-                                    added_by="legacy", added_at=topic.last_activity,
-                                    updated_by="legacy", updated_at=topic.last_activity))
+        topic.links = [link for link in topic.links if link.added_by != "legacy"]
 
     def turn_done(self, context: Optional[str], thread: Optional[int]) -> None:
         """A turn ended in a topic: count it (written at the next beat)."""

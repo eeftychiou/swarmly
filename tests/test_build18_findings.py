@@ -84,15 +84,32 @@ class TestOneStillPausedNoticePerTopic(unittest.TestCase):
         self.assertEqual(make_config().limits.max_peer_turns_per_topic, 8)
 
 
+class TestACliSendIsRefusedOnAnyBot(unittest.TestCase):
+    """Review of #473: ``reroute_gone_topics`` is the caller's switch, not the registry's.
+    `swarmly-telegram send --topic` on a bot with ``state.backend: telegram`` must still raise
+    ``TopicGone`` -- it used to print ``{"state": "sent"}`` and exit 0 having posted nothing."""
+
+    def test_a_cli_send_fails_and_posts_nothing(self):
+        channel = make_channel()
+        channel._sender = None
+        channel.bot = DeadTopicBot()
+        channel.state_link.backend = "telegram"          # the registry is on
+        channel.reroute_gone_topics = False              # the CLI's own switch
+        with self.assertRaises(TopicGone):
+            run(channel.send("probe", thread_id=307))
+        self.assertEqual(channel.bot.accepted, [])
+
+
 class TestARegistryReplyIsNeverMovedToGeneral(unittest.TestCase):
     """Live, 25 Oct: a reply in a just-deleted topic went to General, named a peer there and
     drew its General cooldown notice. With registry routing a reply stays in its topic."""
 
     def test_the_post_is_dropped(self):
+        """#472: a bot on the registry drops it; there is no legacy side left to reroute to."""
         channel = make_channel()
         channel._sender = None
         channel.bot = DeadTopicBot()
-        channel.state_link.routing_mode = "registry"
+        channel.state_link.backend = "telegram"
         run(channel.send("@reasonix_dd_bot thanks", thread_id=307))
         self.assertEqual(channel.bot.accepted, [])
 
@@ -120,8 +137,11 @@ class TestWorkForAGoneTopicGetsANewOne(unittest.TestCase):
             return types.SimpleNamespace(message_thread_id=900, name=kw.get("name"))
         bot.create_forum_topic = create_forum_topic
         channel.bot = bot
-        channel.state_link.routing_mode = "registry"
-        channel._topic_for_refs = lambda text: (channel.config.identity.home_channel_id, 307)
+        channel.state_link.backend = "telegram"      # on the registry: a gone topic is dropped
+        # The item's own link points at a topic that has just been deleted: a real answer from
+        # the registry, not a stubbed helper (review of #473).
+        channel.state_link.topic_for_refs = lambda refs: (
+            channel.config.identity.home_channel_id, 307)
         ev = ChannelEvent(text="go", chat_id=channel.config.identity.home_channel_id,
                           author_id=1, author_username="admin", message_id=5, thread_id=55)
         run(channel._open_topic(ev, "#268 SNAPSHOT heal", "@CodexBot please take #268"))

@@ -63,7 +63,6 @@ class RegistryShadowTests(unittest.TestCase):
             channel_for("DeepSeek", self.clock, "reasonix", "deepseek-flash")
         for channel in (claude, deepseek):
             seen(channel, 10134, "Stability round")
-        claude._ref_topics = {"#237": (HOME, 10134), "#99": (HOME, 1)}
         deepseek.adapter.threads[claude.topics.context(HOME, 10134)] = "sess-1"
         a, b = self.store("Claudebot"), self.store("DeepSeek")
 
@@ -84,12 +83,12 @@ class RegistryShadowTests(unittest.TestCase):
         self.assertEqual(topic.title, "Stability round")
         self.assertEqual(topic.agents["Claudebot"].role, "coordinator")
         self.assertEqual(topic.agents["Claudebot"].model, "claude-opus-5-5")
-        self.assertEqual([(l.ref, l.added_by, l.role) for l in topic.links],
-                         [("https://github.com/o/r/issues/237", "legacy", "reference")])
+        self.assertEqual(topic.links, [],
+                         "a number in a topic's title is not a link (#472)")
         session = a.read("topic/10134/agent/deepseek")
         self.assertEqual((session["session_id"], session["turns"]), ("sess-1", 1))
         text = RegistryShadow(claude, clock=self.clock).describe(a)
-        self.assertIn("Stability round (10134) — #237", text)
+        self.assertIn("Stability round (10134)", text)
         self.assertIn("deepseek not linked s=sess-1 t=1", text)
 
     def test_a_quiet_swarm_writes_nothing(self):

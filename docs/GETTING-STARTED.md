@@ -208,7 +208,8 @@ swarmly-telegram send "HELLO from my-agent"
 swarmly-telegram send --topic 307 "posted in forum topic 307"
 ```
 
-Once General is transport-only (`limits.general_turns: never` or `state.routing: registry`),
+Once General is transport-only (`limits.general_turns: never`, or a bot on the topic
+registry, which never takes General or Swarm pulse),
 `send` refuses General and Swarm pulse: give it `--topic`.
 
 In the group, the admin can hold every bot with `/pause` (running turns finish first) and

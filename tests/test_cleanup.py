@@ -407,7 +407,6 @@ class ChannelCase(unittest.TestCase):
         channel.topics.remember(GROUP, 42, "DeepSeek: 37 fixed", current=True)
         channel.topics.touch(GROUP, 42)
         channel._topic_memory.record(GROUP, 42, "DeepSeek", "working on #37", 43)
-        channel._learn_topic_refs(GROUP, 42, "see #37")
         channel._models["tg-42"] = "deepseek-chat"
         channel._efforts["tg-42"] = "high"
         channel._pending_handoffs[(GROUP, 42, "Codex")] = {"at": 1.0, "message_id": 7,
@@ -446,7 +445,7 @@ class ChannelCase(unittest.TestCase):
         self.channel.state_link.store = store
         self.assertEqual(self.channel._open_work_in(GROUP, 42, {}), "open work item L1 #37")
         self.channel.state_link.store = None
-        self.channel.state_link.routing_mode = "registry"
+        self.channel.state_link.backend = "telegram"      # a registry that cannot be read
         self.assertIn("not readable", self.channel._open_work_in(GROUP, 42, {}))
         del aio
 
@@ -531,7 +530,6 @@ class ChannelCase(unittest.TestCase):
                                                           fresh=True, own_alias="Hermes"), "")
         self.assertNotIn("tg-42", self.channel._models)
         self.assertEqual([k for k in self.channel._pending_handoffs if k[1] == 42], [])
-        self.assertNotIn(tuple((GROUP, 42)), self.channel._ref_topics.values())
         note = [text for text in self.sender.sent if "intent=TOPIC_GONE" in text]
         self.assertEqual(len(note), 1)
         self.assertIn("ref=42", note[0])

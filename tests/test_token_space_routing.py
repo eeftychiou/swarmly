@@ -82,13 +82,19 @@ class TheSendPathRefusesTokenTextTests(unittest.TestCase):
         run(channel.send("a reply", chat_id=GROUP, token=True))
         self.assertEqual(len(channel._test_sender.sent), 1)
 
-    def test_registry_routing_turns_it_on(self):
+    def test_the_registry_turns_it_on(self):
+        """#472: a bot on the topic registry never posts token text in General or the pulse."""
         channel = channel_for(general_turns="allow")
-        channel.state_link.routing_mode = "registry"
+        channel.state_link.backend = "telegram"
         self.assertEqual(channel.token_barred(GROUP, None), "General")
         self.assertEqual(channel.token_barred(GROUP, PULSE), "Swarm pulse")
         self.assertIsNone(channel.token_barred(GROUP, 9400))
         self.assertIsNone(channel.token_barred(ADMIN_ID, None))           # a DM
+
+
+def linked(table):
+    """The registry's links as the channel reads them (#472): a ref -> its topic."""
+    return lambda refs: next((table[ref] for ref in refs if ref in table), None)
 
 
 class RepliesAreNotMovedByWhatTheyNameTests(unittest.TestCase):
@@ -99,7 +105,7 @@ class RepliesAreNotMovedByWhatTheyNameTests(unittest.TestCase):
     def test_transport_only_keeps_a_reply_where_its_turn_ran(self):
         channel = channel_for(work_in_topics=True,
                               adapter=Scripted("Reviewing #300 now; verdict to follow."))
-        channel._learn_topic_refs(GROUP, 9500, "PR #300 lives here")
+        channel.state_link.topic_for_refs = linked({"#300": (GROUP, 9500)})
         spy = Spy(channel)
         run(channel.handle_event(event("@HermesBot please review #300", thread_id=9400)))
         self.assertEqual([(chat, thread) for chat, thread, _ in spy.posts], [(GROUP, 9400)])
@@ -117,26 +123,21 @@ class RepliesAreNotMovedByWhatTheyNameTests(unittest.TestCase):
         log = channel._topic_memory._topics.get((GROUP, None), {}).get("log", [])
         self.assertFalse(any(text == "the answer" for _id, _who, text in log), log)
 
-    def test_today_a_reply_still_moves_but_never_into_the_pulse(self):
+    def test_a_linked_reply_moves_but_never_into_the_pulse(self):
         channel = channel_for(general_turns="allow", work_in_topics=True)
-        channel._learn_topic_refs(GROUP, 9500, "PR #300 lives here")
+        channel.state_link.topic_for_refs = linked({"#300": (GROUP, 9500),
+                                                    "#301": (GROUP, PULSE)})
         self.assertEqual(self.reply_in_a_topic(channel), (GROUP, 9500))
-        # Live, 13:57: refs learned in the pulse moved a reply there.
-        channel._ref_topics["#301"] = (GROUP, PULSE)
-        channel._ref_seen["#301"] = time.time()
+        # Live, 13:57: work moved into the pulse by a number it named.
         self.assertIsNone(self.reply_in_a_topic(channel, "Progress on #301."))
-
-    def test_nothing_is_learned_in_the_pulse(self):
-        channel = channel_for(general_turns="allow")
-        channel._learn_topic_refs(GROUP, PULSE, "Codex is busy on #300")
-        self.assertNotIn("#300", channel._ref_topics)
 
     def test_a_second_pulse_topic_is_the_pulse_too(self):
         channel = channel_for()
         channel.topics.remember(GROUP, 3500, "\U0001f4e1 Swarm pulse")
         self.assertEqual(channel.token_barred(GROUP, 3500), "Swarm pulse")
-        channel._learn_topic_refs(GROUP, 3500, "Codex is busy on #300")
-        self.assertNotIn("#300", channel._ref_topics)
+        channel.state_link.topic_for_refs = linked({"#300": (GROUP, 3500)})
+        self.assertIsNone(channel.topic_for_text("Codex is busy on #300"),
+                          "the pulse is never a work topic")
 
 
 class TopicPinTests(unittest.TestCase):
@@ -155,16 +156,16 @@ class TopicPinTests(unittest.TestCase):
     def test_the_pulse_takes_no_items(self):
         channel = channel_for()
         self.assertIn("works inside a work topic", self.pin(channel, PULSE))
-        self.assertNotIn("#300", channel._ref_topics)
 
 
 class NewTopicOpensTheTopicItAsksForTests(unittest.TestCase):
 
-    def scenario(self, general_turns):
+    def scenario(self, general_turns, link=True):
         adapter = Scripted("NEW_TOPIC: Round on #300\nPlease handle #300.")
         channel = channel_for(general_turns, adapter=adapter)
         channel.bot = TopicBot()
-        channel._learn_topic_refs(GROUP, 9500, "PR #300 lives here")
+        channel.state_link.topic_for_refs = linked({"#300": (GROUP, 9500)} if link
+                                                   else {})
 
         async def go():
             await channel.handle_event(admin("@HermesBot start the round", thread_id=9400))
@@ -173,25 +174,14 @@ class NewTopicOpensTheTopicItAsksForTests(unittest.TestCase):
         return channel
 
     def test_transport_only_opens_it(self):
-        channel = self.scenario("never")
+        """Nothing links the item, so the brief gets a topic of its own."""
+        channel = self.scenario("never", link=False)
         self.assertEqual(channel.bot.created, [(GROUP, "Hermes: Round on #300")])
         texts = [s["text"] for s in channel._test_sender.sent]
         self.assertFalse(any("continued in" in t for t in texts), texts)
 
-    def test_today_the_older_topic_takes_it(self):
+    def test_the_linked_topic_takes_it(self):
         channel = self.scenario("allow")
-        self.assertEqual(channel.bot.created, [])
-        texts = [s["text"] for s in channel._test_sender.sent]
-        self.assertTrue(any("continued in" in t for t in texts), texts)
-
-    def test_an_explicit_link_still_takes_it(self):
-        adapter = Scripted("NEW_TOPIC: Round on #300\nPlease handle #300.")
-        channel = channel_for(adapter=adapter)
-        channel.bot = TopicBot()
-        channel.state_link.links_mode = "registry"
-        channel.state_link.topic_for_refs = lambda refs: (GROUP, 9500) if "#300" in refs \
-            else None
-        run(channel.handle_event(admin("@HermesBot start the round", thread_id=9400)))
         self.assertEqual(channel.bot.created, [])
         texts = [s["text"] for s in channel._test_sender.sent]
         self.assertTrue(any("continued in" in t for t in texts), texts)
@@ -263,7 +253,7 @@ class BusEchoesTests(unittest.TestCase):
 
     def test_transport_only_neither_picks_a_topic_by_its_words_nor_posts_in_general(self):
         channel = channel_for()
-        channel._learn_topic_refs(GROUP, 9400, "PR #300 lives here")
+        channel.state_link.topic_for_refs = linked({"#300": (GROUP, 9400)})
         self.assertEqual(self.echo(channel), [])
         self.assertEqual(self.outcome.replies_unposted, 1)          # counted, not lost quietly
 
@@ -279,9 +269,9 @@ class BusEchoesTests(unittest.TestCase):
         channel._log_topic(GROUP, PULSE, "Codex", "pulse chatter", 78)
         self.assertEqual(self.echo(channel, message_id=78), [])
 
-    def test_today_the_echo_goes_to_the_topic_its_items_name(self):
+    def test_the_echo_goes_to_the_topic_its_items_are_linked_in(self):
         channel = channel_for(general_turns="allow")
-        channel._learn_topic_refs(GROUP, 9400, "PR #300 lives here")
+        channel.state_link.topic_for_refs = linked({"#300": (GROUP, 9400)})
         posts = self.echo(channel)
         self.assertEqual([(chat, thread) for chat, thread, _ in posts], [(GROUP, 9400)])
 

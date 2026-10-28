@@ -162,7 +162,8 @@ swarmly-telegram --config config.yaml post --to Codex --intent PR_REVIEW_REQUEST
 
 Add `--no-telegram` for a durable-only write. A broadcast (`--to '*'`) is sent as a `NOTE`.
 
-With General transport-only (`limits.general_turns: never`, or `state.routing: registry`),
+With General transport-only (`limits.general_turns: never`, or any bot on the topic
+registry, which never takes General or Swarm pulse),
 step 2 is skipped: no bot takes a turn in General, so the pointer would wake nobody. The
 result says so, and the poller delivers the durable copy. `swarmly-telegram send` then refuses
 General and Swarm pulse too; give it `--topic`.
