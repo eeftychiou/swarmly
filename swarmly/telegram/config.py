@@ -213,7 +213,9 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     # issue #240: the local read-only web page, off unless the operator turns it on
     "web": ("enabled", "port", "public_host", "init_max_age"),
     "swarm": ("succession",),
-    # topic registry, phase 1: the shared state store, in shadow unless the operator says
+    # topic registry, phase 1: the shared state store, off unless the operator says.
+    # #472: `lease`, `owed`, `links` and `routing` are accepted-and-ignored, so they stay listed
+    # here rather than counting as unknown keys (config.py warns about each one it sees).
     "state": ("backend", "mode", "heartbeat_minutes", "lease", "links", "routing", "owed",
               "dir"),
 }
@@ -1005,48 +1007,22 @@ class StateSettings:
 
     #: ``off`` or ``telegram`` (the op log in Swarm pulse, the snapshot pinned there).
     backend: str = "off"
-    #: ``shadow``: the store runs beside today's logic and nothing reads it (phase 1).
+    #: ``shadow``, the only value: phase 1's name for the store, kept because configs carry it.
+    #: The store is the record now -- /topics, the dashboard, routing and the lease read it.
     mode: str = "shadow"
-    #: How often each bot writes its heartbeat key in shadow.
+    #: How often each bot writes its heartbeat key, and the registry sync's cadence.
     heartbeat_minutes: float = 10.0
-    #: Phase 3: ``shadow`` -- the gitbus lease decides, the store's mirrors it and /state
-    #: compares them; ``store`` -- the store's lease is the coordinator lease.
-    lease: str = "shadow"
-    #: Phase 5: ``legacy`` -- GitHub notices find their topic by today's ref-learning;
-    #: ``registry`` -- by the topics' explicit links first (ref-learning only as a fallback).
-    links: str = "legacy"
-    #: Phase 6: ``legacy`` -- each bot's mention rules decide who answers in a topic;
-    #: ``registry`` -- the topic registry does: the coordinator takes the topic's messages,
-    #: linked agents when named or handed work, an unlinked mention is refused.
-    routing: str = "legacy"
-    #: Phase 3: ``shadow`` -- the owed table is on gitbus, each bot mirrors its rows into the
-    #: store; ``store`` -- the store holds it: each bot publishes its own rows every heartbeat
-    #: and reads the others' from there, and nothing goes to gitbus.
-    owed: str = "shadow"
     #: Where this bot keeps its own state files (``<dir>/.agents/state``): the store's cache,
     #: sessions, the topic map, its owed rows. Unset: the bus checkout when there is one, else
     #: the folder of config.yaml -- never a folder shared with other bots.
     dir: Optional[str] = None
 
 
-#: Issue #424: on a transport that runs the Telegram state store the four registry flags below
-#: default to the registry side; with ``state.backend: off`` (or no ``state:`` section at all)
-#: they keep the legacy defaults, which are the ``StateSettings`` fields above. An explicit
-#: ``shadow`` / ``legacy`` is still honoured, so downgrading is one config line per flag.
-#: ``docs/telegram/PROTOCOL.md`` §11.7 marks those rows with a dagger and states both defaults.
-STATE_REGISTRY_DEFAULTS: Dict[str, str] = {
-    "lease": "store",
-    "owed": "store",
-    "links": "registry",
-    "routing": "registry",
-}
-
-
-def _state_flag_default(name: str, backend: str) -> str:
-    """The default for a registry flag: the registry side on the store, the legacy one off it."""
-    if backend == "telegram":
-        return STATE_REGISTRY_DEFAULTS[name]
-    return getattr(StateSettings, name)
+#: Phase 9c (#472): these four flags are gone. The store's lease, its owed table, the topics'
+#: links and the registry's routing are the only behaviour there is, so a config that still
+#: names one loads -- with one warning naming the flag -- and the value is ignored. Never an
+#: error: an upgrade must not need a config edit, and neither must a downgrade.
+REMOVED_STATE_FLAGS: Tuple[str, ...] = ("lease", "owed", "links", "routing")
 
 
 @dataclass
@@ -1467,33 +1443,15 @@ class AgentConfig:
                                    state_raw.get("heartbeat_minutes", 10.0), 10.0)
             if minutes <= 0:
                 raise ConfigError("state.heartbeat_minutes must be more than 0")
-            lease = str(state_raw.get("lease")
-                        or _state_flag_default("lease", backend)).strip().lower()
-            if lease not in ("shadow", "store"):
-                raise ConfigError(f"state.lease must be shadow or store (got {lease!r})")
-            if lease == "store" and backend != "telegram":
-                raise ConfigError("state.lease: store needs state.backend: telegram")
-            links = str(state_raw.get("links")
-                        or _state_flag_default("links", backend)).strip().lower()
-            if links not in ("legacy", "registry"):
-                raise ConfigError(f"state.links must be legacy or registry (got {links!r})")
-            if links == "registry" and backend != "telegram":
-                raise ConfigError("state.links: registry needs state.backend: telegram")
-            routing = str(state_raw.get("routing")
-                          or _state_flag_default("routing", backend)).strip().lower()
-            if routing not in ("legacy", "registry"):
-                raise ConfigError(f"state.routing must be legacy or registry (got {routing!r})")
-            if routing == "registry" and backend != "telegram":
-                raise ConfigError("state.routing: registry needs state.backend: telegram")
-            owed = str(state_raw.get("owed")
-                       or _state_flag_default("owed", backend)).strip().lower()
-            if owed not in ("shadow", "store"):
-                raise ConfigError(f"state.owed must be shadow or store (got {owed!r})")
-            if owed == "store" and backend != "telegram":
-                raise ConfigError("state.owed: store needs state.backend: telegram")
+            # #472: the four flags are names only now. One warning each, whatever the value
+            # is -- a shadow side, a value from a newer build, a typo -- and never an error.
+            for flag in REMOVED_STATE_FLAGS:
+                if flag in state_raw:
+                    logger.warning("config: state.%s is no longer a flag (%r ignored): the "
+                                   "registry side is the only behaviour", flag,
+                                   state_raw.get(flag))
             state_dir = str(state_raw.get("dir") or "").strip() or None
             state = StateSettings(backend=backend, mode=mode, heartbeat_minutes=minutes,
-                                  lease=lease, links=links, routing=routing, owed=owed,
                                   dir=state_dir)
         elif state_raw is not None:
             raise ConfigError("'state' must be a mapping")

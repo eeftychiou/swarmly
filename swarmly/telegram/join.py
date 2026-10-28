@@ -142,10 +142,6 @@ def render_config(username: str, alias: str, adapter: str, home_channel: int, ad
         "  transport: telegram",
         "state:",
         "  backend: telegram",
-        "  lease: store",
-        "  routing: registry",
-        "  owed: store",
-        "  links: registry",
     ]
     return "\n".join(lines) + "\n"
 

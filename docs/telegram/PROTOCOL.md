@@ -578,12 +578,11 @@ routes from that record instead of from mention heuristics. The design is
 [`docs/design/topic-registry.md`](../design/topic-registry.md) §1–4; this section is what a
 conforming transport does, and the flag each part is switched by.
 
-**Most of what is below ships behind its flag.** With the store off — no `state:` section at
-all — the legacy path is still the default, and a config that sets none of the flags behaves
-exactly as it did before §11 existed. With `state.backend: telegram` the four registry flags
-default to the registry side instead (phase 9b, `#424`: the daggered rows in §11.7), so from
-there the registry paths are what runs unless a flag says otherwise. What is left for phase 9
-(§6 of the design) is removing the legacy code — and `bus.transport` keeps its default until 9c.
+**The registry paths are what run.** Phase 9c (`#472`) removed the four flags that used to
+switch them between a shadow/legacy side and the registry side, so there is no legacy branch
+left to be the default: the store's lease and owed table, the topics' links and the registry's
+routing are the only behaviour (§11.7 says what a config that still names one gets). What is
+left for phase 9 is `bus.transport`'s default (§6 of the design).
 Two parts are already live with no flag at all: the per-topic session every adapter keeps
 (§11.5) and the session-scoped drift score (§11.6).
 
@@ -613,9 +612,9 @@ bot sees it, and whether every bot's state hash agrees.
 
 Consistency without a server is design §1b: one owner per field, every write a compare-and-set
 stamped with the lease term, stale terms dropped on read, fail closed when the store cannot be
-reached. The store replaces gitbus for the lease (`state.lease: store`) and the owed / `WAIT`
-table (`state.owed: store`), and `bus.transport: telegram` drops gitbus altogether — the durable
-plane is then the store, and it needs `state.backend: telegram`.
+reached. The store holds the lease and the owed / `WAIT` table (phase 9c removed the flags that used to
+switch them), and `bus.transport: telegram` drops gitbus altogether — the durable plane is then
+the store, and it needs `state.backend: telegram`.
 
 ### 11.2 Routing from the registry
 
@@ -729,23 +728,18 @@ that drifts from the code fails the suite.
 | `state.mode` | `shadow` | `shadow` | 1 | The store runs beside today's logic and nothing acts on it. |
 | `state.heartbeat_minutes` | `10` | minutes > 0 | 1 | How often each bot writes its heartbeat key, and the registry sync every bot runs at that cadence. |
 | `state.dir` | `unset` | a path | 1 | Where this bot keeps its own state files (the store's cache, sessions, the topic map). |
-| `state.lease` | `shadow` † | `shadow`, `store` | 3 | `store`: the store's lease is the coordinator lease (`bus.transport: telegram` made it possible). |
-| `state.owed` | `shadow` † | `shadow`, `store` | 3 | `store`: the owed / `WAIT` table lives in the store, and nothing goes to gitbus. |
 | `bus.transport` | `git` | `git`, `folder`, `gdrive`, `telegram` | 3 | `telegram`: gitbus is off; the store is the durable plane (needs `state.backend: telegram`). |
 | `limits.general_turns` | `allow` | `allow`, `never` | 4 | `never`: no model turn in General or Swarm pulse; work typed there gets its own topic. |
-| `state.links` | `legacy` † | `legacy`, `registry` | 5 | Accepted and ignored (#472): a notification's topic comes from the item's links, and ref-learning — with the topic move it drove — is gone (#457). |
-| `state.routing` | `legacy` † | `legacy`, `registry` | 6 | Accepted and ignored (#472): the transport routes from the registry (§11.2), not each bot's mention rules. |
 | `adapter.type` | `echo` | any adapter, `claude_thread` for Claude | 7 | `claude_thread`: one resumable session per topic, like the other adapters. |
 | `adapter.session_turn_limit` | `unset` | turns > 0 | 7 | Turns a topic's session may run before the adapter hands over to a new one. |
 | `adapter.session_token_limit` | `unset` | tokens > 0 | 7 | Input tokens a resumed session may reach before the next turn starts a new one. |
 
-† **On the store these four default to the registry side** (`#424`, phase 9b of `#260`): with
-`state.backend: telegram` an omitted `state.lease`/`state.owed` is `store` and an omitted
-`state.links`/`state.routing` is `registry`. The value in the column is the default with the
-store off — with no `state:` section at all as well — so an existing config loads unchanged and
-raises no new error. An explicit `shadow`/`legacy` is honoured on either backend: downgrading is
-one config line per flag. `bus.transport` keeps its default, and turning gitbus off by default
-is 9c's.
+**Four flags are gone** (phase 9c of `#260`, `#472`): `state.lease`, `state.owed`, `state.links`
+and `state.routing`. The store's lease, its owed / `WAIT` table, the topics' links and the
+registry's routing are the only behaviour there is, so the rows above no longer list them. A
+config that still names one **loads** — with one warning per flag, naming it — and the value is
+ignored; never an error, so neither an upgrade nor a downgrade needs a config edit.
+`bus.transport` keeps its default, and turning gitbus off by default is 9c's.
 
 The snapshot's own cadence (900 s, or 25 ops) is a constant in the code, not a setting.
 

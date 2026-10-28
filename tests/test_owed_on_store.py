@@ -297,9 +297,9 @@ class StoreModeLinkTests(unittest.TestCase):
         asyncio.run(go())
         self.assertEqual(len(calls), 2)
 
-    def test_in_shadow_the_table_waits_for_the_state_cadence(self):
+    def test_the_table_is_published_on_every_beat(self):
+        """#472: the store is the only table, so no mode can make a debt wait."""
         clock, claude, _ = self.links()
-        claude.owed_mode = "shadow"
         calls = []
 
         async def sync(store, now):
@@ -313,7 +313,7 @@ class StoreModeLinkTests(unittest.TestCase):
             clock.t += 60
             await claude.beat(now=clock())
         asyncio.run(go())
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
 
 
 class OwnBusDocumentTests(unittest.TestCase):
@@ -361,20 +361,23 @@ class ChannelTests(unittest.TestCase):
         self.assertIsNone(store.transport)
         self.assertEqual(store.shared, channel.state_link.shared_owed_rows)
 
-    def test_shadow_mode_keeps_gitbus(self):
-        # #424: on the store the default is `store`, so shadow is asked for explicitly.
-        channel = make_channel(make_config(state={"backend": "telegram", "owed": "shadow"}))
+    def test_a_bot_without_the_store_keeps_the_bus_table(self):
+        """#472: `state.owed` is gone; what decides is whether this bot runs the store."""
+        channel = make_channel(make_config())
         self.assertIsNone(channel.owed_store().shared)
+        on_store = make_channel(make_config(state={"backend": "telegram"}))
+        self.assertIsNotNone(on_store.owed_store().shared)
 
 
 class ConfigTests(unittest.TestCase):
-    def test_store_needs_the_telegram_backend(self):
-        with self.assertRaises(ConfigError):
-            make_config(state={"backend": "off", "owed": "store"})
-        with self.assertRaises(ConfigError):
-            make_config(state={"backend": "telegram", "owed": "gitbus"})
-        self.assertEqual(make_config(state={"backend": "telegram", "owed": "store"})
-                         .state.owed, "store")
+    def test_the_owed_flag_is_gone_and_never_an_error(self):
+        """#472: any value loads, is ignored, and says so once -- including a nonsense one."""
+        for named in ("store", "shadow", "gitbus"):
+            with self.assertLogs("swarmly.telegram.config", level="WARNING") as said:
+                config = make_config(state={"backend": "telegram", "owed": named})
+            self.assertIsInstance(config, AgentConfig)
+            self.assertEqual(sum("state.owed" in line for line in said.output), 1, said.output)
+            self.assertFalse(hasattr(config.state, "owed"))
         self.assertIsInstance(make_config(), AgentConfig)
 
 

@@ -1201,8 +1201,11 @@ class TelegramBusJoinTests(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
             cfg = AgentConfig.load(path)
             self.assertEqual(cfg.bus.transport, "telegram")
-            self.assertEqual((cfg.state.backend, cfg.state.routing, cfg.state.owed),
-                             ("telegram", "registry", "store"))
+            self.assertEqual(cfg.state.backend, "telegram")
+            # #472: the four registry flags are gone -- the store is the only behaviour, so
+            # the launcher no longer writes them.
+            for flag in ("lease", "owed", "links", "routing"):
+                self.assertFalse(hasattr(cfg.state, flag), flag)
 
     def test_the_first_agents_greeting_turn_is_not_tried_where_it_would_be_dropped(self):
         """A new group has no work topic and General is transport-only: the general gate

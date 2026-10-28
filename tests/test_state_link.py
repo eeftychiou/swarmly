@@ -48,8 +48,10 @@ class StateLinkTests(unittest.TestCase):
         async def go():
             await claude.store.start()
             await deepseek.store.start()
+            # #472: the store's lease is the only one, and the lease tick claims it -- the
+            # beat publishes what the holder sees, it does not claim.
+            await claude.store.claim_lease(600)
             said = await claude.beat()
-            self.assertIn("lease claimed", said)
             self.assertIn("beat", said)
             self.assertIn("beat", await deepseek.beat())
             clock.t += 60
@@ -120,7 +122,7 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(stats["violations"][0]["kind"], "duplicate_reply")
 
 
-class OwedShadowTests(unittest.TestCase):
+class OwedOnTheStoreTests(unittest.TestCase):
     def test_each_bot_writes_its_own_rows_and_the_store_folds_them(self):
         from swarmly.telegram.owed import Row
         clock = Clock()
@@ -133,7 +135,8 @@ class OwedShadowTests(unittest.TestCase):
                      writer="deepseek", key_extra="tg-7")
         both = [mine, theirs]
         for link in (claude, deepseek):
-            link.channel.owed_store = lambda: SimpleNamespace(load=lambda: list(both))
+            link.channel.owed_store = lambda: SimpleNamespace(
+                load=lambda: list(both), held=lambda: list(both))
 
         async def go():
             await claude.store.start()
@@ -144,10 +147,12 @@ class OwedShadowTests(unittest.TestCase):
             await claude.store.refresh()
         asyncio.run(go())
         stored = claude.store.read("agent/claudebot/owed")["rows"]
-        self.assertEqual([r["item"] for r in stored], ["#12"])     # only its own rows
+        # #472: the store branch publishes every row the bot holds -- a close or a stall it
+        # records on a peer's row has to reach everyone -- so both are there.
+        self.assertEqual(sorted(r["item"] for r in stored), ["#12", "#13"])
         self.assertEqual(sorted(r.id for r in claude.owed_from_store()),
                          sorted([mine.id, theirs.id]))
-        self.assertIn("2 open row(s) in the store, 2 here (agree)", claude.describe())
+        self.assertIn("owed: the store holds the table (2 open row(s))", claude.describe())
 
 
 class FloodWaitTests(unittest.TestCase):

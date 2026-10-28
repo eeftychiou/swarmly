@@ -186,19 +186,21 @@ class ChannelUsesTheStoreLeaseTests(unittest.TestCase):
                 return await channel.check_lease()
         self.assertIsNone(asyncio.run(go()))
 
-    def test_a_shadow_lease_keeps_the_gitbus_lease(self):
-        from swarmly.telegram.lease import LeaseStore
+    def test_a_named_lease_flag_is_ignored_with_one_warning(self):
+        """#472: `state.lease` is no longer a flag. A config that still names one loads -- the
+        store's lease is the only one -- and says so once."""
         from tests.test_telegram_channel import make_channel, make_config
-        # #424: on the store the lease defaults to `store`; the gitbus lease is the explicit ask.
-        channel = make_channel(make_config(state={"backend": "telegram", "lease": "shadow"}))
-        self.assertEqual(channel.state_link.lease_mode, "shadow")
-        self.assertIsInstance(channel.lease_store(), LeaseStore)
+        with self.assertLogs("swarmly.telegram.config", level="WARNING") as said:
+            channel = make_channel(make_config(state={"backend": "telegram",
+                                                      "lease": "shadow"}))
+        self.assertEqual(channel.state_link.lease_mode, "store")
+        self.assertEqual(sum("state.lease" in line for line in said.output), 1, said.output)
 
-    def test_store_lease_needs_the_telegram_backend(self):
-        from swarmly.telegram.config import ConfigError
-        from tests.test_telegram_channel import make_config
-        with self.assertRaises(ConfigError):
-            make_config(state={"lease": "store"})
+    def test_store_lease_no_longer_needs_the_flag(self):
+        """Once the flag is gone there is nothing to ask for: the backend alone decides."""
+        from tests.test_telegram_channel import make_channel, make_config
+        channel = make_channel(make_config(state={"backend": "telegram"}))
+        self.assertEqual(channel.state_link.lease_mode, "store")
 
 
 if __name__ == "__main__":

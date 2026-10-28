@@ -398,7 +398,7 @@ def drift_view(*, alias: str = "", decided: Optional[Mapping[str, Any]] = None,
 
 
 def state_view(*, backend: str = "", mode: str = "", enabled: Any = None,
-               ready: Any = None, routing: str = "", owed: str = "") -> Dict[str, Any]:
+               ready: Any = None) -> Dict[str, Any]:
     """``/state``: how the shared state store is set up, and whether it is readable.
 
     ``ready`` is ``None`` when this bot is not running the store at all -- an absent store is
@@ -410,8 +410,6 @@ def state_view(*, backend: str = "", mode: str = "", enabled: Any = None,
         "backend": name,
         "mode": str(mode or "").strip().lower() or None,
         "enabled": bool(enabled),
-        "routing": str(routing or "").strip().lower() or None,
-        "owed": str(owed or "").strip().lower() or None,
         "note": ("" if not enabled else ("" if ready else NOT_READY)),
     }
 
@@ -1541,8 +1539,6 @@ function storeState(state) {
   const head = el("div", "health");
   head.append(pill("backend", view.backend || "off"));
   head.append(pill("mode", view.mode || "?"));
-  head.append(pill("routing", view.routing || "?"));
-  head.append(pill("owed", view.owed || "?"));
   head.append(pill("store", view.enabled ? (view.ready ? "ready" : "not ready") : "off",
     view.enabled && !view.ready ? "bad" : ""));
   box.append(head);

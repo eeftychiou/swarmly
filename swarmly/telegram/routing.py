@@ -1,7 +1,7 @@
 """Routing from the topic registry (docs/design/topic-registry.md, §2; phase 6).
 
-With ``state.routing: registry`` the transport, not each bot's mention heuristics, decides who
-takes a message in a work topic:
+The transport, not each bot's mention heuristics, decides who takes a message in a work topic
+(the flag that used to choose between them is gone, #472):
 
 - the **coordinator** (the store's lease holder) takes every message in the topic that is not
   addressed only to other agents;

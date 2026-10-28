@@ -1,12 +1,13 @@
-"""The topic registry, filled in shadow from today's logic (topic registry, phase 2).
+"""The topic registry: what each bot publishes, and what ``/topics`` reads back.
 
-Nothing reads the registry yet: this proves the data. Each beat of the state store
-(``state_link.py``) calls :meth:`RegistryShadow.sync`:
+The registry *is* the record now (the phases of #260 landed): ``/topics``, the dashboard and the
+routing read it, and the shadow mode that only proved the data is gone (#472). Each beat of the
+state store (``state_link.py``) calls :meth:`RegistryShadow.sync`:
 
 * **The lease holder** writes ``topic/<id>`` for every forum topic its transport knows: the
   title, the coordinator's binding (runtime, model, effort, where they come from), and the
-  links today's ref-learning found -- marked ``added_by: legacy`` so they are easy to tell
-  from the explicit links of phase 5.
+  topic's links -- the explicit ones; the guesses an earlier build learned from text are
+  dropped here (``added_by: legacy``).
 * **Every bot** writes its own ``topic/<id>/agent/<alias>`` (the CLI session its adapter keeps
   for that topic, the turns since that session began, how often it was replaced) and its
   ``agent/<alias>/profile`` from ``config.yaml``.
@@ -339,16 +340,7 @@ class RegistryShadow:
             if closed:
                 return "Topic registry: no open topics." + suffix
             return "Topic registry: empty so far (the lease holder fills it on its beat)."
-        return f"Topic registry{self._shadow_label()}:\n" + "\n".join(lines) + suffix
-
-    def _shadow_label(self) -> str:
-        """``" (shadow)"`` while any registry flag still runs the legacy path (#435)."""
-        link = getattr(self.channel, "state_link", None)
-        modes = {getattr(link, name, None) for name in
-                 ("lease_mode", "owed_mode", "links_mode", "routing_mode")}
-        if not modes or None in modes or modes & {"shadow", "legacy", "off"}:
-            return " (shadow)"
-        return ""
+        return f"Topic registry:\n" + "\n".join(lines) + suffix
 
     def _canonical(self, alias: str, aliases) -> str:
         """The alias this name belongs to: an agent's Telegram handle is one agent (#435).

@@ -158,14 +158,9 @@ bus:
 #                                      # snapshot in 📡 Swarm pulse, the lease and the owed table
 #   mode: shadow                       # shadow is the only mode for now
 #   heartbeat_minutes: 10              # each bot's heartbeat key, and the registry sync cadence
-#   # The four registry flags. Omitted, they take the registry side on the store and the legacy
-#   # one off it (#424): `store`/`store`, `registry`/`registry` with `backend: telegram`, and
-#   # `shadow`/`shadow`, `legacy`/`legacy` with `backend: off`. Set any of them explicitly to
-#   # downgrade a single path; each value is validated as before.
-#   lease: store                       # store: the store's lease is the coordinator lease
-#   owed: store                        # store: the owed / WAIT table lives in the store
-#   links: registry                    # registry: a notification's topic follows the item's links
-#   routing: registry                  # registry: the transport routes each topic's messages
+#   # `state.lease`, `state.owed`, `state.links` and `state.routing` are gone (#472): the
+#   # store's lease and owed table, the topics' links and the registry's routing are the only
+#   # behaviour. A config that still names one loads and ignores it, with one warning per flag.
 #   dir: /path/to/state                # where this bot keeps its own state files (unset: beside
 #                                      # config.yaml); never a folder shared with other bots
 # `bus.transport` keeps its own default (git): turning gitbus off by default is a later phase.

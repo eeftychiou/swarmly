@@ -1,7 +1,8 @@
 """The coordinator lease on the shared state store (topic registry, phase 3).
 
-``state.lease: store`` makes the store's ``lease`` key the coordinator lease, in place of the
-gitbus claims in ``.agents/leases``. The transport's lease logic (``check_lease``: renew,
+The store's ``lease`` key **is** the coordinator lease, in place of the gitbus claims in
+``.agents/leases``: on a bot that runs the store there is no other lease, and the flag that used
+to choose between them is gone (#472). The transport's lease logic (``check_lease``: renew,
 bootstrap, succession, the named coordinator's reclaim, ``lease_fence``) is unchanged: it
 talks to :class:`StoreLease`, which has the same small interface as
 :class:`~swarmly.telegram.lease.LeaseStore` -- ``refresh``, ``state``, ``claim``,
@@ -13,9 +14,9 @@ lease-holder write by term. Times cross the boundary converted: the fold keeps s
 the transport compares against its own clock, so ``state()`` reports ``expires_at`` in the
 bot's own clock (server expiry minus the offset the store measures).
 
-``state.lease: shadow`` (the default with the store off, and still honoured on it) keeps gitbus
-authoritative and only compares the two leases; ``/state`` says whether they agree. On the store
-an omitted flag is ``store`` (phase 9b, ``#424``): the fold's lease is the coordinator lease.
+A bot with no store keeps the gitbus lease; one that runs the store takes the fold's lease, and
+``/state`` names the holder and its term. The shadow mode that compared the two is gone with the
+flag (#472, phase 9c).
 """
 
 from __future__ import annotations
