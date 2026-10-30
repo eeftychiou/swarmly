@@ -223,6 +223,13 @@ class ChannelTests(unittest.TestCase):
         # These tests are about admission, not copies: every topic's working copy is the same
         # gate, and each topic still gets its own folder (#486).
         channel._topic_adapter = lambda workdir, suffix: gate
+
+        async def resolved_in_place(chat_id, thread_id):
+            """The copy is made on the loop here: these tests count event-loop turns, and a
+            worker thread would hand control back after their ``settle()`` is over."""
+            channel._isolated_workdir(chat_id, thread_id)
+
+        channel.resolve_topic_folder = resolved_in_place
         return channel, gate
 
     def test_the_discussion_reaches_the_agent(self):

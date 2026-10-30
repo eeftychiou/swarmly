@@ -1019,13 +1019,17 @@ to N topics run a turn at the same time.
   `<adapter.cwd>/.swarmly-worktrees/topic-<thread_id>`, or the project's per-topic worktree
   when the topic is bound to a project (`<project cwd>/.swarmly-worktrees/topic-<thread_id>`,
   whatever `projects.<p>.worktrees` says). Each copy gets its own adapter, so two topics never
-  share one CLI session. General and the bus/swarm turns keep `adapter.cwd`, and a topic whose
+  share one CLI session. A topic id in another chat is another discussion, so it gets
+  `<base>/.swarmly-worktrees/topic-<chat_id>-<thread_id>` — two chats are never one folder.
+  General and the bus/swarm turns keep `adapter.cwd`, and a topic whose
   copy cannot be made also keeps it — those turns take the shared lock, so nothing else runs
   in that folder beside them. `git worktree add` needs a checkout: a `max_parallel_turns` above
   1 is refused when `adapter.cwd` is not a git checkout (not needed for `echo`).
   `limits.allow_shared_cwd: true` keeps its meaning — the explicit opt-in to sharing a folder,
   for hosts where copies cannot be made — and the transport logs a warning naming the folder at
-  start. Worktrees are made on the topic's first turn; they are not cleaned up yet (follow-up).
+  start. The copy is made once per topic, off the event loop, on the first message the bot
+  handles in it (a failed creation is not retried until a restart); `/cli` in a topic runs in
+  that same folder. Copies are not cleaned up yet (follow-up).
 - Setup: the group must be a supergroup with Topics turned on. For the bots to read every message
   in a topic, turn privacy mode off in @BotFather or make them admins; to let them open topics
   later, give them the "Manage topics" admin right.

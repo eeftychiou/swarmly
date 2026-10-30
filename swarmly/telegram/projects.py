@@ -19,9 +19,9 @@ logger = logging.getLogger("swarmly.telegram.projects")
 WORKTREES_DIRNAME = ".swarmly-worktrees"
 
 
-def topic_worktree_path(base_cwd: Union[str, Path], thread_id: int) -> Path:
-    """The folder one topic works in: ``<base_cwd>/.swarmly-worktrees/topic-<thread_id>``."""
-    return Path(base_cwd).expanduser().resolve() / WORKTREES_DIRNAME / f"topic-{thread_id}"
+def topic_worktree_path(base_cwd: Union[str, Path], name: str) -> Path:
+    """One topic's working copy: ``<base_cwd>/.swarmly-worktrees/<name>``."""
+    return Path(base_cwd).expanduser().resolve() / WORKTREES_DIRNAME / name
 
 
 def _ensure_git_exclude(base_cwd: Path) -> None:
@@ -53,11 +53,11 @@ def _ensure_git_exclude(base_cwd: Path) -> None:
         logger.warning("could not add .swarmly-worktrees/ to git exclude in %s: %s", base_cwd, exc)
 
 
-def ensure_topic_worktree(base_cwd: Union[str, Path], thread_id: int, *,
+def ensure_topic_worktree(base_cwd: Union[str, Path], name: str, *,
                           create: bool = True) -> Optional[Path]:
     """One topic's own working copy of ``base_cwd`` (#486).
 
-    ``<base_cwd>/.swarmly-worktrees/topic-<thread_id>``, created on first use: a fetch, then
+    ``<base_cwd>/.swarmly-worktrees/<name>``, created on first use: a fetch, then
     a detached worktree of ``origin/HEAD`` (falling back to ``HEAD``), with
     ``.swarmly-worktrees/`` added to ``.git/info/exclude`` rather than the tracked
     ``.gitignore``. ``create=False`` only names the folder (for /status and /where): no
@@ -67,7 +67,7 @@ def ensure_topic_worktree(base_cwd: Union[str, Path], thread_id: int, *,
     shared: a turn there must run **alone** (the shared lock), never beside another turn.
     """
     base = Path(base_cwd).expanduser().resolve()
-    target = topic_worktree_path(base, thread_id)
+    target = topic_worktree_path(base, name)
     if target.exists() or not create:
         return target
     _ensure_git_exclude(base)
@@ -98,17 +98,17 @@ def ensure_topic_worktree(base_cwd: Union[str, Path], thread_id: int, *,
         if res.returncode == 0 and target.exists():
             return target
         logger.warning(
-            "worktree add failed in %s for topic %s: %s (a turn there must run alone in %s)",
+            "worktree add failed in %s for %s: %s (a turn there must run alone in %s)",
             base,
-            thread_id,
+            name,
             res.stderr.strip() or res.stdout.strip(),
             base,
         )
     except Exception as exc:                                  # noqa: BLE001 - no copy, not no turn
         logger.warning(
-            "failed to create worktree for topic %s in %s: %s (a turn there must run alone "
+            "failed to create worktree for %s in %s: %s (a turn there must run alone "
             "in %s)",
-            thread_id,
+            name,
             base,
             exc,
             base,
@@ -166,5 +166,5 @@ class ProjectRouter:
         base_cwd = Path(project.cwd).expanduser().resolve()
         if not project.worktrees:
             return base_cwd
-        target = ensure_topic_worktree(base_cwd, thread_id, create=create)
+        target = ensure_topic_worktree(base_cwd, f"topic-{thread_id}", create=create)
         return base_cwd if target is None else target

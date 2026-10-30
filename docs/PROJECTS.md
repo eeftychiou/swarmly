@@ -80,10 +80,11 @@ topics at once never has two turns in one folder.
   to collide with.
 - **Several topics at once (`max_parallel_turns > 1`)**:
   Every forum topic gets a working copy of its own, whether or not the project sets
-  `worktrees` — `<cwd>/.swarmly-worktrees/topic-<thread_id>` — and a topic with no project gets
-  the same, made from `adapter.cwd`. General keeps `adapter.cwd` and no two shared-folder turns
-  ever run at the same time. See **Running topics in parallel** in
-  [`docs/telegram-channel.md`](telegram-channel.md).
+  `worktrees` — `<cwd>/.swarmly-worktrees/topic-<thread_id>`, and
+  `<cwd>/.swarmly-worktrees/topic-<chat_id>-<thread_id>` for the same topic id in another chat
+  — and a topic with no project gets the same, made from `adapter.cwd`. General keeps
+  `adapter.cwd` and no two shared-folder turns ever run at the same time. See **Running topics
+  in parallel** in [`docs/telegram-channel.md`](telegram-channel.md).
 - **How a copy is made**:
   Swarmly automatically provisions an isolated git worktree for each topic under `<cwd>/.swarmly-worktrees/topic-<thread_id>`, detached from `origin/HEAD`.
   The `.swarmly-worktrees/` directory is automatically ignored in `.git/info/exclude` (so the repository's tracked `.gitignore` is never modified).

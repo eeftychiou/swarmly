@@ -10,17 +10,25 @@ another turn.
 from __future__ import annotations
 
 import subprocess
+import sys
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from tests.gitenv import git_env
-from tests.test_projects import GROUP, FakeSender, event, make_config
+from tests.test_cli_passthrough import CountingAdapter, fake_proc
+from tests.test_projects import ADMIN_ID, GROUP, FakeSender, event, make_config
+from tests.test_telegram_channel import make_channel, run
 
+from swarmly.telegram import channel as channel_mod
 from swarmly.telegram.channel import AgentChannel
 from swarmly.telegram.config import ConfigError
 
 PARALLEL = {"max_parallel_turns": 2}
+#: A second group: its topic 12 is another discussion from the home chat's topic 12.
+OTHER = -1009999999999
 
 
 def git_repo(folder: str) -> str:
@@ -145,6 +153,143 @@ class TestConfigForParallelCopies(unittest.TestCase):
             shared = make_config(adapter={"type": "claude_thread", "cwd": tmp},
                                  limits={"max_parallel_turns": 2, "allow_shared_cwd": True})
             self.assertTrue(shared.limits.allow_shared_cwd)
+
+
+class TestTwoChatsAreTwoFolders(unittest.TestCase):
+    """Review blocker 1: the same topic id in two chats is two discussions, not one folder."""
+
+    def test_one_topic_id_in_two_chats_gets_two_copies(self):
+        with TemporaryDirectory() as tmp:
+            repo = git_repo(tmp)
+            channel = AgentChannel(
+                make_config(adapter={"type": "echo", "cwd": repo}, limits=PARALLEL),
+                sender=FakeSender())
+            home = channel._workdir_for(GROUP, 12)
+            other = channel._workdir_for(OTHER, 12)
+            self.assertNotEqual(home, other)
+            self.assertEqual(home.name, "topic-12")
+            self.assertEqual(other.name, f"topic-{OTHER}-12")
+            self.assertTrue(home.is_dir() and other.is_dir())
+            # Two folders, so two locks: neither chat's turn waits behind the other's.
+            self.assertIsNot(channel._lock_for_key(GROUP, 12),
+                             channel._lock_for_key(OTHER, 12))
+            # And two adapters, so no session is shared across the two discussions.
+            self.assertIsNot(channel._adapter_for(GROUP, 12),
+                             channel._adapter_for(OTHER, 12))
+
+    def test_a_project_bound_topic_in_another_chat_is_named_for_that_chat(self):
+        with TemporaryDirectory() as tmp:
+            repo = git_repo(tmp)
+            channel = AgentChannel(
+                make_config(
+                    adapter={"type": "echo", "cwd": repo}, limits=PARALLEL,
+                    projects={"webapp": {"repo": "example-org/webapp", "cwd": repo,
+                                         "topics": [12, 15]}}),
+                sender=FakeSender())
+            # project_for binds by (chat_id, thread_id): topic 12 in the *other* chat is not
+            # this project's, so it copies adapter.cwd -- a different folder either way.
+            self.assertNotEqual(channel._workdir_for(GROUP, 12),
+                                channel._workdir_for(OTHER, 12))
+
+
+class TestOneResolutionPerTopic(unittest.TestCase):
+    """Review should-fix: the failure cache and the folder resolution are one answer."""
+
+    def test_a_failure_is_not_retried_and_the_lock_follows_it(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as not_git:
+            git_repo(tmp)
+            channel = AgentChannel(
+                make_config(
+                    adapter={"type": "echo", "cwd": tmp}, limits=PARALLEL,
+                    projects={"webapp": {"repo": "example-org/webapp", "cwd": not_git,
+                                         "topics": [12], "worktrees": False}}),
+                sender=FakeSender())
+            with mock.patch.object(channel_mod, "ensure_topic_worktree",
+                                   return_value=None) as made:
+                self.assertEqual(channel._workdir_for(GROUP, 12), Path(not_git).resolve())
+                self.assertIs(channel._lock_for_key(GROUP, 12), channel._turn_lock)
+                self.assertEqual(channel._workdir_for(GROUP, 12), Path(not_git).resolve())
+                self.assertIs(channel._lock_for_key(GROUP, 12), channel._turn_lock)
+            self.assertEqual(made.call_count, 1)     # resolved once, never retried per turn
+
+    def test_the_copy_is_made_off_the_event_loop(self):
+        with TemporaryDirectory() as tmp:
+            repo = git_repo(tmp)
+            channel = AgentChannel(
+                make_config(adapter={"type": "echo", "cwd": repo}, limits=PARALLEL),
+                sender=FakeSender())
+            threads = []
+            real = channel_mod.ensure_topic_worktree
+
+            def record(base, name, *, create=True):
+                threads.append(threading.get_ident())
+                return real(base, name, create=create)
+
+            with mock.patch.object(channel_mod, "ensure_topic_worktree", record):
+                run(channel.resolve_topic_folder(GROUP, 12))
+                folder = channel._workdir_for(GROUP, 12)     # cached: no second creation
+            self.assertEqual(len(threads), 1)
+            self.assertNotEqual(threads[0], threading.get_ident())   # not the loop's thread
+            self.assertTrue(folder.is_dir())
+
+
+class TestThePassthroughUsesTheTopicsFolder(unittest.TestCase):
+    """Review blocker 2: `/cli` ran in `adapter.cwd` while holding only the topic's lock."""
+
+    def passthrough(self, cwd: str, **limits):
+        made = make_channel(
+            make_config(adapter={"type": "claude",
+                                 "command": f"{sys.executable} {{prompt}}", "cwd": cwd},
+                        limits=limits),
+            adapter=CountingAdapter())
+        made.bot = mock.Mock(id=555)                 # a bot with an id, and an editor
+        made.bot.edit_message_text = mock.AsyncMock()
+
+        async def send(payload, reply_to_message_id=None):
+            made._test_sender.sent.append({"text": payload, "reply_to": reply_to_message_id})
+            return mock.Mock(message_id=4000 + len(made._test_sender.sent))
+
+        made._sender = send
+        return made
+
+    def test_cli_runs_in_the_topics_own_copy(self):
+        with TemporaryDirectory() as tmp:
+            repo = git_repo(tmp)
+            made = self.passthrough(repo, **PARALLEL)
+            run(made.resolve_topic_folder(GROUP, 12))    # the copy, before Popen is faked
+            with mock.patch("swarmly.telegram.native.subprocess.Popen",
+                            fake_proc(stdout="ok\n")) as spawned:
+                run(made.handle_event(event("/cli@HermesBot --version", author_id=ADMIN_ID,
+                                            username="alice", is_bot=False, thread_id=12)))
+            copy = Path(repo).resolve() / ".swarmly-worktrees" / "topic-12"
+            self.assertEqual(Path(spawned.call_args.kwargs["cwd"]), copy)
+
+    def test_a_general_passthrough_keeps_the_shared_folder(self):
+        with TemporaryDirectory() as tmp:
+            repo = git_repo(tmp)
+            made = self.passthrough(repo, **PARALLEL)
+            with mock.patch("swarmly.telegram.native.subprocess.Popen",
+                            fake_proc(stdout="ok\n")) as spawned:
+                run(made.handle_event(event("/cli@HermesBot --version", author_id=ADMIN_ID,
+                                            username="alice", is_bot=False)))
+            self.assertEqual(Path(spawned.call_args.kwargs["cwd"]), Path(repo).resolve())
+
+    def test_a_shared_folder_passthrough_refuses_while_general_runs(self):
+        """Above N=1 a topic with no copy takes the shared lock, so the passthrough waits."""
+        with TemporaryDirectory() as not_git:
+            made = self.passthrough(not_git, max_parallel_turns=2, allow_shared_cwd=True)
+
+            async def scenario():
+                await made._turn_lock.acquire()
+                try:
+                    return await made.handle_event(event(
+                        "/cli@HermesBot --version", author_id=ADMIN_ID, username="alice",
+                        is_bot=False, thread_id=12))
+                finally:
+                    made._turn_lock.release()
+
+            run(scenario())
+            self.assertIn("a turn is running", made._test_sender.last)
 
 
 if __name__ == "__main__":

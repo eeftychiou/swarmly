@@ -179,10 +179,12 @@ All notable changes to this project are documented here. The format follows
 - **Each CLI instance gets its own working copy of the code** (`#486`). Above
   `limits.max_parallel_turns: 1`, every forum topic now works in a git worktree of its own —
   the project's per-topic worktree, or, for a topic with no project, one made from
-  `adapter.cwd` the same way (`<base>/.swarmly-worktrees/topic-<thread_id>`, excluded through
+  `adapter.cwd` the same way (`<base>/.swarmly-worktrees/topic-<thread_id>`, or
+  `topic-<chat_id>-<thread_id>` for the same topic id in another chat; excluded through
   `.git/info/exclude`) — and each copy gets its own adapter, so two topics never share one CLI
   session. General and the bus/swarm turns keep `adapter.cwd` and take the shared lock; so does
-  a topic whose copy cannot be made, so no two turns ever run in one folder at once.
+  a topic whose copy cannot be made, so no two turns ever run in one folder at once. The copy
+  is made once per topic, off the event loop, and `/cli` in a topic runs in it.
   `max_parallel_turns > 1` no longer needs `limits.allow_shared_cwd` for a git checkout (it is
   refused, with the reason, for a folder that is not one); `allow_shared_cwd: true` keeps its
   meaning as the explicit opt-in to sharing, and its startup warning. `/status` and `/where`
