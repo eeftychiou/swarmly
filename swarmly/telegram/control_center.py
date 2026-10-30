@@ -116,7 +116,8 @@ class ControlCenter:
                  me_username: str = "",
                  cards: Optional[Callable[[], Optional[Dict[str, int]]]] = None,
                  record: Optional[Callable[[int], Awaitable[Any]]] = None,
-                 me_alias: str = ""):
+                 me_alias: str = "",
+                 note: Optional[Callable[[int], Any]] = None):
         self.bot = bot
         #: This bot's own @username, so a pin it did not send is recognised as a failover's.
         self.me_username = str(me_username or "").lstrip("@").strip()
@@ -131,6 +132,11 @@ class ControlCenter:
         #: restart pinned a new one (live, 26 Oct: 43 pins).
         self._cards = cards
         self._record = record
+        #: Hand a card this transport has just posted to the ephemeral sweep (#480). A card is
+        #: replaced whenever the pinned one is gone (a failover retires it, a deleted message
+        #: is re-created), and the replaced one is nobody's dashboard any more: unrecorded, it
+        #: sat in Swarm pulse for good. The sweep keeps the *current* card itself.
+        self._note = note
         self.me_alias = str(me_alias or "").strip().lower()
         self.message_id: Optional[int] = None
         self.last_text: Optional[str] = None
@@ -237,6 +243,12 @@ class ControlCenter:
         message_id = getattr(sent, "message_id", None)
         self.message_id = message_id
         self.last_text = text
+        if self._note is not None and message_id is not None:
+            try:
+                self._note(int(message_id))
+            except Exception:                          # noqa: BLE001 - swept or not, it is up
+                logger.warning("control center: the card was not recorded for the sweep",
+                               exc_info=True)
         await self._pin(message_id)
         if self._record is not None and message_id is not None:
             try:

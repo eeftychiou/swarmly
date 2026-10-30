@@ -24,6 +24,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Swarm pulse's own posts are swept again** (`#480`). The admin reported the pulse topic
+  still growing (30 Oct). Three writers posted there without anything recording them for
+  `limits.ephemeral_notices_minutes`: the service messages the bot itself causes (the pulse
+  topic being opened, and **every pin** — a snapshot is pinned each time the holder publishes
+  one), which Telegram delivers to the bot as its own posts and which no send path ever saw;
+  the `/storetest` probe's two documents, sent straight through the bot; and a dashboard card
+  the transport replaced (a failover retires one, a deleted message is re-created). The sweep
+  now records own posts in the pulse topic as they are seen, hands the probe files and every
+  created card to it as well, and decides *which* topic is the pulse the way the rest of the
+  transport does (`_is_pulse`: configured, known, or carrying the pulse's name) instead of by
+  one `min()` over the name, which missed a second topic opened at the same time. Kept, as
+  before: the pinned card, the current snapshot and the live beat. A post older than
+  `deleteMessages`' 48 hours is still the admin's to delete by hand.
 - **A hand-off written in the admin's private chat reaches the peer, or says why not**
   (`#425`). A turn from the admin's private chat got the group's turn rules — *"reply here, in
   General … hand work to a bot with a line that starts with its @username"* — but no peer sees

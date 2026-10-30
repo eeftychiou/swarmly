@@ -516,3 +516,28 @@ class TestTheCardIsFoundByItsRecordedId(unittest.TestCase):
         centre, _ = self.make(bot, None)
         run(centre.refresh())
         self.assertEqual((bot.sent, bot.pins), ([], []))
+
+
+class TestACardIsHandedToTheSweep(unittest.TestCase):
+    """#480: the card is posted straight through the bot, so no send path records it. Every
+    card the dashboard replaced (a failover retired it, a deleted message was re-created) was
+    an unrecorded post in Swarm pulse, and stayed there for good; the sweep keeps the card in
+    use itself, so the id has to be recorded for the retired one to go."""
+
+    def centre(self, bot, note):
+        return cc.ControlCenter(bot, chat_id=CHAT, thread_id=3418, render=lambda: TEXT,
+                                note=note)
+
+    def test_a_created_card_is_handed_over(self):
+        bot = FakeBot()
+        noted = []
+        result = run(self.centre(bot, noted.append).refresh())
+        self.assertEqual(noted, [result.message_id])
+
+    def test_a_note_that_raises_does_not_fail_the_refresh(self):
+        def boom(_message_id):
+            raise RuntimeError("no ledger")
+        bot = FakeBot()
+        result = run(self.centre(bot, boom).refresh())
+        self.assertEqual(result.status, cc.CREATED)
+        self.assertEqual(len(bot.pins), 1)                 # the card is up and pinned

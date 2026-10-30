@@ -76,8 +76,13 @@ class FakeChannel:
         self.selftest = SimpleNamespace(peers=lambda: [a for a in everyone if a != alias])
         self.bot = FakeBot(group, self)
         self.reports = []
+        #: (#480) what the transport handed to the ephemeral sweep: (message id, topic).
+        self.noted = []
         self.store_probe = StoreProbe(self)
         group.channels.append(self)
+
+    def note_pulse_post(self, chat_id, message_id, thread_id):
+        self.noted.append((int(message_id), thread_id))
 
     async def _ensure_pulse_topic(self):
         return PULSE
@@ -134,6 +139,16 @@ class StoreProbeTests(unittest.TestCase):
         self.assertEqual(sorted(state.results), ["Claudebot", "DeepSeek", "Reasonix"])
         self.assertIn("PASS: 3/3 bots reported", claude.reports[0])
         self.assertEqual(len(group.pins), 1, "the probe file is unpinned again")
+
+    def test_the_probe_files_are_handed_to_the_sweep(self):
+        """#480: the two documents are sent straight through the bot, so no send path records
+        them; unrecorded they stayed in Swarm pulse for good."""
+        group, (claude, deepseek) = swarm("Claudebot", "DeepSeek")
+        run_test(group, claude)
+        files = [mid for mid, data in group.files.items()]
+        self.assertEqual(len(files), 2, "one probe file per pin step")
+        self.assertEqual(sorted(mid for mid, topic in claude.noted if topic == PULSE),
+                         sorted(files))
 
     def test_a_bot_that_cannot_see_a_peer_fails_the_run(self):
         group, (claude, deepseek, reasonix) = swarm("Claudebot", "DeepSeek", "Reasonix")

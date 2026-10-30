@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from swarmly.telegram.channel import AgentChannel
+from swarmly.telegram.channel import AgentChannel, ChannelEvent
 from swarmly.telegram.cleanup import (LEDGER_TTL_SECONDS, GeneralLedger,
                                       delete_message_ids)
 from swarmly.telegram.config import AgentConfig
@@ -405,3 +405,63 @@ class SwarmPulseTests(Case):
         self.channel.note_pulse_post(GROUP, 900, self.PULSE)
         self.channel.note_pulse_post(GROUP, 901, 9400)             # a work topic: not ours to sweep
         self.assertEqual(self.ledger.notices(GROUP), [900])
+
+
+class PulseWriterTests(Case):
+    """#480: the admin, 30 Oct -- Swarm pulse keeps growing. Every post a transport makes
+    there is swept, and *which* topic is the pulse is decided the way the rest of the
+    transport decides it, not by one name lookup that can miss."""
+
+    PULSE = 3418
+    PEER_PULSE = 3419
+    PULSE_NAME = "\U0001f4e1 Swarm pulse"
+
+    def test_a_second_pulse_topic_is_recorded_too(self):
+        # Two topics opened at once (live, 26 Oct): every bot picked one by ``min()``, and a
+        # post in the other was never recorded, so it was never swept.
+        self.channel.topics.remember(GROUP, self.PULSE, self.PULSE_NAME)
+        self.channel.topics.remember(GROUP, self.PEER_PULSE, self.PULSE_NAME)
+        self.assertEqual(self.channel._pulse_topic(), self.PULSE)
+        self.channel.note_pulse_post(GROUP, 900, self.PEER_PULSE)
+        self.assertEqual(self.ledger.notices(GROUP), [900])
+
+    def test_a_work_topic_with_no_pulse_name_is_still_left_alone(self):
+        self.channel.topics.remember(GROUP, self.PULSE, self.PULSE_NAME)
+        self.channel.note_pulse_post(GROUP, 900, 9400)
+        self.assertEqual(self.ledger.notices(GROUP), [])
+
+    def test_an_own_service_message_in_the_pulse_topic_is_swept(self):
+        # Telegram delivers the service messages the bot causes -- the topic being opened, a
+        # snapshot or the card being pinned -- as its own posts, and none of them went through
+        # a send path. Nothing recorded them, and every pin was one more message for good.
+        self.assertEqual(run(self.channel.handle_event(ChannelEvent(
+            text="", chat_id=GROUP, author_id=202, author_username="HermesBot",
+            author_is_bot=True, message_id=3400, thread_id=self.PULSE,
+            topic_name=self.PULSE_NAME))), None)
+        self.assertIn(3400, self.ledger.notices(GROUP))
+        later = NOW + 61 * MINUTE
+        self.assertEqual(self.sweep(later), 1)
+        self.assertEqual(self.bot.messages, [(GROUP, [3400])])
+
+    def test_a_peers_service_message_in_the_pulse_topic_is_never_ours(self):
+        self.channel.topics.remember(GROUP, self.PULSE, self.PULSE_NAME)
+        run(self.channel.handle_event(ChannelEvent(
+            text="", chat_id=GROUP, author_id=999, author_username="CodexBot",
+            author_is_bot=True, message_id=3401, thread_id=self.PULSE)))
+        self.assertEqual(self.ledger.notices(GROUP), [])
+
+    def test_a_persons_message_in_the_pulse_topic_is_never_ours(self):
+        self.channel.topics.remember(GROUP, self.PULSE, self.PULSE_NAME)
+        run(self.channel.handle_event(ChannelEvent(
+            text="", chat_id=GROUP, author_id=ADMIN_ID, author_username="admin",
+            author_is_bot=False, message_id=3402, thread_id=self.PULSE)))
+        self.assertEqual(self.ledger.notices(GROUP), [])
+
+    def test_a_replaced_card_is_swept_and_the_current_one_kept(self):
+        from types import SimpleNamespace
+        self.channel.topics.remember(GROUP, self.PULSE, self.PULSE_NAME)
+        self.channel.note_pulse_post(GROUP, 11, self.PULSE)        # the retired card
+        self.channel.note_pulse_post(GROUP, 12, self.PULSE)        # the card in use
+        self.channel._control_center = SimpleNamespace(message_id=12)
+        self.assertEqual(self.sweep(NOW + 61 * MINUTE), 1)
+        self.assertEqual(self.bot.messages, [(GROUP, [11])])

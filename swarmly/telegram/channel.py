@@ -2261,13 +2261,19 @@ class AgentChannel:
         All of it is machine traffic, delivered to the peers as live updates and never read
         back from history, so the ephemeral sweep deletes it once it is old -- Swarm pulse had
         thousands of such posts (admin, 26 Oct). The pinned card, the current snapshot and this
-        bot's live status message are kept by the sweep, whatever their age."""
-        pulse = self._pulse_topic()
-        if message_id is None or pulse is None or thread_id is None or \
-                int(thread_id) != int(pulse):
+        bot's live status message are kept by the sweep, whatever their age.
+
+        *Which* topic is the pulse is decided the same way everywhere else in the transport
+        does it (:meth:`_is_pulse`): the configured topic, the one the swarm knows, or one
+        that carries the pulse's name. Asking only for ``_pulse_topic()`` missed a second
+        topic opened at the same time -- the bots never agree on one ``min()`` -- so its posts
+        were never recorded and never swept (#480)."""
+        if message_id is None or thread_id is None:
             return
         home = self.cleanup_home_chat()
         if home is None or int(chat_id) != int(home):
+            return
+        if not self._is_pulse(int(chat_id), int(thread_id)):
             return
         self.ledger.note_notice(int(chat_id), int(message_id))
 
@@ -4192,7 +4198,11 @@ class AgentChannel:
                                cards=self.state_link.dashboard_cards if store_on else None,
                                record=self.state_link.record_dashboard_card if store_on
                                else None,
-                               me_alias=self.config.identity.alias)
+                               me_alias=self.config.identity.alias,
+                               # #480: a card the dashboard replaced is swept like any other
+                               # post of this bot's in Swarm pulse; the current one is kept.
+                               note=lambda message_id: self.note_pulse_post(
+                                   int(chat_id), message_id, thread))
         self._control_center = centre
         return centre
 
@@ -9338,8 +9348,14 @@ class AgentChannel:
         # with registry routing the coordinator takes every person's message in a work topic,
         # and it answered "your message reached me with no text".
         # A General message id is still recorded first, so /cleanup can delete a sticker or pin.
+        # ``own`` is what the message *is*: a post of this bot's own, which it sees here because
+        # Telegram delivers the service messages it caused -- the pulse topic being opened, a
+        # snapshot or the card being pinned -- and those never went through a send path, so no
+        # writer recorded them. In Swarm pulse they are exactly the posts that escaped the
+        # sweep and kept the topic growing (#480); a peer's or a person's post is never ours
+        # and is never marked (#395).
         self._note_general_message(event.chat_id, event.message_id, event.thread_id,
-                                   own=False)
+                                   own=self._is_own_post(event))
         if not (event.text or "").strip() and not event.attachments and not event.self_task:
             self.stats.ignored += 1
             logger.info("message %s in topic %s has no text and nothing attached; no turn",
