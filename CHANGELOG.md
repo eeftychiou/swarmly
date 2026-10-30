@@ -138,6 +138,18 @@ All notable changes to this project are documented here. The format follows
   work item the topic links has merged or closed after it was made, and the admin can close
   the rows owed in a topic with `/owed close [alias]`; the ladder's last rung says so.
 
+- **An open dropdown stays open on the dashboard** (`#481`). The admin picked a model from a
+  dropdown and the list closed after a few seconds: the page redraws every 3 s and
+  `replaceChildren()` replaces the `<select>`, which the browser closes along with its open
+  list. A native select cannot be redrawn without being closed, so the page now holds the
+  redraw while one is being picked in (focus, a tap, or a key on a select that already had the
+  keyboard) and draws the state that arrived meanwhile once the pick is done, or the list is
+  dismissed with a tap elsewhere, `Escape` or a tab-out. Held, not skipped: the stamp is marked
+  `· held while you pick` rather than left reading as current, and the redraw the page makes
+  itself takes no hold (a restored focus is the page's, not the admin's), so the #449 keyboard
+  behaviour is unchanged. `tests/test_web_dashboard.py` pins the hold, the release and the
+  release-path focus.
+
 ## [0.12.1] - 2026-10-26
 
 ### Fixed
