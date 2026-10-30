@@ -1662,6 +1662,9 @@ function holdFor(select) {
 function heldStamp() {
   const stamp = document.getElementById("stamp");
   const text = stamp.textContent || "";
+  // Only the time of a picture is marked as held: an "unavailable" line is already honest
+  // about why nothing was drawn, and a picker's marker on it would be a lie (review, #481).
+  if (text.indexOf("refreshed ") !== 0) return;
   // The stamp keeps the time of the picture on screen, which is now older than the poll: it is
   // marked as held rather than made to read as current.
   if (text.indexOf(" · held while you pick") < 0)
@@ -1670,7 +1673,10 @@ function heldStamp() {
 
 // The pick is done, or the list was dismissed: draw what the held ticks fetched. On the next
 // task, so the tap that ended it has moved the keyboard first, and only if nothing is open now.
-function releaseHold() {
+// `from` is the dropdown the event belongs to: a tap that moves the keyboard from one dropdown
+// to another ends the first one's hold, never the second one's.
+function releaseHold(from) {
+  if (from && PICKING && PICKING !== (from.dataset.pending || "")) return;
   PICKING = "";
   const state = HELD;
   HELD = null;
@@ -1685,7 +1691,7 @@ function watchPick(select, key) {
   select.addEventListener("change", () => {
     pendingSet(key, select.value);
     rememberFocus(key);
-    releaseHold();
+    releaseHold(select);
   });
   select.addEventListener("focus", () => {
     rememberFocus(key);
@@ -1695,10 +1701,10 @@ function watchPick(select, key) {
   select.addEventListener("keydown", (event) => {
     // Escape closes a list nobody picked from, as a tap elsewhere does; every other key may
     // have opened one or moved inside it, so the redraw keeps waiting.
-    if (event.key === "Escape") releaseHold();
+    if (event.key === "Escape") releaseHold(select);
     else holdFor(select);
   });
-  select.addEventListener("blur", () => releaseHold());
+  select.addEventListener("blur", () => releaseHold(select));
 }
 
 function picker(forAction, choices, first, key) {
@@ -2028,10 +2034,23 @@ function render(state) {
 }
 
 // A tap anywhere that is not a control is the page's own: the keyboard went there on purpose,
-// and the next redraw must not pull it back.
+// and the next redraw must not pull it back. It is also how a list is dismissed when the select
+// itself never hears it -- Android Back, a Mini App overlay that swallows the blur -- so the
+// hold ends here too, or one dismissed picker would freeze the page for good (review, #481).
+// The select's own handler sees the tap first (it bubbles up from the target), so opening a
+// list is not cut short by this.
 document.addEventListener("pointerdown", (event) => {
   const target = event.target;
-  if (!target || !target.closest || !target.closest("[data-pending]")) FOCUS = "";
+  if (!target || !target.closest || !target.closest("[data-pending]")) {
+    FOCUS = "";
+    releaseHold();
+  }
+});
+
+// And a page that went away in the middle of a pick comes back with no list open: the hold
+// ends there too, rather than waiting for a tap that may not come (review, #481).
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) releaseHold();
 });
 
 // And the same for the keyboard: a focus that moved to something that is not a control -- the
