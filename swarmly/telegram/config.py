@@ -39,6 +39,7 @@ import math
 import os
 import re
 import shlex
+import subprocess
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
@@ -655,6 +656,21 @@ MAX_PARALLEL_TURNS = 8
 MAX_REPLY_PARTS = 20
 
 
+def _is_git_checkout(folder: Optional[str]) -> bool:
+    """Whether *folder* is inside a git working tree (#486: where a per-topic copy of it can
+    be made). A folder that cannot be asked -- unset, missing, git absent -- is not one."""
+    cwd = (folder or "").strip()
+    if not cwd:
+        return False
+    try:
+        res = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, check=False, timeout=10)
+    except Exception:                              # noqa: BLE001 - no answer is not a checkout
+        return False
+    return res.returncode == 0 and res.stdout.strip() == "true"
+
+
 @dataclass
 class ChannelLimits:
     """Pacing and size limits — by default sends at least 3 s apart (per topic when topics
@@ -685,7 +701,7 @@ class ChannelLimits:
     #: one dropped (with a word in the topic), which is the order the queue is drained in anyway.
     busy_held_max: int = 50                             # matches the inbox's own MAX_ENTRIES
     max_parallel_turns: int = 1                         # forum topics running a turn at once
-    allow_shared_cwd: bool = False                      # parallel topics share adapter.cwd
+    allow_shared_cwd: bool = False                      # opt in: parallel topics may share a folder
     max_peer_turns_per_topic: int = 8                   # peer turns in a row per forum topic
     work_in_topics: bool = True                         # General is for setup; work moves to a topic
     handoff_nudge_minutes: float = 10.0                 # a hand-off with no word from its bot: remind it, then the admin; 0 = off
@@ -1329,11 +1345,16 @@ class AgentConfig:
                     "parallel turns would interleave in it. Use 1, or drop the pinned "
                     "conversation.")
         if (limits.max_parallel_turns > 1 and adapter.type not in NO_FILES_ADAPTERS
-                and not limits.allow_shared_cwd):
+                and not limits.allow_shared_cwd and not _is_git_checkout(adapter.cwd)):
+            # #486: every parallel topic works in its own copy, made as a git worktree of
+            # adapter.cwd. Outside a checkout no copy can be made, and the turns would share
+            # one folder -- that stays an explicit opt-in.
             raise ConfigError(
-                f"limits.max_parallel_turns > 1 runs several {adapter.type!r} turns in the same "
-                f"working directory ({adapter.cwd or '.'}), where they can overwrite each "
-                "other's edits. Set limits.allow_shared_cwd: true to accept that, or use 1.")
+                f"limits.max_parallel_turns > 1 gives every topic its own working copy, but "
+                f"{adapter.cwd or '.'} is not a git checkout, so no copy can be made there and "
+                f"several {adapter.type!r} turns would run in the same directory, where they can "
+                "overwrite each other's edits. Point adapter.cwd at a git checkout, set "
+                "limits.allow_shared_cwd: true to accept the sharing, or use 1.")
         projects_dict: Dict[str, ProjectSettings] = {}
         projects_raw = data.get("projects") or {}
         if not isinstance(projects_raw, dict):
@@ -1659,7 +1680,9 @@ class AgentConfig:
                         same = Path(p1.cwd).expanduser().resolve() == Path(p2.cwd).expanduser().resolve()
                     except Exception:
                         same = Path(p1.cwd).expanduser() == Path(p2.cwd).expanduser()
-                    if same:
+                    # #486: a git checkout gets one copy per topic, so two projects sharing it
+                    # is fine; outside a checkout the turns really do share one folder.
+                    if same and not _is_git_checkout(p1.cwd):
                         problems.append(
                             f"projects '{p1.key}' and '{p2.key}' share the same cwd ({p1.cwd}) with "
                             "worktrees: false while limits.max_parallel_turns > 1 and limits.allow_shared_cwd is false"

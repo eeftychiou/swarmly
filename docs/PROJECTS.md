@@ -71,14 +71,23 @@ backstop work the same either way: they need no gitbus, only the repository name
 
 ### Git worktrees vs shared working copy
 
-For projects mapped to multiple active topics, concurrent agent turns on the same checkout risk stepping on each other's unstaged edits or checking out conflicting branches:
+**Each CLI instance gets its own working copy of the code (#486):** a bot running several
+topics at once never has two turns in one folder.
 
-- **Shared working copy (`worktrees: false`, default)**:
-  All topics bound to the project share the base `cwd`. Suitable for sequential tasks or single-topic projects.
-- **Isolated git worktrees (`worktrees: true`)**:
+- **One turn at a time (`limits.max_parallel_turns: 1`, default)**:
+  Every topic bound to the project works in its base `cwd` (`worktrees: false`, default), or in
+  an isolated git worktree of it per topic (`worktrees: true`). One turn at a time, so nothing
+  to collide with.
+- **Several topics at once (`max_parallel_turns > 1`)**:
+  Every forum topic gets a working copy of its own, whether or not the project sets
+  `worktrees` — `<cwd>/.swarmly-worktrees/topic-<thread_id>` — and a topic with no project gets
+  the same, made from `adapter.cwd`. General keeps `adapter.cwd` and no two shared-folder turns
+  ever run at the same time. See **Running topics in parallel** in
+  [`docs/telegram-channel.md`](telegram-channel.md).
+- **How a copy is made**:
   Swarmly automatically provisions an isolated git worktree for each topic under `<cwd>/.swarmly-worktrees/topic-<thread_id>`, detached from `origin/HEAD`.
   The `.swarmly-worktrees/` directory is automatically ignored in `.git/info/exclude` (so the repository's tracked `.gitignore` is never modified).
-  If worktree creation fails (for instance in an uninitialized git repo), Swarmly logs a warning and falls back to `cwd` without dropping or failing the turn.
+  If worktree creation fails (for instance in an uninitialized git repo), Swarmly logs a warning and falls back to `cwd` without dropping or failing the turn; a turn there then runs **alone** under the shared lock, never beside another turn.
 
 ---
 
@@ -199,7 +208,8 @@ swarmly-telegram --config config.yaml gh-poll --once
 ### `/where`
 Sends an immediate diagnostic reply indicating the active routing:
 - **In an unbound topic**:
-  `WHERE Hermes chat=-1001234567890 topic=99 not bound: Telegram only`
+  `WHERE Hermes chat=-1001234567890 topic=99 not bound: Telegram only` — with `max_parallel_turns`
+  above 1 it also names the topic's own working copy (`workdir=<adapter.cwd>/.swarmly-worktrees/topic-99`).
 - **In a bound topic**:
   `WHERE Hermes chat=-1001234567890 topic=12 project=webapp repo=example-org/webapp workdir=/home/user/projects/webapp/.swarmly-worktrees/topic-12`
 
@@ -227,9 +237,12 @@ swarmly-telegram --config config.yaml gh-poll --once --json
 ## 5. Troubleshooting
 
 ### Worktree creation failure fallback
-- If `worktrees: true` is configured but git worktree creation fails (e.g., bare clone, detached HEAD without origin, or disk permissions), Swarmly logs a warning:
-  `Failed to create worktree at ...; falling back to cwd`
-- The turn executes safely inside the project's base `cwd`. Turns are never aborted due to worktree provisioning issues.
+- If a worktree is needed (`worktrees: true`, or any forum topic while `max_parallel_turns` is
+  above 1) but git worktree creation fails (e.g., bare clone, detached HEAD without origin, or
+  disk permissions), Swarmly logs a warning and falls back to the base `cwd`.
+- The turn executes safely inside the project's base `cwd`, and — with parallel topics — it
+  runs **alone**: it takes the shared lock, so no other turn is in that folder at the same
+  time. Turns are never aborted due to worktree provisioning issues.
 
 ### Missing repo or cwd at startup
 - `swarmly-telegram check` catches missing directories or invalid `owner/repo` formats immediately.

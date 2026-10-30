@@ -174,6 +174,21 @@ All notable changes to this project are documented here. The format follows
   `tests/test_web_dashboard.py` pins the hold, the release, the outside tap, the stamp and the
   release-path focus.
 
+### Changed
+
+- **Each CLI instance gets its own working copy of the code** (`#486`). Above
+  `limits.max_parallel_turns: 1`, every forum topic now works in a git worktree of its own —
+  the project's per-topic worktree, or, for a topic with no project, one made from
+  `adapter.cwd` the same way (`<base>/.swarmly-worktrees/topic-<thread_id>`, excluded through
+  `.git/info/exclude`) — and each copy gets its own adapter, so two topics never share one CLI
+  session. General and the bus/swarm turns keep `adapter.cwd` and take the shared lock; so does
+  a topic whose copy cannot be made, so no two turns ever run in one folder at once.
+  `max_parallel_turns > 1` no longer needs `limits.allow_shared_cwd` for a git checkout (it is
+  refused, with the reason, for a folder that is not one); `allow_shared_cwd: true` keeps its
+  meaning as the explicit opt-in to sharing, and its startup warning. `/status` and `/where`
+  name the folder of a topic with no project too, and `docs/PROJECTS.md` and
+  `docs/telegram-channel.md` state the principle (the "planned" wording is gone).
+
 ## [0.12.1] - 2026-10-26
 
 ### Fixed

@@ -15,6 +15,14 @@ from swarmly.telegram.config import ProjectSettings
 
 logger = logging.getLogger("swarmly.telegram.projects")
 
+#: Where per-topic working copies live, under the checkout they are made from.
+WORKTREES_DIRNAME = ".swarmly-worktrees"
+
+
+def topic_worktree_path(base_cwd: Union[str, Path], thread_id: int) -> Path:
+    """The folder one topic works in: ``<base_cwd>/.swarmly-worktrees/topic-<thread_id>``."""
+    return Path(base_cwd).expanduser().resolve() / WORKTREES_DIRNAME / f"topic-{thread_id}"
+
 
 def _ensure_git_exclude(base_cwd: Path) -> None:
     """Ensure ``.swarmly-worktrees/`` is listed in the repository's local exclude file,
@@ -43,6 +51,69 @@ def _ensure_git_exclude(base_cwd: Path) -> None:
                 handle.write(".swarmly-worktrees/\n")
     except Exception as exc:
         logger.warning("could not add .swarmly-worktrees/ to git exclude in %s: %s", base_cwd, exc)
+
+
+def ensure_topic_worktree(base_cwd: Union[str, Path], thread_id: int, *,
+                          create: bool = True) -> Optional[Path]:
+    """One topic's own working copy of ``base_cwd`` (#486).
+
+    ``<base_cwd>/.swarmly-worktrees/topic-<thread_id>``, created on first use: a fetch, then
+    a detached worktree of ``origin/HEAD`` (falling back to ``HEAD``), with
+    ``.swarmly-worktrees/`` added to ``.git/info/exclude`` rather than the tracked
+    ``.gitignore``. ``create=False`` only names the folder (for /status and /where): no
+    fetch, no worktree.
+
+    Returns ``None`` when the copy cannot be made. The caller then knows ``base_cwd`` is
+    shared: a turn there must run **alone** (the shared lock), never beside another turn.
+    """
+    base = Path(base_cwd).expanduser().resolve()
+    target = topic_worktree_path(base, thread_id)
+    if target.exists() or not create:
+        return target
+    _ensure_git_exclude(base)
+    try:
+        subprocess.run(
+            ["git", "-C", str(base), "fetch", "origin"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        res = subprocess.run(
+            ["git", "-C", str(base), "worktree", "add", str(target), "origin/HEAD", "--detach"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if res.returncode != 0:
+            res = subprocess.run(
+                ["git", "-C", str(base), "worktree", "add", str(target), "HEAD", "--detach"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        if res.returncode == 0 and target.exists():
+            return target
+        logger.warning(
+            "worktree add failed in %s for topic %s: %s (a turn there must run alone in %s)",
+            base,
+            thread_id,
+            res.stderr.strip() or res.stdout.strip(),
+            base,
+        )
+    except Exception as exc:                                  # noqa: BLE001 - no copy, not no turn
+        logger.warning(
+            "failed to create worktree for topic %s in %s: %s (a turn there must run alone "
+            "in %s)",
+            thread_id,
+            base,
+            exc,
+            base,
+        )
+    return None
 
 
 class ProjectRouter:
@@ -87,57 +158,13 @@ class ProjectRouter:
                     create: bool = True) -> Path:
         """Return the working directory for this project and thread.
         Returns ``cwd`` when worktrees is false, or ``<cwd>/.swarmly-worktrees/topic-<thread_id>``
-        when worktrees is true (created on first use). A failed worktree creation falls back
-        to ``cwd`` and logs a warning; it never blocks the turn. ``create=False`` only names
-        the folder (for /status): no fetch, no worktree.
+        when worktrees is true (created on first use). A failed creation falls back to
+        ``cwd`` -- the caller must then hold the shared lock so no two turns run there at
+        once (#486); :func:`ensure_topic_worktree` says which case it was. ``create=False``
+        only names the folder (for /status): no fetch, no worktree.
         """
         base_cwd = Path(project.cwd).expanduser().resolve()
         if not project.worktrees:
             return base_cwd
-        target = base_cwd / ".swarmly-worktrees" / f"topic-{thread_id}"
-        if target.exists() or not create:
-            return target
-        _ensure_git_exclude(base_cwd)
-        try:
-            subprocess.run(
-                ["git", "-C", str(base_cwd), "fetch", "origin"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            res = subprocess.run(
-                ["git", "-C", str(base_cwd), "worktree", "add", str(target), "origin/HEAD", "--detach"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-            )
-            if res.returncode != 0:
-                res = subprocess.run(
-                    ["git", "-C", str(base_cwd), "worktree", "add", str(target), "HEAD", "--detach"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=30,
-                )
-            if res.returncode == 0 and target.exists():
-                return target
-            logger.warning(
-                "worktree add failed in %s for topic %s: %s (falling back to %s)",
-                base_cwd,
-                thread_id,
-                res.stderr.strip() or res.stdout.strip(),
-                base_cwd,
-            )
-            return base_cwd
-        except Exception as exc:
-            logger.warning(
-                "failed to create worktree for topic %s in %s: %s (falling back to %s)",
-                thread_id,
-                base_cwd,
-                exc,
-                base_cwd,
-            )
-            return base_cwd
+        target = ensure_topic_worktree(base_cwd, thread_id, create=create)
+        return base_cwd if target is None else target
