@@ -172,4 +172,9 @@ def where_reply(alias: str, chat_id: int, thread_id: Optional[int],
             f"workdir={_clean(workdir)}",
         ]
         return f"WHERE {_clean(alias)} {' '.join(parts)}"
-    return f"WHERE {_clean(alias)} chat={chat_id} topic={topic_str} not bound: Telegram only"
+    line = f"WHERE {_clean(alias)} chat={chat_id} topic={topic_str} not bound: Telegram only"
+    # #486: a topic with no project still works in a folder of its own above N=1, and that
+    # folder is the thing a peer needs to know.
+    if workdir:
+        line += f" workdir={_clean(workdir)}"
+    return line

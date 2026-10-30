@@ -192,10 +192,45 @@ class NamesTests(unittest.TestCase):
 
 
 class ChannelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # #486: above N=1 every topic works in its own git worktree of adapter.cwd, so the
+        # parallel tests need a real (temporary) checkout to make copies from.
+        import subprocess
+        from tests.gitenv import git_env
+        cls._repo = TemporaryDirectory()
+        repo = cls._repo.name
+        subprocess.run(["git", "init", "-b", "main", repo], capture_output=True, check=True,
+                       env=git_env())
+        subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True,
+                       env=git_env())
+        subprocess.run(["git", "-C", repo, "config", "user.email", "test@example.com"],
+                       check=True, env=git_env())
+        Path(repo, "README.md").write_text("init\n", encoding="utf-8")
+        subprocess.run(["git", "-C", repo, "add", "README.md"], check=True, env=git_env())
+        subprocess.run(["git", "-C", repo, "commit", "-m", "init"], check=True, env=git_env())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._repo.cleanup()
+
     def channel(self, parallel=1, **limits):
-        channel = make_channel(make_config(limits={"max_parallel_turns": parallel, **limits}))
+        channel = make_channel(make_config(
+            limits={"max_parallel_turns": parallel, **limits},
+            adapter={"type": "echo", "cwd": self._repo.name}))
         gate = Gate()
         channel.adapter = gate
+        # These tests are about admission, not copies: every topic's working copy is the same
+        # gate, and each topic still gets its own folder (#486).
+        channel._topic_adapter = lambda workdir, suffix: gate
+
+        async def resolved_in_place(chat_id, thread_id):
+            """The copy is made on the loop here: these tests count event-loop turns, and a
+            worker thread would hand control back after their ``settle()`` is over."""
+            if thread_id is not None:
+                channel._resolve_folder(int(chat_id), int(thread_id))
+
+        channel.resolve_topic_folder = resolved_in_place
         return channel, gate
 
     def test_the_discussion_reaches_the_agent(self):

@@ -35,6 +35,7 @@ import re
 import secrets
 import socket
 import subprocess
+import threading
 import types
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import time
@@ -78,7 +79,11 @@ from swarmly.telegram import snapshot as snapshot_mod
 
 from swarmly.telegram import usage as usage_mod
 from swarmly.telegram.pulsebus import PulseBus, notes_from
-from swarmly.telegram.projects import ProjectRouter
+from swarmly.telegram.projects import (
+    ProjectRouter,
+    ensure_topic_worktree,
+    topic_worktree_path,
+)
 from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
 from swarmly.telegram.model_list import available_models, cached_models, format_list
 from swarmly.telegram.redact import Redactor
@@ -595,13 +600,20 @@ class AgentChannel:
         self._turn_locks: Dict[Tuple[int, Optional[int]], asyncio.Lock] = {}
         parallel = int(getattr(config.limits, "max_parallel_turns", 1) or 1)
         self._parallel_turns = max(parallel, 1)
+        # #486: each topic's working copy, resolved once ((base, name) -> folder or None), so
+        # the lock, the folder and the adapter all read the same answer. The lock makes that
+        # "once" true under concurrency: the creation may run in a worker thread (the loop's
+        # own call would otherwise race it into git's index.lock).
+        self._topic_folders: Dict[Tuple[str, str], Optional[Path]] = {}
+        self._topic_folders_lock = threading.Lock()
         self._turn_slots: Optional[asyncio.Semaphore] = (
             asyncio.Semaphore(parallel) if parallel > 1 else None)
         home = getattr(config.identity, "home_channel_id", None)
         self.topics = TopicMap(_topics_path(config), home_chat_id=int(home) if home else None)
         if parallel > 1 and getattr(config.limits, "allow_shared_cwd", False):
-            logger.warning("%s runs up to %d topic turns at once in one working directory (%s): "
-                           "they can overwrite each other's edits",
+            logger.warning("%s runs up to %d topic turns at once and allows a shared working "
+                           "directory (%s): a topic whose own copy cannot be made runs there "
+                           "alone, and nothing stops it overwriting what it finds",
                            config.identity.alias, parallel, config.adapter.cwd or ".")
         self._last_agent_turn = float("-inf")     # the bot-to-bot cooldown, per lock key
         self._last_turn_at: Dict[Any, float] = {}
@@ -884,32 +896,137 @@ class AgentChannel:
                 return True
         return False
 
-    def _workdir_for(self, chat_id: int, thread_id: Optional[int]) -> Path:
+    def _shared_cwd(self) -> Path:
+        """The folder a turn outside any per-topic copy runs in (``adapter.cwd``)."""
+        return Path(self.config.adapter.cwd or ".").expanduser().resolve()
+
+    def _topic_base(self, chat_id: int, thread_id: int) -> Path:
+        """The checkout a topic's copy is made from: its project's, or ``adapter.cwd``."""
+        project = self.router.project_for(chat_id, thread_id)
+        return (Path(project.cwd).expanduser().resolve() if project is not None
+                else self._shared_cwd())
+
+    def _in_home_chat(self, chat_id: int) -> bool:
+        """Whether *chat_id* is this bot's home chat (whose state files keep their old names)."""
+        home = self.config.identity.home_channel_id
+        return home is not None and int(chat_id) == int(home)
+
+    def _worktree_name(self, chat_id: int, thread_id: int) -> str:
+        """The folder name of a topic's copy.
+
+        The home chat keeps the plain ``topic-<id>``; the same topic id in another chat is
+        another discussion, so it gets ``topic-<chat>-<id>`` -- two chats are never one folder
+        (and never one lock, nor one session).
+        """
+        if self._in_home_chat(chat_id):
+            return f"topic-{thread_id}"
+        return f"topic-{chat_id}-{thread_id}"
+
+    def _isolated_workdir(self, chat_id: int, thread_id: Optional[int], *,
+                          create: bool = True) -> Optional[Path]:
+        """#486: the working copy this topic's turn gets, or ``None`` when it belongs in the
+        shared folder.
+
+        Above ``limits.max_parallel_turns`` 1 two turns can run at once, so **every** forum
+        topic works in a copy of its own: the project's per-topic worktree, or, for a topic
+        with no project, one made from ``adapter.cwd`` the same way. General (no thread) and
+        bus turns keep the shared folder -- they run one at a time under the shared lock --
+        and so does a topic whose copy cannot be made: it then runs *alone* there, never
+        beside another turn. ``create=False`` names the folder without making it.
+
+        A plain read of ``_topic_folders``, never a creation and never a lock: this is called
+        on the event loop, where waiting on another topic's ``git fetch`` would freeze the
+        transport. ``None`` means "not resolved (yet) or no copy", and both answer the shared
+        folder and the shared lock -- the safe pair. ``resolve_topic_folder`` makes the copy,
+        off the loop, and is awaited before a message is judged or admitted.
+        """
+        if self._parallel_turns <= 1 or thread_id is None:
+            return None
+        base = self._topic_base(chat_id, thread_id)
+        name = self._worktree_name(int(chat_id), int(thread_id))
+        if not create:                                 # /status and /where: name it only
+            return topic_worktree_path(base, name)
+        return self._topic_folders.get((str(base), name))
+
+    def _resolve_folder(self, chat_id: int, thread_id: int) -> Optional[Path]:
+        """Make (or confirm) a topic's copy, once per topic. **Worker threads only**: ``git
+        fetch`` and ``git worktree add`` block for up to 30 s each and must not hold the loop.
+        """
+        base = self._topic_base(chat_id, thread_id)
+        name = self._worktree_name(int(chat_id), int(thread_id))
+        key = (str(base), name)
+        with self._topic_folders_lock:                 # one creation per topic, even raced
+            if key not in self._topic_folders:
+                self._topic_folders[key] = ensure_topic_worktree(base, name)
+            return self._topic_folders[key]
+
+    async def resolve_topic_folder(self, chat_id: int, thread_id: Optional[int]) -> None:
+        """Make (or confirm) this topic's working copy **off the event loop**.
+
+        ``git fetch`` and ``git worktree add`` block for up to 30 s each; run where they can,
+        they would stall every other topic, and the heartbeats, for a minute. Resolved once
+        per topic; every later call is a dictionary lookup.
+        """
+        if self._parallel_turns <= 1 or thread_id is None:
+            return
+        key = (str(self._topic_base(chat_id, thread_id)),
+               self._worktree_name(int(chat_id), int(thread_id)))
+        if key in self._topic_folders:
+            return
+        await asyncio.to_thread(self._resolve_folder, int(chat_id), int(thread_id))
+
+    def _workdir_for(self, chat_id: int, thread_id: Optional[int], *,
+                     create: bool = True) -> Path:
+        """The folder a turn in this topic runs in (#486)."""
+        isolated = self._isolated_workdir(chat_id, thread_id, create=create)
+        if isolated is not None:
+            return isolated
         project = self.router.project_for(chat_id, thread_id)
         if project is not None and thread_id is not None:
-            return self.router.workdir_for(project, thread_id)
-        return Path(self.config.adapter.cwd or ".").expanduser().resolve()
+            if self._parallel_turns > 1:      # the copy was asked for above and is not there
+                return self._topic_base(chat_id, thread_id)
+            return self.router.workdir_for(project, thread_id, create=create)
+        return self._shared_cwd()
+
+    def _topic_adapter(self, workdir: Path, suffix: str) -> AgentAdapter:
+        """The adapter a topic's turn runs in ``workdir``, its own working copy (#486).
+
+        One adapter per working copy, with its sessions and child registry keyed by
+        ``suffix``, so two topics never share one CLI conversation.
+        """
+        cfg_adapter = dataclasses.replace(self.config.adapter, cwd=str(workdir))
+        cfg = dataclasses.replace(self.config, adapter=cfg_adapter)
+        adapter = build_adapter(cfg, transport=True)
+        if hasattr(adapter, "use_parallel_limit"):
+            adapter.use_parallel_limit(self.config.limits.max_parallel_turns)
+        sessions = getattr(adapter, "SESSIONS_STATE", None)
+        if sessions and hasattr(adapter, "use_state_file"):
+            adapter.use_state_file(_state_file(self.config, sessions, suffix=suffix))
+        if hasattr(adapter, "use_child_registry"):
+            adapter.use_child_registry(_state_file(self.config, "children", suffix=suffix))
+        return adapter
 
     def _adapter_for(self, chat_id: int, thread_id: Optional[int]) -> AgentAdapter:
         project = self.router.project_for(chat_id, thread_id)
-        if project is None or thread_id is None:
+        if thread_id is None or (project is None and self._parallel_turns <= 1):
             return self.adapter
-        workdir = self.router.workdir_for(project, thread_id)
+        workdir = self._workdir_for(chat_id, thread_id)
+        if project is None and workdir == self._shared_cwd():
+            return self.adapter              # no copy to be had: the shared folder's adapter
         cache_key = str(workdir)
         if cache_key not in self._project_adapters:
-            cfg_adapter = dataclasses.replace(self.config.adapter, cwd=str(workdir))
-            cfg = dataclasses.replace(self.config, adapter=cfg_adapter)
-            adapter = build_adapter(cfg, transport=True)
-            if hasattr(adapter, "use_parallel_limit"):
-                adapter.use_parallel_limit(self.config.limits.max_parallel_turns)
-            sessions = getattr(adapter, "SESSIONS_STATE", None)
-            if sessions and hasattr(adapter, "use_state_file"):
-                suffix = f"{project.key}-t{thread_id}" if project.worktrees else project.key
-                adapter.use_state_file(_state_file(self.config, sessions, suffix=suffix))
-            if hasattr(adapter, "use_child_registry"):
-                suffix = f"{project.key}-t{thread_id}" if project.worktrees else project.key
-                adapter.use_child_registry(_state_file(self.config, "children", suffix=suffix))
-            self._project_adapters[cache_key] = adapter
+            # #486: one session and one child registry per topic. The suffix names the chat
+            # whenever it is not the home one (home keeps its old names, so no state file
+            # moves), exactly as the folder does -- two chats' topic 12 are two discussions
+            # and must not write over one another's session id.
+            chat_part = "" if self._in_home_chat(chat_id) else f"{int(chat_id)}-"
+            if project is None:
+                suffix: str = f"topic-{chat_part}{thread_id}"
+            elif project.worktrees or self._parallel_turns > 1:
+                suffix = f"{project.key}-t{chat_part}{thread_id}"
+            else:
+                suffix = project.key
+            self._project_adapters[cache_key] = self._topic_adapter(workdir, suffix)
         return self._project_adapters[cache_key]
 
     # ----------------------------------------------------------------------------------
@@ -1637,9 +1754,12 @@ class AgentChannel:
         chat_id = event.chat_id if event is not None else int(self.config.identity.home_channel_id or 0)
         thread_id = event.thread_id if event is not None else None
         project = self.router.project_for(chat_id, thread_id)
-        # create=False: /status must not fetch or add a worktree (only a turn does).
-        workdir = (str(self.router.workdir_for(project, thread_id, create=False))
-                   if project and thread_id is not None else None)
+        # create=False: /status must not fetch or add a worktree (only a turn does). #486: a
+        # topic with no project names the copy a turn there would use -- above N=1, where it
+        # has one; at N=1 it shares adapter.cwd like it always did.
+        workdir = (str(self._workdir_for(chat_id, thread_id, create=False))
+                   if thread_id is not None
+                   and (project is not None or self._parallel_turns > 1) else None)
         return where_reply(
             alias=alias,
             chat_id=chat_id,
@@ -1667,15 +1787,17 @@ class AgentChannel:
         """The adapter session a turn in this discussion resumes, when the adapter keeps one
         per discussion; else the configured conversation."""
         adapter: Optional[AgentAdapter] = self.adapter
-        project = (self.router.project_for(event.chat_id, event.thread_id)
-                   if event is not None and event.thread_id is not None else None)
-        if project is not None and event is not None and event.thread_id is not None:
+        if event is not None and event.thread_id is not None:
             # The adapter a turn made for this topic, never a new one: /status is asked by
             # peers too, and making the adapter adds the topic's worktree.
-            adapter = self._project_adapters.get(
-                str(self.router.workdir_for(project, event.thread_id, create=False)))
-            if adapter is None:
-                return None                            # no turn here yet, so no session
+            key = str(self._workdir_for(event.chat_id, event.thread_id, create=False))
+            if key in self._project_adapters:
+                adapter = self._project_adapters[key]
+            elif (self.router.project_for(event.chat_id, event.thread_id) is not None
+                  or self._parallel_turns > 1):
+                # No turn here yet, so no session -- above N=1 a topic's session is never the
+                # shared adapter's, even when the topic has no project.
+                return None
         session_for = getattr(adapter, "session_for", None)
         if callable(session_for):
             try:
@@ -2120,7 +2242,8 @@ class AgentChannel:
             return None
         context = self.topics.context(event.chat_id, event.thread_id)
         try:
-            return derive(self.config.identity.alias, self.config.adapter.cwd, context)
+            return derive(self.config.identity.alias,
+                          str(self._workdir_for(event.chat_id, event.thread_id)), context)
         except Exception:                                  # noqa: BLE001 - optional
             logger.warning("native: no session id for this topic", exc_info=True)
             return None
@@ -2133,7 +2256,12 @@ class AgentChannel:
         where a turn starts mid-passthrough. Holding the topic's admission for the (bounded)
         run closes it -- a message that arrives meanwhile waits, exactly as it would behind a
         turn. A turn that is already running is refused rather than queued behind.
+
+        #486: it runs in the folder the topic's turns run in, never in the shared
+        ``adapter.cwd`` -- a passthrough there would be a second CLI instance in a folder a
+        General turn may be working in, and it would drive a session its topic never resumes.
         """
+        await self.resolve_topic_folder(event.chat_id, event.thread_id)
         lock = self._lock_for(event)
         if lock.locked():
             return await self.send(
@@ -2148,7 +2276,8 @@ class AgentChannel:
         """The passthrough itself, with the topic's admission already held."""
         limits = self.config.limits
         runner = native_cli.Runner(
-            cwd=self.config.adapter.cwd,
+            # #486: the topic's own folder, which is the session its turns drive.
+            cwd=str(self._workdir_for(event.chat_id, event.thread_id)),
             timeout=float(getattr(limits, "native_timeout_seconds", 20.0) or 20.0),
             max_chars=int(getattr(self.config.adapter, "max_output_chars", 3500) or 3500),
             env=native_cli.sanitized_env(self.config.adapter.extra_env),
@@ -9069,6 +9198,9 @@ class AgentChannel:
         token = _INBOX_KEYS.set([])
         keep = False
         try:
+            # #486: a topic's own working copy is made here, off the event loop, before the
+            # message is judged (the acceptance check asks its adapter) or queued behind a lock.
+            await self.resolve_topic_folder(event.chat_id, event.thread_id)
             return await self._route_event(event)
         except asyncio.CancelledError:
             keep = self._shutting_down        # a stopping transport: the next start replays it
@@ -9757,8 +9889,9 @@ class AgentChannel:
         project_settings = self.router.project_for(event.chat_id, event.thread_id)
         ticket = None
         instructions = ""
-        workdir = (self.router.workdir_for(project_settings, event.thread_id)
-                   if project_settings and event.thread_id is not None else None)
+        workdir = (str(self._workdir_for(event.chat_id, event.thread_id))
+                   if event.thread_id is not None
+                   and (project_settings is not None or self._parallel_turns > 1) else None)
         if self.replies is not None:
             from swarmly.telegram.replies import reply_instructions
             ticket, created = self.replies.register(
@@ -10337,6 +10470,7 @@ class AgentChannel:
         adapter past ``limits.max_parallel_turns``."""
         if chat_id is None:
             chat_id = int(self.config.identity.home_channel_id or 0)
+        await self.resolve_topic_folder(chat_id, thread_id)
         lock = self._lock_for_key(chat_id, thread_id)
         async with lock:
             if self._turn_slots is None:
@@ -10347,6 +10481,12 @@ class AgentChannel:
 
     def _lock_for_key(self, chat_id: int, thread_id: Optional[int]) -> asyncio.Lock:
         if self._turn_slots is None:
+            return self._turn_lock
+        if self._isolated_workdir(chat_id, thread_id) is None:
+            # #486: this turn runs in the shared folder (General, a bus turn, or a topic
+            # whose own copy could not be made), so it takes the shared lock: no two turns
+            # are ever in one folder at the same time. ``resolve_topic_folder`` normally
+            # answers this from the cache; a caller that skipped it resolves here.
             return self._turn_lock
         key = (chat_id, thread_id)
         lock = self._turn_locks.get(key)

@@ -1014,10 +1014,24 @@ to N topics run a turn at the same time.
   the same reason while N is above 1 — it replies why, writes no `.active_conversation`, and
   `switch context to per-topic` still takes the bot back to one conversation per topic. A
   `custom` adapter is allowed too: only set N above 1 if each run is independent.
-- **All topics share `adapter.cwd`,** so parallel turns can overwrite each other's edits. N
-  above 1 is refused unless you also set `limits.allow_shared_cwd: true` (not needed for
-  `echo`), and the transport logs a warning naming the folder at start. Per-topic worktrees are
-  planned.
+- **Each CLI instance gets its own working copy of the code (#486).** Two turns never run in
+  the same folder at once. Above 1, every forum topic works in a copy of its own:
+  `<adapter.cwd>/.swarmly-worktrees/topic-<thread_id>`, or the project's per-topic worktree
+  when the topic is bound to a project (`<project cwd>/.swarmly-worktrees/topic-<thread_id>`,
+  whatever `projects.<p>.worktrees` says). Each copy gets its own adapter, so two topics never
+  share one CLI session. A topic id in another chat is another discussion, so it gets
+  `<base>/.swarmly-worktrees/topic-<chat_id>-<thread_id>`, and its sessions and child registry
+  are keyed the same way (`claude-sessions-<alias>-topic-<chat_id>-<thread_id>.json`) — two
+  chats are never one folder, one lock or one state file.
+  General and the bus/swarm turns keep `adapter.cwd`, and a topic whose
+  copy cannot be made also keeps it — those turns take the shared lock, so nothing else runs
+  in that folder beside them. `git worktree add` needs a checkout: a `max_parallel_turns` above
+  1 is refused when `adapter.cwd` is not a git checkout (not needed for `echo`).
+  `limits.allow_shared_cwd: true` keeps its meaning — the explicit opt-in to sharing a folder,
+  for hosts where copies cannot be made — and the transport logs a warning naming the folder at
+  start. The copy is made once per topic, off the event loop, on the first message the bot
+  handles in it (a failed creation is not retried until a restart); `/cli` in a topic runs in
+  that same folder. Copies are not cleaned up yet (follow-up).
 - Setup: the group must be a supergroup with Topics turned on. For the bots to read every message
   in a topic, turn privacy mode off in @BotFather or make them admins; to let them open topics
   later, give them the "Manage topics" admin right.
