@@ -227,7 +227,8 @@ class ChannelTests(unittest.TestCase):
         async def resolved_in_place(chat_id, thread_id):
             """The copy is made on the loop here: these tests count event-loop turns, and a
             worker thread would hand control back after their ``settle()`` is over."""
-            channel._isolated_workdir(chat_id, thread_id)
+            if thread_id is not None:
+                channel._resolve_folder(int(chat_id), int(thread_id))
 
         channel.resolve_topic_folder = resolved_in_place
         return channel, gate

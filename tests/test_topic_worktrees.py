@@ -43,6 +43,14 @@ def git_repo(folder: str) -> str:
     return folder
 
 
+def resolved(channel, *places) -> None:
+    """Resolve each ``(chat_id, thread_id)`` the way a turn does: awaited, off the loop.
+    Only a resolved topic has a folder of its own; an unresolved one answers the shared
+    folder and the shared lock (the safe pair)."""
+    for chat_id, thread_id in places:
+        run(channel.resolve_topic_folder(chat_id, thread_id))
+
+
 class TestOneWorkingCopyPerTopic(unittest.TestCase):
     def test_two_unbound_topics_get_two_copies(self):
         with TemporaryDirectory() as tmp:
@@ -50,6 +58,7 @@ class TestOneWorkingCopyPerTopic(unittest.TestCase):
             channel = AgentChannel(
                 make_config(adapter={"type": "echo", "cwd": repo}, limits=PARALLEL),
                 sender=FakeSender())
+            resolved(channel, (GROUP, 12), (GROUP, 15))
             first = channel._workdir_for(GROUP, 12)
             second = channel._workdir_for(GROUP, 15)
             self.assertNotEqual(first, second)
@@ -71,6 +80,7 @@ class TestOneWorkingCopyPerTopic(unittest.TestCase):
                     projects={"webapp": {"repo": "example-org/webapp", "cwd": repo,
                                          "topics": [12, 15], "worktrees": False}}),
                 sender=FakeSender())
+            resolved(channel, (GROUP, 12), (GROUP, 15))
             first = channel._workdir_for(GROUP, 12)
             second = channel._workdir_for(GROUP, 15)
             self.assertEqual(first, Path(repo).resolve() / ".swarmly-worktrees" / "topic-12")
@@ -85,6 +95,7 @@ class TestOneWorkingCopyPerTopic(unittest.TestCase):
                 sender=FakeSender())
             suffixes = []
             channel._topic_adapter = lambda workdir, suffix: suffixes.append(suffix) or object()
+            resolved(channel, (GROUP, 12), (GROUP, 15))
             channel._adapter_for(GROUP, 12)
             channel._adapter_for(GROUP, 15)
             self.assertEqual(suffixes, ["topic-12", "topic-15"])
@@ -95,6 +106,7 @@ class TestOneWorkingCopyPerTopic(unittest.TestCase):
             channel = AgentChannel(
                 make_config(adapter={"type": "echo", "cwd": repo}, limits=PARALLEL),
                 sender=FakeSender())
+            resolved(channel, (GROUP, 12))
             self.assertEqual(channel._workdir_for(GROUP, None), Path(repo).resolve())
             self.assertIs(channel._adapter_for(GROUP, None), channel.adapter)
             self.assertIs(channel._lock_for_key(GROUP, None), channel._turn_lock)
@@ -106,6 +118,7 @@ class TestOneWorkingCopyPerTopic(unittest.TestCase):
             channel = AgentChannel(
                 make_config(adapter={"type": "echo", "cwd": tmp}, limits=PARALLEL),
                 sender=FakeSender())
+            resolved(channel, (GROUP, 12), (GROUP, 15))
             self.assertEqual(channel._workdir_for(GROUP, 12), Path(tmp).resolve())
             first = channel._lock_for_key(GROUP, 12)
             self.assertIs(first, channel._turn_lock)
@@ -164,6 +177,7 @@ class TestTwoChatsAreTwoFolders(unittest.TestCase):
             channel = AgentChannel(
                 make_config(adapter={"type": "echo", "cwd": repo}, limits=PARALLEL),
                 sender=FakeSender())
+            resolved(channel, (GROUP, 12), (OTHER, 12))
             home = channel._workdir_for(GROUP, 12)
             other = channel._workdir_for(OTHER, 12)
             self.assertNotEqual(home, other)
@@ -177,6 +191,40 @@ class TestTwoChatsAreTwoFolders(unittest.TestCase):
             self.assertIsNot(channel._adapter_for(GROUP, 12),
                              channel._adapter_for(OTHER, 12))
 
+    def test_two_chats_do_not_share_one_session_state_file(self):
+        """Two chats' topic 12 are two discussions: two folders *and* two state files."""
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as cfg_dir:
+            repo = git_repo(tmp)
+            config = make_config(adapter={"type": "claude_thread", "cwd": repo},
+                                 limits=PARALLEL)
+            config_file = Path(cfg_dir) / "config.yaml"
+            config_file.write_text("agent:\n  name: TestBot\n  alias: hermes\n",
+                                   encoding="utf-8")
+            config.source_path = config_file
+            channel = AgentChannel(config, sender=FakeSender())
+            resolved(channel, (GROUP, 12), (OTHER, 12))
+            home, other = channel._adapter_for(GROUP, 12), channel._adapter_for(OTHER, 12)
+            self.assertIsNotNone(home._state_path)
+            self.assertNotEqual(home._state_path, other._state_path)
+            self.assertTrue(str(home._state_path).endswith(
+                f"claude-sessions-hermes-topic-12.json"), home._state_path)
+            self.assertIn(f"topic-{OTHER}-12", str(other._state_path))
+            # The child registry is per discussion for the same reason.
+            self.assertNotEqual(home.children.path, other.children.path)
+
+    def test_an_unresolved_topic_uses_the_shared_pair_without_blocking(self):
+        """The loop never creates (nor waits on another topic's creation): a topic nobody
+        resolved yet answers the shared folder, and so the shared lock."""
+        with TemporaryDirectory() as tmp:
+            repo = git_repo(tmp)
+            channel = AgentChannel(
+                make_config(adapter={"type": "echo", "cwd": repo}, limits=PARALLEL),
+                sender=FakeSender())
+            with mock.patch.object(channel_mod, "ensure_topic_worktree") as made:
+                self.assertEqual(channel._workdir_for(GROUP, 12), Path(repo).resolve())
+                self.assertIs(channel._lock_for_key(GROUP, 12), channel._turn_lock)
+            self.assertEqual(made.call_count, 0)
+
     def test_a_project_bound_topic_in_another_chat_is_named_for_that_chat(self):
         with TemporaryDirectory() as tmp:
             repo = git_repo(tmp)
@@ -186,6 +234,7 @@ class TestTwoChatsAreTwoFolders(unittest.TestCase):
                     projects={"webapp": {"repo": "example-org/webapp", "cwd": repo,
                                          "topics": [12, 15]}}),
                 sender=FakeSender())
+            resolved(channel, (GROUP, 12), (OTHER, 12))
             # project_for binds by (chat_id, thread_id): topic 12 in the *other* chat is not
             # this project's, so it copies adapter.cwd -- a different folder either way.
             self.assertNotEqual(channel._workdir_for(GROUP, 12),
@@ -206,6 +255,7 @@ class TestOneResolutionPerTopic(unittest.TestCase):
                 sender=FakeSender())
             with mock.patch.object(channel_mod, "ensure_topic_worktree",
                                    return_value=None) as made:
+                resolved(channel, (GROUP, 12))
                 self.assertEqual(channel._workdir_for(GROUP, 12), Path(not_git).resolve())
                 self.assertIs(channel._lock_for_key(GROUP, 12), channel._turn_lock)
                 self.assertEqual(channel._workdir_for(GROUP, 12), Path(not_git).resolve())

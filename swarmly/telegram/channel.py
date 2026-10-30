@@ -906,6 +906,11 @@ class AgentChannel:
         return (Path(project.cwd).expanduser().resolve() if project is not None
                 else self._shared_cwd())
 
+    def _in_home_chat(self, chat_id: int) -> bool:
+        """Whether *chat_id* is this bot's home chat (whose state files keep their old names)."""
+        home = self.config.identity.home_channel_id
+        return home is not None and int(chat_id) == int(home)
+
     def _worktree_name(self, chat_id: int, thread_id: int) -> str:
         """The folder name of a topic's copy.
 
@@ -913,8 +918,7 @@ class AgentChannel:
         another discussion, so it gets ``topic-<chat>-<id>`` -- two chats are never one folder
         (and never one lock, nor one session).
         """
-        home = self.config.identity.home_channel_id
-        if home is not None and int(chat_id) == int(home):
+        if self._in_home_chat(chat_id):
             return f"topic-{thread_id}"
         return f"topic-{chat_id}-{thread_id}"
 
@@ -930,11 +934,11 @@ class AgentChannel:
         and so does a topic whose copy cannot be made: it then runs *alone* there, never
         beside another turn. ``create=False`` names the folder without making it.
 
-        The outcome is resolved **once** per topic and kept in ``_topic_folders`` (a copy, or
-        ``None``): the lock, the folder and the adapter all read that one answer, so a single
-        failed ``git fetch`` is not retried every turn and cannot leave a turn holding the
-        shared lock while working in a copy of its own. ``resolve_topic_folder`` warms it off
-        the event loop, where a caller can await it.
+        A plain read of ``_topic_folders``, never a creation and never a lock: this is called
+        on the event loop, where waiting on another topic's ``git fetch`` would freeze the
+        transport. ``None`` means "not resolved (yet) or no copy", and both answer the shared
+        folder and the shared lock -- the safe pair. ``resolve_topic_folder`` makes the copy,
+        off the loop, and is awaited before a message is judged or admitted.
         """
         if self._parallel_turns <= 1 or thread_id is None:
             return None
@@ -942,6 +946,14 @@ class AgentChannel:
         name = self._worktree_name(int(chat_id), int(thread_id))
         if not create:                                 # /status and /where: name it only
             return topic_worktree_path(base, name)
+        return self._topic_folders.get((str(base), name))
+
+    def _resolve_folder(self, chat_id: int, thread_id: int) -> Optional[Path]:
+        """Make (or confirm) a topic's copy, once per topic. **Worker threads only**: ``git
+        fetch`` and ``git worktree add`` block for up to 30 s each and must not hold the loop.
+        """
+        base = self._topic_base(chat_id, thread_id)
+        name = self._worktree_name(int(chat_id), int(thread_id))
         key = (str(base), name)
         with self._topic_folders_lock:                 # one creation per topic, even raced
             if key not in self._topic_folders:
@@ -961,7 +973,7 @@ class AgentChannel:
                self._worktree_name(int(chat_id), int(thread_id)))
         if key in self._topic_folders:
             return
-        await asyncio.to_thread(self._isolated_workdir, chat_id, thread_id)
+        await asyncio.to_thread(self._resolve_folder, int(chat_id), int(thread_id))
 
     def _workdir_for(self, chat_id: int, thread_id: Optional[int], *,
                      create: bool = True) -> Path:
@@ -1003,11 +1015,15 @@ class AgentChannel:
             return self.adapter              # no copy to be had: the shared folder's adapter
         cache_key = str(workdir)
         if cache_key not in self._project_adapters:
-            # #486: one session per topic whenever the topic has a folder of its own.
+            # #486: one session and one child registry per topic. The suffix names the chat
+            # whenever it is not the home one (home keeps its old names, so no state file
+            # moves), exactly as the folder does -- two chats' topic 12 are two discussions
+            # and must not write over one another's session id.
+            chat_part = "" if self._in_home_chat(chat_id) else f"{int(chat_id)}-"
             if project is None:
-                suffix: str = f"topic-{thread_id}"
+                suffix: str = f"topic-{chat_part}{thread_id}"
             elif project.worktrees or self._parallel_turns > 1:
-                suffix = f"{project.key}-t{thread_id}"
+                suffix = f"{project.key}-t{chat_part}{thread_id}"
             else:
                 suffix = project.key
             self._project_adapters[cache_key] = self._topic_adapter(workdir, suffix)

@@ -1020,7 +1020,9 @@ to N topics run a turn at the same time.
   when the topic is bound to a project (`<project cwd>/.swarmly-worktrees/topic-<thread_id>`,
   whatever `projects.<p>.worktrees` says). Each copy gets its own adapter, so two topics never
   share one CLI session. A topic id in another chat is another discussion, so it gets
-  `<base>/.swarmly-worktrees/topic-<chat_id>-<thread_id>` — two chats are never one folder.
+  `<base>/.swarmly-worktrees/topic-<chat_id>-<thread_id>`, and its sessions and child registry
+  are keyed the same way (`claude-sessions-<alias>-topic-<chat_id>-<thread_id>.json`) — two
+  chats are never one folder, one lock or one state file.
   General and the bus/swarm turns keep `adapter.cwd`, and a topic whose
   copy cannot be made also keeps it — those turns take the shared lock, so nothing else runs
   in that folder beside them. `git worktree add` needs a checkout: a `max_parallel_turns` above
