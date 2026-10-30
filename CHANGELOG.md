@@ -24,6 +24,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The dashboard's pickers and confirm buttons in Swarm pulse are swept too** (`#483`, follow-up
+  to `#480`). Both are sent straight through the bot — a keyboard cannot ride a paced reply —
+  so no send path recorded them: with the dashboard on `control.topic_id: pulse` every pick and
+  every "tap again" was one more message in the pulse the sweep never offered. Both now go
+  through `note_pulse_post`, so they are deleted after `limits.ephemeral_notices_minutes` like
+  the rest of the machine traffic. A picker in a configured control topic is still that
+  topic's: it goes when the topic goes, and nothing else is recorded.
 - **Swarm pulse's own posts are swept again** (`#480`). The admin reported the pulse topic
   still growing (30 Oct). Three writers posted there without anything recording them for
   `limits.ephemeral_notices_minutes`: the service messages the bot itself causes (the pulse
