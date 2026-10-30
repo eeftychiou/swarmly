@@ -1593,6 +1593,14 @@ const PENDING = {};
 const CARET = {};
 //: The control that had the keyboard, so a re-render does not take it away mid-typing.
 let FOCUS = "";
+//: The dropdown the admin is picking in (#481). A native `<select>` cannot be replaced without
+//: closing its list, so while one is open the page holds the redraw instead of dropping it.
+let PICKING = "";
+//: The state a held redraw was fetched with: drawn as soon as the pick is done, so a refresh
+//: that was held back is late at worst, never lost.
+let HELD = null;
+//: Set while the page puts the keyboard back itself: that focus is not the admin opening a list.
+let SILENT = false;
 
 function pendingKey(target, forAction) {
   return (target || "") + "|" + forAction;
@@ -1628,7 +1636,9 @@ function restoreFocus() {
   const nodes = document.querySelectorAll("[data-pending]");
   for (let at = 0; at < nodes.length; at += 1) {
     if (nodes[at].dataset.pending !== FOCUS) continue;
+    SILENT = true;                 // the page's own focus, not the admin opening a list (#481)
     try { nodes[at].focus(); } catch (err) { /* a disabled control cannot take it back */ }
+    SILENT = false;
     // And where the caret was, when it takes one: a redraw that keeps the text and moves the
     // caret to the end still edits the wrong place (review, #451).
     const caret = CARET[FOCUS];
@@ -1638,6 +1648,63 @@ function restoreFocus() {
     return;
   }
   FOCUS = "";                        // the control is gone: nothing to give the keyboard to
+}
+
+// A dropdown is the one control a redraw cannot simply replace: the browser owns its open list,
+// and it closes the moment the node goes. So while one is being picked in the page holds the
+// picture -- the stamp says it is holding -- and draws the state that arrived meanwhile once
+// the pick is done (#481).
+function holdFor(select) {
+  if (!select || select.tagName !== "SELECT") return;
+  PICKING = select.dataset.pending || "";
+}
+
+function heldStamp() {
+  const stamp = document.getElementById("stamp");
+  const text = stamp.textContent || "";
+  // Only the time of a picture is marked as held: an "unavailable" line is already honest
+  // about why nothing was drawn, and a picker's marker on it would be a lie (review, #481).
+  if (text.indexOf("refreshed ") !== 0) return;
+  // The stamp keeps the time of the picture on screen, which is now older than the poll: it is
+  // marked as held rather than made to read as current.
+  if (text.indexOf(" · held while you pick") < 0)
+    stamp.textContent = text + " · held while you pick";
+}
+
+// The pick is done, or the list was dismissed: draw what the held ticks fetched. On the next
+// task, so the tap that ended it has moved the keyboard first, and only if nothing is open now.
+// `from` is the dropdown the event belongs to: a tap that moves the keyboard from one dropdown
+// to another ends the first one's hold, never the second one's.
+function releaseHold(from) {
+  if (from && PICKING && PICKING !== (from.dataset.pending || "")) return;
+  PICKING = "";
+  const state = HELD;
+  HELD = null;
+  if (!state) return;
+  setTimeout(() => { if (!PICKING) render(state); }, 0);
+}
+
+// A dropdown's own events: the pick is kept (#449), the keyboard is remembered, and while the
+// list is open the redraw is held (#481) -- by the mouse, or from the keyboard on a select that
+// already had the keyboard and so never fires another `focus`.
+function watchPick(select, key) {
+  select.addEventListener("change", () => {
+    pendingSet(key, select.value);
+    rememberFocus(key);
+    releaseHold(select);
+  });
+  select.addEventListener("focus", () => {
+    rememberFocus(key);
+    if (!SILENT) holdFor(select);
+  });
+  select.addEventListener("pointerdown", () => holdFor(select));
+  select.addEventListener("keydown", (event) => {
+    // Escape closes a list nobody picked from, as a tap elsewhere does; every other key may
+    // have opened one or moved inside it, so the redraw keeps waiting.
+    if (event.key === "Escape") releaseHold(select);
+    else holdFor(select);
+  });
+  select.addEventListener("blur", () => releaseHold(select));
 }
 
 function picker(forAction, choices, first, key) {
@@ -1660,11 +1727,7 @@ function picker(forAction, choices, first, key) {
     if ((choices || []).some((choice) => choice.value === kept)) select.value = kept;
     else pendingSet(key, "");
   }
-  select.addEventListener("change", () => {
-    pendingSet(key, select.value);
-    rememberFocus(key);
-  });
-  select.addEventListener("focus", () => rememberFocus(key));
+  watchPick(select, key);
   return select;
 }
 
@@ -1708,11 +1771,7 @@ function settingsForm(button, target, fields, box) {
     if (kept !== null) pendingSet(key, kept);
     else pendingSet(key, "");            // the bot runs it now: nothing left to send
     if (kept !== null) select.value = kept;
-    select.addEventListener("change", () => {
-      pendingSet(key, select.value);
-      rememberFocus(key);
-    });
-    select.addEventListener("focus", () => rememberFocus(key));
+    watchPick(select, key);
     box.append(select);
     return {field, key, select};
   }).filter((read) => read);        // a field with nothing to pick from drew no dropdown
@@ -1927,6 +1986,14 @@ async function confirmPress() {
 }
 
 function render(state) {
+  // #481: an open dropdown cannot be redrawn without closing it, so the redraw waits for the
+  // pick. The state the tick fetched is kept and drawn on release: held, not skipped.
+  if (PICKING) {
+    HELD = state;
+    heldStamp();
+    return;
+  }
+  HELD = null;
   ADMIN = Boolean(state.admin);
   document.body.dataset.admin = ADMIN ? "1" : "0";
   document.getElementById("stamp").textContent =
@@ -1967,10 +2034,23 @@ function render(state) {
 }
 
 // A tap anywhere that is not a control is the page's own: the keyboard went there on purpose,
-// and the next redraw must not pull it back.
+// and the next redraw must not pull it back. It is also how a list is dismissed when the select
+// itself never hears it -- Android Back, a Mini App overlay that swallows the blur -- so the
+// hold ends here too, or one dismissed picker would freeze the page for good (review, #481).
+// The select's own handler sees the tap first (it bubbles up from the target), so opening a
+// list is not cut short by this.
 document.addEventListener("pointerdown", (event) => {
   const target = event.target;
-  if (!target || !target.closest || !target.closest("[data-pending]")) FOCUS = "";
+  if (!target || !target.closest || !target.closest("[data-pending]")) {
+    FOCUS = "";
+    releaseHold();
+  }
+});
+
+// And a page that went away in the middle of a pick comes back with no list open: the hold
+// ends there too, rather than waiting for a tap that may not come (review, #481).
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) releaseHold();
 });
 
 // And the same for the keyboard: a focus that moved to something that is not a control -- the

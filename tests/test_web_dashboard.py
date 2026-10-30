@@ -1713,5 +1713,111 @@ class TestAPickSurvivesTheRefresh(unittest.TestCase):
                         page.index("function tick()"))
 
 
+class TestAnOpenDropdownSurvivesTheRefresh(unittest.TestCase):
+    """#481: the 3 s redraw replaced the open `<select>`, so the browser closed its list.
+
+    The admin opened a dropdown to pick a model and the list vanished under the pointer. A
+    dropdown is the one control a redraw cannot replace: while one is open the page holds the
+    picture, keeps the state the tick fetched, and draws it once the pick is done -- late at
+    worst, never skipped.
+    """
+
+    def page(self) -> str:
+        return webui.page_html()
+
+    def body(self, name: str) -> str:
+        """One page function's body: from its `function` line to the next line that closes it."""
+        page = self.page()
+        start = page.index("function " + name + "(")
+        return page[start:page.index("\n}\n", start)]
+
+    def test_a_dropdown_holds_the_redraw_while_it_is_open(self):
+        page = self.page()
+        # What is being picked in, and what the held ticks fetched.
+        self.assertIn('let PICKING = "";', page)
+        self.assertIn("let HELD = null;", page)
+        render = self.body("render")
+        # The hold is the first thing a render does: before a single control is replaced.
+        self.assertIn("if (PICKING) {", render)
+        self.assertIn("HELD = state;", render)
+        self.assertLess(render.index("if (PICKING) {"), render.index("bots.replaceChildren();"))
+        self.assertLess(render.index("if (PICKING) {"),
+                        render.index("ADMIN = Boolean(state.admin);"))
+
+    def test_the_dropdowns_own_events_start_and_end_the_hold(self):
+        watch = self.body("watchPick")
+        # Opening it -- with the mouse, or from the keyboard on a select that already had the
+        # keyboard and so never fires another `focus`.
+        self.assertIn('select.addEventListener("pointerdown", () => holdFor(select));', watch)
+        self.assertIn("else holdFor(select);", watch)
+        # Ending it: a pick, a tap elsewhere, Escape, or the keyboard leaving the control.
+        self.assertIn('select.addEventListener("change", () => {', watch)
+        self.assertIn('select.addEventListener("blur", () => releaseHold(select));', watch)
+        self.assertIn('if (event.key === "Escape") releaseHold(select);', watch)
+        self.assertGreaterEqual(watch.count("releaseHold(select);"), 2)
+
+    def test_a_held_redraw_is_drawn_once_the_pick_is_done(self):
+        """Held, not dropped: the page still catches up with what the ticks fetched."""
+        release = self.body("releaseHold")
+        self.assertIn("const state = HELD;", release)
+        self.assertIn("HELD = null;", release)
+        self.assertIn("setTimeout(() => { if (!PICKING) render(state); }, 0);", release)
+        # And the next real render takes no held state with it.
+        self.assertIn("HELD = null;", self.body("render"))
+
+    def test_a_held_redraw_does_not_pass_for_a_current_one(self):
+        page = self.page()
+        self.assertIn("function heldStamp() {", page)
+        self.assertIn('" · held while you pick"', page)
+        # The stamp keeps the time of the picture on screen and says it is holding, so a page
+        # that is three seconds behind does not read as refreshed just now.
+        self.assertIn("heldStamp();", self.body("render"))
+        self.assertIn('"refreshed " + state.refreshed', page)
+
+    def test_the_pages_own_focus_does_not_start_a_hold(self):
+        """A redraw gives the keyboard back (#449); that focus is not the admin opening a list."""
+        page = self.page()
+        self.assertIn("let SILENT = false;", page)
+        focus = page.index("try { nodes[at].focus(); }")
+        self.assertLess(page.index("SILENT = true;"), focus)
+        self.assertLess(focus, page.index("SILENT = false;", focus))
+        self.assertIn("if (!SILENT) holdFor(select);", page)
+
+    def test_every_dropdown_is_watched_wherever_it_is_drawn(self):
+        page = self.page()
+        self.assertIn("function watchPick(select, key) {", page)
+        # The picker on a card, and the one in a settings form: both, not just one of them.
+        self.assertEqual(2, page.count("watchPick(select, key);"))
+        # And no dropdown is left with the bare listeners that cannot hold a redraw.
+        self.assertNotIn('select.addEventListener("focus", () => rememberFocus(key));', page)
+
+    def test_a_tap_outside_the_controls_releases_the_hold(self):
+        """Review #481: a picker dismissed with no blur and no value froze the whole page."""
+        page = self.page()
+        start = page.index('document.addEventListener("pointerdown"')
+        tap = page[start:page.index("\n});", start)]
+        # The same handler that lets go of the keyboard lets go of the hold.
+        self.assertIn('target.closest("[data-pending]")', tap)
+        self.assertIn("releaseHold();", tap)
+        self.assertLess(tap.index("[data-pending]"), tap.index("releaseHold();"))
+        # And a page left behind mid-pick comes back with no list open: the hold ends there too.
+        away = page.index('document.addEventListener("visibilitychange"')
+        self.assertIn("if (document.hidden) releaseHold();",
+                      page[away:page.index("\n});", away)])
+        # A tap that moves the keyboard from one dropdown to another ends the first one's hold,
+        # never the second one's -- or the list it just opened would be closed under it.
+        self.assertIn('if (from && PICKING && PICKING !== (from.dataset.pending || "")) return;',
+                      self.body("releaseHold"))
+
+    def test_the_hold_marker_never_lands_on_an_unavailable_stamp(self):
+        """Review #481: a held tick after a failed one must not stamp an error as a hold."""
+        stamp = self.body("heldStamp")
+        self.assertIn('if (text.indexOf("refreshed ") !== 0) return;', stamp)
+        self.assertIn('" · held while you pick"', stamp)
+        # The mark is added only past that guard.
+        self.assertLess(stamp.index('text.indexOf("refreshed ")'),
+                        stamp.index('" · held while you pick"'))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
