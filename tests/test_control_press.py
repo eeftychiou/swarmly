@@ -21,7 +21,7 @@ from swarmly.telegram import control as ct
 from swarmly.telegram.commands import MENU_COMMANDS
 from swarmly.telegram import control_press as cp
 from tests.test_control_center import FakeBot
-from tests.test_telegram_channel import (ADMIN_ID, event, make_channel, make_config,
+from tests.test_telegram_channel import (ADMIN_ID, GROUP, event, make_channel, make_config,
                                         run)
 
 NOW = 1_800_000_000.0
@@ -1398,7 +1398,7 @@ class TestAPickIsStoredWhereTurnsReadIt(unittest.TestCase):
         return run(channel.dashboard_action({"code": asked["confirm"]}))
 
     def test_a_card_pick_is_read_by_the_next_turn_with_a_pulse_dashboard(self):
-        channel = self.channel(follow_pulse=True)
+        channel = self.channel(topic_id="pulse")
         done = self.card_pick(channel)
         self.assertIn("high", done)
         self.assertEqual(channel.bus_turn_choices(""), (None, "high"))
@@ -1415,7 +1415,7 @@ class TestAPickIsStoredWhereTurnsReadIt(unittest.TestCase):
         self.assertEqual(channel.bus_turn_choices(""), (None, "high"))
 
     def test_a_page_pick_is_read_with_a_pulse_dashboard(self):
-        channel = self.channel(follow_pulse=True)
+        channel = self.channel(topic_id="pulse")
         done = self.page_pick(channel)
         self.assertTrue(done["ok"], done)
         self.assertEqual(channel.bus_turn_choices(""), (None, "high"))
@@ -2079,3 +2079,51 @@ def round_state(items):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestTheButtonPostsAreSwept(unittest.TestCase):
+    """#483: with the dashboard on ``control.follow_pulse``, every picker and every "tap
+    again" is a plain ``bot.send_message`` into Swarm pulse -- no send path, so nothing
+    recorded it and the sweep never offered it. A picker in a control topic stays that
+    topic's: it goes when the topic goes."""
+
+    PULSE = 3418
+
+    def channel(self, **control):
+        from swarmly.telegram.cleanup import GeneralLedger
+        channel = make_channel(make_config(control={"chat_id": GROUP, **control}))
+        channel.control_round = lambda: None
+        bot = channel.bot = FakeBot()
+        channel._pulse_topic = lambda: self.PULSE
+        self.ledger = GeneralLedger()
+        channel.ledger = self.ledger
+        self.ids = []                       # (topic, message id) for every dashboard post
+        real = bot.send_message
+
+        async def send_message(**kwargs):
+            sent = await real(**kwargs)
+            self.ids.append((kwargs.get("message_thread_id"), sent.message_id))
+            return sent
+        bot.send_message = send_message
+        return channel
+
+    def posted_into_the_pulse(self, channel):
+        return [mid for topic, mid in self.ids if topic == self.PULSE]
+
+    def test_a_picker_in_the_pulse_is_recorded(self):
+        channel = self.channel(topic_id="pulse")
+        run(channel.handle_control_press(press("ctl:swarm.role")))
+        self.assertTrue(self.posted_into_the_pulse(channel), "the picker went to the pulse")
+        self.assertEqual(self.ledger.notices(GROUP), self.posted_into_the_pulse(channel))
+
+    def test_a_confirm_button_in_the_pulse_is_recorded(self):
+        channel = self.channel(topic_id="pulse")
+        run(channel.handle_control_press(press("ctl:swarm.pause_all")))
+        self.assertTrue(self.posted_into_the_pulse(channel), "the confirm went to the pulse")
+        self.assertEqual(self.ledger.notices(GROUP), self.posted_into_the_pulse(channel))
+
+    def test_a_picker_in_a_control_topic_is_not_recorded(self):
+        channel = self.channel(topic_id=307)
+        run(channel.handle_control_press(press("ctl:swarm.role")))
+        self.assertEqual(self.posted_into_the_pulse(channel), [])
+        self.assertEqual(self.ledger.notices(GROUP), [])

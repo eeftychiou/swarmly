@@ -5129,11 +5129,26 @@ class AgentChannel:
         chat_id, thread_id = self._control_chat()
         if not chat_id:
             raise ControlRefused(f"{label}: this bot has nowhere to post the picker")
-        await bot.send_message(**self._control_post(
+        sent = await bot.send_message(**self._control_post(
             chat_id, thread_id,
             text=control_mod.picker_text(action, self.config.identity.alias, target),
             disable_web_page_preview=True, reply_markup=markup))
+        self._note_control_post(chat_id, thread_id, sent)
         return f"{label}: {len(choices)} choice(s) offered"
+
+    def _note_control_post(self, chat_id: int, thread_id: Optional[int], sent: Any) -> None:
+        """Record a picker or a confirmation the dashboard posted, when it is in Swarm pulse.
+
+        Both are sent straight through the bot (a keyboard cannot ride a paced reply), so no
+        send path records them: with the dashboard on ``control.follow_pulse`` every pick and
+        every "tap again" was one more message in the pulse that the sweep never offered
+        (#483). The topic decides -- a picker in a control topic is that topic's, and goes
+        with it.
+        """
+        message_id = getattr(sent, "message_id", None)
+        if message_id is None:
+            return
+        self.note_pulse_post(int(chat_id), int(message_id), thread_id)
 
     def _control_chat(self) -> Tuple[int, Optional[int]]:
         """Where the dashboard lives: ``control.chat_id``/``control.topic_id``, else home.
@@ -5180,11 +5195,13 @@ class AgentChannel:
         except Exception:                      # noqa: BLE001 - no aiogram: the plain shape
             markup = {"inline_keyboard": rows}
         try:
-            await bot.send_message(**self._control_post(
+            sent = await bot.send_message(**self._control_post(
                 chat_id, thread_id, text=decision.text, disable_web_page_preview=True,
                 reply_markup=markup))
         except Exception:                      # noqa: BLE001 - the answer still stands
             logger.warning("control centre: could not post the confirm button", exc_info=True)
+        else:
+            self._note_control_post(chat_id, thread_id, sent)
 
     def own_target(self, target: str) -> bool:
         """Whether a press names this bot (or nobody): the only bot its own picks can change."""
