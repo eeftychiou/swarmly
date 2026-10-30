@@ -223,6 +223,11 @@ class StoreProbe:
                                        document=BufferedInputFile(data,
                                                                   f"probe-{state.run}-{n}.json"),
                                        caption=caption, disable_notification=True)
+        # #480: a document posted straight through the bot never passes a send path, so it was
+        # never recorded and never swept -- a /storetest left its files in Swarm pulse for good.
+        note = getattr(self.channel, "note_pulse_post", None)
+        if callable(note):
+            note(chat, int(sent.message_id), topic)
         await bot.pin_chat_message(chat_id=chat, message_id=sent.message_id,
                                    disable_notification=True)
         return sent.message_id, sha
