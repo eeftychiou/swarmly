@@ -439,7 +439,9 @@ class PulseWriterTests(Case):
             author_is_bot=True, message_id=3400, thread_id=self.PULSE,
             topic_name=self.PULSE_NAME))), None)
         self.assertIn(3400, self.ledger.notices(GROUP))
-        later = NOW + 61 * MINUTE
+        # The post was recorded at the wall clock, not at NOW (import time): under xdist a
+        # test can start minutes after the import, so NOW + 61 min was not yet an hour later.
+        later = time.time() + 61 * MINUTE
         self.assertEqual(self.sweep(later), 1)
         self.assertEqual(self.bot.messages, [(GROUP, [3400])])
 
@@ -463,5 +465,5 @@ class PulseWriterTests(Case):
         self.channel.note_pulse_post(GROUP, 11, self.PULSE)        # the retired card
         self.channel.note_pulse_post(GROUP, 12, self.PULSE)        # the card in use
         self.channel._control_center = SimpleNamespace(message_id=12)
-        self.assertEqual(self.sweep(NOW + 61 * MINUTE), 1)
+        self.assertEqual(self.sweep(time.time() + 61 * MINUTE), 1)    # recorded at the wall clock
         self.assertEqual(self.bot.messages, [(GROUP, [11])])
