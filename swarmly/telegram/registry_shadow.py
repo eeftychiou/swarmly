@@ -24,6 +24,7 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from swarmly.state import keys as K
+from swarmly.telegram import snapshot as snapshot_mod
 from swarmly.telegram import topic_filter
 from swarmly.state.records import (AgentInTopic, Binding, Link, Profile, RecordError,
                                    Topic, now_iso)
@@ -297,6 +298,7 @@ class RegistryShadow:
                 closed += 1
             records.append((place[0], status, data))
         lines, hidden = [], 0
+        working = self._working_by_topic()
         for thread, status, data in records:
             is_open = status == "open"
             links = list(data.get("links") or ())
@@ -312,9 +314,11 @@ class RegistryShadow:
             agents = self._agent_rows(sorted(set(bindings) | sessions), bindings, store,
                                       place[0])
             links = ", ".join(self._link_text(link) for link in data.get("links") or [])
+            busy = working.get(f"tg-{place[0]}") or []
             lines.append(f"• {data.get('title')} ({place[0]})"
                          + ("" if is_open else " closed")
                          + (f" — {links}" if links else "")
+                         + (f" — working: {', '.join(busy)}" if busy else "")
                          + ("".join(f"\n    {a}" for a in agents)))
         suffix = ""
         if closed:
@@ -341,6 +345,28 @@ class RegistryShadow:
                 return "Topic registry: no open topics." + suffix
             return "Topic registry: empty so far (the lease holder fills it on its beat)."
         return f"Topic registry:\n" + "\n".join(lines) + suffix
+
+    def _working_by_topic(self) -> Dict[str, List[str]]:
+        """Topic token -> the bots running a turn there now, from every bot's pulse (#488).
+
+        A bot with two parallel turns is named under both topics; a stale record names none.
+        Read defensively: a listing never fails for want of the pulses.
+        """
+        out: Dict[str, List[str]] = {}
+        try:
+            clock = getattr(self.channel, "presence_clock", None)
+            now = float(clock()) if callable(clock) else time.time()
+            for row in self.channel.control_snapshots(now):
+                if row.is_stale(now) or row.state not in (snapshot_mod.BUSY,
+                                                          snapshot_mod.STUCK):
+                    continue
+                topics = [topic for topic, _, _ in row.turns] or [row.topic]
+                for topic in dict.fromkeys(topics):
+                    out.setdefault(str(topic), []).append(str(row.alias))
+        except Exception:                               # noqa: BLE001 - names, not facts
+            logger.debug("topics: no pulses to name the working bots", exc_info=True)
+            return {}
+        return {topic: sorted(names, key=str.lower) for topic, names in out.items()}
 
     def _canonical(self, alias: str, aliases) -> str:
         """The alias this name belongs to: an agent's Telegram handle is one agent (#435).

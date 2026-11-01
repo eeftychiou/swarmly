@@ -43,6 +43,8 @@ STATES = (IDLE, BUSY, PAUSED, FROZEN, STUCK, DOWN)
 
 #: How many beats may pass before a snapshot is called stale.
 MISSED_BEATS = 2
+#: Most running turns one snapshot lists (#488): ``limits.max_parallel_turns`` is capped at 8.
+MAX_TURNS = 8
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,11 @@ class Snapshot:
     #: Round 5.5 (#161): how long that turn's CLI has been silent. Elapsed when the adapter
     #: cannot see its output.
     silent: float = 0.0
+    #: #488: every running turn, ``(topic token, elapsed, silent)``, longest first. With
+    #: ``limits.max_parallel_turns`` above 1 a bot runs several at once; the single fields above
+    #: stay filled (from the turn that decides the state) so a peer on an older rev still reads
+    #: one. Empty from such a peer, and on an idle bot.
+    turns: Tuple[Tuple[str, float, float], ...] = ()
     #: Messages waiting for the turn lock.
     queue: int = 0
     #: Armed WAKE timers: ``(id, next fire at)``.
@@ -98,6 +105,8 @@ class Snapshot:
             "every": self.every, "topic": self.topic,
             "turn_elapsed": self.turn_elapsed, "turn_timeout": self.turn_timeout,
             "silent": self.silent,
+            "turns": [{"topic": str(topic), "elapsed": float(elapsed), "silent": float(silent)}
+                      for topic, elapsed, silent in self.turns],
             "queue": int(self.queue), "wakes": [[str(i), float(at)] for i, at in self.wakes],
             "model": self.model, "effort": self.effort, "rev": self.rev,
             "models": list(self.models), "efforts": list(self.efforts),
@@ -129,6 +138,11 @@ class Snapshot:
                     wakes.append((str(row[0]), float(row[1])))
                 except (TypeError, ValueError):
                     continue
+        turns: List[Tuple[str, float, float]] = []
+        for row in data.get("turns") or []:
+            if isinstance(row, dict) and len(turns) < MAX_TURNS:
+                turns.append((str(row.get("topic") or "general"), _num(row.get("elapsed")),
+                              _num(row.get("silent"))))
         drift_score = (int(_num(data["drift_score"]))
                        if data.get("drift_score") is not None else None)
         drift_hard = (int(_num(data["drift_hard"]))
@@ -147,7 +161,7 @@ class Snapshot:
             every=_num(data.get("every")), topic=str(data.get("topic") or "general"),
             turn_elapsed=_num(data.get("turn_elapsed")),
             turn_timeout=_num(data.get("turn_timeout")), silent=_num(data.get("silent")),
-            queue=int(_num(data.get("queue"))), wakes=tuple(wakes),
+            turns=tuple(turns), queue=int(_num(data.get("queue"))), wakes=tuple(wakes),
             model=str(data.get("model") or ""), effort=str(data.get("effort") or ""),
             models=_names(data.get("models")), efforts=_names(data.get("efforts")),
             rev=str(data.get("rev") or ""), uptime=_num(data.get("uptime")),
@@ -184,7 +198,11 @@ class Snapshot:
         if self.state == BUSY and self.turn_elapsed:
             parts.append(f"turn {_duration(self.turn_elapsed)}"
                          + (f"/{_duration(self.turn_timeout)}" if self.turn_timeout else ""))
-        if self.topic and self.topic != "general":
+        if len(self.turns) > 1:
+            # #488: two turns at once are two topics, each with its own clock.
+            parts.append(f"{len(self.turns)} turns: " + ", ".join(
+                f"{topic} {_duration(elapsed)}" for topic, elapsed, _ in self.turns))
+        elif self.topic and self.topic != "general":
             parts.append(self.topic)
         if self.queue:
             parts.append(f"queue={self.queue}")

@@ -168,6 +168,14 @@ def bot_cards(*, now: float, snapshots: Sequence[Snapshot] = (),
             "topic": str(row.topic or "").strip() or None,
             "turn_seconds": (max(0.0, _num(row.turn_elapsed)) if working else None),
             "turn_timeout": (_num(row.turn_timeout) if working and row.turn_timeout else None),
+            # #488: one row per running turn. A peer on an older rev sends none: its single
+            # topic and clock make the one row it has.
+            "running": ([{"topic": str(topic or "").strip() or None,
+                        "seconds": max(0.0, _num(elapsed)), "silent": max(0.0, _num(silent))}
+                       for topic, elapsed, silent in (row.turns or ())]
+                      or [{"topic": str(row.topic or "").strip() or None,
+                           "seconds": max(0.0, _num(row.turn_elapsed)),
+                           "silent": max(0.0, _num(row.silent))}]) if working else [],
             "pulse_age": row.age(moment),
             "queue": int(_num(row.queue)),
             "wakes": len(row.wakes or ()),
@@ -1292,11 +1300,20 @@ function card(bot, state) {
   top.append(el("span", "badge " + bot.badge, bot.badge));
   if (bot.role) top.append(el("span", "sub", bot.role));
   box.append(top);
-  if (bot.state === "working" || bot.state === "stuck") {
-    const turn = bot.turn_seconds === null ? "?" : ago(bot.turn_seconds);
+  // A busy bot's state is "busy" and its badge "working" (BADGES): the badge is the test.
+  const working = bot.badge === "working" || bot.state === "stuck";
+  if (working) {
     const cap = bot.turn_timeout === null ? "" : " / " + ago(bot.turn_timeout);
-    box.append(el("div", "doing",
-      "working on " + (bot.topic || "?") + " for " + turn + cap));
+    // #488: a row per running turn; an older record without the list draws its single one.
+    const turns = (bot.running && bot.running.length) ? bot.running
+      : [{topic: bot.topic, seconds: bot.turn_seconds, silent: null}];
+    turns.forEach((turn) => {
+      const took = turn.seconds === null || turn.seconds === undefined ? "?" : ago(turn.seconds);
+      const quiet = turn.silent ? " · silent " + ago(turn.silent) : "";
+      box.append(el("div", "doing",
+        "working on " + (turn.topic || "?") + " for " + took + cap + quiet));
+    });
+    if (bot.queue) box.append(el("div", "doing", bot.queue + " queued behind them"));
   } else {
     box.append(el("div", "doing", bot.badge + " for " + ago(bot.since)));
   }
@@ -1308,7 +1325,8 @@ function card(bot, state) {
   meta.append(el("span", "", "today " + num(bot.turns) + " turns"));
   meta.append(el("span", "", compact(bot.tokens_in) + "/" + compact(bot.tokens_out) + " tok"));
   meta.append(el("span", "", money(bot.cost)));
-  if (bot.queue) meta.append(el("span", "", "queue " + bot.queue));
+  // The queue sits right under the turn rows while working (#488), in the meta otherwise.
+  if (bot.queue && !working) meta.append(el("span", "", "queue " + bot.queue));
   box.append(meta);
   const own = controlsFor(state, "bot", bot.alias);
   if (own.children.length) box.append(own);

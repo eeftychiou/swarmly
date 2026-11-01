@@ -1146,7 +1146,12 @@ holds across heartbeats instead of resetting each beat — the discussion it is 
 (as its `tg-…` token, never a chat id), the turn's elapsed time against its timeout, the queue
 of messages waiting for it, the armed `WAKE` timers with their next fire time, the model and
 effort, `rev:`, uptime, the restart count, and its lease term and expiry when it holds the
-coordinator lease. It rides the pulse — on the bot's own git ref, or the `STATUS intent=PULSE`
+coordinator lease. **Every running turn is listed (#488):** with `limits.max_parallel_turns`
+above 1 a bot runs several topics at once, and `turns` carries one row per running turn —
+its `tg-…` token, elapsed time and silence, longest first, never a chat id or a path. The bot
+is `stuck` when **any** of them is, and the single `topic` / `turn_elapsed` / `silent` fields
+stay filled — from the stuck turn when there is one, else the longest — so a peer on an older
+rev still reads one. It rides the pulse — on the bot's own git ref, or the `STATUS intent=PULSE`
 line when there is no bus — so a bot that missed a beat can still be rendered, and a snapshot
 that stopped being renewed shows as **stale** (more than two beats old) rather than as current.
 Nothing in the record is a token, key, chat id or local path.
@@ -1293,8 +1298,9 @@ web:
 in code, per request, from records the transport already holds — the status snapshots (#124),
 the `/usage` ledger (#125), the round state (#86), the lease (#83) the roster's roles and the
 owed table (#162) — so a refresh costs no model turn and no Telegram edit. One card per bot:
-alias, role, a coloured badge (working / idle / paused / frozen / stuck / down), the topic and
-running time of a turn in flight, the age of the last pulse, runtime (model/effort) and rev,
+alias, role, a coloured badge (working / idle / paused / frozen / stuck / down), one row per
+turn in flight — its topic, running time and silence, with the queue waiting behind them
+(#488; a peer on an older rev draws its single turn) — the age of the last pulse, runtime (model/effort) and rev,
 today's turns, tokens in/out and cost. A strip on top carries the coordinator, the lease term
 and time left, and the round in flight with its checklist progress; the open debts are listed
 under the cards. A bot that stopped beating is `down` whatever it last said of itself, and a
@@ -1331,7 +1337,9 @@ instead of claiming it ran, and two presses at once never swap their answers.
 
 **A view per read command (#344).** `/status` and `/swarm` are the roster (each bot's role,
 state, model, effort and rev, plus the peers this bot knows), `/usage all` the usage table,
-`/round` and `/owed` the round board, `/topics` the registry panel, `/model`, `/reasoning` and
+`/round` and `/owed` the round board, `/topics` the registry panel (each topic's line also
+names the bot or bots running a turn there right now, from their pulses — a bot with two
+parallel turns under both topics, #488), `/model`, `/reasoning` and
 `/role` the settings section (each bot's default, and the binding a topic overrides it with),
 `/drift` the ledger's score plus the kinds and weights of the live violations, and `/state` the
 store's backend, mode and readiness. A source that is not collected is `null` in the JSON and

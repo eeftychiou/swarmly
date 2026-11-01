@@ -24,6 +24,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A bot running two turns shows both** (`#488`). With `limits.max_parallel_turns: 2` (`#486`)
+  the pulse snapshot described one turn — the first it found — so the dashboard, `/state` and
+  the coordinator saw one of the two, and a second turn that hung never showed. The snapshot
+  now carries `turns`, one row per running turn (topic token, elapsed, silence; no ids or
+  paths), and the bot is `stuck` when any of them is. The single `topic` / `turn_elapsed` /
+  `silent` fields stay filled — from the stuck turn when there is one — so older peers still
+  read them. The dashboard draws a row per turn with the queue under them, and `/topics` names
+  the bot or bots working in each topic. The dashboard card also tells a busy bot by its badge:
+  its state is `busy`, so the turn line it used to look for never drew.
+
 - **The dashboard's pickers and confirm buttons in Swarm pulse are swept too** (`#483`, follow-up
   to `#480`). Both are sent straight through the bot — a keyboard cannot ride a paced reply —
   so no send path recorded them: with the dashboard on `control.topic_id: pulse` every pick and

@@ -3982,30 +3982,45 @@ class AgentChannel:
         busy = {key: start for key, start in self._busy_since.items()
                 if isinstance(start, (int, float))}
         elapsed = max((self._clock() - start for start in busy.values()), default=0.0)
-        silent = self._silent_seconds(next(iter(busy)), elapsed) if busy else 0.0
         silence_limit = float(getattr(self.config.limits, "turn_silence_minutes", 0) or 0) * 60
-        state, topic = snapshot_mod.IDLE, "general"
+
+        def topic_of(key: Any) -> str:
+            try:
+                chat_id, thread_id = key if isinstance(key, tuple) else (key, None)
+                return self.topics.context(int(chat_id), thread_id) or "general"
+            except Exception:                          # noqa: BLE001 - a name, not a fact
+                return "general"
+
+        # #488: every running turn, each with its own clock and its own silence -- with
+        # limits.max_parallel_turns above 1 a stuck second turn must not hide behind a
+        # healthy first one. Longest first.
+        running = []
+        for key, start in busy.items():
+            took = self._clock() - start
+            quiet = self._silent_seconds(key, took)
+            # Stuck is "working, but not visibly" (#161): the CLI has written nothing for
+            # limits.turn_silence_minutes, or the turn has run past its own hard timeout.
+            stuck = bool(silence_limit and quiet > silence_limit) or bool(
+                turn_timeout and took > turn_timeout)
+            running.append((stuck, took, quiet, key))
+        running.sort(key=lambda row: row[1], reverse=True)
+        turns = tuple((topic_of(key), took, quiet)
+                      for _, took, quiet, key in running[:snapshot_mod.MAX_TURNS])
+        state, topic, silent = snapshot_mod.IDLE, "general", 0.0
         if self._frozen:
             state = (snapshot_mod.FROZEN if self._freeze_ref == "quota"
                      else snapshot_mod.PAUSED)
         elif self._pause_pending or self._paused_topics:
             state = snapshot_mod.PAUSED
         if busy:
-            # Stuck is "working, but not visibly" (#161): the CLI has written nothing for
-            # limits.turn_silence_minutes, or the turn has run past its own hard timeout.
-            stuck = bool(silence_limit and silent > silence_limit) or bool(
-                turn_timeout and elapsed > turn_timeout)
-            state = snapshot_mod.STUCK if stuck else snapshot_mod.BUSY
-        if busy:
+            # The single fields a peer on an older rev reads come from the turn that decides
+            # the state: a stuck one when there is one, else the longest.
+            lead = next((row for row in running if row[0]), running[0])
+            state = snapshot_mod.STUCK if lead[0] else snapshot_mod.BUSY
+            silent, topic = lead[2], topic_of(lead[3])
             # A turn's start is known exactly from its own clock, so busy/stuck do not need the
             # table: elapsed is measured, not remembered.
             since = moment - elapsed
-            key = next(iter(busy))
-            try:
-                chat_id, thread_id = key if isinstance(key, tuple) else (key, None)
-                topic = self.topics.context(int(chat_id), thread_id) or "general"
-            except Exception:                          # noqa: BLE001 - a name, not a fact
-                topic = "general"
         else:
             # First seen in this state: this beat is the moment it began. Recorded, so the next
             # beat reports the same answer instead of moving with the clock.
@@ -4066,7 +4081,7 @@ class AgentChannel:
         return snapshot_mod.Snapshot(
             alias=self.config.identity.alias, state=state, since=since, at=moment,
             every=every, topic=str(topic), turn_elapsed=elapsed, turn_timeout=turn_timeout,
-            silent=silent,
+            silent=silent, turns=turns,
             queue=queue, wakes=(),                  # #215: no timers left to report
             model=str(model or ""), effort=str(effort or ""),
             models=models, efforts=efforts,
