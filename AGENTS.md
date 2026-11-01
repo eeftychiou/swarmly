@@ -115,7 +115,33 @@ need approval, and **escalate to the admin only when strictly necessary**.
    conflict and cannot converge. A necessary escalation states the question, the options,
    and the default the swarm would take.
 
-## 6. Related documents
+## 6. Runtime settings belong to the dashboard and the commands (admin directive, 2026-11-01)
+
+A setting the admin tunes while the swarm runs is changed **per bot from the dashboard or a
+`/` command**, never only by editing that bot's `config.yaml` and restarting it.
+`limits.max_parallel_turns` is the example that prompted this: raising it for five bots took
+a hand edit, a config check and a restart on each host, one of them a machine the admin had
+to log in to.
+
+1. **Every new runtime setting ships with both controls.** A field on the bot's settings form
+   in the dashboard (#451) and a `/` command addressed to one bot (`/<setting>@bot <value>`),
+   both admin-only, both answering with what the bot now runs. A PR that adds a setting
+   without them is a fix-first.
+2. **The change is checked like the config is.** A value the config parser would refuse is
+   refused with the same reason, and nothing changes.
+3. **It is stored where the bot reads it, and survives a restart.** `config.yaml` keeps the
+   default; the runtime value overrides it until it is cleared, and `/status` says which one
+   is in force.
+4. **It takes effect without the admin restarting anything.** A setting that is only read at
+   start-up makes the bot apply it on its next idle moment, and says so when it does.
+5. **Identity, secrets and paths stay in `config.yaml`.** Tokens, keys, chat ids, working
+   folders and the bot's name are not runtime settings and get no such control.
+
+Settings that predate this rule (for example `limits.max_parallel_turns` and
+`web.init_max_age`) are brought under it as issues, not left as exceptions; `max_parallel_turns`
+is #491.
+
+## 7. Related documents
 
 - `docs/telegram/PROTOCOL.md` — channel protocol v1.1 (delivery semantics, escalation ladder).
 - `docs/telegram/UPGRADE.md` — safe upgrade + revert procedure.

@@ -28,6 +28,9 @@ This document describes the component relationships, data flow, and architectura
   - Durable round state writes require coordinator authority and term fencing (`Authority(alias, source="lease", term)`), preventing split-brain updates and stale overwrites.
 - **Human-in-the-Loop & Override**:
   - A human operator has visibility and control over all agent turns and can intervene in Telegram at any time.
+- **Runtime Settings Are Live Controls (AGENTS.md §6)**:
+  - Any setting the admin tunes while the swarm runs (model, effort, `limits.max_parallel_turns`, and every new one) is changed per bot from the dashboard's settings form or an admin `/` command, validated like the config, persisted across restarts, and applied without a manual restart.
+  - `config.yaml` holds the defaults and what is not a runtime setting: identity, secrets, chat ids and working folders.
 - **Status Snapshots, Pulse & Usage Accounting (#166)**:
   - `status_snapshot` captures real-time bot state, active topic, queues, resolved model/effort, and safe drift metrics without invoking model turns.
   - Heartbeat status snapshots report per-bot drift metrics (`drift_score`, `drift_hard`, `drift_resets_today`, `drift_standing`, newest violation kind and age) without exposing sensitive evidence strings or session identifiers (#452).
