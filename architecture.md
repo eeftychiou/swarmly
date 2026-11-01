@@ -28,6 +28,8 @@ This document describes the component relationships, data flow, and architectura
   - Durable round state writes require coordinator authority and term fencing (`Authority(alias, source="lease", term)`), preventing split-brain updates and stale overwrites.
 - **Human-in-the-Loop & Override**:
   - A human operator has visibility and control over all agent turns and can intervene in Telegram at any time.
+- **Runtime-Settable Settings (admin directive, 2026-11-01)**:
+  - Operational settings such as `limits.max_parallel_turns`, timeouts, model, effort and role can be changed per bot at runtime, from the dashboard and from `/` commands, without editing `config.yaml` or restarting. `config.yaml` is the default, and an override is persisted in `.agents/state/`, shown in `/status` and on the dashboard, admin-only, written as a `CONTROL` line, and validated like `check`. Secrets and identity stay config-only. See [AGENTS.md §6](AGENTS.md#6-settings-are-changed-live-per-bot-admin-directive-2026-11-01).
 - **Status Snapshots, Pulse & Usage Accounting (#166)**:
   - `status_snapshot` captures real-time bot state, active topic, queues, resolved model/effort, and safe drift metrics without invoking model turns.
   - Heartbeat status snapshots report per-bot drift metrics (`drift_score`, `drift_hard`, `drift_resets_today`, `drift_standing`, newest violation kind and age) without exposing sensitive evidence strings or session identifiers (#452).

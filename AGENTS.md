@@ -115,7 +115,35 @@ need approval, and **escalate to the admin only when strictly necessary**.
    conflict and cannot converge. A necessary escalation states the question, the options,
    and the default the swarm would take.
 
-## 6. Related documents
+## 6. Settings are changed live, per bot (admin directive, 2026-11-01)
+
+A setting the admin may want to tune while the swarm runs — `limits.max_parallel_turns`, the
+other operational `limits.*`, timeouts, model, effort, role — is **changeable per bot at
+runtime, from the dashboard and from a `/` command**, not only by editing that bot's
+`config.yaml` and restarting it. `/model` and `/reasoning` already work this way; new
+settings follow them.
+
+1. **Both doors, one path.** Each setting has a dashboard control (the Settings panel) and a
+   command (`/<setting>@<bot> <value>`, `/<setting>@<bot>` to show it, `default` to go back
+   to `config.yaml`). A press and a typed command write the same `CONTROL` line, so who
+   changed what is on the record.
+2. **`config.yaml` is the default; the override is state.** A runtime value is kept in the
+   bot's `.agents/state/` beside the others, so it survives a restart. `/status` and the
+   dashboard show the value in force and whether it is an override.
+3. **Admin only, validated like `check`.** A change runs the same validation as
+   `swarmly-telegram check`. For example, `max_parallel_turns` above 1 is refused for
+   `codex_thread`, or when `adapter.cwd` is not a git checkout (#486). A refused change
+   says why and changes nothing. Changes that stop or widen something ask again before
+   they apply, as the dashboard's controls already do.
+4. **Live, or it says so.** A change applies from the next turn without a restart. A setting
+   that truly needs a restart says so when it is set, and does not pretend to have applied.
+5. **Not for secrets or identity.** Tokens, keys, `.env` values, the bot identity and its
+   paths stay in config only: never typed into a chat, never shown on the page.
+6. **New settings come with their controls.** A PR that adds an operational setting adds
+   its dashboard control and command, or says in the PR why that setting must stay
+   config-only.
+
+## 7. Related documents
 
 - `docs/telegram/PROTOCOL.md` — channel protocol v1.1 (delivery semantics, escalation ladder).
 - `docs/telegram/UPGRADE.md` — safe upgrade + revert procedure.
