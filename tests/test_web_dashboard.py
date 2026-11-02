@@ -515,11 +515,42 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
             self.assertEqual(channel._sync_web_dashboard(), "off")
             self.assertIsNone(getattr(channel, "_web_server", None))
 
-    def test_a_bot_that_does_not_hold_the_lease_serves_nothing(self):
+    def test_a_non_holder_serves_a_loopback_pointer_page(self):
         channel = self.channel()
         channel.is_coordinator = lambda now=None: False
-        self.assertIn("not the lease holder", channel._sync_web_dashboard())
-        self.assertIsNone(getattr(channel, "_web_server", None))
+        channel.current_coordinator = lambda now=None: "Reasonix"
+        from swarmly.telegram.presence import Pulse
+        channel.presence().note(Pulse(alias="Reasonix", at=NOW,
+            status={"at": NOW, "web": {"public_host": "new.example.ts.net",
+                                       "bot_username": "ReasonixBot"}}), seen_at=NOW)
+        said = channel._sync_web_dashboard()
+        try:
+            self.assertIn("serving lease pointer", said)
+            with urllib.request.urlopen(channel._web_server.url) as response:
+                self.assertEqual(response.status, 200)
+                body = response.read()
+                self.assertIn(b"current lease holder", body)
+                self.assertIn(b'href="https://t.me/ReasonixBot?startapp=dashboard"', body)
+        finally:
+            channel._web_server.stop()
+
+    def test_pointer_bind_failure_is_throttled(self):
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: False
+        tries: list = []
+
+        def refuse(self: Any) -> str:
+            tries.append(1)
+            raise OSError("port busy")
+
+        original = webui.DashboardServer.start
+        webui.DashboardServer.start = refuse
+        try:
+            self.assertTrue(channel._sync_web_dashboard().startswith("failed"))
+            self.assertIn("waiting to retry", channel._sync_web_dashboard())
+            self.assertEqual(len(tries), 1)
+        finally:
+            webui.DashboardServer.start = original
 
     def test_the_lease_holder_serves_the_page_and_losing_the_lease_closes_it(self):
         channel = self.channel()
@@ -531,8 +562,9 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
             self.assertTrue(channel._sync_web_dashboard().startswith("serving"))
         finally:
             channel.is_coordinator = lambda now=None: False
-            self.assertIn("stopped", channel._sync_web_dashboard())
-        self.assertIsNone(channel._web_server)
+            self.assertIn("serving lease pointer", channel._sync_web_dashboard())
+            channel._web_server.stop()
+        self.assertFalse(channel._web_server.running)
 
     def test_the_page_reads_this_bots_own_records_and_no_identifier(self):
         channel = self.channel()
@@ -804,6 +836,12 @@ class TestThePinnedCardsButton(unittest.TestCase):
             for button in row:
                 self.assertNotIn("web_app", button)
 
+    def test_enabled_bot_advertises_its_username_with_its_public_host(self):
+        channel = self.channel(public_host="swarm.example.ts.net")
+        web = channel.own_pulse(NOW).status["web"]
+        self.assertEqual(web, {"public_host": "swarm.example.ts.net",
+                               "bot_username": "HermesBot"})
+
     def test_a_disabled_section_draws_no_button_even_with_a_public_host(self):
         """A button that opens nothing is worse than no button (review, #258)."""
         from tests.test_telegram_channel import make_channel, make_config
@@ -815,20 +853,20 @@ class TestThePinnedCardsButton(unittest.TestCase):
 
     def test_a_non_443_public_port_goes_in_the_host(self):
         channel = self.channel(public_host="swarm.example.ts.net:9443")
-        self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net:9443/")
+        self.assertEqual(channel.mini_app_url(),
+                         "https://t.me/HermesBot?startapp=dashboard")
 
     def test_a_public_host_puts_the_button_first(self):
         channel = self.channel(public_host="swarm.example.ts.net")
         # The public name is served on 443 by the tunnel: web.port is the loopback *bind* port
         # and must not appear, or the button opens a dead address (review, #258).
-        self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net/")
+        self.assertEqual(channel.mini_app_url(),
+                         "https://t.me/HermesBot?startapp=dashboard")
         first = channel.control_markup()[0][0]
         self.assertEqual(first["text"], "Open dashboard")
-        # A link to the bot's Mini App, not a web_app button: Telegram refuses those in a
-        # group, and the whole card then failed to refresh (live, 26 Oct).
+        # The pinned card follows the holder's public address.
         self.assertNotIn("web_app", first)
-        handle = channel.config.identity.name.lstrip("@")
-        self.assertEqual(first["url"], f"https://t.me/{handle}?startapp=dashboard")
+        self.assertEqual(first["url"], "https://t.me/HermesBot?startapp=dashboard")
         # The controls are still there, below it.
         self.assertTrue(any("callback_data" in button
                             for row in channel.control_markup() for button in row))
@@ -845,6 +883,36 @@ class TestThePinnedCardsButton(unittest.TestCase):
             self.assertIn("127.0.0.1", server.hosts)
         finally:
             channel._sync_web_dashboard()
+
+    def test_the_button_uses_the_new_holders_host_from_its_pulse(self):
+        from swarmly.telegram.presence import Pulse
+        channel = self.channel(public_host="old.example.ts.net")
+        channel.current_coordinator = lambda now=None: "Reasonix"
+        channel.presence().note(Pulse(alias="Reasonix", at=NOW,
+            status={"at": NOW, "web": {"public_host": "new.example.ts.net",
+                                       "bot_username": "ReasonixBot"}}), seen_at=NOW)
+        expected = "https://t.me/ReasonixBot?startapp=dashboard"
+        self.assertEqual(channel.mini_app_link(), expected)
+        self.assertEqual(channel.control_markup()[0][0]["url"], expected)
+
+    def test_holder_username_falls_back_to_the_roster_handle(self):
+        from swarmly.telegram.presence import Pulse
+        channel = self.channel(public_host="old.example.ts.net")
+        channel.current_coordinator = lambda now=None: "Reasonix"
+        channel.bot_handle = lambda alias: "@RosterBot"
+        channel.presence().note(Pulse(alias="Reasonix", at=NOW,
+            status={"at": NOW, "web": {"public_host": "new.example.ts.net"}}), seen_at=NOW)
+        self.assertEqual(channel.mini_app_link(), "https://t.me/RosterBot?startapp=dashboard")
+
+    def test_holder_numeric_peer_id_is_not_used_as_a_telegram_handle(self):
+        from swarmly.telegram.presence import Pulse
+        channel = self.channel(public_host="old.example.ts.net")
+        channel.current_coordinator = lambda now=None: "Reasonix"
+        channel.bot_handle = lambda alias: "123456789"
+        channel.presence().note(Pulse(alias="Reasonix", at=NOW,
+            status={"at": NOW, "web": {"public_host": "new.example.ts.net",
+                                       "bot_username": "123456789"}}), seen_at=NOW)
+        self.assertEqual(channel.mini_app_link(), "")
 
     def test_a_taken_port_is_retried_on_an_interval_not_every_beat(self):
         """A bind that fails is one warning and a quiet minute, not one per heartbeat."""
@@ -866,6 +934,17 @@ class TestThePinnedCardsButton(unittest.TestCase):
             self.assertIsNone(getattr(channel, "_web_server", None))
         finally:
             webui.DashboardServer.start = original
+
+    def test_pointer_failure_does_not_throttle_dashboard_after_failover(self):
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: False
+        with mock.patch.object(webui.DashboardServer, "start", side_effect=OSError("busy")):
+            self.assertTrue(channel._sync_web_dashboard().startswith("failed"))
+        channel.is_coordinator = lambda now=None: True
+        with mock.patch.object(webui.DashboardServer, "start", return_value="http://127.0.0.1:8787/") as start:
+            self.assertTrue(channel._sync_web_dashboard().startswith("serving"))
+            start.assert_called_once()
+        channel._web_server.stop()
 
 class TestTheLookAndLayout(unittest.TestCase):
     """#343: one shell (header, navigation, sections) and a design system behind it."""

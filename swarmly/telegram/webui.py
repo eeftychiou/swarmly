@@ -34,6 +34,7 @@ first, light and dark by ``prefers-color-scheme`` -- ready to be the Mini App's 
 from __future__ import annotations
 
 import calendar
+import html
 import hashlib
 import hmac
 import inspect
@@ -2323,7 +2324,8 @@ class DashboardServer:
                  init_max_age: float = INIT_MAX_AGE,
                  read_max_age: float = READ_MAX_AGE,
                  action: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None,
-                 memory: Optional[Callable[[], Optional[str]]] = None) -> None:
+                 memory: Optional[Callable[[], Optional[str]]] = None,
+                 pointer: Optional[Callable[[], str]] = None) -> None:
         self.provider = provider
         #: Whether the provider takes this request's topic filters (#438). A provider that
         #: does is called with them; one that does not (a test's ``lambda: {...}``) is called
@@ -2350,6 +2352,7 @@ class DashboardServer:
         #: ``/memory``'s text (#344), served only to a verified admin login. ``None`` means this
         #: page has no memory to show, and that path stays a 404.
         self.memory = memory
+        self.pointer = pointer
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -2548,6 +2551,15 @@ class DashboardServer:
                 path, _, query = self.path.partition("?")
                 if not self._host_ok():
                     self._not_found()
+                    return
+                if server.pointer is not None:
+                    target = str(server.pointer() or "")
+                    escaped = html.escape(target, quote=True)
+                    label = html.escape(target or "the dashboard is currently local only")
+                    body = ("<!doctype html><meta charset=utf-8><title>Swarm dashboard</title>"
+                            f"<p>the dashboard is on its current lease holder: "
+                            f"<a href=\"{escaped}\">{label}</a></p>").encode("utf-8")
+                    self._send(200, body, "text/html; charset=utf-8")
                     return
                 if path in (PAGE_PATH, "/index.html"):
                     body = page_html(title=server.title, every=server.every)

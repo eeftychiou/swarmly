@@ -3917,6 +3917,12 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - a pulse without a term
             term = 0
         status = self.status_snapshot(now).to_dict()
+        web = self.web_settings()
+        if web is not None and getattr(web, "enabled", False):
+            status["web"] = {
+                "public_host": str(getattr(web, "public_host", "") or ""),
+                "bot_username": str(self.config.identity.username or "").lstrip("@"),
+            }
         usage = self._pulse_usage(now)
         if usage:
             status["usage"] = usage
@@ -4453,11 +4459,16 @@ class AgentChannel:
         """The dashboard's text, built in code from this bot's own records -- no turn."""
         moment = self.presence_clock() if now is None else float(now)
         usage = self.control_usage()
-        return control_mod.dashboard(now=moment, snapshots=self.control_snapshots(moment),
+        text = control_mod.dashboard(now=moment, snapshots=self.control_snapshots(moment),
                                      round_state=self.control_round(), usage=usage,
                                      coordinator=str(self.current_coordinator() or ""),
                                      roles=self.control_roles(),
                                      limit=self.config.limits.max_message_chars)
+        if self.web_settings() is not None and getattr(self.web_settings(), "enabled", False):
+            holder = str(self.current_coordinator() or self.config.identity.alias)
+            if not self._holder_public_host(holder):
+                text += f"\nDashboard: local only on {holder}"
+        return text
 
     def control_markup(self) -> List[List[Dict[str, Any]]]:
         """The pinned card's keyboard: the dashboard button first when a Mini App is set.
@@ -4513,17 +4524,51 @@ class AgentChannel:
         web = self.web_settings()
         if web is None or not getattr(web, "enabled", False):
             return ""
-        host = str(getattr(web, "public_host", "") or "").strip()
-        if not host:
+        holder = str(self.current_coordinator() or self.config.identity.alias)
+        if not self._holder_public_host(holder):
             return ""
-        return f"https://{host}/"
+        username = self._holder_bot_username(holder)
+        return f"https://t.me/{username}?startapp=dashboard" if username else ""
 
     def mini_app_link(self) -> str:
-        """The ``t.me`` link that opens this bot's Mini App, or ``""`` (no public page)."""
-        if not self.mini_app_url():
+        """The current lease holder's public dashboard address, or empty when local-only."""
+        return self.mini_app_url()
+
+    def _holder_public_host(self, holder: str) -> str:
+        """Public hostname advertised by the current holder's pulse."""
+        alias = str(holder or "").strip()
+        if alias.lower() == str(self.config.identity.alias or "").strip().lower():
+            web = self.web_settings()
+            if web is None or not getattr(web, "enabled", False):
+                return ""
+            return str(getattr(web, "public_host", "") or "").strip()
+        try:
+            peer = next((peer for name, peer in self.presence().peers.items()
+                         if str(name).strip().lower() == alias.lower()), None)
+            data = (peer.snapshot or {}).get("web") if peer else None
+            return str((data or {}).get("public_host") or "").strip() if isinstance(data, dict) else ""
+        except Exception:                         # noqa: BLE001 - no public link is safe
+            logger.debug("web dashboard: holder's public host is not readable", exc_info=True)
             return ""
-        handle = str(getattr(self.config.identity, "name", "") or "").lstrip("@").strip()
-        return f"https://t.me/{handle}?startapp=dashboard" if handle else ""
+
+    def _holder_bot_username(self, holder: str) -> str:
+        """Telegram username advertised by the lease holder for its Mini App."""
+        alias = str(holder or "").strip()
+        if alias.lower() == str(self.config.identity.alias or "").strip().lower():
+            username = str(self.config.identity.username or "").lstrip("@").strip()
+            return "" if username.isdigit() else username
+        try:
+            peer = next((peer for name, peer in self.presence().peers.items()
+                         if str(name).strip().lower() == alias.lower()), None)
+            data = (peer.snapshot or {}).get("web") if peer else None
+            username = (data or {}).get("bot_username") if isinstance(data, dict) else ""
+            username = str(username or "").lstrip("@").strip()
+            if not username or username.isdigit():
+                username = str(self.bot_handle(alias) or "").lstrip("@").strip()
+            return "" if username.isdigit() else username
+        except Exception:                         # noqa: BLE001 - no public link is safe
+            logger.debug("web dashboard: holder's bot username is not readable", exc_info=True)
+            return ""
 
     def web_settings(self) -> Any:
         """``web`` from the config, or ``None``: no section means no page, and no port opened."""
@@ -4742,18 +4787,40 @@ class AgentChannel:
                 return "stopped: web dashboard is off"
             return "off"
         if not self.is_coordinator(now=moment):
-            if server is not None:
+            if server is not None and getattr(server, "pointer", None) is None:
                 server.stop()
+                server = None
                 self._web_server = None
-                return "stopped: not the lease holder"
-            return "idle: not the lease holder"
+            if server is not None and server.running:
+                return "serving lease pointer " + server.url
+            now_wall = time.time()
+            failed_at = float(getattr(self, "_web_pointer_failed_at", 0.0) or 0.0)
+            if failed_at and now_wall - failed_at < self.WEB_RETRY_SECONDS:
+                return "failed: waiting to retry the port"
+            server = webui.DashboardServer(
+                lambda: {}, port=int(getattr(web, "port", 8787) or 0),
+                pointer=lambda: self.mini_app_url())
+            try:
+                url = server.start()
+            except OSError as exc:
+                self._web_pointer_failed_at = now_wall
+                logger.warning("web dashboard pointer: cannot serve on port %s (%s); retrying in %ds",
+                               getattr(web, "port", 8787), exc, self.WEB_RETRY_SECONDS)
+                return f"failed: {exc}"
+            self._web_pointer_failed_at = 0.0
+            self._web_server = server
+            return "serving lease pointer " + url
+        if server is not None and getattr(server, "pointer", None):
+            server.stop()
+            server = None
+            self._web_server = None
         if server is not None and server.running:
             return "serving " + server.url
         # A port that cannot be bound is not worth a warning per heartbeat (review, #256):
         # one line, then a quiet retry interval -- the port may be a peer's for a moment
         # during a failover, and the operator needs the fact once, not sixty times an hour.
         now_wall = time.time()
-        failed_at = float(getattr(self, "_web_failed_at", 0.0) or 0.0)
+        failed_at = float(getattr(self, "_web_dashboard_failed_at", 0.0) or 0.0)
         if failed_at and now_wall - failed_at < self.WEB_RETRY_SECONDS:
             return "failed: waiting to retry the port"
         server = webui.DashboardServer(
@@ -4767,11 +4834,11 @@ class AgentChannel:
         try:
             url = server.start()
         except OSError as exc:
-            self._web_failed_at = now_wall
+            self._web_dashboard_failed_at = now_wall
             logger.warning("web dashboard: cannot serve on port %s (%s); retrying in %ds",
                            getattr(web, "port", 8787), exc, self.WEB_RETRY_SECONDS)
             return f"failed: {exc}"
-        self._web_failed_at = 0.0
+        self._web_dashboard_failed_at = 0.0
         self._web_server = server
         logger.info("web dashboard: serving %s (read-only, %s)", url,
                     f"Mini App for {server.public_host}" if server.requires_init else "loopback")
