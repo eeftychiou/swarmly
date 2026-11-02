@@ -9,7 +9,8 @@ import unittest
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
 from swarmly.telegram.topic_open import (MAX_TOPICS_PER_HOUR, parse_new_topic,
-                                         parse_report_back, topic_link, topic_name)
+                                         parse_post_to_topic, parse_report_back,
+                                         topic_link, topic_name)
 from tests.test_telegram_channel import ADMIN_ID, GROUP, event, make_channel, run
 
 
@@ -65,12 +66,71 @@ class TestParsing(unittest.TestCase):
         self.assertIsNone(parse_report_back("plain reply"))
         self.assertIsNone(parse_report_back("REPORT_BACK:   "))
 
+    def test_post_to_topic_directive(self):
+        self.assertEqual(parse_post_to_topic(
+            "POST_TO_TOPIC: 77\n@CodexBot please review #42"),
+            (77, "@CodexBot please review #42"))
+        self.assertIsNone(parse_post_to_topic("POST_TO_TOPIC: nope\nassignment"))
+
     def test_names_and_links(self):
         self.assertEqual(topic_link(-1001234567890, 7), "https://t.me/c/1234567890/7")
         self.assertEqual(len(topic_name("Hermes", "x" * 300)), 128)
 
 
 class TestOpenTopic(unittest.TestCase):
+
+    def test_handle_event_posts_assignment_into_a_known_topic(self):
+        channel = make_channel(adapter=Scripted("POST_TO_TOPIC: 77\n"
+                                                "@CodexBot please review #42"))
+        channel.is_coordinator = lambda: True
+        channel.topics.remember(GROUP, 77, "coordinated work")
+        linked = []
+        channel.state_link.note_handoff_peers = lambda *args: linked.append(args)
+        sent = []
+        original_send = channel.send
+
+        async def capture(text, **kwargs):
+            sent.append((text, kwargs))
+            return await original_send(text, **kwargs)
+
+        channel.send = capture
+        run(channel.handle_event(ask("@HermesBot dispatch the next round")))
+        self.assertTrue(any("@CodexBot please review #42" in text and
+                            kwargs.get("thread_id") == 77 for text, kwargs in sent), sent)
+        self.assertEqual(linked, [(GROUP, 77, ["Codex"], channel.config.identity.alias)])
+
+    def test_new_topic_copies_shared_plan_into_its_coordinator_turn(self):
+        adapter = Scripted("NO_REPLY")
+        adapter.KEEPS_TOPIC_SESSION = True
+        channel = make_channel(adapter=adapter)
+        channel.bot = TopicBot()
+        channel._topic_memory.record(GROUP, 12, "Hermes", "Opening context for the topic.", 13)
+        channel._topic_memory.record(
+            GROUP, 12, "Hermes", "Plan: split work into rounds 1, 2 and 3.", 14)
+        source = ask("open round two", thread_id=12)
+
+        async def scenario():
+            await channel._open_topic(source, "round two", "Handle round two.")
+            await drain(channel)
+        run(scenario())
+        self.assertTrue(any("Plan: split work into rounds 1, 2 and 3." in msg.text
+                            for msg in adapter.seen), adapter.seen)
+
+    def test_plan_context_does_not_turn_peer_handoff_into_own_task(self):
+        adapter = Scripted("NO_REPLY")
+        adapter.KEEPS_TOPIC_SESSION = True
+        channel = make_channel(adapter=adapter)
+        channel.bot = TopicBot()
+        channel._topic_memory.record(GROUP, 12, "Hermes", "Opening context for the topic.", 13)
+        channel._topic_memory.record(GROUP, 12, "Hermes", "Plan: round two is topic B.", 14)
+        own_tasks = []
+        channel._run_own_task = lambda *args: own_tasks.append(args)
+
+        run(channel._open_topic(ask("open round two", thread_id=12), "round two",
+                                "@CodexBot please handle round two."))
+        self.assertEqual(own_tasks, [])
+        self.assertTrue(any("@CodexBot please handle round two." in item["text"]
+                            for item in channel._test_sender.sent))
 
     def test_opens_topic_runs_own_brief_and_reports_back(self):
         adapter = Scripted("NEW_TOPIC: research\nCompare the two APIs.",
