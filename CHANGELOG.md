@@ -35,10 +35,11 @@ All notable changes to this project are documented here. The format follows
   same live test's round-2 post began `@<owner>: Starting round 2 here…`, carried the round's
   question in the same breath and gave one line per agent; the split cut the owner's line down
   to a bot's own segment, so two agents answered that no round-2 question had been posted. The
-  words a line carries before its first bot handle are now every recipient's, and only the asks
-  below them are cut; a post that opens by addressing its own author — a bot posting
-  `@<its own handle>: round 2 starts here…` — has its header read as shared words too, not as a
-  hand-off (`#504` review). `docs/telegram-channel.md` documents both.
+  words a line carries before its first ask are now every recipient's, and only the asks below
+  them are cut; an agent named inside the shared sentence is not cut out of it, and a post that
+  opens by addressing its own author — a bot posting `@<its own handle>: round 2 starts here…` —
+  has its header read as shared words too, not as a hand-off (`#504` review).
+  `docs/telegram-channel.md` documents both.
 - **A turn that owed an answer says so instead of ending in silence** (`#497`). In the
   `#486`/`#488` live test the admin addressed a task to the swarm in topic B; DeepSeek's turn
   ran it and returned `NO_REPLY`, so nothing was posted, and a re-dispatch of the same task

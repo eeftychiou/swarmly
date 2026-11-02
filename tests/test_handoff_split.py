@@ -223,3 +223,20 @@ class TestTheSharedBriefAboveTheAsks(unittest.TestCase):
         own = hs.own_brief(text, "agy_dd_bot", BOTS, sender=["Claude_obot"])
         self.assertIn("QA it", own)
         self.assertNotIn("review it", own)
+
+    def test_a_peer_named_mid_sentence_does_not_cut_the_shared_brief(self):
+        """#504 re-review: the peer is named *inside* the question, so the question is shared.
+
+        The coordinator's line asks the round's question and names one agent in it
+        ("Which token were you given, @agy_dd_bot? Answer it."). Cutting at that handle left
+        the other agents a half sentence; a handle named inside a sentence is not the start of
+        that bot's own ask, so the whole line is every recipient's.
+        """
+        text = ("@Claude_obot: Round 2. Which token were you given, @agy_dd_bot? Answer it.\n"
+                "@reasonix_dd_bot answer as Reasonix\n"
+                "@agy_dd_bot answer as Antigravity")
+        for bot, own_line in (("reasonix_dd_bot", "as Reasonix"),
+                              ("agy_dd_bot", "as Antigravity")):
+            own = hs.own_brief(text, bot, BOTS, sender=["Claudebot", "claude_obot"])
+            self.assertIn("Which token were you given, @agy_dd_bot? Answer it.", own, bot)
+            self.assertIn(own_line, own, bot)

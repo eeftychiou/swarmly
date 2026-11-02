@@ -141,3 +141,18 @@ class TestTheSharedBriefReachesEveryPeer(unittest.TestCase):
                 said = " ".join(str(sent) for sent in channel._test_sender.sent)
                 self.assertIn("which token were you given", said)
                 self.assertIn(own_line, said)
+
+    def test_a_peer_named_in_the_question_does_not_cut_the_brief(self):
+        """#504 re-review, end to end: the question names one agent and every agent reads it."""
+        post = ("@Claude_obot: Round 2. Which token were you given, @agy_dd_bot? Answer it.\n"
+                "@reasonix_dd_bot answer as Reasonix\n"
+                "@agy_dd_bot answer as Antigravity")
+        for alias, username, own_line in (("Reasonix", "reasonix_dd_bot", "as Reasonix"),
+                                          ("Antigravity", "agy_dd_bot", "as Antigravity")):
+            with self.subTest(peer=username):
+                channel = channel_named(alias, username)
+                run(channel.handle_event(event(post, author_id=303, username="Claude_obot",
+                                              thread_id=307, message_id=59)))
+                said = " ".join(str(sent) for sent in channel._test_sender.sent)
+                self.assertIn("Which token were you given, @agy_dd_bot? Answer it.", said)
+                self.assertIn(own_line, said)

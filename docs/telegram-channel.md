@@ -613,8 +613,10 @@ recipient keeps.
 **The shared brief above the asks is never cut (#496).** A round post often opens by addressing
 the owner and asks the round's question in the same breath, naming an agent in it
 ("`@<owner>: round 2 starts here. Which token were you given, @a?`"), with one line per agent
-below. The words a line carries *before* its first bot handle are every recipient's, so each
-named bot reads them; only the asks below them are the other bots'. A post that opens by
+below. The words a line carries *before its first ask* are every recipient's, so each named
+bot reads them; only the asks below them are the other bots'. A bot named **inside** a sentence
+("`which token were you given, @a? Answer it.`") is part of the shared words, not the start of
+its own ask — only a handle that opens a sentence of its own begins one. A post that opens by
 addressing its **own author** (`@<its own handle>: round 2 starts here…`) is a header, so its
 words are shared too, even when the author is a bot and the header reads as a request. Before
 this, such a line was cut down to whichever segment named this bot, and two agents in the
