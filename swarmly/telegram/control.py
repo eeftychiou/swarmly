@@ -114,6 +114,7 @@ CONTROLS: Tuple[Control, ...] = (
                  "brings it back, so start it on the host"),
     Control("bot.model", "Model", report=True),
     Control("bot.effort", "Effort", report=True),
+    Control("bot.parallel", "Parallel turns", report=True),
     # #451: the whole settings form as one press. Only the fields that changed are in the
     # value, so one Apply is one line -- and no second tap: setting a model or an effort
     # starts nothing, and the admin's complaint was that it took two presses.
@@ -171,7 +172,8 @@ def typed(action: str) -> str:
 #: is launched, not per turn, so a dashboard that offered it would be lying about when it
 #: takes effect -- see docs/telegram/COMMANDS.md.
 SETTING_ACTIONS: Tuple[Tuple[str, str], ...] = (("model", "bot.model"),
-                                                ("effort", "bot.effort"))
+                                                ("effort", "bot.effort"),
+                                                ("max_parallel_turns", "bot.parallel"))
 
 SETTING_KEYS: Tuple[str, ...] = tuple(key for key, _ in SETTING_ACTIONS)
 
@@ -253,7 +255,7 @@ def peer_self_only(action: str, target: str, alias: str) -> str:
 #: ``/reasoning`` rules (its adapter's allowed list, its own per-topic scope). So the answer
 #: says *sent*, and the bot's card shows the new value only once its own beat reports it: a
 #: forward is not a setting, and a page that claimed otherwise would be guessing.
-REMOTE_PICKS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.settings")
+REMOTE_PICKS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.parallel", "bot.settings")
 
 
 def remote_pick(action: str) -> bool:
@@ -310,6 +312,7 @@ MENU_COVERAGE: Tuple[Coverage, ...] = (
     # policy -- admin only, a second tap for anything that stops or changes, one CONTROL line.
     Coverage("model", actions=("bot.model",)),
     Coverage("reasoning", actions=("bot.effort",)),
+    Coverage("parallel", actions=("bot.parallel",)),
     Coverage("memory", actions=("bot.memory",)),
     Coverage("role", actions=("swarm.role",)),
     Coverage("stop", actions=("bot.stop_turn",)),
