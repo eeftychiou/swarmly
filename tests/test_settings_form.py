@@ -133,7 +133,8 @@ class TestTheFormOnThePage(unittest.TestCase):
     def test_the_form_replaces_the_two_pickers_it_carries(self):
         page = self.page()
         self.assertIn('const form = (view.controls || []).find((row) => row.settings);', page)
-        self.assertIn('.map((field) => "bot." + field.key)', page)
+        # A field is not always "bot." + key: max_parallel_turns is carried by bot.parallel.
+        self.assertIn('.map((field) => carriedFor[field.key] || ("bot." + field.key))', page)
         self.assertIn(".filter((row) => !carried.includes(row.action))", page)
 
     def test_the_card_draws_one_form_with_a_dropdown_per_field(self):

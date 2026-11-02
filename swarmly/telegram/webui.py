@@ -1922,8 +1922,12 @@ function controlsFor(state, where, target) {
     // What the card's one form already carries is not drawn beside it (#451): a Model picker
     // next to a Model dropdown is the two-step the admin asked to be rid of.
     const form = (view.controls || []).find((row) => row.settings);
-    const carried = form ? (form.settings[target || ""] || []).map((field) => "bot." + field.key) : [];
-    if (form) (form.settings[target || ""] || []).forEach((f) => { if (f.key === "max_parallel_turns") carried.push("bot.parallel"); });
+    // A form field is not always "bot." + key: max_parallel_turns is carried by bot.parallel
+    // (#491), and the old push-after-the-map left a dead bot.max_parallel_turns entry.
+    const carriedFor = { model: "bot.model", effort: "bot.effort", max_parallel_turns: "bot.parallel" };
+    const carried = form
+      ? (form.settings[target || ""] || []).map((field) => carriedFor[field.key] || ("bot." + field.key))
+      : [];
 
     (view.controls || [])
       // Model, effort, CLI and memory are this bot's own: drawn on its card, never on a

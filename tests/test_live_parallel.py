@@ -22,7 +22,7 @@ from typing import Any, List
 from swarmly.telegram import config as config_mod
 from swarmly.telegram import control as ct
 from swarmly.telegram import control_press as cp
-from swarmly.telegram.channel import ChannelEvent
+from swarmly.telegram.channel import AgentChannel, ChannelEvent
 from tests.aio import run
 from tests.test_topics import Gate, settle
 from tests.test_telegram_channel import ADMIN_ID, GROUP, event, make_channel, make_config
@@ -63,12 +63,15 @@ class TestLiveParallel(unittest.TestCase):
 
     def channel(self, state_dir: str | None = None, parallel: int = 1,
                 adapter_type: str = "echo", cwd: str | None = None,
-                allow_shared_cwd: bool = False, **extra):
+                allow_shared_cwd: bool = False, conversation: str | None = None,
+                **extra):
         cfg_dict: dict[str, Any] = {
             "agent": {"alias": "Hermes", "name": "HermesBot", "admin_user_id": ADMIN_ID},
             "limits": {"max_parallel_turns": parallel, "allow_shared_cwd": allow_shared_cwd},
             "adapter": {"type": adapter_type, "cwd": cwd or self._repo.name},
         }
+        if conversation:
+            cfg_dict["adapter"]["conversation"] = conversation
         if state_dir:
             cfg_dict["state"] = {"dir": state_dir}
         cfg_dict.update(extra)
@@ -249,9 +252,7 @@ class TestLiveParallel(unittest.TestCase):
             self.assertEqual(gate.running, 2)
             self.assertFalse(t3.done())
 
-            # Release t1
-            # Note: gate.release releases both in this simple gate, so let's use separate gate events if needed,
-            # or release one by one.
+            # Release t1 and t2 together: the gate's one event frees both.
             gate.release.set()
             await asyncio.gather(t1, t2)
             await settle()
@@ -262,6 +263,117 @@ class TestLiveParallel(unittest.TestCase):
             # A notice was posted stating that max_parallel_turns is now 1
             sent_texts = [s["text"] for s in channel._test_sender.sent]
             self.assertTrue(any("max_parallel_turns is now 1" in t for t in sent_texts))
+
+        run(scenario())
+
+    def test_lowering_to_1_with_one_turn_running_holds_the_next(self):
+        """A cap of 1 set while one turn runs still lets only that turn run (#491 review B1).
+
+        Applying the lower value at once dropped `_turn_slots` while the running turn held
+        only its own per-topic lock, so the next topic started beside it: two turns at a cap
+        of 1.
+        """
+        channel, gate = self.channel(parallel=2)
+
+        async def scenario():
+            t1 = asyncio.ensure_future(
+                channel.handle_event(human("@HermesBot t1", thread_id=4, message_id=1)))
+            await settle()
+            self.assertEqual(gate.running, 1)
+
+            await channel.handle_event(human("/parallel@HermesBot 1", thread_id=4, message_id=3))
+            ans = channel._test_sender.sent[-1]["text"]
+            self.assertIn("from the next idle moment", ans)
+
+            t2 = asyncio.ensure_future(
+                channel.handle_event(human("@HermesBot t2", thread_id=5, message_id=2)))
+            await settle()
+            self.assertEqual(gate.running, 1, "a second turn ran at max_parallel_turns=1")
+            self.assertFalse(t2.done())
+
+            gate.release.set()
+            await asyncio.gather(t1, t2)
+            await settle()
+            self.assertEqual(channel.max_parallel_turns(), 1)
+
+        run(scenario())
+
+    def test_a_pinned_conversation_is_refused(self):
+        """Above 1 is refused while the adapter pins one conversation (#491 point 3)."""
+        channel, _ = self.channel(parallel=1, adapter_type="antigravity",
+                                 conversation="conv-42")
+
+        async def scenario():
+            await channel.handle_event(human("/parallel@HermesBot 2"))
+            ans = channel._test_sender.sent[-1]["text"]
+            self.assertIn("pins a single one", ans)
+            self.assertEqual(channel.max_parallel_turns(), 1)
+            self.assertIsNone(channel._parallel_override)
+
+        run(scenario())
+
+    def test_a_stale_pick_is_dropped_on_load(self):
+        """A stored pick the adapter can no longer carry falls back to config (#491 point 4)."""
+        with TemporaryDirectory() as state_tmp:
+            ch1, _ = self.channel(state_dir=state_tmp, parallel=1)
+
+            async def set_override():
+                await ch1.handle_event(human("/parallel@HermesBot 3"))
+                self.assertEqual(ch1.max_parallel_turns(), 3)
+
+            run(set_override())
+
+            # The config changes under the pick: codex_thread keeps one conversation, so 4 is
+            # not a value this bot may run any more.
+            ch2, _ = self.channel(state_dir=state_tmp, parallel=1, adapter_type="codex_thread")
+            self.assertEqual(ch2.max_parallel_turns(), 1)
+            self.assertIsNone(ch2._parallel_override)
+            self.assertIsNone(ch2._turn_slots)
+
+    def test_a_stored_pick_reaches_the_adapter_on_load(self):
+        """A restart hands the stored pick to the adapter too, not only to the limiter (B2).
+
+        The #78 pinned-conversation guard reads the adapter's own idea of the limit: an
+        adapter left at the config's number while the limiter ran the pick would accept a
+        runtime conversation pin with parallel turns above 1.
+        """
+        with TemporaryDirectory() as state_tmp:
+            ch1, _ = self.channel(state_dir=state_tmp, parallel=1)
+
+            async def set_override():
+                await ch1.handle_event(human("/parallel@HermesBot 3"))
+                self.assertEqual(ch1.max_parallel_turns(), 3)
+
+            run(set_override())
+
+            cfg = make_config(
+                agent={"alias": "Hermes", "name": "HermesBot", "admin_user_id": ADMIN_ID},
+                limits={"max_parallel_turns": 1},
+                adapter={"type": "antigravity", "cwd": self._repo.name},
+                state={"dir": state_tmp},
+            )
+            cfg.source_path = Path(state_tmp) / "config.yaml"
+            ch2 = AgentChannel(cfg)          # its own real adapter, built from the config
+            self.assertEqual(ch2.max_parallel_turns(), 3)
+            self.assertEqual(ch2.adapter.max_parallel_turns, 3)
+
+    def test_one_control_line_per_press(self):
+        """A press logs its own line, so the command must not log a second (#491 review S1)."""
+        channel, _ = self.channel(parallel=1)
+
+        async def scenario():
+            def controls():
+                return [s["text"] for s in channel._test_sender.sent
+                        if "CONTROL" in s["text"] and "bot.parallel" in s["text"]]
+            # The typed command owns its line ...
+            await channel.handle_event(human("/parallel@HermesBot 2"))
+            await settle()
+            self.assertEqual(len(controls()), 1, controls())
+            # ... and a press, which writes its own, does not get a second.
+            await channel._apply_pick("bot.parallel", "3")
+            await settle()
+            self.assertEqual(channel.max_parallel_turns(), 3)
+            self.assertEqual(len(controls()), 1, controls())
 
         run(scenario())
 
