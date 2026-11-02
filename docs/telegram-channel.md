@@ -1530,14 +1530,14 @@ Three things change when `public_host` is set, and only then.
   These two settings are **config-only**: they gate the server at the moment it is created,
   not a per-turn behaviour, and the runtime `/` settings (AGENTS.md §6) do not carry a web
   control. Change them in `config.yaml` and restart the bot that serves the page.
-- **The button.** A `web_app` button is the only kind that opens a Mini App, so it appears only
+- **The host's Mini App button.** A `web_app` button is the only kind that opens a Mini App, so it appears only
   when `public_host` is set *and* the section is enabled, first row, above the controls; its URL
   is `https://<public_host>/`. `web.port` is the loopback port the tunnel forwards *to*, never
   part of the public URL — a tunnel publishes on 443. An operator whose public port is not 443
   puts it in `public_host` itself (`swarm.example.ts.net:9443`), which is why that key takes a
   host and optional port.
 
-- **The button.** The card follows the current lease holder. Each enabled bot advertises its
+- **The lease dashboard link.** The card follows the current lease holder. Each enabled bot advertises its
   public host and Telegram bot username in its pulse; if the username is missing, the
   coordinator uses that bot's handle from the roster. The link is
   `https://t.me/<holder-bot>?startapp=dashboard`. Every bot that can hold the lease needs its
