@@ -4759,6 +4759,7 @@ class AgentChannel:
             bot_token=str(getattr(self.config.identity, "bot_token", "") or ""),
             admin_id=getattr(self.config.identity, "admin_user_id", 0),
             init_max_age=float(getattr(web, "init_max_age", 300.0) or 0.0),
+            read_max_age=float(getattr(web, "read_max_age", 86400.0) or 0.0),
             action=self.web_action, memory=self.web_memory)
         try:
             url = server.start()

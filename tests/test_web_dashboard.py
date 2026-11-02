@@ -648,7 +648,7 @@ class TestWhoMayRead(unittest.TestCase):
             self.assertEqual(self.get(url, host=host,
                                       headers={webui.INIT_HEADER:
                                                init_data(hash_override="0" * 64)})[0], 403)
-            stale = init_data(auth_date=time.time() - 3600)
+            stale = init_data(auth_date=time.time() - webui.READ_MAX_AGE - 60)
             self.assertEqual(self.get(url, host=host,
                                       headers={webui.INIT_HEADER: stale})[0], 403)
             self.assertEqual(self.get(url, host=host,
@@ -692,6 +692,102 @@ class TestWhoMayRead(unittest.TestCase):
         finally:
             server.stop()
         self.assertFalse(server.running)
+
+
+class TestTheTwoLoginWindows(unittest.TestCase):
+    """#445: Telegram stamps ``initData`` once, so reads and writes get different windows.
+
+    A page left open polls with the payload it was opened with. Reads must keep working for
+    ``read_max_age``; writes keep the short ``init_max_age`` window. Every case here goes
+    through the real HTTP server, not ``verify_init_data`` called directly.
+    """
+
+    TEN_MINUTES = 600.0
+
+    def server(self, **fields: Any) -> Any:
+        self.asked: list = []
+
+        def handler(payload: Any) -> Any:
+            self.asked.append(dict(payload))
+            return {"ok": True, "verdict": "run", "text": "Pause done."}
+
+        base: Dict[str, Any] = dict(provider=lambda: {"ok": True}, port=0,
+                                    public_host="swarm.example.ts.net",
+                                    bot_token=TOKEN, admin_id=ADMIN_ID, action=handler)
+        base.update(fields)
+        return webui.DashboardServer(**base)
+
+    def read_state(self, server: Any, raw: str) -> Any:
+        request = urllib.request.Request(server.start() + webui.STATE_PATH.lstrip("/"),
+                                         headers={"Host": server.public_host,
+                                                  webui.INIT_HEADER: raw})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
+    def write(self, server: Any, raw: str) -> Any:
+        request = urllib.request.Request(
+            server.start() + webui.ACTION_PATH.lstrip("/"),
+            data=json.dumps({"action": "bot.pause"}).encode("utf-8"),
+            headers={"Host": server.public_host, "Content-Type": "application/json",
+                     webui.INIT_HEADER: raw}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
+    def test_a_ten_minute_old_login_still_reads_the_state(self):
+        server = self.server()
+        try:
+            status, view = self.read_state(
+                server, init_data(auth_date=time.time() - self.TEN_MINUTES))
+            self.assertEqual(status, 200)
+            # The admin flag is part of the read: the controls stay drawn as the admin's.
+            self.assertIs(view["admin"], True)
+        finally:
+            server.stop()
+
+    def test_the_same_ten_minute_old_login_cannot_write(self):
+        server = self.server()
+        try:
+            status, answer = self.write(
+                server, init_data(auth_date=time.time() - self.TEN_MINUTES))
+            self.assertEqual(status, 403)
+            self.assertEqual(answer["refused"], "expired")
+            self.assertEqual(answer["text"], webui.EXPIRED_TEXT)
+            self.assertEqual(self.asked, [])                  # nothing ran
+        finally:
+            server.stop()
+
+    def test_a_read_older_than_the_read_window_is_refused_with_the_banner_text(self):
+        server = self.server()
+        try:
+            status, answer = self.read_state(
+                server, init_data(auth_date=time.time() - webui.READ_MAX_AGE - 60))
+            self.assertEqual(status, 403)
+            self.assertEqual(answer["refused"], "expired")
+            self.assertEqual(answer["text"], webui.EXPIRED_TEXT)
+        finally:
+            server.stop()
+
+    def test_the_page_carries_the_banner_and_shows_it_on_that_refusal(self):
+        """The real entry point: the served page, not a mock, draws the expired banner."""
+        server = self.server()
+        try:
+            url = server.start()
+            with urllib.request.urlopen(url, timeout=5) as response:
+                page = response.read().decode("utf-8")
+        finally:
+            server.stop()
+        self.assertIn('id="expired" role="alert" hidden', page)
+        self.assertIn(webui.EXPIRED_TEXT, page)
+        self.assertIn('answer.refused === "expired"', page)
+        self.assertIn("expiredBanner(answer.text)", page)
+        # And it stops the poll: no refresh can bring a new login.
+        self.assertIn("clearInterval(TIMER)", page)
 
 
 class TestThePinnedCardsButton(unittest.TestCase):
@@ -1034,7 +1130,10 @@ class TestTheWritePath(unittest.TestCase):
         server = self.server()
         try:
             url = server.start()
-            status, answer = self.post(url, init=init_data(admin=ADMIN_ID + 1))
+            # Fresh, so the refusal is the user id and not the age (#445 gave reads a longer
+            # window; a write's own window must not be what this test measures).
+            status, answer = self.post(url, init=init_data(admin=ADMIN_ID + 1,
+                                                           auth_date=time.time()))
             self.assertEqual(status, 403)
             self.assertEqual(answer["refused"], "auth")
             self.assertEqual(self.asked, [])

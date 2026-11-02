@@ -129,12 +129,15 @@ class TestWebDashboardConfig(unittest.TestCase):
 
     def test_the_mini_app_host_and_window_parse(self):
         web = make_config(web={"enabled": True, "public_host": "Swarm.Example.ts.net",
-                               "init_max_age": 120}).web
+                               "init_max_age": 120, "read_max_age": 7200}).web
         self.assertEqual(web.public_host, "swarm.example.ts.net")     # a host, normalised
         self.assertEqual(web.init_max_age, 120.0)
+        self.assertEqual(web.read_max_age, 7200.0)
         # Off by default: no public host, so the page stays local and asks for no initData.
         self.assertEqual(make_config(web={"enabled": True}).web.public_host, "")
         self.assertEqual(make_config(web={"enabled": True}).web.init_max_age, 300.0)
+        # #445: reads outlive writes by default, so a page left open keeps polling.
+        self.assertEqual(make_config(web={"enabled": True}).web.read_max_age, 86400.0)
 
     def test_a_url_where_a_host_belongs_is_refused_by_name(self):
         for wrong in ("https://swarm.example.ts.net", "http://x", "/dash"):
@@ -143,7 +146,8 @@ class TestWebDashboardConfig(unittest.TestCase):
             self.assertIn("web.public_host", str(caught.exception))
 
     def test_a_window_of_zero_is_refused_because_that_is_no_window(self):
-        for wrong in (0, -5):
-            with self.assertRaises(ConfigError) as caught:
-                make_config(web={"enabled": True, "init_max_age": wrong})
-            self.assertIn("web.init_max_age", str(caught.exception))
+        for key in ("init_max_age", "read_max_age"):
+            for wrong in (0, -5):
+                with self.assertRaises(ConfigError) as caught:
+                    make_config(web={"enabled": True, key: wrong})
+                self.assertIn("web.%s" % key, str(caught.exception))

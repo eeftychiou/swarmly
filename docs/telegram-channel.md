@@ -1487,7 +1487,8 @@ web:
   enabled: true
   port: 8787
   public_host: swarm.example.ts.net   # the name a tunnel gives you, no scheme, no path
-  init_max_age: 300                   # optional: how old initData may be, in seconds
+  init_max_age: 300                   # optional: how old initData may be for a write, in seconds
+  read_max_age: 86400                 # optional: how old initData may be for a read, in seconds
 ```
 
 Three things change when `public_host` is set, and only then.
@@ -1500,13 +1501,30 @@ Three things change when `public_host` is set, and only then.
 - **`initData`.** Telegram appends a signed payload to the Mini App's URL; the page passes it
   back on every poll (`X-Telegram-Init-Data`, or `?init=`), and the server checks it the way
   Telegram says to: `HMAC-SHA256` of the sorted `key=value` pairs under a secret that is
-  itself `HMAC-SHA256` of the bot token keyed by `WebAppData`. A payload older than
-  `init_max_age`, one dated in the future, one signed by another bot, or one whose `user.id` is
-  not this bot's `admin_user_id` is a `403`. A request from the loopback never needs one: the
-  operator sitting at the host keeps the plain local page, and the `Host` check still applies to
-  it. The page itself is served without it — it holds no state — and it loads no Telegram
-  script: the payload is read from the URL hash, so the page
+  itself `HMAC-SHA256` of the bot token keyed by `WebAppData`. A payload dated in the future,
+  one signed by another bot, or one whose `user.id` is not this bot's `admin_user_id` is a
+  `403`. A request from the
+  loopback never needs one: the operator sitting at the host keeps the plain local page, and
+  the `Host` check still applies to it. The page itself is served without it — it holds no
+  state — and it loads no Telegram script: the payload is read from the URL hash, so the page
   stays self-contained and works on a LAN.
+
+  **Two age windows (#445).** Telegram stamps `initData` **once**, when the Mini App opens,
+  and never refreshes it, so a single window made a page left open go dead:
+  - **Reads** — the JSON state the page polls (`/state.json`), `/memory.json`, and the
+    `admin` flag that enables the controls — are accepted for `read_max_age` seconds
+    (default `86400`, 24 h). The payload is still signature-checked and admin-only, so a long
+    read window is low risk.
+  - **Writes** — `POST /api/action` — keep the short `init_max_age` window (default `300` s).
+    A captured write payload is useless after five minutes.
+  Both must be more than zero seconds; there is no "0 means forever". When a read is refused
+  for age, `/state.json` answers `403` with `{"refused": "expired", "text": "Session expired:
+  close and reopen the dashboard"}`, and the page shows that as a banner and stops polling
+  instead of freezing silently. A write refused for age says the same, in the toast.
+
+  These two settings are **config-only**: they gate the server at the moment it is created,
+  not a per-turn behaviour, and the runtime `/` settings (AGENTS.md §6) do not carry a web
+  control. Change them in `config.yaml` and restart the bot that serves the page.
 - **The button.** A `web_app` button is the only kind that opens a Mini App, so it appears only
   when `public_host` is set *and* the section is enabled, first row, above the controls; its URL
   is `https://<public_host>/`. `web.port` is the loopback port the tunnel forwards *to*, never

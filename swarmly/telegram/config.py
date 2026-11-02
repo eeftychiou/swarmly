@@ -212,7 +212,7 @@ KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
     # issue #117: where the pinned dashboard lives -- it rides the heartbeat, so no interval
     "control": ("chat_id", "topic_id"),
     # issue #240: the local read-only web page, off unless the operator turns it on
-    "web": ("enabled", "port", "public_host", "init_max_age"),
+    "web": ("enabled", "port", "public_host", "init_max_age", "read_max_age"),
     "swarm": ("succession",),
     # topic registry, phase 1: the shared state store, off unless the operator says.
     # #472: `lease`, `owed`, `links` and `routing` are accepted-and-ignored, so they stay listed
@@ -1058,10 +1058,16 @@ class WebSettings:
     #: ``/state.json``, and the pinned card grows a button that opens the page. Empty keeps the
     #: local page exactly as slice 1 shipped it.
     public_host: str = ""
-    #: How old a Mini App ``initData`` may be and still be accepted, in seconds (must be
-    #: positive). Telegram signs it when the app opens; a replayed one is refused after this
-    #: window, which is why there is no "0 means forever".
+    #: How old a Mini App ``initData`` may be and still be accepted for a **write**, in
+    #: seconds (must be positive). Telegram signs it when the app opens; a replayed one is
+    #: refused after this window, which is why there is no "0 means forever".
     init_max_age: float = 300.0
+    #: How old ``initData`` may be for a **read** -- the JSON state the page polls, its
+    #: ``/memory`` and the admin flag (#445). Telegram stamps it once when the Mini App opens
+    #: and never refreshes it, so a page left open would otherwise go dead after
+    #: ``init_max_age``. A long read window is low risk: the payload is still signature-checked
+    #: and admin-only, and writes keep the short ``init_max_age`` window.
+    read_max_age: float = 86400.0
 
 
 @dataclass
@@ -1496,12 +1502,19 @@ class AgentConfig:
                 public_host=public_host,
                 init_max_age=_parse_float("web.init_max_age",
                                           web_raw.get("init_max_age", 300.0), 300.0),
+                read_max_age=_parse_float("web.read_max_age",
+                                          web_raw.get("read_max_age", 86400.0), 86400.0),
             )
             if web.init_max_age <= 0:
                 # A zero window would silently accept a replayed payload forever; a window is
                 # the point of asking for one (review, #258).
                 raise ConfigError("web.init_max_age must be more than 0 seconds "
                                   f"(got {web.init_max_age:g})")
+            if web.read_max_age <= 0:
+                # The same rule for the read window (#445): a zero read window is no window,
+                # and the state poll would be refused the moment the page opened.
+                raise ConfigError("web.read_max_age must be more than 0 seconds "
+                                  f"(got {web.read_max_age:g})")
             if web.port < 0 or web.port > 65535:
                 raise ConfigError(f"web.port must be 0-65535 (got {web.port})")
         elif web_raw is not None:
