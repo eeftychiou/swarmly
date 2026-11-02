@@ -24,7 +24,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **A bot running two turns shows both** (`#488`). With `limits.max_parallel_turns: 2` (`#486`)
+- **A turn that owed an answer says so instead of ending in silence** (`#497`). In the
+  `#486`/`#488` live test the admin addressed a task to the swarm in topic B; DeepSeek's turn
+  ran it and returned `NO_REPLY`, so nothing was posted, and a re-dispatch of the same task
+  ended the same way — the admin waited on a report that never came.
+  A turn on the admin's message, or on an assignment that names this agent, that ends in the
+  sentinel now posts one short notice (`<alias> finished the turn without a reply; the request
+  was not answered.`) as machine traffic, so a peer's transport drops it instead of starting a
+  turn back. Unaddressed peer traffic, acknowledgements and the transport's own briefs keep
+  their silence, which is what `NO_REPLY` is for. `docs/telegram-channel.md` documents it.
+ With `limits.max_parallel_turns: 2` (`#486`)
   the pulse snapshot described one turn — the first it found — so the dashboard, `/state` and
   the coordinator saw one of the two, and a second turn that hung never showed. The snapshot
   now carries `turns`, one row per running turn (topic token, elapsed, silence; no ids or

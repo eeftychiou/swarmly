@@ -10912,6 +10912,7 @@ class AgentChannel:
                 logger.info("turn for message %s chose to stay silent", event.message_id)
             self.stats.ignored += 1
             self._ask_for_report(event)
+            await self._silence_fallback(event)
             return None
 
         if await self.membership.on_reply(body, event):
@@ -11954,6 +11955,44 @@ class AgentChannel:
         logger.info("topic %s went quiet without a report back; asking for one", key)
         self._run_own_task(REPORT_NOTE, event.chat_id, event.thread_id,
                            self.topics.name(event.chat_id, event.thread_id))
+
+    def _owed_an_answer(self, event: ChannelEvent) -> bool:
+        """Whether this message must not end in silence (#497).
+
+        A person's message — the admin's above all — and an assignment that names this agent
+        asked for an answer, so ``NO_REPLY`` there is a lost reply, not a decision: the topic
+        goes quiet with nothing to read, and the sender cannot tell it from a dead transport
+        without asking (#497). Unaddressed peer traffic and acknowledgements keep their
+        silence: that is what the sentinel is for, and the drop paths above answer them.
+        """
+        if event.self_task:
+            return False                       # a brief this transport wrote itself
+        if not event.author_is_bot and self.config.is_admin(event.author_id):
+            return True
+        return self.mentions_me(self._routing_text(event.text or ""))
+
+    async def _silence_fallback(self, event: ChannelEvent) -> None:
+        """Say a turn ended without the line it owed, instead of leaving the topic silent.
+
+        The fallback is posted as a notice: it is machine traffic, so a peer's transport
+        drops it rather than starting a turn back, and the ephemeral sweep may retire it.
+        A send that fails is logged and swallowed — the turn is already over, and an
+        exception here would report the *fallback* as the failure.
+        """
+        if not self._owed_an_answer(event):
+            return
+        logger.info("turn for message %s owed an answer and stayed silent; saying so",
+                    event.message_id)
+        try:
+            await self.send(
+                f"{self.config.identity.alias} finished the turn without a reply; the "
+                "request was not answered.",
+                reply_to_message_id=event.message_id if event.author_is_bot else None,
+                chat_id=event.chat_id, thread_id=event.thread_id,
+                notice=True, silent=True, address_peers=False)
+        except Exception:                      # noqa: BLE001 - the turn is already over
+            logger.warning("could not post the silent-end fallback for message %s",
+                           event.message_id, exc_info=True)
 
     def _unaddress_self(self, body: str) -> str:
         """Drop a reply's leading address to this bot itself.
