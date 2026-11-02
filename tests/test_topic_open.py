@@ -9,7 +9,8 @@ import unittest
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
 from swarmly.telegram.topic_open import (MAX_TOPICS_PER_HOUR, parse_new_topic,
-                                         parse_report_back, topic_link, topic_name)
+                                         parse_post_to_topic, parse_report_back,
+                                         topic_link, topic_name)
 from tests.test_telegram_channel import ADMIN_ID, GROUP, event, make_channel, run
 
 
@@ -65,12 +66,35 @@ class TestParsing(unittest.TestCase):
         self.assertIsNone(parse_report_back("plain reply"))
         self.assertIsNone(parse_report_back("REPORT_BACK:   "))
 
+    def test_post_to_topic_directive(self):
+        self.assertEqual(parse_post_to_topic(
+            "POST_TO_TOPIC: 77\n@CodexBot please review #42"),
+            (77, "@CodexBot please review #42"))
+        self.assertIsNone(parse_post_to_topic("POST_TO_TOPIC: nope\nassignment"))
+
     def test_names_and_links(self):
         self.assertEqual(topic_link(-1001234567890, 7), "https://t.me/c/1234567890/7")
         self.assertEqual(len(topic_name("Hermes", "x" * 300)), 128)
 
 
 class TestOpenTopic(unittest.TestCase):
+
+    def test_handle_event_posts_assignment_into_a_known_topic(self):
+        channel = make_channel(adapter=Scripted("POST_TO_TOPIC: 77\n"
+                                                "@CodexBot please review #42"))
+        channel.is_coordinator = lambda: True
+        channel.topics.remember(GROUP, 77, "coordinated work")
+        sent = []
+        original_send = channel.send
+
+        async def capture(text, **kwargs):
+            sent.append((text, kwargs))
+            return await original_send(text, **kwargs)
+
+        channel.send = capture
+        run(channel.handle_event(ask("@HermesBot dispatch the next round")))
+        self.assertTrue(any("@CodexBot please review #42" in text and
+                            kwargs.get("thread_id") == 77 for text, kwargs in sent), sent)
 
     def test_opens_topic_runs_own_brief_and_reports_back(self):
         adapter = Scripted("NEW_TOPIC: research\nCompare the two APIs.",

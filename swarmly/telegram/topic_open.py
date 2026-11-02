@@ -19,6 +19,7 @@ from typing import Optional, Tuple
 
 NEW_TOPIC = "NEW_TOPIC:"
 REPORT_BACK = "REPORT_BACK:"
+POST_TO_TOPIC = "POST_TO_TOPIC:"
 #: Topics one agent may open per hour: a guard against a loop opening topics.
 MAX_TOPICS_PER_HOUR = 5
 #: Telegram's limit on a topic name.
@@ -46,6 +47,17 @@ def parse_report_back(body: str) -> Optional[str]:
         return None
     summary = (match.group(1) + body[match.end():]).strip()
     return summary or None
+
+
+def parse_post_to_topic(body: str) -> Optional[Tuple[int, str]]:
+    """Parse a transport-directed post to an existing forum topic."""
+    first, _, rest = _LEAD.sub("", body or "").lstrip().partition("\n")
+    if not first.upper().startswith(POST_TO_TOPIC):
+        return None
+    target = first[len(POST_TO_TOPIC):].strip()
+    if not target.isdecimal() or not rest.strip():
+        return None
+    return int(target), rest.strip()
 
 
 _URL = re.compile(r"\(?https?://\S+\)?")

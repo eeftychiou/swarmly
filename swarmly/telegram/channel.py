@@ -91,6 +91,7 @@ from swarmly.telegram.topic_open import (GENERAL_PEER_REPLY_CHARS, GENERAL_REPLY
                                          MAX_TOPICS_PER_HOUR, REPORT_NOTE, SELF_TASK_NOTE,
                                          TOPIC_ASKED_NOTE, asks_for_topic, defuse_mentions,
                                          hands_over, issue_refs, parse_new_topic,
+                                         parse_post_to_topic,
                                          parse_report_back, strip_report_marker, title_from,
                                          topic_link, topic_name)
 from swarmly.telegram.lessons import Lessons, describe as describe_memory
@@ -10922,6 +10923,9 @@ class AgentChannel:
         opened = parse_new_topic(body)
         if opened is not None:
             return await self._open_topic(event, *opened)
+        directed = parse_post_to_topic(body)
+        if directed is not None:
+            return await self._post_to_known_topic(event, *directed)
         limit = GENERAL_PEER_REPLY_CHARS if event.author_is_bot else GENERAL_REPLY_CHARS
         hands_off = bool(self._work_moves_to_topics(event) and [
             p for p in self.assigned_peers(body)
@@ -11223,6 +11227,24 @@ class AgentChannel:
         self._mirror_handoffs(body, chat_id, thread_id, self.last_first_message_id,
                               asker=self._asker(event))
         return await self.send(f"↪ moved this to {topic_link(chat_id, thread_id)}",
+                               chat_id=event.chat_id, thread_id=event.thread_id,
+                               reply_to_message_id=event.message_id, notice=True)
+
+    async def _post_to_known_topic(self, event: ChannelEvent, thread_id: int,
+                                   message: str) -> Any:
+        """Execute POST_TO_TOPIC for a known topic, linking any addressed peers there."""
+        home = int(self.config.identity.home_channel_id or 0)
+        if (not self.is_coordinator() or not self.topics.name(home, thread_id)
+                or (home, thread_id) in self._gone_topics):
+            return await self.send("⚠️ POST_TO_TOPIC refused: target is not a known coordinated "
+                                   "topic.", chat_id=event.chat_id,
+                                   thread_id=event.thread_id, notice=True)
+        await self.send(message, chat_id=home, thread_id=thread_id, token=True)
+        self._log_topic(home, thread_id, self.config.identity.alias, message,
+                        self.last_first_message_id)
+        self._mirror_handoffs(message, home, thread_id, self.last_first_message_id,
+                              asker=self._asker(event))
+        return await self.send(f"↪ posted in {topic_link(home, thread_id)}",
                                chat_id=event.chat_id, thread_id=event.thread_id,
                                reply_to_message_id=event.message_id, notice=True)
 
