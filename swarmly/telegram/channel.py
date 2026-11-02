@@ -528,10 +528,6 @@ class AgentChannel:
         # Issue #123: only the long-running transport may arm the fail-fast gate;
         # it calls `AgentChannel(config, transport=True)` from cli._run.
         self.adapter = adapter or build_adapter(config, transport=transport)
-        if hasattr(self.adapter, "use_parallel_limit"):
-            # Issue #78: the adapter refuses a runtime conversation pin while topics run in
-            # parallel -- a pinned conversation is one context for all of them.
-            self.adapter.use_parallel_limit(config.limits.max_parallel_turns)
         sessions = getattr(self.adapter, "SESSIONS_STATE", None)
         if adapter is None and sessions and hasattr(self.adapter, "use_state_file"):
             self.adapter.use_state_file(_state_file(config, sessions))
@@ -619,6 +615,10 @@ class AgentChannel:
         parallel = (self._parallel_override if self._parallel_override is not None
                     else int(getattr(config.limits, "max_parallel_turns", 1) or 1))
         self._parallel_turns = max(parallel, 1)
+        # Issue #78/#491: the adapters refuse a runtime conversation pin while topics run in
+        # parallel, so they must be told the number **in force** -- config.yaml's only when no
+        # runtime pick is stored, since the pick is what the limiter runs.
+        self._tell_adapters(self._parallel_turns)
         # #486: each topic's working copy, resolved once ((base, name) -> folder or None), so
         # the lock, the folder and the adapter all read the same answer. The lock makes that
         # "once" true under concurrency: the creation may run in a worker thread (the loop's
@@ -1019,7 +1019,7 @@ class AgentChannel:
         cfg = dataclasses.replace(self.config, adapter=cfg_adapter)
         adapter = build_adapter(cfg, transport=True)
         if hasattr(adapter, "use_parallel_limit"):
-            adapter.use_parallel_limit(self.config.limits.max_parallel_turns)
+            adapter.use_parallel_limit(self._parallel_turns)
         sessions = getattr(adapter, "SESSIONS_STATE", None)
         if sessions and hasattr(adapter, "use_state_file"):
             adapter.use_state_file(_state_file(self.config, sessions, suffix=suffix))
@@ -2212,12 +2212,23 @@ class AgentChannel:
             self._turn_slots = sem
         else:
             self._turn_slots = None
-        if hasattr(self.adapter, "use_parallel_limit"):
-            self.adapter.use_parallel_limit(n)
+        self._tell_adapters(n)
         self._idle_event.set()
         self._beat_soon("parallel turns changed")
         logger.info("turn limiter: max_parallel_turns=%d applied for %s immediately", n, alias)
         return " from now"
+
+    def _tell_adapters(self, n: int) -> None:
+        """Tell every adapter this channel holds the number of parallel turns in force (#491).
+
+        A topic's adapter is built once and cached (#486), so telling only ``self.adapter``
+        would leave a cached one believing config.yaml's value: an antigravity adapter that
+        still thought 1 would accept a pinned conversation while two topics ran, and the
+        pin would then interleave them (#78, the QA finding on #509).
+        """
+        for adapter in (self.adapter, *getattr(self, "_project_adapters", {}).values()):
+            if hasattr(adapter, "use_parallel_limit"):
+                adapter.use_parallel_limit(n)
 
     def _log_control_parallel(self, event: ChannelEvent, value: str) -> None:
         """Post a CONTROL line on the durable plane when /parallel is run by admin."""
@@ -10358,8 +10369,7 @@ class AgentChannel:
             self._pending_parallel_turns = None
             self._parallel_turns = new_n
             self._turn_slots = asyncio.Semaphore(new_n) if new_n > 1 else None
-            if hasattr(self.adapter, "use_parallel_limit"):
-                self.adapter.use_parallel_limit(new_n)
+            self._tell_adapters(new_n)
             self._idle_event.set()
             alias = self.config.identity.alias
             notice = f"▶ {alias}: max_parallel_turns is now {new_n}."

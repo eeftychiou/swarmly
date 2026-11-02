@@ -335,6 +335,43 @@ class TestLiveParallel(unittest.TestCase):
         self.assertEqual(len(data), 8)                # echo in a git checkout accepts 1..8
         self.assertEqual(channel.max_parallel_turns(), 1)     # offering is not setting
 
+    def test_a_pick_reaches_the_adapters_not_config_yaml(self):
+        """QA on #509: pick 2 with `config.yaml` at 1 must reach the adapters.
+
+        Both the boot path and ``_topic_adapter`` read ``config.limits``, so a stored pick
+        never reached an adapter: an antigravity adapter still believed 1 and accepted a
+        pinned conversation while two topics ran.
+        """
+        def antigravity(state_dir=None):
+            cfg = make_config(limits={"max_parallel_turns": 1},
+                              adapter={"type": "antigravity", "cwd": self._repo.name})
+            if state_dir:
+                cfg.source_path = Path(state_dir) / "config.yaml"
+            # The channel must build *this* config's adapter: make_channel's default is an
+            # EchoAdapter, which has no parallel limit to be told.
+            from swarmly.telegram.adapters import build_adapter
+            return make_channel(cfg, adapter=build_adapter(cfg, transport=True))
+
+        with TemporaryDirectory() as state_tmp:
+            first = antigravity(state_tmp)
+
+            async def pick_two():
+                await first.handle_event(human("/parallel@HermesBot 2"))
+            run(pick_two())
+            self.assertEqual(first.max_parallel_turns(), 2)
+            self.assertEqual(first.adapter.max_parallel_turns, 2)     # told at once
+
+            second = antigravity(state_tmp)                            # a restart
+            self.assertEqual(second.max_parallel_turns(), 2)           # the pick, not the config
+            self.assertEqual(second.adapter.max_parallel_turns, 2)      # told at boot
+
+            topic_adapter = second._topic_adapter(Path(self._repo.name), "topic-4")
+            self.assertEqual(topic_adapter.max_parallel_turns, 2)       # and each topic's own
+            ok, said = topic_adapter.set_active_conversation(
+                "0190f000-0000-7000-8000-000000000001")
+            self.assertFalse(ok, said)
+            self.assertIn("parallel turns", said)
+
     def test_dashboard_settings_press_and_choices(self):
         """Settings form carries max_parallel_turns and one Apply sets it with CONTROL line."""
         channel, _ = self.channel(parallel=1)
