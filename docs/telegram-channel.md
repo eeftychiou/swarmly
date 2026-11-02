@@ -614,9 +614,11 @@ recipient keeps.
 the owner and asks the round's question in the same breath, naming an agent in it
 ("`@<owner>: round 2 starts here. Which token were you given, @a?`"), with one line per agent
 below. The words a line carries *before* its first bot handle are every recipient's, so each
-named bot reads them; only the asks below them are the other bots'. Before this, such a line
-was cut down to whichever segment named this bot, and two agents in the `#486`/`#488` live test
-answered that no round-2 question had been posted at all.
+named bot reads them; only the asks below them are the other bots'. A post that opens by
+addressing its **own author** (`@<its own handle>: round 2 starts here…`) is a header, so its
+words are shared too, even when the author is a bot and the header reads as a request. Before
+this, such a line was cut down to whichever segment named this bot, and two agents in the
+`#486`/`#488` live test answered that no round-2 question had been posted at all.
 
 **An addressed message is never answered with silence (#497).** `NO_REPLY` is a decision for
 unaddressed peer traffic and acknowledgements only. When a turn on the admin's message, or on an

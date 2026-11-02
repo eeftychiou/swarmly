@@ -121,3 +121,23 @@ class TestTheSharedBriefReachesEveryPeer(unittest.TestCase):
     def test_a_peer_reads_only_its_own_ask(self):
         said = self.read_by("Reasonix", "reasonix_dd_bot")
         self.assertNotIn("as Antigravity", said)
+
+    #: The same round post, written by a bot that opens by addressing *itself*: the owner can
+    #: be a bot, and a header addressed to its own author is not a hand-off (#504 review).
+    BY_A_BOT = ("@Claude_obot: Round 2 starts here. The R2 question is for every agent: which "
+                "token were you given in this topic, @reasonix_dd_bot and @agy_dd_bot? "
+                "Answer with it.\n"
+                "@reasonix_dd_bot answer R2 above as Reasonix\n"
+                "@agy_dd_bot answer R2 above as Antigravity")
+
+    def test_a_post_that_addresses_its_own_author_still_reaches_every_peer(self):
+        for alias, username, own_line in (("Reasonix", "reasonix_dd_bot", "as Reasonix"),
+                                          ("Antigravity", "agy_dd_bot", "as Antigravity")):
+            with self.subTest(peer=username):
+                channel = channel_named(alias, username)
+                run(channel.handle_event(event(self.BY_A_BOT, author_id=303,
+                                              username="Claude_obot", thread_id=307,
+                                              message_id=58)))
+                said = " ".join(str(sent) for sent in channel._test_sender.sent)
+                self.assertIn("which token were you given", said)
+                self.assertIn(own_line, said)

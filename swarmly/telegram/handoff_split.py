@@ -178,8 +178,9 @@ def handoff_lines(text: str) -> str:
     return "\n".join(block for _handle, block in handoff_blocks(text)).strip()
 
 
-def _shared_prefix(line: str, known: Sequence[str]) -> str:
-    """The words a line holds *above* its first bot handle: every recipient's context (#496).
+def _shared_prefix(line: str, known: Sequence[str],
+                   sender: Sequence[str] = ()) -> str:
+    """The words a line holds *above* its asks: every recipient's context (#496).
 
     A coordinator's round post opens by addressing the owner and carries the round's question
     in the same breath ("@<owner>: round 2 starts here. Which token did you get?"), with one
@@ -187,17 +188,25 @@ def _shared_prefix(line: str, known: Sequence[str]) -> str:
     outside two agents' briefs, and both answered that nothing had been posted. So the text
     before the line's first bot handle is kept -- unless it is itself another bot's ask
     ("@A: review it. @B: QA it."), which is that bot's brief and nothing else's.
+
+    A post that opens by addressing its own author is a header, not a hand-off: the round's
+    coordinator writes "@<its own handle>: round 2 starts here…", and the question after it is
+    every agent's. So the author's own handles are not asks, and the header's own segment is
+    part of the shared words rather than a segment to cut (#496 review).
     """
-    segments = _segments(line, known)
+    others = set(_known(sender))
+    segments = [spot for spot in _segments(line, known) if spot[1] not in others]
     if not segments:
-        return ""
+        return ""                       # the line only addresses its author: a header
     prefix = line[:segments[0][0]]
     if not re.search(r"[^\s\-*•.)\d]", prefix):
         return ""                       # a bullet, a label or a number: not words
-    return "" if requests(prefix, known) else prefix
+    asked = {name for name in requests(prefix, known) if name not in others}
+    return "" if asked else prefix
 
 
-def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
+def own_brief(text: str, me: str, handles: Iterable[str],
+              sender: Iterable[str] = ()) -> str:
     """*text* as one bot reads it: the shared lines, plus the lines that name it.
 
     Lines that ask something of another bot are dropped -- they are that bot's brief, and the
@@ -209,6 +218,7 @@ def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
     """
     mine = _norm(me)
     known = _known(handles)
+    sender = _known(sender)
     body = str(text or "")
     if not mine or not known or not is_multi_recipient(body, known):
         return body
@@ -219,7 +229,9 @@ def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
         if not names:
             kept.append(line)               # shared context: it asks nobody
             continue
-        asked = [_norm(name) for name in requests(line, known)]
+        # An ask the author's own handle carries is a header ("@<its own handle>: round 2
+        # starts here…"), not work for anyone reading the split (#496 review).
+        asked = [_norm(name) for name in requests(line, known) if _norm(name) not in sender]
         if mine in asked:
             # A line that opens with a run of handles shares one sentence between them
             # ("@A @B: review #195 and QA it today"), so there is nothing to cut: the whole
@@ -236,7 +248,7 @@ def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
             # asks on one line therefore give each bot its own, which is the shape Claudebot
             # posts most (#181 review).
             segments = _segments(line, known)
-            prefix = _shared_prefix(line, known)
+            prefix = _shared_prefix(line, known, sender)
             for index, (offset, name, _tail) in enumerate(segments):
                 if name != mine:
                     continue
@@ -249,7 +261,7 @@ def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
         if asked:
             # Another bot's ask: theirs, not mine. The words above it still are mine when they
             # are the shared brief (#496): only the ask itself is dropped.
-            prefix = _shared_prefix(line, known)
+            prefix = _shared_prefix(line, known, sender)
             if prefix.strip():
                 kept.append(prefix.strip())
             continue

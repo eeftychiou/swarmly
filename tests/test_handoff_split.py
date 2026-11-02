@@ -188,3 +188,38 @@ class TestTheSharedBriefAboveTheAsks(unittest.TestCase):
                 "@agy_dd_bot: QA #195 at cc57d8a.")
         own = hs.own_brief(text, "reasonix_dd_bot", BOTS)
         self.assertNotIn("QA #195", own)
+
+    #: The coordinator addresses *itself* as the author of the round ("@<its own handle>:").
+    BY_A_BOT = ("@Claude_obot: Round 2 starts here. The R2 question is for every agent: which "
+                "token were you given in this topic, @reasonix_dd_bot and @agy_dd_bot? "
+                "Answer with it.\n"
+                "@reasonix_dd_bot answer R2 above as Reasonix\n"
+                "@agy_dd_bot answer R2 above as Antigravity")
+
+    def test_a_header_addressed_to_the_sender_is_not_another_bots_ask(self):
+        """#504 review: the owner can be a bot, and the post still opens by addressing it.
+
+        A prefix that asks the message's own author is a header, so the round's question
+        reaches every agent; only a prefix that asks a *peer* is that peer's brief. The author
+        is named by both its spellings, as the transport passes them (alias and @username).
+        """
+        own = hs.own_brief(self.BY_A_BOT, "reasonix_dd_bot", BOTS,
+                           sender=["Claude_obot", "Claude"])
+        self.assertIn("which token were you given", own)
+        self.assertIn("as Reasonix", own)
+
+    def test_a_prefix_that_asks_a_peer_is_still_that_peers_brief(self):
+        """The sender rule does not blunt #181: a peer's ask above mine is still cut."""
+        text = ("@Claude_obot: the round is open.\n"
+                "@reasonix_dd_bot: review #195.\n"
+                "@agy_dd_bot: QA #195 at cc57d8a.")
+        own = hs.own_brief(text, "agy_dd_bot", BOTS, sender=["Claude_obot"])
+        self.assertIn("QA #195", own)
+        self.assertNotIn("review #195", own)
+        self.assertIn("the round is open", own)
+
+    def test_a_peer_still_cuts_the_line_it_asks_on(self):
+        text = "@reasonix_dd_bot: review it. @agy_dd_bot: QA it."
+        own = hs.own_brief(text, "agy_dd_bot", BOTS, sender=["Claude_obot"])
+        self.assertIn("QA it", own)
+        self.assertNotIn("review it", own)

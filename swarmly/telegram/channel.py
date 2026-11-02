@@ -1153,12 +1153,28 @@ class AgentChannel:
                 return name
         return names[0] if names else ""
 
-    def _own_brief(self, text: str) -> str:
+    def _sender_handles(self, event: ChannelEvent) -> List[str]:
+        """The handles that name the bot which wrote *event*, however it spelled itself.
+
+        A post that opens by addressing its own author ("@<its own handle>: round 2 starts
+        here…") is a header, not a hand-off: the round's question after it is every agent's
+        (#496 review).
+        """
+        found: List[str] = []
+        for name in (event.author_username,
+                     self.config.peer_alias_for(event.author_username, event.author_id)):
+            name = str(name or "").strip().lstrip("@")
+            if name and name.lower() not in {f.lower() for f in found}:
+                found.append(name)
+        return found
+
+    def _own_brief(self, text: str, event: Optional[ChannelEvent] = None) -> str:
         """One multi-recipient message, as *this* bot reads it: its own line plus the context."""
         from swarmly.telegram.handoff_split import own_brief
         if not text:
             return text
-        return own_brief(text, self._own_handle(text), self._handoff_handles())
+        return own_brief(text, self._own_handle(text), self._handoff_handles(),
+                         sender=self._sender_handles(event) if event is not None else ())
 
     def _routing_text(self, text: Optional[str]) -> str:
         """*text* as routing reads it: without the trailer of handles a transport appended (#28).
@@ -9493,7 +9509,7 @@ class AgentChannel:
         # #181: a peer message that asks several bots at once is one hand-off per bot. This
         # bot reads its own line plus the shared context, so it does its share and no more.
         if event.author_is_bot and event.text:
-            own = self._own_brief(event.text)
+            own = self._own_brief(event.text, event)
             if own != event.text:
                 logger.info("multi-recipient hand-off: reading %d of %d chars as this bot's "
                             "share", len(own), len(event.text))
