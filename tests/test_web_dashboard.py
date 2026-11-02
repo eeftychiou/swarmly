@@ -518,14 +518,39 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
     def test_a_non_holder_serves_a_loopback_pointer_page(self):
         channel = self.channel()
         channel.is_coordinator = lambda now=None: False
+        channel.current_coordinator = lambda now=None: "Reasonix"
+        from swarmly.telegram.presence import Pulse
+        channel.presence().note(Pulse(alias="Reasonix", at=NOW,
+            status={"at": NOW, "web": {"public_host": "new.example.ts.net",
+                                       "bot_username": "ReasonixBot"}}), seen_at=NOW)
         said = channel._sync_web_dashboard()
         try:
             self.assertIn("serving lease pointer", said)
             with urllib.request.urlopen(channel._web_server.url) as response:
                 self.assertEqual(response.status, 200)
-                self.assertIn(b"current lease holder", response.read())
+                body = response.read()
+                self.assertIn(b"current lease holder", body)
+                self.assertIn(b'href="https://t.me/ReasonixBot?startapp=dashboard"', body)
         finally:
             channel._web_server.stop()
+
+    def test_pointer_bind_failure_is_throttled(self):
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: False
+        tries: list = []
+
+        def refuse(self: Any) -> str:
+            tries.append(1)
+            raise OSError("port busy")
+
+        original = webui.DashboardServer.start
+        webui.DashboardServer.start = refuse
+        try:
+            self.assertTrue(channel._sync_web_dashboard().startswith("failed"))
+            self.assertIn("waiting to retry", channel._sync_web_dashboard())
+            self.assertEqual(len(tries), 1)
+        finally:
+            webui.DashboardServer.start = original
 
     def test_the_lease_holder_serves_the_page_and_losing_the_lease_closes_it(self):
         channel = self.channel()
@@ -811,6 +836,12 @@ class TestThePinnedCardsButton(unittest.TestCase):
             for button in row:
                 self.assertNotIn("web_app", button)
 
+    def test_enabled_bot_advertises_its_username_with_its_public_host(self):
+        channel = self.channel(public_host="swarm.example.ts.net")
+        web = channel.own_pulse(NOW).status["web"]
+        self.assertEqual(web, {"public_host": "swarm.example.ts.net",
+                               "bot_username": "HermesBot"})
+
     def test_a_disabled_section_draws_no_button_even_with_a_public_host(self):
         """A button that opens nothing is worse than no button (review, #258)."""
         from tests.test_telegram_channel import make_channel, make_config
@@ -822,18 +853,20 @@ class TestThePinnedCardsButton(unittest.TestCase):
 
     def test_a_non_443_public_port_goes_in_the_host(self):
         channel = self.channel(public_host="swarm.example.ts.net:9443")
-        self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net:9443/")
+        self.assertEqual(channel.mini_app_url(),
+                         "https://t.me/HermesBot?startapp=dashboard")
 
     def test_a_public_host_puts_the_button_first(self):
         channel = self.channel(public_host="swarm.example.ts.net")
         # The public name is served on 443 by the tunnel: web.port is the loopback *bind* port
         # and must not appear, or the button opens a dead address (review, #258).
-        self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net/")
+        self.assertEqual(channel.mini_app_url(),
+                         "https://t.me/HermesBot?startapp=dashboard")
         first = channel.control_markup()[0][0]
         self.assertEqual(first["text"], "Open dashboard")
         # The pinned card follows the holder's public address.
         self.assertNotIn("web_app", first)
-        self.assertEqual(first["url"], "https://swarm.example.ts.net/")
+        self.assertEqual(first["url"], "https://t.me/HermesBot?startapp=dashboard")
         # The controls are still there, below it.
         self.assertTrue(any("callback_data" in button
                             for row in channel.control_markup() for button in row))
@@ -856,9 +889,11 @@ class TestThePinnedCardsButton(unittest.TestCase):
         channel = self.channel(public_host="old.example.ts.net")
         channel.current_coordinator = lambda now=None: "Reasonix"
         channel.presence().note(Pulse(alias="Reasonix", at=NOW,
-            status={"at": NOW, "web": {"public_host": "new.example.ts.net"}}), seen_at=NOW)
-        self.assertEqual(channel.mini_app_link(), "https://new.example.ts.net/")
-        self.assertEqual(channel.control_markup()[0][0]["url"], "https://new.example.ts.net/")
+            status={"at": NOW, "web": {"public_host": "new.example.ts.net",
+                                       "bot_username": "ReasonixBot"}}), seen_at=NOW)
+        expected = "https://t.me/ReasonixBot?startapp=dashboard"
+        self.assertEqual(channel.mini_app_link(), expected)
+        self.assertEqual(channel.control_markup()[0][0]["url"], expected)
 
     def test_a_taken_port_is_retried_on_an_interval_not_every_beat(self):
         """A bind that fails is one warning and a quiet minute, not one per heartbeat."""

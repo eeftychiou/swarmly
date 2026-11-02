@@ -3919,7 +3919,10 @@ class AgentChannel:
         status = self.status_snapshot(now).to_dict()
         web = self.web_settings()
         if web is not None and getattr(web, "enabled", False):
-            status["web"] = {"public_host": str(getattr(web, "public_host", "") or "")}
+            status["web"] = {
+                "public_host": str(getattr(web, "public_host", "") or ""),
+                "bot_username": str(self.config.identity.username or "").lstrip("@"),
+            }
         usage = self._pulse_usage(now)
         if usage:
             status["usage"] = usage
@@ -4522,10 +4525,10 @@ class AgentChannel:
         if web is None or not getattr(web, "enabled", False):
             return ""
         holder = str(self.current_coordinator() or self.config.identity.alias)
-        host = self._holder_public_host(holder)
-        if not host:
+        if not self._holder_public_host(holder):
             return ""
-        return f"https://{host}/"
+        username = self._holder_bot_username(holder)
+        return f"https://t.me/{username}?startapp=dashboard" if username else ""
 
     def mini_app_link(self) -> str:
         """The current lease holder's public dashboard address, or empty when local-only."""
@@ -4546,6 +4549,21 @@ class AgentChannel:
             return str((data or {}).get("public_host") or "").strip() if isinstance(data, dict) else ""
         except Exception:                         # noqa: BLE001 - no public link is safe
             logger.debug("web dashboard: holder's public host is not readable", exc_info=True)
+            return ""
+
+    def _holder_bot_username(self, holder: str) -> str:
+        """Telegram username advertised by the lease holder for its Mini App."""
+        alias = str(holder or "").strip()
+        if alias.lower() == str(self.config.identity.alias or "").strip().lower():
+            return str(self.config.identity.username or "").lstrip("@").strip()
+        try:
+            peer = next((peer for name, peer in self.presence().peers.items()
+                         if str(name).strip().lower() == alias.lower()), None)
+            data = (peer.snapshot or {}).get("web") if peer else None
+            return (str((data or {}).get("bot_username") or "").lstrip("@").strip()
+                    if isinstance(data, dict) else "")
+        except Exception:                         # noqa: BLE001 - no public link is safe
+            logger.debug("web dashboard: holder's bot username is not readable", exc_info=True)
             return ""
 
     def web_settings(self) -> Any:
@@ -4771,13 +4789,21 @@ class AgentChannel:
                 self._web_server = None
             if server is not None and server.running:
                 return "serving lease pointer " + server.url
+            now_wall = time.time()
+            failed_at = float(getattr(self, "_web_failed_at", 0.0) or 0.0)
+            if failed_at and now_wall - failed_at < self.WEB_RETRY_SECONDS:
+                return "failed: waiting to retry the port"
             server = webui.DashboardServer(
                 lambda: {}, port=int(getattr(web, "port", 8787) or 0),
                 pointer=lambda: self.mini_app_url())
             try:
                 url = server.start()
             except OSError as exc:
+                self._web_failed_at = now_wall
+                logger.warning("web dashboard pointer: cannot serve on port %s (%s); retrying in %ds",
+                               getattr(web, "port", 8787), exc, self.WEB_RETRY_SECONDS)
                 return f"failed: {exc}"
+            self._web_failed_at = 0.0
             self._web_server = server
             return "serving lease pointer " + url
         if server is not None and getattr(server, "pointer", None):

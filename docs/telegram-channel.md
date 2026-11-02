@@ -1514,7 +1514,6 @@ Three things change when `public_host` is set, and only then.
   the `Host` check still applies to it. The page itself is served without it — it holds no
   state — and it loads no Telegram script: the payload is read from the URL hash, so the page
   stays self-contained and works on a LAN.
-
   **Two age windows (#445).** Telegram stamps `initData` **once**, when the Mini App opens,
   and never refreshes it, so a single window made a page left open go dead:
   - **Reads** — the JSON state the page polls (`/state.json`), `/memory.json`, and the
@@ -1537,6 +1536,20 @@ Three things change when `public_host` is set, and only then.
   part of the public URL — a tunnel publishes on 443. An operator whose public port is not 443
   puts it in `public_host` itself (`swarm.example.ts.net:9443`), which is why that key takes a
   host and optional port.
+
+- **The button.** The card follows the current lease holder. Each enabled bot advertises its
+  public host and Telegram bot username in its pulse; the coordinator uses the holder's latest
+  values and links to `https://t.me/<holder-bot>?startapp=dashboard`. Telegram launches the
+  configured Mini App with its signed login intact. A holder with no public host gets a
+  `Dashboard: local only on <bot>` note and no dead link. `web.port` is the loopback port the
+  tunnel forwards to; it is not part of the Telegram link.
+
+Every bot with `web.enabled` also serves a small lease pointer on its loopback port when it is
+not the holder. Configure a distinct `web.port` per bot on a host, and point each tunnel at that
+bot's own loopback port. The pointer follows the lease and links to the holder's Telegram Mini
+App; it serves no swarm data. A bind failure is retried after the same quiet interval as the
+dashboard server. This keeps the BotFather menu URL useful across a handover while the menu
+still names one fixed host.
 
 Exposing the port is the admin's job, not the transport's: the tunnel terminates TLS and
 forwards to `127.0.0.1:8787`, so the bind stays local and nothing on the LAN can reach it
