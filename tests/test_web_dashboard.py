@@ -515,11 +515,17 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
             self.assertEqual(channel._sync_web_dashboard(), "off")
             self.assertIsNone(getattr(channel, "_web_server", None))
 
-    def test_a_bot_that_does_not_hold_the_lease_serves_nothing(self):
+    def test_a_non_holder_serves_a_loopback_pointer_page(self):
         channel = self.channel()
         channel.is_coordinator = lambda now=None: False
-        self.assertIn("not the lease holder", channel._sync_web_dashboard())
-        self.assertIsNone(getattr(channel, "_web_server", None))
+        said = channel._sync_web_dashboard()
+        try:
+            self.assertIn("serving lease pointer", said)
+            with urllib.request.urlopen(channel._web_server.url) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(b"current lease holder", response.read())
+        finally:
+            channel._web_server.stop()
 
     def test_the_lease_holder_serves_the_page_and_losing_the_lease_closes_it(self):
         channel = self.channel()
@@ -531,8 +537,9 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
             self.assertTrue(channel._sync_web_dashboard().startswith("serving"))
         finally:
             channel.is_coordinator = lambda now=None: False
-            self.assertIn("stopped", channel._sync_web_dashboard())
-        self.assertIsNone(channel._web_server)
+            self.assertIn("serving lease pointer", channel._sync_web_dashboard())
+            channel._web_server.stop()
+        self.assertFalse(channel._web_server.running)
 
     def test_the_page_reads_this_bots_own_records_and_no_identifier(self):
         channel = self.channel()
@@ -824,11 +831,9 @@ class TestThePinnedCardsButton(unittest.TestCase):
         self.assertEqual(channel.mini_app_url(), "https://swarm.example.ts.net/")
         first = channel.control_markup()[0][0]
         self.assertEqual(first["text"], "Open dashboard")
-        # A link to the bot's Mini App, not a web_app button: Telegram refuses those in a
-        # group, and the whole card then failed to refresh (live, 26 Oct).
+        # The pinned card follows the holder's public address.
         self.assertNotIn("web_app", first)
-        handle = channel.config.identity.name.lstrip("@")
-        self.assertEqual(first["url"], f"https://t.me/{handle}?startapp=dashboard")
+        self.assertEqual(first["url"], "https://swarm.example.ts.net/")
         # The controls are still there, below it.
         self.assertTrue(any("callback_data" in button
                             for row in channel.control_markup() for button in row))
@@ -845,6 +850,15 @@ class TestThePinnedCardsButton(unittest.TestCase):
             self.assertIn("127.0.0.1", server.hosts)
         finally:
             channel._sync_web_dashboard()
+
+    def test_the_button_uses_the_new_holders_host_from_its_pulse(self):
+        from swarmly.telegram.presence import Pulse
+        channel = self.channel(public_host="old.example.ts.net")
+        channel.current_coordinator = lambda now=None: "Reasonix"
+        channel.presence().note(Pulse(alias="Reasonix", at=NOW,
+            status={"at": NOW, "web": {"public_host": "new.example.ts.net"}}), seen_at=NOW)
+        self.assertEqual(channel.mini_app_link(), "https://new.example.ts.net/")
+        self.assertEqual(channel.control_markup()[0][0]["url"], "https://new.example.ts.net/")
 
     def test_a_taken_port_is_retried_on_an_interval_not_every_beat(self):
         """A bind that fails is one warning and a quiet minute, not one per heartbeat."""
