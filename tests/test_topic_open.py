@@ -8,9 +8,9 @@ import unittest
 
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
-from swarmly.telegram.topic_open import (MAX_TOPICS_PER_HOUR, parse_new_topic,
-                                         parse_post_to_topic, parse_report_back,
-                                         topic_link, topic_name)
+from swarmly.telegram.topic_open import (MAX_POSTS_PER_HOUR, MAX_TOPICS_PER_HOUR,
+                                         parse_new_topic, parse_post_to_topic,
+                                         parse_report_back, topic_link, topic_name)
 from tests.test_telegram_channel import ADMIN_ID, GROUP, event, make_channel, run
 
 
@@ -133,6 +133,19 @@ class TestOpenTopic(unittest.TestCase):
         channel.send = capture
         run(channel.handle_event(ask("@HermesBot dispatch the next round")))
         self.assertEqual(order, ["link", "post"])
+
+    def test_the_hourly_cap_refuses_the_extra_assignment(self):
+        """QA at d6264ba: `MAX_POSTS_PER_HOUR` had no test (#506)."""
+        directive = "POST_TO_TOPIC: 77\n@CodexBot please review #42"
+        channel = self.coordinator_channel(*([directive] * (MAX_POSTS_PER_HOUR + 1)))
+        for i in range(MAX_POSTS_PER_HOUR + 1):
+            run(channel.handle_event(ask(f"@HermesBot dispatch round {i}",
+                                         message_id=200 + i)))
+        posted = [text for text, kw in channel.sent if kw.get("thread_id") == 77]
+        self.assertEqual(len(posted), MAX_POSTS_PER_HOUR, posted)
+        self.assertTrue(any(f"{MAX_POSTS_PER_HOUR} assignments" in text and
+                            "POST_TO_TOPIC refused" in text
+                            for text, _ in channel.sent), channel.sent)
 
     def test_an_agent_that_is_not_the_coordinator_cannot_post_into_a_topic(self):
         channel = self.coordinator_channel("POST_TO_TOPIC: 77\n@CodexBot please review #42")
