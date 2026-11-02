@@ -359,6 +359,38 @@ class TestLiveParallel(unittest.TestCase):
             self.assertEqual(ch2.max_parallel_turns(), 3)
             self.assertEqual(ch2.adapter.max_parallel_turns, 3)
 
+    def test_a_stored_pick_reaches_a_topics_own_adapter(self):
+        """pick 2 with `config.yaml` at 1 must reach the adapter a topic's turn runs in (B2).
+
+        `_topic_adapter` builds one adapter per working copy, and it used config.yaml's
+        number: that adapter would accept a pinned conversation while two topics run, which
+        is the #78 guard turned off by a runtime pick (QA on #509).
+        """
+        with TemporaryDirectory() as state_tmp:
+            ch1, _ = self.channel(state_dir=state_tmp, parallel=1)
+
+            async def set_override():
+                await ch1.handle_event(human("/parallel@HermesBot 2"))
+                self.assertEqual(ch1.max_parallel_turns(), 2)
+
+            run(set_override())
+
+            cfg = make_config(
+                agent={"alias": "Hermes", "name": "HermesBot", "admin_user_id": ADMIN_ID},
+                limits={"max_parallel_turns": 1},
+                adapter={"type": "antigravity", "cwd": self._repo.name},
+                state={"dir": state_tmp},
+            )
+            cfg.source_path = Path(state_tmp) / "config.yaml"
+            ch2 = AgentChannel(cfg)
+            self.assertEqual(ch2.max_parallel_turns(), 2)
+            topic_adapter = ch2._topic_adapter(Path(self._repo.name), "topic-4")
+            self.assertEqual(topic_adapter.max_parallel_turns, 2)
+            ok, said = topic_adapter.set_active_conversation(
+                "0190f000-0000-7000-8000-000000000001")
+            self.assertFalse(ok, said)
+            self.assertIn("parallel turns", said)
+
     def test_one_control_line_per_press(self):
         """A press logs its own line, so the command must not log a second (#491 review S1)."""
         channel, _ = self.channel(parallel=1)
