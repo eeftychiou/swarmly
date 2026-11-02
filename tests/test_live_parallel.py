@@ -249,9 +249,7 @@ class TestLiveParallel(unittest.TestCase):
             self.assertEqual(gate.running, 2)
             self.assertFalse(t3.done())
 
-            # Release t1
-            # Note: gate.release releases both in this simple gate, so let's use separate gate events if needed,
-            # or release one by one.
+            # Release both turns: the idle moment is when the lowered limit is applied.
             gate.release.set()
             await asyncio.gather(t1, t2)
             await settle()
@@ -264,6 +262,38 @@ class TestLiveParallel(unittest.TestCase):
             self.assertTrue(any("max_parallel_turns is now 1" in t for t in sent_texts))
 
         run(scenario())
+
+    def test_one_press_one_control_line(self):
+        """AGENTS.md §6: a typed command and a press each leave exactly one CONTROL line.
+
+        The command used to log ``bot.parallel`` itself and was then also reached from the
+        press path, so one settings-form Apply put ``bot.settings`` *and* ``bot.parallel`` on
+        the durable plane (two lines for one press).
+        """
+        def control_lines(channel, action: str):
+            return [s["text"] for s in channel._test_sender.sent
+                    if "CONTROL" in s["text"] and action in s["text"]]
+
+        async def typed_then_press():
+            channel, _ = self.channel(parallel=1)
+            await channel.handle_event(human("/parallel@HermesBot 2"))
+            await settle()
+            self.assertEqual(len(control_lines(channel, "bot.parallel")), 1,
+                             [s["text"] for s in channel._test_sender.sent])
+            self.assertEqual(channel.max_parallel_turns(), 2)
+
+            sent_before = len(channel._test_sender.sent)
+            answer = await channel.dashboard_action(
+                {"action": "bot.settings", "value": "max_parallel_turns=3"})
+            await settle()
+            self.assertTrue(answer["ok"], answer)
+            self.assertEqual(channel.max_parallel_turns(), 3)
+            press_lines = [s["text"] for s in channel._test_sender.sent[sent_before:]
+                           if "CONTROL" in s["text"]]
+            self.assertEqual(len(press_lines), 1, press_lines)
+            self.assertIn("bot.settings", press_lines[0])
+
+        run(typed_then_press())
 
     def test_dashboard_settings_press_and_choices(self):
         """Settings form carries max_parallel_turns and one Apply sets it with CONTROL line."""

@@ -112,6 +112,8 @@ class Snapshot:
             "queue": int(self.queue), "wakes": [[str(i), float(at)] for i, at in self.wakes],
             "model": self.model, "effort": self.effort, "rev": self.rev,
             "models": list(self.models), "efforts": list(self.efforts),
+            "max_parallel_turns": int(self.max_parallel_turns),
+            "parallels": list(self.parallels),
             "uptime": self.uptime, "restarts": int(self.restarts),
             "term": int(self.term), "lease_ends": self.lease_ends,
             "drift_score": self.drift_score,

@@ -2144,10 +2144,15 @@ class AgentChannel:
         return [k for k in range(1, MAX_PARALLEL_TURNS + 1)
                 if parallel_problem(ad, lim, k) is None]
 
-    def _parallel_command(self, event: ChannelEvent) -> str:
+    def _parallel_command(self, event: ChannelEvent, record: bool = True) -> str:
         """``/parallel`` shows the parallel turn limit in force and its source;
         ``/parallel <n>`` (admin only) switches it live;
-        ``/parallel default`` returns to config.yaml (#491)."""
+        ``/parallel default`` returns to config.yaml (#491).
+
+        *record* is for a typed command only: a dashboard press already writes its own
+        CONTROL line (``bot.parallel``, or ``bot.settings`` for the form), so logging here as
+        well would put two lines on the durable plane for one press (AGENTS.md §6).
+        """
         alias = self.config.identity.alias
         args = command_args(event.text or "")
         current = self.max_parallel_turns()
@@ -2169,7 +2174,8 @@ class AgentChannel:
             save_state(self._parallel_path, {}, "parallel choices")
             cfg_val = int(getattr(self.config.limits, "max_parallel_turns", 1) or 1)
             said = self._apply_parallel_turns(cfg_val, event=event)
-            self._log_control_parallel(event, "default")
+            if record:
+                self._log_control_parallel(event, "default")
             return (f"{alias} goes back to {cfg_val} parallel turn{'s' if cfg_val > 1 else ''} "
                     f"(from config.yaml){said}.")
         problem = parallel_problem(self.config.adapter, self.config.limits, target_val)
@@ -2179,7 +2185,8 @@ class AgentChannel:
         self._parallel_override = n
         save_state(self._parallel_path, {"max_parallel_turns": n}, "parallel choices")
         said = self._apply_parallel_turns(n, event=event)
-        self._log_control_parallel(event, str(n))
+        if record:
+            self._log_control_parallel(event, str(n))
         return f"{alias} runs up to {n} parallel turn{'s' if n > 1 else ''}{said}."
 
     def _apply_parallel_turns(self, n: int, event: Optional[ChannelEvent] = None) -> str:
@@ -5236,7 +5243,7 @@ class AgentChannel:
                                      author_id=self.config.identity.admin_user_id,
                                      author_username=self.config.identity.name,
                                      thread_id=self._pick_topic())
-                said = self._parallel_command(event)
+                said = self._parallel_command(event, record=False)
                 after = str(self.max_parallel_turns())
             else:
                 store = self._models if key == "model" else self._efforts
@@ -5306,7 +5313,8 @@ class AgentChannel:
         (#451): the chat keyboard leaves it out, the dashboard draws it as one form.
         """
         return ("bot.pause", "bot.resume", "bot.restart", "bot.offline", "bot.stop_turn",
-                "bot.model", "bot.effort", "bot.settings", "bot.cli", "bot.memory",
+                "bot.model", "bot.effort", "bot.parallel", "bot.settings", "bot.cli",
+                "bot.memory",
                 "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
                 "swarm.lease", "swarm.failback",
                 "swarm.hold", "swarm.release", "swarm.admit", "swarm.remove",
@@ -5793,7 +5801,7 @@ class AgentChannel:
             if key == "max_parallel_turns":
                 before = str(self.max_parallel_turns())
                 event = self._control_event("parallel", wanted)
-                said = self._parallel_command(event)
+                said = self._parallel_command(event, record=False)
                 after = str(self.max_parallel_turns())
             else:
                 store = self._models if key == "model" else self._efforts
@@ -5880,7 +5888,7 @@ class AgentChannel:
         if action == "bot.parallel":
             event = self._control_event("parallel", value)
             before = str(self.max_parallel_turns())
-            said = self._parallel_command(event)
+            said = self._parallel_command(event, record=False)
             after = str(self.max_parallel_turns())
             if after == before and after == value:
                 if pending is not None:

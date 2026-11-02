@@ -8,6 +8,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`max_parallel_turns` is a live, per-bot setting** (`#491`, AGENTS.md §6). Raising it to 2
+  on 1 Nov meant editing five `config.yaml` files, checking each and restarting each bot. It is
+  now a field on the bot's dashboard settings form and `/parallel@<bot> <n>` (admin only), both
+  writing the same CONTROL line; bare `/parallel@<bot>` says the value in force and its source,
+  and `default` clears the pick. A value is refused with the config parser's own reason (over
+  8, above 1 on a single-session adapter or a pinned conversation, or above 1 where
+  `adapter.cwd` is not a git checkout) and nothing changes. The pick is kept in the bot's state
+  so it survives a restart, `config.yaml` stays the default, and the turn limiter takes the new
+  value at the next idle moment — a running turn is never cut, and the bot says when it applied
+  it. `/status` and the dashboard card show the value, `(override)` when it is a pick. One
+  press leaves one CONTROL line: the command no longer logs a second one of its own.
+  `docs/telegram-channel.md` and `docs/telegram/COMMANDS.md` document it.
+
 - **The coordinator can post into its own topics, and its plan follows it** (`#498`). In the
   `#486`/`#488` live run the coordinator could not run the next rounds from its main topic — a
   turn only posts where it runs — and its per-topic sessions each held a different piece of one

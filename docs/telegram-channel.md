@@ -1025,6 +1025,20 @@ with one `context_id`, which every agent works out the same way from the topic's
   digest alerts, gitbus delivery receipts, and `codex_thread` ticket answers. A reply whose topic
   was closed or deleted meanwhile is posted in General, with a note giving the topic's id.
 
+**The parallel setting is live per bot (`#491`, AGENTS.md §6).** `limits.max_parallel_turns` is
+no longer edit-and-restart: it is a field on the bot's dashboard settings form and
+`/parallel@<bot> <n>` (admin only), and both write the same CONTROL line. Bare
+`/parallel@<bot>` says the value in force and whether it comes from `config.yaml` or a runtime
+pick; `/parallel@<bot> default` clears the pick. A value is refused — with the config parser's
+own reason, and nothing changes — above `MAX_PARALLEL_TURNS` (8), above 1 on a single-session
+adapter or a pinned conversation, or above 1 where `adapter.cwd` is not a git checkout and
+`allow_shared_cwd` is false. The pick is kept in the bot's state beside its other runtime
+values, so it survives a restart while `config.yaml` stays the default. The turn limiter takes
+the new value at the bot's next idle moment: a raised limit lets a second topic start at once,
+and a lowered one never cuts a running turn — turns already running finish, the next waits —
+and the bot posts when it has applied the setting. `/status` and the dashboard card show the
+value in force, marked `(override)` when it is a pick.
+
 **Running topics in parallel.** `limits.max_parallel_turns: N` (default 1, at most 8) lets up
 to N topics run a turn at the same time.
 - Messages in one topic still run one after another. A message that has to wait (same topic, or
