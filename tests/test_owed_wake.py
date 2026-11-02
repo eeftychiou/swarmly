@@ -33,6 +33,13 @@ class TestNoNewsNoTurn(unittest.TestCase):
     def test_a_closed_row_never_wakes_anybody(self):
         self.assertEqual(wk.plan([row(observed="green", woken="pending", state=ow.CLOSED)]), [])
 
+    def test_coordinator_step_wakes_once_and_does_not_retry(self):
+        step = ow.self_step_row(debtor="Codex", step="open topic B", topic="tg-5122", at=100)
+        wake = wk.plan([step], now=100, bots={"Codex"})
+        self.assertEqual(len(wake), 1)
+        saved = wk.mark_woken([step], wake, now=100)[0]
+        self.assertEqual(wk.plan([saved], now=100 + wk.WAKE_GRACE + 1, bots={"Codex"}), [])
+
 
 class TestWhatIsNotABot(unittest.TestCase):
     """A wake starts a turn, so it needs a chat handler behind the debtor (#163 review)."""

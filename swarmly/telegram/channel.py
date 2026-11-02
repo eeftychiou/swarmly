@@ -7487,6 +7487,27 @@ class AgentChannel:
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
 
+    def apply_next_step_lines(self, text: str, event: ChannelEvent) -> str:
+        """Persist coordinator NEXT_STEP declarations so the idle wake survives restarts."""
+        pattern = re.compile(r"(?m)^\s*NEXT_STEP:\s*(.{1,240})\s*$")
+        matches = list(pattern.finditer(text or ""))
+        if not matches:
+            return text
+        body = pattern.sub("", text or "").strip()
+        if not self.is_coordinator():
+            return (body + "\n⚠️ NEXT_STEP is coordinator only").strip()
+        from swarmly.telegram.owed import self_step_row
+        rows = [self_step_row(debtor=self.config.identity.alias, step=m.group(1).strip(),
+                              topic=self._topic_token(event.chat_id, event.thread_id))
+                for m in matches]
+        try:
+            self.owed_store().save_all(rows)
+            notes = [f"Next step recorded in /owed: {row.owes}" for row in rows]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("NEXT_STEP: could not record row", exc_info=True)
+            notes = [f"⚠️ NEXT_STEP not recorded: {exc}"]
+        return "\n".join([body, *notes]).strip()
+
     def apply_memory_block(self, text: str, event: ChannelEvent) -> str:
         """Take a ``MEMORY:`` block out of a reply and save it as this bot's lessons (#226).
 
@@ -8187,6 +8208,9 @@ class AgentChannel:
     def _owed_wake_note(wake: Any) -> str:
         """The brief a wake turn starts with: the news, in one line, and what it asks for."""
         from swarmly.telegram.owed_wake import MAX_WAKES
+        if str(wake.row).startswith("self:"):
+            return (f"Your declared next plan step is due now: {wake.text}. Continue it once. "
+                    "If it fails, report the blocker; it will not retry automatically.")
         if wake.escalated:
             return (f"Owed-row escalation: {wake.text}. Nobody acted on it and it is still "
                     f"open; tell the admin in one short line. This is the last notice for "
@@ -8247,7 +8271,8 @@ class AgentChannel:
                 if not self.is_coordinator(now=moment):
                     done.append(f"{wake.row}: held: the escalation is the coordinator's to post")
                     continue
-            elif str(wake.debtor or "").strip().lower() != me:
+            elif (str(wake.debtor or "").strip().lower() != me and
+                  not (str(wake.row).startswith("self:") and self.is_coordinator(now=moment))):
                 done.append(f"{wake.row}: held: owed by {wake.debtor}, not me")
                 continue
             if len(acted) >= MAX_WAKES_PER_TICK:
@@ -8263,13 +8288,14 @@ class AgentChannel:
                 # debt stays armed and is looked at again on the next tick.
                 done.append(f"{wake.row}: held: turn running")
                 continue
-            if has_bus and wake.debtor.strip().lower() == me:
+            is_self_step = str(wake.row).startswith("self:")
+            if has_bus and (wake.debtor.strip().lower() == me or is_self_step):
                 # A round budget needs a round, and a round lives on the bus: without one there
                 # is nothing to count against, and no lease worth reading for it.
                 if counts_budget is None:
                     counts_budget = self.is_coordinator()
                     round_key = self.owed_round_key() if counts_budget else ""
-            if counts_budget and wake.debtor.strip().lower() == me:
+            if counts_budget and (wake.debtor.strip().lower() == me or is_self_step):
                 # #164: a round's coordinator wakes are budgeted; a developer's or a reviewer's
                 # are the debt's own. Reaching the cap pauses them and tells the admin once.
                 budget = self.owed_budget()
@@ -10891,6 +10917,7 @@ class AgentChannel:
         # is taken out here -- on the adapter's raw text, before the reply is clamped or
         # split, so the block is never counted against limits.reply_chars and never posted.
         body = self.apply_wake_lines(reply.text or "", event)
+        body = self.apply_next_step_lines(body, event)
         # Round 5.5 (#165): a WAIT line is a row, taken out of the reply the same way.
         body = self.apply_wait_lines(body, event)
         # The coordinator switches a peer's role with a ROLE line in any reply (#189).

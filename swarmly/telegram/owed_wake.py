@@ -165,6 +165,8 @@ def plan(rows: Iterable[Row], *, now: Optional[float] = None,
         if not _addressable(row.debtor, bots):
             continue                       # CI, the admin, or nobody this swarm can wake
         woken = str(row.woken or "").strip()
+        if row.kind == "self" and observed == woken:
+            continue                    # a plan step is claimed once; failures do not loop
         if observed == woken:
             repeat = _repeat(row, moment, admin_topic)
             if repeat is not None:

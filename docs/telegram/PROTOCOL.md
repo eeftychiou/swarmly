@@ -528,6 +528,13 @@ lost it, and let a successor adopt an armed timer whose owner had died.
 coordinator role says so: for a PR blocked only on CI, the coordinator declares `WAIT ci #<n>
 head <sha>` itself and does not count on an external CI wake.
 
+For a coordinator's own multi-step plan, `NEXT_STEP: <action>` records a durable `self` row.
+The normal owed tick starts it once the declaring turn is idle. The row is written before a
+wake, so restart replay is idempotent; a successor coordinator reads it from the shared owed
+store and can adopt it. A failed attempt is not retried automatically: the coordinator must
+declare a new step or report the blocker. The per-round wake budget applies as it does to other
+coordinator wakes.
+
 ---
 
 **Messages that arrive mid-turn are queued.** With `busy_behavior: queue` (the default) an
