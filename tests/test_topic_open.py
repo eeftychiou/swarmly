@@ -8,7 +8,8 @@ import unittest
 
 from swarmly.telegram.adapters import EchoAdapter
 from swarmly.telegram.adapters.base import AdapterReply
-from swarmly.telegram.topic_open import (MAX_TOPICS_PER_HOUR, parse_new_topic,
+from swarmly.telegram.topic_open import (MAX_POSTS_PER_HOUR, MAX_TOPICS_PER_HOUR,
+                                         parse_new_topic, parse_post_to_topic,
                                          parse_report_back, topic_link, topic_name)
 from tests.test_telegram_channel import ADMIN_ID, GROUP, event, make_channel, run
 
@@ -24,6 +25,12 @@ class Scripted(EchoAdapter):
     async def respond(self, message):
         self.seen.append(message)
         return AdapterReply(text=self.replies.pop(0) if self.replies else "NO_REPLY")
+
+
+class Session(Scripted):
+    """A runtime that resumes one session per topic: its own recap is only what is new."""
+
+    KEEPS_TOPIC_SESSION = True
 
 
 class TopicBot:
@@ -65,12 +72,158 @@ class TestParsing(unittest.TestCase):
         self.assertIsNone(parse_report_back("plain reply"))
         self.assertIsNone(parse_report_back("REPORT_BACK:   "))
 
+    def test_post_to_topic_directive(self):
+        self.assertEqual(parse_post_to_topic(
+            "POST_TO_TOPIC: 77\n@CodexBot please review #42"),
+            (77, "@CodexBot please review #42"))
+        self.assertIsNone(parse_post_to_topic("plain reply"))
+        # A directive with no usable target is answered, not posted as prose (#498 review).
+        self.assertEqual(parse_post_to_topic("POST_TO_TOPIC: nope\nassignment"),
+                         (None, "assignment"))
+
     def test_names_and_links(self):
         self.assertEqual(topic_link(-1001234567890, 7), "https://t.me/c/1234567890/7")
         self.assertEqual(len(topic_name("Hermes", "x" * 300)), 128)
 
 
 class TestOpenTopic(unittest.TestCase):
+
+    def coordinator_channel(self, *replies, adapter=None):
+        """A channel that acts as the coordinator, with the sends and links it makes recorded."""
+        channel = make_channel(adapter=adapter or Scripted(*replies))
+        channel.is_coordinator = lambda: True
+        channel.topics.remember(GROUP, 77, "coordinated work")
+        channel.sent = []
+        channel.linked = []
+        channel.state_link.note_handoff_peers = lambda *args: channel.linked.append(args)
+        original_send = channel.send
+
+        async def capture(text, **kwargs):
+            channel.sent.append((text, kwargs))
+            return await original_send(text, **kwargs)
+
+        channel.send = capture
+        return channel
+
+    def test_handle_event_posts_assignment_into_a_known_topic(self):
+        channel = self.coordinator_channel("POST_TO_TOPIC: 77\n"
+                                           "@CodexBot please review #42")
+        run(channel.handle_event(ask("@HermesBot dispatch the next round")))
+        self.assertTrue(any("@CodexBot please review #42" in text and
+                            kwargs.get("thread_id") == 77 for text, kwargs in channel.sent),
+                        channel.sent)
+        # The other half of the acceptance: the peer the assignment names is linked in that
+        # topic, or it takes no turn there (review S2).
+        self.assertEqual(channel.linked,
+                         [(GROUP, 77, ["Codex"], channel.config.identity.alias)])
+        self.assertTrue(any("posted in" in text for text, _ in channel.sent), channel.sent)
+
+    def test_the_peer_is_linked_before_the_assignment_is_posted(self):
+        """#506 review: a peer that reads the post the moment it lands must already be linked."""
+        channel = self.coordinator_channel("POST_TO_TOPIC: 77\n@CodexBot please review #42")
+        order = []
+        channel.state_link.note_handoff_peers = lambda *args: order.append("link")
+        post = channel.send
+
+        async def capture(text, **kwargs):
+            if kwargs.get("thread_id") == 77:
+                order.append("post")
+            return await post(text, **kwargs)
+
+        channel.send = capture
+        run(channel.handle_event(ask("@HermesBot dispatch the next round")))
+        self.assertEqual(order, ["link", "post"])
+
+    def test_the_hourly_cap_refuses_the_extra_assignment(self):
+        """QA at d6264ba: `MAX_POSTS_PER_HOUR` had no test (#506)."""
+        directive = "POST_TO_TOPIC: 77\n@CodexBot please review #42"
+        channel = self.coordinator_channel(*([directive] * (MAX_POSTS_PER_HOUR + 1)))
+        for i in range(MAX_POSTS_PER_HOUR + 1):
+            run(channel.handle_event(ask(f"@HermesBot dispatch round {i}",
+                                         message_id=200 + i)))
+        posted = [text for text, kw in channel.sent if kw.get("thread_id") == 77]
+        self.assertEqual(len(posted), MAX_POSTS_PER_HOUR, posted)
+        self.assertTrue(any(f"{MAX_POSTS_PER_HOUR} assignments" in text and
+                            "POST_TO_TOPIC refused" in text
+                            for text, _ in channel.sent), channel.sent)
+
+    def test_an_agent_that_is_not_the_coordinator_cannot_post_into_a_topic(self):
+        channel = self.coordinator_channel("POST_TO_TOPIC: 77\n@CodexBot please review #42")
+        channel.is_coordinator = lambda: False
+        run(channel.handle_event(ask("@HermesBot dispatch the next round")))
+        self.assertFalse(any("@CodexBot please review" in text for text, _ in channel.sent),
+                         channel.sent)
+        self.assertTrue(any("POST_TO_TOPIC refused" in text for text, _ in channel.sent),
+                        channel.sent)
+
+    def test_an_unknown_topic_is_refused_not_posted(self):
+        channel = self.coordinator_channel("POST_TO_TOPIC: 999\n@CodexBot please review #42")
+        run(channel.handle_event(ask("@HermesBot dispatch the next round")))
+        self.assertFalse(any("@CodexBot please review" in text for text, kw in channel.sent
+                             if kw.get("thread_id") == 999), channel.sent)
+        self.assertTrue(any("POST_TO_TOPIC refused" in text for text, _ in channel.sent),
+                        channel.sent)
+
+    def test_a_gone_topic_is_refused(self):
+        channel = self.coordinator_channel("POST_TO_TOPIC: 77\n@CodexBot please review #42")
+        channel._gone_topics.add((GROUP, 77))
+        run(channel.handle_event(ask("@HermesBot dispatch the next round")))
+        self.assertFalse(any("@CodexBot please review" in text for text, kw in channel.sent
+                             if kw.get("thread_id") == 77), channel.sent)
+        self.assertTrue(any("POST_TO_TOPIC refused" in text for text, _ in channel.sent),
+                        channel.sent)
+
+    def test_a_directive_without_a_topic_id_is_answered(self):
+        channel = self.coordinator_channel("POST_TO_TOPIC: nope\n@CodexBot please review #42")
+        run(channel.handle_event(ask("@HermesBot dispatch the next round")))
+        self.assertTrue(any("POST_TO_TOPIC refused" in text for text, _ in channel.sent),
+                        channel.sent)
+
+    def test_new_topic_copies_shared_plan_into_its_coordinator_turn(self):
+        adapter = Session("NO_REPLY")          # the live run's coordinator resumes a session
+        channel = make_channel(adapter=adapter)
+        channel.bot = TopicBot()
+        # The plan lives in the source topic, and nothing here stubs the recap (review B2).
+        channel._log_topic(GROUP, 12, "admin", "Opening context for the topic.", 12)
+        channel._log_topic(GROUP, 12, "Hermes", "Plan: split work into rounds 1, 2 and 3.", 14)
+        source = ask("open round two", thread_id=12, message_id=16)
+        # The source topic has already had its own turn: a session runtime's recap is empty,
+        # which is what lost the plan in the live run.
+        self.assertEqual(channel._topic_recap(source), "")
+
+        async def scenario():
+            await channel._open_topic(source, "round two", "Handle round two.")
+            await drain(channel)
+        run(scenario())
+        self.assertTrue(any("Plan: split work into rounds 1, 2 and 3." in msg.text
+                            for msg in adapter.seen), adapter.seen)
+
+    def test_plan_context_does_not_turn_peer_handoff_into_own_task(self):
+        """B1: the copied plan must not sit in front of the peer's handle.
+
+        An own line is in the log too, so the plan really is copied in from a session
+        runtime's topic -- with nothing to copy, the test would pass on the old head.
+        """
+        own_tasks, handoffs = [], []
+        adapter = Session("NO_REPLY")
+        channel = make_channel(adapter=adapter)
+        channel.bot = TopicBot()
+        channel._log_topic(GROUP, 12, "admin", "Plan: split work into rounds 1, 2 and 3.", 12)
+        channel._run_own_task = lambda brief, *a, **kw: own_tasks.append(brief)
+        channel._mirror_handoffs = lambda body, *a, **kw: handoffs.append(body)
+        source = ask("open round two", thread_id=12, message_id=13)
+
+        async def scenario():
+            await channel._open_topic(source, "round two", "@CodexBot please handle round two.")
+            await drain(channel)
+        run(scenario())
+        # The plan really was copied in, so the hand-off below met a prepended block.
+        texts = [s["text"] for s in channel._test_sender.sent]
+        self.assertTrue(any("Plan: split work into rounds 1, 2 and 3." in text
+                            for text in texts), texts)
+        self.assertEqual(own_tasks, [])
+        self.assertTrue(any("@CodexBot please handle round two." in body for body in handoffs),
+                        handoffs)
 
     def test_opens_topic_runs_own_brief_and_reports_back(self):
         adapter = Scripted("NEW_TOPIC: research\nCompare the two APIs.",

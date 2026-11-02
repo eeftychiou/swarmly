@@ -610,6 +610,18 @@ with a run of handles (`@a @b: review #195 and QA it today`) is one sentence sha
 both — nothing is cut from it. A line that only *mentions* another bot is context every
 recipient keeps.
 
+**The shared brief above the asks is never cut (#496).** A round post often opens by addressing
+the owner and asks the round's question in the same breath, naming an agent in it
+("`@<owner>: round 2 starts here. Which token were you given, @a?`"), with one line per agent
+below. The words a line carries *before its first ask* are every recipient's, so each named
+bot reads them; only the asks below them are the other bots'. A bot named **inside** a sentence
+("`which token were you given, @a? Answer it.`") is part of the shared words, not the start of
+its own ask — only a handle that opens a sentence of its own begins one. A post that opens by
+addressing its **own author** (`@<its own handle>: round 2 starts here…`) is a header, so its
+words are shared too, even when the author is a bot and the header reads as a request. Before
+this, such a line was cut down to whichever segment named this bot, and two agents in the
+`#486`/`#488` live test answered that no round-2 question had been posted at all.
+
 **An addressed message is never answered with silence (#497).** `NO_REPLY` is a decision for
 unaddressed peer traffic and acknowledgements only. When a turn on the admin's message, or on an
 assignment that names this agent, ends in that sentinel, the transport posts one short notice
@@ -776,7 +788,11 @@ liveness line, e.g. `peers=Claudebot:up,DeepSeek:down(12m),Reasonix:busy(25m)`. 
 **Busy is not gone.** A message that queues behind a turn running for two minutes or more
 gets one "⏳ <alias> is busy with a turn running since HH:MM UTC" line in its topic (at
 most one per topic per five minutes), so peers and people see a working bot rather than a
-silent one. When the turn ends, every message that queued behind it in that topic runs as
+silent one. The line names the turn *that topic's* message waits for, and the two minutes
+are measured from that turn's start: with `limits.max_parallel_turns` above 1 a neighbor
+topic's older turn is not it (#495). When the topic has no turn of its own and waits only
+because the bot is at its cap, the line says so instead — "busy with 2 turns in other
+topics" — rather than naming another topic's start time. When the turn ends, every message that queued behind it in that topic runs as
 one turn, oldest first, instead of one turn each.
 
 **A turn that hits the time limit continues.** When a topic turn of a runtime that resumes
@@ -882,10 +898,29 @@ research X") reminds the agent of this format. A brief that opens by addressing 
 the work over; any other brief becomes the agent's own task, run at once in the new topic (a
 peer named further down still sees it). A final reply in that topic that starts with
 `REPORT_BACK: <summary>` is posted there and its summary also goes back where the work came
-from, with a link. When the opener's turn in its topic ends in silence before it reported
+from, with a link — unless that is another work topic (#496): a topic's history holds only its
+own work, so the topic that opened it hears `«<topic>» reported back` with the link and the
+summary stays where it is. In the `#486`/`#488` live test the coordinator's topic B was opened
+from topic A, and B's summary — its token and each agent's B worktree path — was relayed into
+A, which an agent later quoted as A's own. General (when it takes turns) still gets the
+summary. When the opener's turn in its topic ends in silence before it reported
 back, it is asked once for that summary. Each agent opens at most 5 topics an hour. Topics must be turned
 on in the group and the bot needs the admin right to manage topics (`check` warns when it is
 missing); without them the brief is posted in place with a note.
+
+The coordinator can also post an assignment from any of its turns into a known coordinated
+topic by starting its reply with `POST_TO_TOPIC: <topic id>` and putting the assignment on the
+next line. The transport checks the destination against its topic registry — the topic must be
+known, a work topic, not one found gone — posts there, and **links the peers the assignment
+names in that topic** on the coordinator's path, *before* the post goes out: a peer that reads
+the assignment the moment it lands must already be linked, or its turn is refused as unlinked
+and the assignment is lost in the gap. Only the coordinator may use it (any other agent's post stays in the topic its turn
+runs in), and a directive it cannot carry out is answered with a `POST_TO_TOPIC refused` notice
+rather than posted as prose; at most 20 assignments an hour, since each one wakes the peers it
+names. When the coordinator opens a topic from another topic, the source topic's task, progress
+and latest messages are copied into the new topic's opening brief as shared plan context — read
+the way a fresh turn reads that topic, whatever runtime it runs, so a coordinator on a session
+runtime gets the plan too — and that pinned brief is available to every later turn there.
 
 **Rate Limit & Turn Cooldown.** By default an agent's sends are at least 3 seconds apart, at
 most 18 a minute (per topic when topics run in parallel; see **Running topics in parallel**):
@@ -1458,7 +1493,8 @@ web:
   enabled: true
   port: 8787
   public_host: swarm.example.ts.net   # the name a tunnel gives you, no scheme, no path
-  init_max_age: 300                   # optional: how old initData may be, in seconds
+  init_max_age: 300                   # optional: how old initData may be for a write, in seconds
+  read_max_age: 86400                 # optional: how old initData may be for a read, in seconds
 ```
 
 Three things change when `public_host` is set, and only then.
@@ -1471,19 +1507,53 @@ Three things change when `public_host` is set, and only then.
 - **`initData`.** Telegram appends a signed payload to the Mini App's URL; the page passes it
   back on every poll (`X-Telegram-Init-Data`, or `?init=`), and the server checks it the way
   Telegram says to: `HMAC-SHA256` of the sorted `key=value` pairs under a secret that is
-  itself `HMAC-SHA256` of the bot token keyed by `WebAppData`. A payload older than
-  `init_max_age`, one dated in the future, one signed by another bot, or one whose `user.id` is
-  not this bot's `admin_user_id` is a `403`. A request from the loopback never needs one: the
-  operator sitting at the host keeps the plain local page, and the `Host` check still applies to
-  it. The page itself is served without it — it holds no state — and it loads no Telegram
-  script: the payload is read from the URL hash, so the page
+  itself `HMAC-SHA256` of the bot token keyed by `WebAppData`. A payload dated in the future,
+  one signed by another bot, or one whose `user.id` is not this bot's `admin_user_id` is a
+  `403`. A request from the
+  loopback never needs one: the operator sitting at the host keeps the plain local page, and
+  the `Host` check still applies to it. The page itself is served without it — it holds no
+  state — and it loads no Telegram script: the payload is read from the URL hash, so the page
   stays self-contained and works on a LAN.
-- **The button.** A `web_app` button is the only kind that opens a Mini App, so it appears only
+  **Two age windows (#445).** Telegram stamps `initData` **once**, when the Mini App opens,
+  and never refreshes it, so a single window made a page left open go dead:
+  - **Reads** — the JSON state the page polls (`/state.json`), `/memory.json`, and the
+    `admin` flag that enables the controls — are accepted for `read_max_age` seconds
+    (default `86400`, 24 h). The payload is still signature-checked and admin-only, so a long
+    read window is low risk.
+  - **Writes** — `POST /api/action` — keep the short `init_max_age` window (default `300` s).
+    A captured write payload is useless after five minutes.
+  Both must be more than zero seconds; there is no "0 means forever". When a read is refused
+  for age, `/state.json` answers `403` with `{"refused": "expired", "text": "Session expired:
+  close and reopen the dashboard"}`, and the page shows that as a banner and stops polling
+  instead of freezing silently. A write refused for age says the same, in the toast.
+
+  These two settings are **config-only**: they gate the server at the moment it is created,
+  not a per-turn behaviour, and the runtime `/` settings (AGENTS.md §6) do not carry a web
+  control. Change them in `config.yaml` and restart the bot that serves the page.
+- **The host's Mini App button.** A `web_app` button is the only kind that opens a Mini App, so it appears only
   when `public_host` is set *and* the section is enabled, first row, above the controls; its URL
   is `https://<public_host>/`. `web.port` is the loopback port the tunnel forwards *to*, never
   part of the public URL — a tunnel publishes on 443. An operator whose public port is not 443
   puts it in `public_host` itself (`swarm.example.ts.net:9443`), which is why that key takes a
   host and optional port.
+
+- **The lease dashboard link.** The card follows the current lease holder. Each enabled bot advertises its
+  public host and Telegram bot username in its pulse; if the username is missing, the
+  coordinator uses that bot's handle from the roster. The link is
+  `https://t.me/<holder-bot>?startapp=dashboard`. Every bot that can hold the lease needs its
+  own Mini App configured in BotFather, since Telegram resolves `startapp` against the bot in
+  the link. Without it, Telegram cannot launch the dashboard and the button/pointer may lead
+  to the bot chat instead. Telegram launches the configured Mini App with its signed login
+  intact. A holder with no public host or known handle gets a `Dashboard: local only on <bot>`
+  note and no dead link. `web.port` is the loopback port the tunnel forwards to; it is not part
+  of the Telegram link.
+
+Every bot with `web.enabled` also serves a small lease pointer on its loopback port when it is
+not the holder. Configure a distinct `web.port` per bot on a host, and point each tunnel at that
+bot's own loopback port. The pointer follows the lease and links to the holder's Telegram Mini
+App; it serves no swarm data. A bind failure is retried after the same quiet interval as the
+dashboard server. This keeps the BotFather menu URL useful across a handover while the menu
+still names one fixed host.
 
 Exposing the port is the admin's job, not the transport's: the tunnel terminates TLS and
 forwards to `127.0.0.1:8787`, so the bind stays local and nothing on the LAN can reach it

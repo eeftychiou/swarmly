@@ -178,17 +178,62 @@ def handoff_lines(text: str) -> str:
     return "\n".join(block for _handle, block in handoff_blocks(text)).strip()
 
 
-def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
+def _starts_an_ask(line: str, pos: int) -> bool:
+    """Whether the handle at *pos* opens its own sentence -- the start of a bot's own ask.
+
+    A handle named *inside* a sentence ("which token were you given, @agy_dd_bot?") belongs to
+    that sentence: it is the shared brief's own words, not the start of that bot's share. A
+    handle after a terminator ("@A: review it. @B: QA it.") does open one (#496 review).
+    """
+    before = _LABEL.sub("", _BULLET.sub("", line[:pos])).rstrip()
+    return not before or before[-1] in ".!?"
+
+
+def _shared_words(line: str, known: Sequence[str],
+                  sender: Sequence[str] = ()) -> Tuple[bool, str]:
+    """Whether the whole line is shared words, and the shared words above its first ask (#496).
+
+    A coordinator's round post opens by addressing the owner and carries the round's question
+    in the same breath ("@<owner>: round 2 starts here. Which token did you get?"), with one
+    line per agent below. Cutting such a line down to a bot's own segment put the question
+    outside two agents' briefs, and both answered that nothing had been posted. So the words
+    before the line's first *ask* are kept: a peer named inside the sentence is part of the
+    shared words, and only a peer whose own sentence starts there is asked.
+
+    A post that opens by addressing its own author is a header, not a hand-off: the round's
+    coordinator writes "@<its own handle>: round 2 starts here…", and the question after it is
+    every agent's. So the author's own handles are not asks, and the header's own segment is
+    part of the shared words rather than a segment to cut.
+
+    The kept words are still dropped when they are themselves another bot's ask ("@A: review
+    it. @B: QA it."), which is that bot's brief and nothing else's.
+    """
+    others = set(_known(sender))
+    cuts = [pos for pos, name, _tail in _segments(line, known)
+            if name not in others and _starts_an_ask(line, pos)]
+    if not cuts:
+        return True, ""                 # every handle on it is inside the shared words
+    prefix = line[:cuts[0]]
+    if not re.search(r"[^\s\-*•.)\d]", prefix):
+        return False, ""                # a bullet, a label or a number: not words
+    asked = {name for name in requests(prefix, known) if name not in others}
+    return False, ("" if asked else prefix)
+
+
+def own_brief(text: str, me: str, handles: Iterable[str],
+              sender: Iterable[str] = ()) -> str:
     """*text* as one bot reads it: the shared lines, plus the lines that name it.
 
     Lines that ask something of another bot are dropped -- they are that bot's brief, and the
     point of the split is that each bot runs its own share and no more. Lines that name nobody
-    stay: they are the context every recipient needs. When nothing is left (a message that is
-    only a list of handles and bullets for others), the text is returned unchanged rather than
-    emptied: losing the context is worse than repeating it.
+    stay: they are the context every recipient needs, and so does the shared brief a line
+    carries above its first ask (:func:`_shared_words`, #496). When nothing is left (a
+    message that is only a list of handles and bullets for others), the text is returned
+    unchanged rather than emptied: losing the context is worse than repeating it.
     """
     mine = _norm(me)
     known = _known(handles)
+    sender = _known(sender)
     body = str(text or "")
     if not mine or not known or not is_multi_recipient(body, known):
         return body
@@ -199,7 +244,15 @@ def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
         if not names:
             kept.append(line)               # shared context: it asks nobody
             continue
-        asked = [_norm(name) for name in requests(line, known)]
+        # An ask the author's own handle carries is a header ("@<its own handle>: round 2
+        # starts here…"), not work for anyone reading the split (#496 review).
+        asked = [_norm(name) for name in requests(line, known) if _norm(name) not in sender]
+        whole, prefix = _shared_words(line, known, sender)
+        if whole:
+            # Every handle on the line sits inside one shared sentence ("...which token were
+            # you given, @a and @b? Answer it."): the line is every recipient's, untouched.
+            kept.append(line)
+            continue
         if mine in asked:
             # A line that opens with a run of handles shares one sentence between them
             # ("@A @B: review #195 and QA it today"), so there is nothing to cut: the whole
@@ -211,22 +264,26 @@ def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
             if len([name for name in lead if name in known]) > 1 and mine in lead:
                 kept.append(line)
                 continue
-            # Otherwise my share of *this* line: the shared prefix when mine is its first
-            # handle, then my segment up to the next handle. Two asks on one line therefore
-            # give each bot its own, which is the shape Claudebot posts most (#181 review).
+            # Otherwise my share of *this* line: the shared prefix above its first bot handle
+            # (the owner's opening words, #496), then my segment up to the next handle. Two
+            # asks on one line therefore give each bot its own, which is the shape Claudebot
+            # posts most (#181 review).
             segments = _segments(line, known)
             for index, (offset, name, _tail) in enumerate(segments):
                 if name != mine:
                     continue
                 stop = segments[index + 1][0] if index + 1 < len(segments) else len(line)
-                prefix = line[:offset] if index == 0 else ""
                 piece = (prefix + line[offset:stop]).strip()
                 if piece:
                     kept.append(piece)
                 break
             continue
         if asked:
-            continue                        # another bot's ask: theirs, not mine
+            # Another bot's ask: theirs, not mine. The words above it still are mine when they
+            # are the shared brief (#496): only the ask itself is dropped.
+            if prefix.strip():
+                kept.append(prefix.strip())
+            continue
         kept.append(line)                   # a mention only: context, not a task
     kept_text = "\n".join(kept).strip()
     return kept_text or body

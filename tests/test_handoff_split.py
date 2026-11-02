@@ -127,3 +127,116 @@ class TestTheSplit(unittest.TestCase):
         own = hs.own_brief(text, "DeepSeek", BOTS)
         self.assertIn("push the fix", own)
         self.assertNotIn("review #191", own)
+
+
+class TestTheSharedBriefAboveTheAsks(unittest.TestCase):
+    """#496: a round post that opens by addressing the owner reached two agents with no question.
+
+    The live post began ``@<owner>: Starting round 2 here…``, carried round 2's question in the
+    same breath -- naming an agent in the question, as a coordinator does -- and gave one line
+    per agent below. Two agents answered that no R2 question had been posted. Cutting a line
+    down to a bot's own segment took the shared brief above it away: the words before a line's
+    first bot handle are every recipient's, and only the asks below them are cut.
+    """
+
+    OWNER = "eeftychiou"
+
+    #: The owner's opening line asks the agents in the same breath as it asks the question.
+    POST = (f"@{OWNER}: Round 2 starts here. The R2 question: which token were you given in "
+            "this topic? Answer with it.\n"
+            "@reasonix_dd_bot answer R2 above as Reasonix\n"
+            "@agy_dd_bot answer R2 above as Antigravity")
+
+    #: The owner's line carries the question *and* names one agent to answer it.
+    QUESTION_NAMING_ONE = (f"@{OWNER}: Round 2 starts here. The R2 question: which token were "
+                           "you given in this topic, @agy_dd_bot? Answer with it.\n"
+                           "@reasonix_dd_bot answer R2 above as Reasonix\n"
+                           "@agy_dd_bot answer R2 above as Antigravity")
+
+    #: Question and per-agent asks on one line, which is how a model often writes it.
+    ONE_LINE = (f"@{OWNER}: Round 2 starts here. The R2 question: which token were you given in "
+                "this topic? @reasonix_dd_bot answer as Reasonix. "
+                "@agy_dd_bot answer as Antigravity.")
+
+    def test_the_owner_line_reaches_every_named_agent(self):
+        self.assertTrue(hs.is_multi_recipient(self.POST, BOTS))
+        for bot in ("reasonix_dd_bot", "agy_dd_bot"):
+            own = hs.own_brief(self.POST, bot, BOTS)
+            self.assertIn("which token were you given", own, bot)   # the shared brief
+            self.assertIn(f"@{self.OWNER}: Round 2 starts here", own, bot)
+
+    def test_a_question_that_names_one_agent_still_reaches_the_others(self):
+        own = hs.own_brief(self.QUESTION_NAMING_ONE, "reasonix_dd_bot", BOTS)
+        self.assertIn("which token were you given", own)
+        self.assertIn("as Reasonix", own)
+
+    def test_a_single_line_post_keeps_the_question_for_the_last_agent(self):
+        own = hs.own_brief(self.ONE_LINE, "agy_dd_bot", BOTS)
+        self.assertIn("which token were you given", own)
+        self.assertIn("as Antigravity", own)
+
+    def test_an_agent_never_reads_another_agents_ask(self):
+        for bot, mine, other in (("reasonix_dd_bot", "as Reasonix", "as Antigravity"),
+                                 ("agy_dd_bot", "as Antigravity", "as Reasonix")):
+            own = hs.own_brief(self.POST, bot, BOTS)
+            self.assertIn(mine, own, bot)
+            self.assertNotIn(other, own, bot)
+
+    def test_another_bots_ask_with_nothing_above_it_is_still_dropped(self):
+        """The rule keeps its teeth: an ask with no shared brief above it is that bot's alone."""
+        text = ("@reasonix_dd_bot: review #195.\n"
+                "@agy_dd_bot: QA #195 at cc57d8a.")
+        own = hs.own_brief(text, "reasonix_dd_bot", BOTS)
+        self.assertNotIn("QA #195", own)
+
+    #: The coordinator addresses *itself* as the author of the round ("@<its own handle>:").
+    BY_A_BOT = ("@Claude_obot: Round 2 starts here. The R2 question is for every agent: which "
+                "token were you given in this topic, @reasonix_dd_bot and @agy_dd_bot? "
+                "Answer with it.\n"
+                "@reasonix_dd_bot answer R2 above as Reasonix\n"
+                "@agy_dd_bot answer R2 above as Antigravity")
+
+    def test_a_header_addressed_to_the_sender_is_not_another_bots_ask(self):
+        """#504 review: the owner can be a bot, and the post still opens by addressing it.
+
+        A prefix that asks the message's own author is a header, so the round's question
+        reaches every agent; only a prefix that asks a *peer* is that peer's brief. The author
+        is named by both its spellings, as the transport passes them (alias and @username).
+        """
+        own = hs.own_brief(self.BY_A_BOT, "reasonix_dd_bot", BOTS,
+                           sender=["Claude_obot", "Claude"])
+        self.assertIn("which token were you given", own)
+        self.assertIn("as Reasonix", own)
+
+    def test_a_prefix_that_asks_a_peer_is_still_that_peers_brief(self):
+        """The sender rule does not blunt #181: a peer's ask above mine is still cut."""
+        text = ("@Claude_obot: the round is open.\n"
+                "@reasonix_dd_bot: review #195.\n"
+                "@agy_dd_bot: QA #195 at cc57d8a.")
+        own = hs.own_brief(text, "agy_dd_bot", BOTS, sender=["Claude_obot"])
+        self.assertIn("QA #195", own)
+        self.assertNotIn("review #195", own)
+        self.assertIn("the round is open", own)
+
+    def test_a_peer_still_cuts_the_line_it_asks_on(self):
+        text = "@reasonix_dd_bot: review it. @agy_dd_bot: QA it."
+        own = hs.own_brief(text, "agy_dd_bot", BOTS, sender=["Claude_obot"])
+        self.assertIn("QA it", own)
+        self.assertNotIn("review it", own)
+
+    def test_a_peer_named_mid_sentence_does_not_cut_the_shared_brief(self):
+        """#504 re-review: the peer is named *inside* the question, so the question is shared.
+
+        The coordinator's line asks the round's question and names one agent in it
+        ("Which token were you given, @agy_dd_bot? Answer it."). Cutting at that handle left
+        the other agents a half sentence; a handle named inside a sentence is not the start of
+        that bot's own ask, so the whole line is every recipient's.
+        """
+        text = ("@Claude_obot: Round 2. Which token were you given, @agy_dd_bot? Answer it.\n"
+                "@reasonix_dd_bot answer as Reasonix\n"
+                "@agy_dd_bot answer as Antigravity")
+        for bot, own_line in (("reasonix_dd_bot", "as Reasonix"),
+                              ("agy_dd_bot", "as Antigravity")):
+            own = hs.own_brief(text, bot, BOTS, sender=["Claudebot", "claude_obot"])
+            self.assertIn("Which token were you given, @agy_dd_bot? Answer it.", own, bot)
+            self.assertIn(own_line, own, bot)

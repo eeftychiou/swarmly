@@ -34,6 +34,7 @@ first, light and dark by ``prefers-color-scheme`` -- ready to be the Mini App's 
 from __future__ import annotations
 
 import calendar
+import html
 import hashlib
 import hmac
 import inspect
@@ -42,7 +43,7 @@ import logging
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlsplit
 
 from swarmly.state import keys as K
@@ -92,8 +93,15 @@ logger = logging.getLogger(__name__)
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
 
 #: The header a Mini App's page sends its ``initData`` in, and how long a known-good one lasts.
+#: A write keeps the short window; a read gets the long one (#445) -- Telegram stamps the
+#: payload once, when the app opens, so a page left open must keep polling without it going
+#: dead, while a captured payload must not stay usable for a write.
 INIT_HEADER = "X-Telegram-Init-Data"
 INIT_MAX_AGE = 300.0
+READ_MAX_AGE = 86400.0
+
+#: What the page shows when a read is refused because the login is older than the read window.
+EXPIRED_TEXT = "Session expired: close and reopen the dashboard"
 
 
 # ------------------------------------------------------------------------------------
@@ -1131,6 +1139,13 @@ body[data-admin="0"] .controls input { opacity: .55; cursor: not-allowed; }
 #toast[hidden] { display: none; }
 #toast.ok { border-left-color: var(--ok); }
 #toast.bad { border-left-color: var(--bad); }
+/* #445: the login the poll carries has expired. A banner, not a frozen page: it says what
+   happened and what to do, and the poll stops until the dashboard is reopened. */
+#expired { margin: 0 0 var(--space-3); padding: var(--space-2) var(--space-3);
+  background: var(--card); color: var(--ink); border: 1px solid var(--bad);
+  border-left: 4px solid var(--bad); border-radius: var(--radius);
+  font: var(--font-small); }
+#expired[hidden] { display: none; }
 @media (min-width: 760px) {
   body { padding: var(--space-5); }
   /* Two columns from tablet up: the swarm beside everything else. */
@@ -1162,6 +1177,8 @@ body[data-admin="0"] .controls input { opacity: .55; cursor: not-allowed; }
   </nav>
   <div class="health" id="health"></div>
 </header>
+
+<div id="expired" role="alert" hidden></div>
 
 <main>
   <section class="panel" id="swarm">
@@ -1236,6 +1253,8 @@ body[data-admin="0"] .controls input { opacity: .55; cursor: not-allowed; }
 const STATE = "__STATE_PATH__";
 const MEMORY = "__MEMORY_PATH__";
 const EVERY = __EVERY_MS__;
+const EXPIRED_TEXT = "Session expired: close and reopen the dashboard";
+let TIMER = 0;
 const el = (tag, cls, text) => {
   const node = document.createElement(tag);
   if (cls) node.className = cls;
@@ -1981,8 +2000,15 @@ async function press(action, target, value) {
   if (value) body.value = value;
   const answer = await post(body);
   if (answer.verdict === "confirm") { askSecond(answer); return; }
-  toast(answer.text, answer.ok ? "ok" : "bad");
+  showAnswer(answer);
   if (answer.ok) tick();                     // the card that changed is redrawn at once
+}
+
+// What a press answered: its words in the toast, and the expired banner when the login the
+// write was checked against is too old (#445) -- the same reason a read would be refused.
+function showAnswer(answer) {
+  toast(answer.text, answer.ok ? "ok" : "bad");
+  if (!answer.ok && answer.refused === "expired") expiredBanner(answer.text);
 }
 
 // The second tap: exactly what it will do, and the only two answers to it.
@@ -2002,7 +2028,7 @@ async function confirmPress() {
   veil.hidden = true;
   if (!code) { toast("that confirmation expired", "bad"); return; }
   const answer = await post({code});
-  toast(answer.text, answer.ok ? "ok" : "bad");
+  showAnswer(answer);
   if (answer.ok) tick();
 }
 
@@ -2198,11 +2224,24 @@ async function tick() {
   try {
     const headers = INIT ? {"X-Telegram-Init-Data": INIT} : {};
     const response = await fetch(STATE + filterQuery(), {cache: "no-store", headers});
-    if (!response.ok) throw new Error("status " + response.status);
+    if (!response.ok) {
+      const answer = await response.json().catch(() => ({}));
+      if (answer.refused === "expired") { expiredBanner(answer.text); return; }
+      throw new Error("status " + response.status);
+    }
     render(await response.json());
   } catch (err) {
     document.getElementById("stamp").textContent = "dashboard unavailable: " + err.message;
   }
+}
+
+// #445: the login Telegram stamped when the app opened is older than the read window. The
+// page cannot get a new one, so say so and stop polling; reopening the dashboard does.
+function expiredBanner(text) {
+  const box = document.getElementById("expired");
+  box.textContent = text || EXPIRED_TEXT;
+  box.hidden = false;
+  if (TIMER) { clearInterval(TIMER); TIMER = 0; }
 }
 
 document.getElementById("veil-cancel").addEventListener("click", () => {
@@ -2221,7 +2260,7 @@ document.getElementById("veil").addEventListener("click", (event) => {
 
 document.getElementById("every").textContent = String(EVERY / 1000);
 tick();
-setInterval(tick, EVERY);
+TIMER = setInterval(tick, EVERY);
 // The memory is read once, and again only when its section is opened: it never changes on a
 // 3 s beat, and a large memory.md must not be fetched forty times a heartbeat (review, #349).
 memory();
@@ -2286,8 +2325,10 @@ class DashboardServer:
                  host: str = HOST, title: str = "Swarm", every: float = 3.0,
                  public_host: str = "", bot_token: str = "", admin_id: Any = 0,
                  init_max_age: float = INIT_MAX_AGE,
+                 read_max_age: float = READ_MAX_AGE,
                  action: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None,
-                 memory: Optional[Callable[[], Optional[str]]] = None) -> None:
+                 memory: Optional[Callable[[], Optional[str]]] = None,
+                 pointer: Optional[Callable[[], str]] = None) -> None:
         self.provider = provider
         #: Whether the provider takes this request's topic filters (#438). A provider that
         #: does is called with them; one that does not (a test's ``lambda: {...}``) is called
@@ -2308,9 +2349,13 @@ class DashboardServer:
         self.bot_token = str(bot_token or "")
         self.admin_id = admin_id
         self.init_max_age = float(init_max_age)
+        #: Reads get a longer window than writes (#445): the page polls with the one payload
+        #: Telegram stamped when it opened, and never gets a new one.
+        self.read_max_age = float(read_max_age)
         #: ``/memory``'s text (#344), served only to a verified admin login. ``None`` means this
         #: page has no memory to show, and that path stays a 404.
         self.memory = memory
+        self.pointer = pointer
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -2479,15 +2524,19 @@ class DashboardServer:
                 raw = str(self.headers.get(INIT_HEADER, "") or "")
                 ok, why = verify_init_data(raw, bot_token=server.bot_token,
                                            admin_id=server.admin_id,
-                                           now=time.time(), max_age=server.init_max_age)
+                                           now=time.time(), max_age=server.read_max_age)
                 if not ok:
                     logger.info("web dashboard: refused %s (%s)", what, why)
                 return ok
 
-            def _init_ok(self, query: str) -> bool:
-                """Whether this request carries a valid Mini App ``initData`` for the admin."""
+            def _init_ok(self, query: str) -> Tuple[bool, str]:
+                """``(ok, why not)`` for a read's Mini App ``initData``.
+
+                Reads use ``read_max_age`` (#445): Telegram stamps the payload once, when the
+                Mini App opens, and the page polls with it for as long as it stays open.
+                """
                 if not server.needs_init(self.headers.get("Host", "")):
-                    return True
+                    return True, "ok"
                 raw = str(self.headers.get(INIT_HEADER, "") or "")
                 if not raw:
                     for key, value in parse_qsl(query, keep_blank_values=True):
@@ -2495,16 +2544,25 @@ class DashboardServer:
                             raw = value
                 ok, why = verify_init_data(raw, bot_token=server.bot_token,
                                            admin_id=server.admin_id,
-                                           now=time.time(), max_age=server.init_max_age)
+                                           now=time.time(), max_age=server.read_max_age)
                 if not ok:
                     logger.info("web dashboard: refused a request from %s (%s)",
                                 self.headers.get("Host", "?"), why)
-                return ok
+                return ok, why
 
             def do_GET(self) -> None:                       # noqa: N802 - http.server's name
                 path, _, query = self.path.partition("?")
                 if not self._host_ok():
                     self._not_found()
+                    return
+                if server.pointer is not None:
+                    target = str(server.pointer() or "")
+                    escaped = html.escape(target, quote=True)
+                    label = html.escape(target or "the dashboard is currently local only")
+                    body = ("<!doctype html><meta charset=utf-8><title>Swarm dashboard</title>"
+                            f"<p>the dashboard is on its current lease holder: "
+                            f"<a href=\"{escaped}\">{label}</a></p>").encode("utf-8")
+                    self._send(200, body, "text/html; charset=utf-8")
                     return
                 if path in (PAGE_PATH, "/index.html"):
                     body = page_html(title=server.title, every=server.every)
@@ -2535,8 +2593,15 @@ class DashboardServer:
                     self._send(200, body.encode("utf-8"), "application/json")
                     return
                 if path == STATE_PATH:
-                    if not self._init_ok(query):
-                        self._send(403, b'{"error":"not the admin"}', "application/json")
+                    ok, why = self._init_ok(query)
+                    if not ok:
+                        refused: Dict[str, Any] = {"error": "not the admin"}
+                        if why.startswith("the payload is older than"):
+                            # The page can still read; it only lost its login (#445). Say so,
+                            # so the page shows the expired banner instead of freezing.
+                            refused.update(refused="expired", text=EXPIRED_TEXT)
+                        self._send(403, json.dumps(refused).encode("utf-8"),
+                                   "application/json")
                         return
                     try:
                         chosen = topic_filter.from_query(dict(parse_qsl(
@@ -2616,7 +2681,10 @@ class DashboardServer:
                 if not ok:
                     logger.info("web dashboard: refused a write (%s)", why)
                     self._drain()
-                    self._write(403, {"ok": False, "refused": "auth", "text": why})
+                    aged = why.startswith("the payload is older than")
+                    self._write(403, {"ok": False,
+                                      "refused": "expired" if aged else "auth",
+                                      "text": EXPIRED_TEXT if aged else why})
                     return
                 try:
                     length = int(self.headers.get("Content-Length") or 0)

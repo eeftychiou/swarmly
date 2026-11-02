@@ -88,9 +88,11 @@ from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
 from swarmly.telegram.model_list import available_models, cached_models, format_list
 from swarmly.telegram.redact import Redactor
 from swarmly.telegram.topic_open import (GENERAL_PEER_REPLY_CHARS, GENERAL_REPLY_CHARS,
-                                         MAX_TOPICS_PER_HOUR, REPORT_NOTE, SELF_TASK_NOTE,
+                                         MAX_POSTS_PER_HOUR, MAX_TOPICS_PER_HOUR,
+                                         REPORT_NOTE, SELF_TASK_NOTE,
                                          TOPIC_ASKED_NOTE, asks_for_topic, defuse_mentions,
                                          hands_over, issue_refs, parse_new_topic,
+                                         parse_post_to_topic,
                                          parse_report_back, strip_report_marker, title_from,
                                          topic_link, topic_name)
 from swarmly.telegram.lessons import Lessons, describe as describe_memory
@@ -656,6 +658,8 @@ class AgentChannel:
         # Agent-opened topics (topic_open.py): topic -> where its work was asked for.
         self._topic_origins: Dict[Tuple[int, Optional[int]], Tuple[int, Optional[int]]] = {}
         self._topics_opened: List[float] = []
+        # #498: assignments posted into other topics, per hour (MAX_POSTS_PER_HOUR).
+        self._topic_posts: List[float] = []
         self._anonymous_noticed = float("-inf")
         # #27 review: (chat, topic, sender) -> clock of the last cooldown notice, so each peer
         # whose message the cooldown dropped hears it once, not one peer per window for all.
@@ -1170,12 +1174,28 @@ class AgentChannel:
                 return name
         return names[0] if names else ""
 
-    def _own_brief(self, text: str) -> str:
+    def _sender_handles(self, event: ChannelEvent) -> List[str]:
+        """The handles that name the bot which wrote *event*, however it spelled itself.
+
+        A post that opens by addressing its own author ("@<its own handle>: round 2 starts
+        here…") is a header, not a hand-off: the round's question after it is every agent's
+        (#496 review).
+        """
+        found: List[str] = []
+        for name in (event.author_username,
+                     self.config.peer_alias_for(event.author_username, event.author_id)):
+            name = str(name or "").strip().lstrip("@")
+            if name and name.lower() not in {f.lower() for f in found}:
+                found.append(name)
+        return found
+
+    def _own_brief(self, text: str, event: Optional[ChannelEvent] = None) -> str:
         """One multi-recipient message, as *this* bot reads it: its own line plus the context."""
         from swarmly.telegram.handoff_split import own_brief
         if not text:
             return text
-        return own_brief(text, self._own_handle(text), self._handoff_handles())
+        return own_brief(text, self._own_handle(text), self._handoff_handles(),
+                         sender=self._sender_handles(event) if event is not None else ())
 
     def _routing_text(self, text: Optional[str]) -> str:
         """*text* as routing reads it: without the trailer of handles a transport appended (#28).
@@ -4007,6 +4027,12 @@ class AgentChannel:
         except Exception:                          # noqa: BLE001 - a pulse without a term
             term = 0
         status = self.status_snapshot(now).to_dict()
+        web = self.web_settings()
+        if web is not None and getattr(web, "enabled", False):
+            status["web"] = {
+                "public_host": str(getattr(web, "public_host", "") or ""),
+                "bot_username": str(self.config.identity.username or "").lstrip("@"),
+            }
         usage = self._pulse_usage(now)
         if usage:
             status["usage"] = usage
@@ -4546,11 +4572,16 @@ class AgentChannel:
         """The dashboard's text, built in code from this bot's own records -- no turn."""
         moment = self.presence_clock() if now is None else float(now)
         usage = self.control_usage()
-        return control_mod.dashboard(now=moment, snapshots=self.control_snapshots(moment),
+        text = control_mod.dashboard(now=moment, snapshots=self.control_snapshots(moment),
                                      round_state=self.control_round(), usage=usage,
                                      coordinator=str(self.current_coordinator() or ""),
                                      roles=self.control_roles(),
                                      limit=self.config.limits.max_message_chars)
+        if self.web_settings() is not None and getattr(self.web_settings(), "enabled", False):
+            holder = str(self.current_coordinator() or self.config.identity.alias)
+            if not self._holder_public_host(holder):
+                text += f"\nDashboard: local only on {holder}"
+        return text
 
     def control_markup(self) -> List[List[Dict[str, Any]]]:
         """The pinned card's keyboard: the dashboard button first when a Mini App is set.
@@ -4606,17 +4637,51 @@ class AgentChannel:
         web = self.web_settings()
         if web is None or not getattr(web, "enabled", False):
             return ""
-        host = str(getattr(web, "public_host", "") or "").strip()
-        if not host:
+        holder = str(self.current_coordinator() or self.config.identity.alias)
+        if not self._holder_public_host(holder):
             return ""
-        return f"https://{host}/"
+        username = self._holder_bot_username(holder)
+        return f"https://t.me/{username}?startapp=dashboard" if username else ""
 
     def mini_app_link(self) -> str:
-        """The ``t.me`` link that opens this bot's Mini App, or ``""`` (no public page)."""
-        if not self.mini_app_url():
+        """The current lease holder's public dashboard address, or empty when local-only."""
+        return self.mini_app_url()
+
+    def _holder_public_host(self, holder: str) -> str:
+        """Public hostname advertised by the current holder's pulse."""
+        alias = str(holder or "").strip()
+        if alias.lower() == str(self.config.identity.alias or "").strip().lower():
+            web = self.web_settings()
+            if web is None or not getattr(web, "enabled", False):
+                return ""
+            return str(getattr(web, "public_host", "") or "").strip()
+        try:
+            peer = next((peer for name, peer in self.presence().peers.items()
+                         if str(name).strip().lower() == alias.lower()), None)
+            data = (peer.snapshot or {}).get("web") if peer else None
+            return str((data or {}).get("public_host") or "").strip() if isinstance(data, dict) else ""
+        except Exception:                         # noqa: BLE001 - no public link is safe
+            logger.debug("web dashboard: holder's public host is not readable", exc_info=True)
             return ""
-        handle = str(getattr(self.config.identity, "name", "") or "").lstrip("@").strip()
-        return f"https://t.me/{handle}?startapp=dashboard" if handle else ""
+
+    def _holder_bot_username(self, holder: str) -> str:
+        """Telegram username advertised by the lease holder for its Mini App."""
+        alias = str(holder or "").strip()
+        if alias.lower() == str(self.config.identity.alias or "").strip().lower():
+            username = str(self.config.identity.username or "").lstrip("@").strip()
+            return "" if username.isdigit() else username
+        try:
+            peer = next((peer for name, peer in self.presence().peers.items()
+                         if str(name).strip().lower() == alias.lower()), None)
+            data = (peer.snapshot or {}).get("web") if peer else None
+            username = (data or {}).get("bot_username") if isinstance(data, dict) else ""
+            username = str(username or "").lstrip("@").strip()
+            if not username or username.isdigit():
+                username = str(self.bot_handle(alias) or "").lstrip("@").strip()
+            return "" if username.isdigit() else username
+        except Exception:                         # noqa: BLE001 - no public link is safe
+            logger.debug("web dashboard: holder's bot username is not readable", exc_info=True)
+            return ""
 
     def web_settings(self) -> Any:
         """``web`` from the config, or ``None``: no section means no page, and no port opened."""
@@ -4835,18 +4900,40 @@ class AgentChannel:
                 return "stopped: web dashboard is off"
             return "off"
         if not self.is_coordinator(now=moment):
-            if server is not None:
+            if server is not None and getattr(server, "pointer", None) is None:
                 server.stop()
+                server = None
                 self._web_server = None
-                return "stopped: not the lease holder"
-            return "idle: not the lease holder"
+            if server is not None and server.running:
+                return "serving lease pointer " + server.url
+            now_wall = time.time()
+            failed_at = float(getattr(self, "_web_pointer_failed_at", 0.0) or 0.0)
+            if failed_at and now_wall - failed_at < self.WEB_RETRY_SECONDS:
+                return "failed: waiting to retry the port"
+            server = webui.DashboardServer(
+                lambda: {}, port=int(getattr(web, "port", 8787) or 0),
+                pointer=lambda: self.mini_app_url())
+            try:
+                url = server.start()
+            except OSError as exc:
+                self._web_pointer_failed_at = now_wall
+                logger.warning("web dashboard pointer: cannot serve on port %s (%s); retrying in %ds",
+                               getattr(web, "port", 8787), exc, self.WEB_RETRY_SECONDS)
+                return f"failed: {exc}"
+            self._web_pointer_failed_at = 0.0
+            self._web_server = server
+            return "serving lease pointer " + url
+        if server is not None and getattr(server, "pointer", None):
+            server.stop()
+            server = None
+            self._web_server = None
         if server is not None and server.running:
             return "serving " + server.url
         # A port that cannot be bound is not worth a warning per heartbeat (review, #256):
         # one line, then a quiet retry interval -- the port may be a peer's for a moment
         # during a failover, and the operator needs the fact once, not sixty times an hour.
         now_wall = time.time()
-        failed_at = float(getattr(self, "_web_failed_at", 0.0) or 0.0)
+        failed_at = float(getattr(self, "_web_dashboard_failed_at", 0.0) or 0.0)
         if failed_at and now_wall - failed_at < self.WEB_RETRY_SECONDS:
             return "failed: waiting to retry the port"
         server = webui.DashboardServer(
@@ -4855,15 +4942,16 @@ class AgentChannel:
             bot_token=str(getattr(self.config.identity, "bot_token", "") or ""),
             admin_id=getattr(self.config.identity, "admin_user_id", 0),
             init_max_age=float(getattr(web, "init_max_age", 300.0) or 0.0),
+            read_max_age=float(getattr(web, "read_max_age", 86400.0) or 0.0),
             action=self.web_action, memory=self.web_memory)
         try:
             url = server.start()
         except OSError as exc:
-            self._web_failed_at = now_wall
+            self._web_dashboard_failed_at = now_wall
             logger.warning("web dashboard: cannot serve on port %s (%s); retrying in %ds",
                            getattr(web, "port", 8787), exc, self.WEB_RETRY_SECONDS)
             return f"failed: {exc}"
-        self._web_failed_at = 0.0
+        self._web_dashboard_failed_at = 0.0
         self._web_server = server
         logger.info("web dashboard: serving %s (read-only, %s)", url,
                     f"Mini App for {server.public_host}" if server.requires_init else "loopback")
@@ -7641,6 +7729,27 @@ class AgentChannel:
         joined = "\n".join([body, *notes]).strip() if body else "\n".join(notes)
         return joined
 
+    def apply_next_step_lines(self, text: str, event: ChannelEvent) -> str:
+        """Persist coordinator NEXT_STEP declarations so the idle wake survives restarts."""
+        pattern = re.compile(r"(?m)^\s*NEXT_STEP:\s*(.{1,240})\s*$")
+        matches = list(pattern.finditer(text or ""))
+        if not matches:
+            return text
+        body = pattern.sub("", text or "").strip()
+        if not self.is_coordinator():
+            return (body + "\n⚠️ NEXT_STEP is coordinator only").strip()
+        from swarmly.telegram.owed import self_step_row
+        rows = [self_step_row(debtor=self.config.identity.alias, step=m.group(1).strip(),
+                              topic=self._topic_token(event.chat_id, event.thread_id))
+                for m in matches]
+        try:
+            self.owed_store().save_all(rows)
+            notes = [f"Next step recorded in /owed: {row.owes}" for row in rows]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("NEXT_STEP: could not record row", exc_info=True)
+            notes = [f"⚠️ NEXT_STEP not recorded: {exc}"]
+        return "\n".join([body, *notes]).strip()
+
     def apply_memory_block(self, text: str, event: ChannelEvent) -> str:
         """Take a ``MEMORY:`` block out of a reply and save it as this bot's lessons (#226).
 
@@ -8341,6 +8450,9 @@ class AgentChannel:
     def _owed_wake_note(wake: Any) -> str:
         """The brief a wake turn starts with: the news, in one line, and what it asks for."""
         from swarmly.telegram.owed_wake import MAX_WAKES
+        if str(wake.row).startswith("self:"):
+            return (f"Your declared next plan step is due now: {wake.text}. Continue it once. "
+                    "If it fails, report the blocker; it will not retry automatically.")
         if wake.escalated:
             return (f"Owed-row escalation: {wake.text}. Nobody acted on it and it is still "
                     f"open; tell the admin in one short line. This is the last notice for "
@@ -8401,7 +8513,8 @@ class AgentChannel:
                 if not self.is_coordinator(now=moment):
                     done.append(f"{wake.row}: held: the escalation is the coordinator's to post")
                     continue
-            elif str(wake.debtor or "").strip().lower() != me:
+            elif (str(wake.debtor or "").strip().lower() != me and
+                  not (str(wake.row).startswith("self:") and self.is_coordinator(now=moment))):
                 done.append(f"{wake.row}: held: owed by {wake.debtor}, not me")
                 continue
             if len(acted) >= MAX_WAKES_PER_TICK:
@@ -8417,13 +8530,14 @@ class AgentChannel:
                 # debt stays armed and is looked at again on the next tick.
                 done.append(f"{wake.row}: held: turn running")
                 continue
-            if has_bus and wake.debtor.strip().lower() == me:
+            is_self_step = str(wake.row).startswith("self:")
+            if has_bus and (wake.debtor.strip().lower() == me or is_self_step):
                 # A round budget needs a round, and a round lives on the bus: without one there
                 # is nothing to count against, and no lease worth reading for it.
                 if counts_budget is None:
                     counts_budget = self.is_coordinator()
                     round_key = self.owed_round_key() if counts_budget else ""
-            if counts_budget and wake.debtor.strip().lower() == me:
+            if counts_budget and (wake.debtor.strip().lower() == me or is_self_step):
                 # #164: a round's coordinator wakes are budgeted; a developer's or a reviewer's
                 # are the debt's own. Reaching the cap pauses them and tells the admin once.
                 budget = self.owed_budget()
@@ -9647,7 +9761,7 @@ class AgentChannel:
         # #181: a peer message that asks several bots at once is one hand-off per bot. This
         # bot reads its own line plus the shared context, so it does its share and no more.
         if event.author_is_bot and event.text:
-            own = self._own_brief(event.text)
+            own = self._own_brief(event.text, event)
             if own != event.text:
                 logger.info("multi-recipient hand-off: reading %d of %d chars as this bot's "
                             "share", len(own), len(event.text))
@@ -10543,6 +10657,29 @@ class AgentChannel:
     #: At most one ⏳ line per topic per this many seconds.
     BUSY_NOTICE_REPEAT_SECONDS = 300.0
 
+    def _waited_turn(self, key: Any) -> Tuple[Optional[float], Optional[int]]:
+        """The turn a message for ``key`` waits on: ``(start clock, other running turns)``.
+
+        ``other`` is None when that is one identified turn -- this topic's own, or, with one
+        turn for the whole bot, whatever is running -- and a count when the message waits only
+        because the bot is at ``limits.max_parallel_turns`` (#495). Before #486 a bot ran one
+        turn at a time, so the oldest turn across all topics was always the one a queued
+        message waited for; with parallel turns it is not, and measuring the threshold from
+        it announced a peer topic's turn in a topic whose own turn was seconds old.
+        """
+        own = self._busy_since.get(key)
+        if own is not None:
+            return own, None
+        if self._turn_slots is None:
+            # One turn at a time for the whole bot: the one running is what this waits for.
+            if not self._busy_since:
+                return None, None
+            return min(self._busy_since.values()), None
+        others = [start for other, start in self._busy_since.items() if other != key]
+        if not others:
+            return None, None
+        return min(others), len(others)
+
     async def _busy_notice(self, event: ChannelEvent, key: Any) -> None:
         """Say once in a while that a long turn is running: to the swarm a busy bot used to
         look exactly like a dead one, and peers reminded and escalated (live run). A peer's
@@ -10550,13 +10687,23 @@ class AgentChannel:
         if not self._busy_since:
             return
         now = self._clock()
-        started = min(self._busy_since.values())
-        if now - started < self.BUSY_NOTICE_SECONDS or \
+        started, others = self._waited_turn(key)
+        if started is None or now - started < self.BUSY_NOTICE_SECONDS or \
                 now - self._busy_noticed.get(key, float("-inf")) < self.BUSY_NOTICE_REPEAT_SECONDS:
             return
         self._busy_noticed[key] = now
-        since = time.strftime("%H:%M", time.gmtime(time.time() - (now - started)))
         waiting = self._busy_waiting_by.get(key, 0)
+        if others:
+            # No turn of its own: the wait is the cap, so name the cap rather than a peer's
+            # turn -- its start time is not what this topic's message waits for.
+            plural = "s" if others != 1 else ""
+            await self.send(
+                f"⏳ {self.config.identity.alias} is busy with {others} turn{plural} in other "
+                f"topics; {waiting} message(s) here wait for a free slot and get one answer "
+                "when one frees.", chat_id=event.chat_id, thread_id=event.thread_id,
+                silent=True, notice=True)
+            return
+        since = time.strftime("%H:%M", time.gmtime(time.time() - (now - started)))
         await self.send(f"⏳ {self.config.identity.alias} is busy with a turn running since "
                         f"{since} UTC; {waiting} message(s) here wait for it and get one "
                         "answer when it ends.", chat_id=event.chat_id,
@@ -11068,6 +11215,7 @@ class AgentChannel:
         # is taken out here -- on the adapter's raw text, before the reply is clamped or
         # split, so the block is never counted against limits.reply_chars and never posted.
         body = self.apply_wake_lines(reply.text or "", event)
+        body = self.apply_next_step_lines(body, event)
         # Round 5.5 (#165): a WAIT line is a row, taken out of the reply the same way.
         body = self.apply_wait_lines(body, event)
         # The coordinator switches a peer's role with a ROLE line in any reply (#189).
@@ -11099,6 +11247,9 @@ class AgentChannel:
         opened = parse_new_topic(body)
         if opened is not None:
             return await self._open_topic(event, *opened)
+        directed = parse_post_to_topic(body)
+        if directed is not None:
+            return await self._post_to_known_topic(event, *directed)
         limit = GENERAL_PEER_REPLY_CHARS if event.author_is_bot else GENERAL_REPLY_CHARS
         hands_off = bool(self._work_moves_to_topics(event) and [
             p for p in self.assigned_peers(body)
@@ -11156,9 +11307,13 @@ class AgentChannel:
         if report is not None and origin is not None:
             self._topics_reported.add((event.chat_id, event.thread_id))
             link = topic_link(event.chat_id, event.thread_id) if event.thread_id else ""
-            if self.token_barred(*origin) is not None:
-                # The request came from General, which is transport-only: the summary stays in
-                # the topic, and General gets the transport's own line pointing at it.
+            if origin[1] is not None or self.token_barred(*origin) is not None:
+                # #496: a sibling work topic never hears this topic's summary. Work opened from
+                # another work topic (A's coordinator opened B) had B's summary -- its token,
+                # every agent's B worktree path -- relayed into A, so A's history held B's work
+                # and an agent answering from memory named the other topic's token. The origin
+                # gets the transport's own line pointing at the summary, and the summary stays
+                # in the topic it is about. The same line is all a transport-only General gets.
                 name = self.topics.name(event.chat_id, event.thread_id) or "the topic"
                 await self.send(f"↩ «{name}» reported back: {link}".rstrip(": "),
                                 chat_id=origin[0], thread_id=origin[1])
@@ -11387,9 +11542,10 @@ class AgentChannel:
         return target
 
     async def _post_in_known_topic(self, event: ChannelEvent, body: str,
-                                   topic: Tuple[int, int]) -> Any:
+                                   topic: Tuple[int, int], *,
+                                   notice_verb: str = "moved this to") -> Any:
         chat_id, thread_id = topic
-        logger.info("moving work from %s to topic %s, which is about the same item",
+        logger.info("posting work from %s in topic %s",
                     event.thread_id or "General", thread_id)
         await self.send(body, chat_id=chat_id, thread_id=thread_id, token=True)
         # A bot never receives its own posts: the new items the reply names are learned here,
@@ -11399,9 +11555,58 @@ class AgentChannel:
         # The moved reply may be the hand-off that matters (live test: it had no bus copy).
         self._mirror_handoffs(body, chat_id, thread_id, self.last_first_message_id,
                               asker=self._asker(event))
-        return await self.send(f"↪ moved this to {topic_link(chat_id, thread_id)}",
+        return await self.send(f"↪ {notice_verb} {topic_link(chat_id, thread_id)}",
                                chat_id=event.chat_id, thread_id=event.thread_id,
                                reply_to_message_id=event.message_id, notice=True)
+
+    def _topic_post_refusal(self, thread_id: Optional[int]) -> Optional[str]:
+        """Why ``POST_TO_TOPIC: <thread_id>`` cannot be carried out, or None when it can.
+
+        The same checks the other routes make before a post goes into a topic: the target is
+        known, is a work topic (never Swarm pulse), has not been found gone, and this agent
+        is the coordinator -- a plan spanning topics is the coordinator's, and any other
+        agent's post stays where its turn runs.
+        """
+        home = int(self.config.identity.home_channel_id or 0)
+        if thread_id is None:
+            return "it needs the numeric id of the topic, on the directive's own line"
+        if not self.is_coordinator():
+            return "only the coordinator posts an assignment into another topic"
+        if not self.topics.name(home, thread_id):
+            return f"topic {thread_id} is not a topic this bot knows"
+        if not self._work_topic((home, thread_id)) or (home, thread_id) in self._gone_topics:
+            return f"topic {thread_id} is gone, or is not a work topic"
+        now = self._clock()
+        self._topic_posts = [t for t in self._topic_posts if now - t < 3600]
+        if len(self._topic_posts) >= MAX_POSTS_PER_HOUR:
+            return f"{MAX_POSTS_PER_HOUR} assignments were posted into topics in the last hour"
+        return None
+
+    async def _post_to_known_topic(self, event: ChannelEvent, thread_id: Optional[int],
+                                   message: str) -> Any:
+        """Execute ``POST_TO_TOPIC``: carry an assignment into a topic this agent coordinates.
+
+        #498: the coordinator runs one plan across the topics it opened, and a turn only
+        posts where it runs. The directive says which topic the post goes in, so where it
+        lands is decided in code. The peers the assignment names are linked in the target
+        topic on the coordinator's own path -- an unlinked peer takes no turn there, which
+        is the half of "carry the assignment over" a post alone does not do.
+        """
+        refusal = self._topic_post_refusal(thread_id)
+        if refusal is not None:
+            logger.info("POST_TO_TOPIC refused in topic %s: %s", event.thread_id, refusal)
+            return await self.send(f"⚠️ POST_TO_TOPIC refused: {refusal}.",
+                                   chat_id=event.chat_id, thread_id=event.thread_id,
+                                   reply_to_message_id=event.message_id, notice=True)
+        home = int(self.config.identity.home_channel_id or 0)
+        self._topic_posts.append(self._clock())
+        # The link goes in **before** the post (#506 review): a peer that reads the assignment
+        # the moment it lands must already be linked, or its turn is refused as unlinked and
+        # the assignment is lost in the gap between the send and the record.
+        self.state_link.note_handoff_peers(
+            home, thread_id, self.assigned_peers(message), self.config.identity.alias)
+        return await self._post_in_known_topic(
+            event, message, (home, int(thread_id)), notice_verb="posted in")
 
     def _work_moves_to_topics(self, event: ChannelEvent) -> bool:
         """Whether this message is in the home group's General with limits.work_in_topics on
@@ -11418,6 +11623,7 @@ class AgentChannel:
         ``moved``: the brief is this agent's reply to work started in General, posted in the
         new topic instead; it already is the work, so nothing more is run."""
         home = self.config.identity.home_channel_id
+        hands = hands_over(brief, self._peer_handle())
         if not moved:
             # A topic already about the same issue or PR takes the work (round 2 export:
             # "PR #37 re-review" was opened while a topic about #37 existed). With General and
@@ -11484,6 +11690,15 @@ class AgentChannel:
             # A bot never receives its own posts: its topic memory learns the task here.
             self._log_topic(home, thread_id, self._alias_for(event), event.text or "",
                             self.last_first_message_id)
+        # Carry the source discussion's shared plan into the new topic's opening brief (#498).
+        # Topic sessions stay isolated, so the coordinator's plan is copied deliberately when
+        # it opens a work topic, and later turns there do not depend on the source session.
+        # ``hands`` was read before the copy: the plan block would otherwise sit in front of a
+        # peer's handle and turn a hand-off into the opener's own task (review B1).
+        source_context = self._plan_copy(event)
+        if source_context:
+            brief = (f"Shared plan context from the coordinating topic:\n{source_context}"
+                     f"\n\nAssignment for this topic:\n{brief}")
         await self.send(brief, chat_id=home, thread_id=thread_id, token=True)
         self._log_topic(home, thread_id, self.config.identity.alias, brief,
                         self.last_first_message_id)
@@ -11496,7 +11711,7 @@ class AgentChannel:
                                notice=True)
         if moved:
             return sent
-        if not hands_over(brief, self._peer_handle()):
+        if not hands:
             # Not addressed to a peer: the brief is this agent's own task, in the new topic.
             # A peer named further down (to confirm scope, say) still sees the brief.
             self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", home, thread_id, name)
@@ -11835,6 +12050,21 @@ class AgentChannel:
         return dataclasses.replace(
             incoming, text=lead + (incoming.text or ""),
             fresh_text=lead + incoming.fresh_text if incoming.fresh_text else None)
+
+    def _plan_copy(self, event: ChannelEvent) -> str:
+        """The source discussion's task and progress, for a brief opened from it (#498).
+
+        Read the way a **fresh** turn would read it, whatever runtime the source topic runs:
+        a session runtime's own recap is only "posted since your last reply", which is empty
+        as the plan is being carried (review B2), so the plan would never follow the
+        coordinator -- and the coordinator in the live run was a session adapter. Nothing is
+        marked seen: this copy is context for another topic, not a turn here.
+        """
+        if event.thread_id is None:
+            return ""
+        return self._topic_memory.recap(
+            event.chat_id, event.thread_id, current_id=event.message_id, fresh=True,
+            own_alias=self.config.identity.alias, mark_seen=False).strip()
 
     def _topic_recap(self, event: ChannelEvent) -> str:
         """What the discussion is about, before the new message. A runtime that starts every

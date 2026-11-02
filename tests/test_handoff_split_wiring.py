@@ -85,3 +85,74 @@ class TestTheHandlesItKnows(unittest.TestCase):
         channel = channel_named("Antigravity", "agy_dd_bot")
         self.assertEqual(channel._own_handle("@agy_dd_bot: QA it."), "agy_dd_bot")
         self.assertEqual(channel._own_handle("@Antigravity: QA it."), "Antigravity")
+
+
+class TestTheSharedBriefReachesEveryPeer(unittest.TestCase):
+    """#496: a post that opens by addressing the owner must reach every named agent with its brief.
+
+    Live, round 2: the coordinator's post in topic A began ``@<owner>: Starting round 2 here…``
+    and carried round 2's question in the same breath, then one line per agent. Two agents
+    answered that no R2 question had been posted, only the owner's opening line -- the question
+    was cut from their brief. The text a peer's turn reads is what decides the work it does, so
+    this is checked through ``handle_event``, not in the split alone.
+    """
+
+    POST = ("@eeftychiou: Round 2 starts here. The R2 question is for every agent: which token "
+            "were you given in this topic, @reasonix_dd_bot and @agy_dd_bot? Answer with it.\n"
+            "@reasonix_dd_bot answer R2 above as Reasonix\n"
+            "@agy_dd_bot answer R2 above as Antigravity")
+
+    def read_by(self, alias, username):
+        """What the turn for *username* in topic 307 actually read, end to end."""
+        channel = channel_named(alias, username)
+        run(channel.handle_event(event(self.POST, author_id=303, username="Claude_obot",
+                                      thread_id=307, message_id=57)))
+        return " ".join(str(sent) for sent in channel._test_sender.sent)
+
+    def test_every_named_peer_reads_the_question_above_its_line(self):
+        for alias, username, own_line in (("Reasonix", "reasonix_dd_bot", "as Reasonix"),
+                                          ("Antigravity", "agy_dd_bot", "as Antigravity")):
+            with self.subTest(peer=username):
+                said = self.read_by(alias, username)
+                self.assertIn("which token were you given", said)
+                self.assertIn("Round 2 starts here", said)              # the owner's own line
+                self.assertIn(own_line, said)
+
+    def test_a_peer_reads_only_its_own_ask(self):
+        said = self.read_by("Reasonix", "reasonix_dd_bot")
+        self.assertNotIn("as Antigravity", said)
+
+    #: The same round post, written by a bot that opens by addressing *itself*: the owner can
+    #: be a bot, and a header addressed to its own author is not a hand-off (#504 review).
+    BY_A_BOT = ("@Claude_obot: Round 2 starts here. The R2 question is for every agent: which "
+                "token were you given in this topic, @reasonix_dd_bot and @agy_dd_bot? "
+                "Answer with it.\n"
+                "@reasonix_dd_bot answer R2 above as Reasonix\n"
+                "@agy_dd_bot answer R2 above as Antigravity")
+
+    def test_a_post_that_addresses_its_own_author_still_reaches_every_peer(self):
+        for alias, username, own_line in (("Reasonix", "reasonix_dd_bot", "as Reasonix"),
+                                          ("Antigravity", "agy_dd_bot", "as Antigravity")):
+            with self.subTest(peer=username):
+                channel = channel_named(alias, username)
+                run(channel.handle_event(event(self.BY_A_BOT, author_id=303,
+                                              username="Claude_obot", thread_id=307,
+                                              message_id=58)))
+                said = " ".join(str(sent) for sent in channel._test_sender.sent)
+                self.assertIn("which token were you given", said)
+                self.assertIn(own_line, said)
+
+    def test_a_peer_named_in_the_question_does_not_cut_the_brief(self):
+        """#504 re-review, end to end: the question names one agent and every agent reads it."""
+        post = ("@Claude_obot: Round 2. Which token were you given, @agy_dd_bot? Answer it.\n"
+                "@reasonix_dd_bot answer as Reasonix\n"
+                "@agy_dd_bot answer as Antigravity")
+        for alias, username, own_line in (("Reasonix", "reasonix_dd_bot", "as Reasonix"),
+                                          ("Antigravity", "agy_dd_bot", "as Antigravity")):
+            with self.subTest(peer=username):
+                channel = channel_named(alias, username)
+                run(channel.handle_event(event(post, author_id=303, username="Claude_obot",
+                                              thread_id=307, message_id=59)))
+                said = " ".join(str(sent) for sent in channel._test_sender.sent)
+                self.assertIn("Which token were you given, @agy_dd_bot? Answer it.", said)
+                self.assertIn(own_line, said)

@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The coordinator can post into its own topics, and its plan follows it** (`#498`). In the
+  `#486`/`#488` live run the coordinator could not run the next rounds from its main topic — a
+  turn only posts where it runs — and its per-topic sessions each held a different piece of one
+  plan. A reply that starts `POST_TO_TOPIC: <topic id>` now carries the assignment into a topic
+  the coordinator coordinates: the transport checks the target (known, a work topic, not found
+  gone, coordinator only, at most 20 an hour), posts there, and links the peers the assignment
+  names in that topic so they can act instead of being refused as unlinked; a directive it
+  cannot carry out is answered, never posted as prose. Opening a topic from another topic now
+  copies that topic's task, progress and latest messages into the new one's opening brief as
+  shared plan context, read the way a fresh turn reads it, so a coordinator on a session
+  runtime carries the plan too. `docs/telegram-channel.md` documents both.
+
 - **`audit-public` asks the other question** (`#1`, item 4): the redactor stops the maintainer's
   handle, chat ids and absolute paths leaving a host, but nothing could say what is *already*
   public — which is what a publication incident needs first. `swarmly-telegram --config
@@ -24,6 +36,31 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The Mini App dashboard no longer freezes after five minutes** (`#445`). Telegram stamps
+  `initData` once, when the app opens, and never refreshes it; the server applied
+  `web.init_max_age` (300 s) to reads and writes alike, so a page left open lost every poll and
+  every button press with no hint why. Reads now use `web.read_max_age` (default 24 h): the
+  JSON state the page polls, `/memory.json` and the `admin` flag, still signature-checked and
+  admin-only. Writes keep the short `web.init_max_age` window. A read refused for age answers
+  `{"refused": "expired", "text": "Session expired: close and reopen the dashboard"}` and the
+  page shows it as a banner and stops polling; a write refused for age says the same in its
+  toast. `docs/telegram-channel.md` documents both keys.
+- **A work topic's summary is no longer relayed into another work topic** (`#496`). In the
+  `#486`/`#488` live test the coordinator opened topic B from a turn in topic A; B's
+  `REPORT_BACK:` summary — its token and every agent's B worktree path — was then posted into
+  A with `↩ from`, so A's history held B's work and an agent answering from A quoted B's token
+  as its own. A summary goes back where the work came from only when that is not a work topic
+  (General when it takes turns); a work topic that opened another hears
+  `«<topic>» reported back` with the link, and the summary stays in the topic it is about.
+- **The shared brief above a post's per-agent asks reaches every named agent** (`#496`). The
+  same live test's round-2 post began `@<owner>: Starting round 2 here…`, carried the round's
+  question in the same breath and gave one line per agent; the split cut the owner's line down
+  to a bot's own segment, so two agents answered that no round-2 question had been posted. The
+  words a line carries before its first ask are now every recipient's, and only the asks below
+  them are cut; an agent named inside the shared sentence is not cut out of it, and a post that
+  opens by addressing its own author — a bot posting `@<its own handle>: round 2 starts here…` —
+  has its header read as shared words too, not as a hand-off (`#504` review).
+  `docs/telegram-channel.md` documents both.
 - **A turn that owed an answer says so instead of ending in silence** (`#497`). In the
   `#486`/`#488` live test the admin addressed a task to the swarm in topic B; DeepSeek's turn
   ran it and returned `NO_REPLY`, so nothing was posted, and a re-dispatch of the same task
