@@ -11355,11 +11355,13 @@ class AgentChannel:
                                    reply_to_message_id=event.message_id, notice=True)
         home = int(self.config.identity.home_channel_id or 0)
         self._topic_posts.append(self._clock())
-        sent = await self._post_in_known_topic(
-            event, message, (home, int(thread_id)), notice_verb="posted in")
+        # The link goes in **before** the post (#506 review): a peer that reads the assignment
+        # the moment it lands must already be linked, or its turn is refused as unlinked and
+        # the assignment is lost in the gap between the send and the record.
         self.state_link.note_handoff_peers(
             home, thread_id, self.assigned_peers(message), self.config.identity.alias)
-        return sent
+        return await self._post_in_known_topic(
+            event, message, (home, int(thread_id)), notice_verb="posted in")
 
     def _work_moves_to_topics(self, event: ChannelEvent) -> bool:
         """Whether this message is in the home group's General with limits.work_in_topics on

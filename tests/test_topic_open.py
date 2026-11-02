@@ -118,6 +118,22 @@ class TestOpenTopic(unittest.TestCase):
                          [(GROUP, 77, ["Codex"], channel.config.identity.alias)])
         self.assertTrue(any("posted in" in text for text, _ in channel.sent), channel.sent)
 
+    def test_the_peer_is_linked_before_the_assignment_is_posted(self):
+        """#506 review: a peer that reads the post the moment it lands must already be linked."""
+        channel = self.coordinator_channel("POST_TO_TOPIC: 77\n@CodexBot please review #42")
+        order = []
+        channel.state_link.note_handoff_peers = lambda *args: order.append("link")
+        post = channel.send
+
+        async def capture(text, **kwargs):
+            if kwargs.get("thread_id") == 77:
+                order.append("post")
+            return await post(text, **kwargs)
+
+        channel.send = capture
+        run(channel.handle_event(ask("@HermesBot dispatch the next round")))
+        self.assertEqual(order, ["link", "post"])
+
     def test_an_agent_that_is_not_the_coordinator_cannot_post_into_a_topic(self):
         channel = self.coordinator_channel("POST_TO_TOPIC: 77\n@CodexBot please review #42")
         channel.is_coordinator = lambda: False

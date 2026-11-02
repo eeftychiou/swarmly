@@ -912,8 +912,9 @@ The coordinator can also post an assignment from any of its turns into a known c
 topic by starting its reply with `POST_TO_TOPIC: <topic id>` and putting the assignment on the
 next line. The transport checks the destination against its topic registry — the topic must be
 known, a work topic, not one found gone — posts there, and **links the peers the assignment
-names in that topic** on the coordinator's path, so they can act there instead of being refused
-as unlinked. Only the coordinator may use it (any other agent's post stays in the topic its turn
+names in that topic** on the coordinator's path, *before* the post goes out: a peer that reads
+the assignment the moment it lands must already be linked, or its turn is refused as unlinked
+and the assignment is lost in the gap. Only the coordinator may use it (any other agent's post stays in the topic its turn
 runs in), and a directive it cannot carry out is answered with a `POST_TO_TOPIC refused` notice
 rather than posted as prose; at most 20 assignments an hour, since each one wakes the peers it
 names. When the coordinator opens a topic from another topic, the source topic's task, progress
