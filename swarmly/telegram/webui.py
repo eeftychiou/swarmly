@@ -1924,7 +1924,7 @@ function controlsFor(state, where, target) {
     const form = (view.controls || []).find((row) => row.settings);
     const carried = form ? (form.settings[target || ""] || []).map((field) => "bot." + field.key) : [];
     if (form) (form.settings[target || ""] || []).forEach((f) => { if (f.key === "max_parallel_turns") carried.push("bot.parallel"); });
-     
+
     (view.controls || [])
       // Model, effort, CLI and memory are this bot's own: drawn on its card, never on a
       // peer's, because a pick is applied by the bot the press lands on (review, #345).
