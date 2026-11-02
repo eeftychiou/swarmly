@@ -29,7 +29,7 @@ from typing import Optional
 
 from swarmly import __version__
 from swarmly.logsetup import configure as configure_logging
-from swarmly.telegram.channel import AgentChannel, TopicGone
+from swarmly.telegram.channel import AgentChannel, TopicGone, peer_web_ports
 from swarmly.telegram.config import AgentConfig, ConfigError
 
 
@@ -337,6 +337,23 @@ async def _check(config: AgentConfig, live: bool = False) -> int:
     print(f"peers           : {', '.join(config.peers) or '(none configured)'}")
     notes: list = []
     print(f"bus transport   : {_describe_bus(config, problems, notes)}")
+    web = getattr(config, "web", None)
+    if web is not None and getattr(web, "enabled", False):
+        sharers = sorted(alias for alias, port in peer_web_ports(config).items()
+                         if int(port) == int(getattr(web, "port", 0)))
+        print(f"web dashboard   : loopback port {getattr(web, 'port', 0)}"
+              + (f", also named by {', '.join(sharers)}" if sharers else ""))
+        if sharers:
+            # #510: the port used to be one per bot. It is one per host now -- only the bot
+            # holding the lease binds it -- so a duplicate is the intended arrangement, and a
+            # bot with its own number is the leftover of the old workaround the tunnel cannot
+            # follow: web.port is where *the* tunnel forwards, whoever holds the lease.
+            notes.append(
+                f"web.port {getattr(web, 'port', 0)} is also named by "
+                f"{', '.join(sharers)} in its pulse: since #510 only the bot holding the lease "
+                "binds it, so one port for every bot on the host is now the intended "
+                "arrangement -- give a bot its own port only when a tunnel of its own needs it, "
+                "and remember the page moves to whichever bot holds the lease")
     # Review P1-7: a misspelt key used to be ignored without a word.
     if config.identity.role:
         try:

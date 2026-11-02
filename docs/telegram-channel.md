@@ -1346,7 +1346,9 @@ holds the lease serves it on the loopback:
 ```yaml
 web:
   enabled: true
-  port: 8787          # optional, default 8787; 0 asks the OS for a free one
+  port: 8787          # optional, default 8787; 0 asks the OS for a free one.
+                      # One number per host, the one your tunnel forwards to: only the bot
+                      # holding the lease binds it (#510).
 ```
 
 `http://127.0.0.1:8787/` is one page; `/state.json` is the state it polls. Both are rendered
@@ -1554,18 +1556,25 @@ Three things change when `public_host` is set, and only then.
   coordinator uses that bot's handle from the roster. The link is
   `https://t.me/<holder-bot>?startapp=dashboard`. Every bot that can hold the lease needs its
   own Mini App configured in BotFather, since Telegram resolves `startapp` against the bot in
-  the link. Without it, Telegram cannot launch the dashboard and the button/pointer may lead
+  the link. Without it, Telegram cannot launch the dashboard and the button may lead
   to the bot chat instead. Telegram launches the configured Mini App with its signed login
   intact. A holder with no public host or known handle gets a `Dashboard: local only on <bot>`
   note and no dead link. `web.port` is the loopback port the tunnel forwards to; it is not part
   of the Telegram link.
 
-Every bot with `web.enabled` also serves a small lease pointer on its loopback port when it is
-not the holder. Configure a distinct `web.port` per bot on a host, and point each tunnel at that
-bot's own loopback port. The pointer follows the lease and links to the holder's Telegram Mini
-App; it serves no swarm data. A bind failure is retried after the same quiet interval as the
-dashboard server. This keeps the BotFather menu URL useful across a handover while the menu
-still names one fixed host.
+One port, one bot, one page (#510). `web.port` is a **host-wide** address, not a per-bot one:
+only the bot holding the lease binds it, and a bot that is not the holder binds nothing at all —
+it used to serve a small lease pointer there, which is how four transports on one host came to
+listen on `127.0.0.1:8787` at once, with the tunnel reaching a pointer page instead of the
+dashboard. So **every bot on a host names the same `web.port`**, the one the tunnel forwards to
+(`tailscale funnel 8787`), and no config change is needed when the lease moves: the old holder
+closes the port on the first beat that finds it replaced, and the new holder binds the same
+number on its next retry, within a minute. The bind is exclusive — `SO_EXCLUSIVEADDRUSE` on
+Windows, no `SO_REUSEADDR` — so a second bind fails with `OSError` instead of quietly sharing
+the port, and that failure is retried on the same quiet interval. `swarmly-telegram check`
+prints the port in force and notes it when a peer's pulse names the same one, read from the
+presence table this bot already keeps; a peer on an older rev names no port and is no note. A
+distinct `web.port` is only for a bot with a tunnel of its own.
 
 Exposing the port is the admin's job, not the transport's: the tunnel terminates TLS and
 forwards to `127.0.0.1:8787`, so the bind stays local and nothing on the LAN can reach it

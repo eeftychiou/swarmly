@@ -34,12 +34,12 @@ first, light and dark by ``prefers-color-scheme`` -- ready to be the Mini App's 
 from __future__ import annotations
 
 import calendar
-import html
 import hashlib
 import hmac
 import inspect
 import json
 import logging
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2313,6 +2313,33 @@ def _takes_filters(provider: Any) -> bool:
     return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
 
 
+class _ExclusiveHTTPServer(ThreadingHTTPServer):
+    """A dashboard port that only one process on the host can hold (#510).
+
+    ``ThreadingHTTPServer`` ships ``allow_reuse_address = True``, which sets ``SO_REUSEADDR``.
+    On Windows that does not mean what it means on POSIX: a *second* process may bind a port
+    that is already listening, and the OS then hands each connection to whichever socket it
+    picks. Four transports on one host all bound ``127.0.0.1:8787`` and requests reached a
+    non-holder's lease pointer instead of the holder's page.
+
+    So: on Windows, "exclusive" is said outright -- ``SO_EXCLUSIVEADDRUSE``, which refuses a
+    bind over any other socket on the port -- and ``SO_REUSEADDR`` is never set. On POSIX
+    ``SO_REUSEADDR`` is kept, because there it only shortens the wait for a ``TIME_WAIT``
+    socket, never admits a second live listener; dropping it would make a restart fail for up
+    to a minute with no gain. A bind on a port someone else holds raises ``OSError`` in both
+    cases, and the caller's retry path handles it.
+    """
+
+    allow_reuse_address = not hasattr(socket, "SO_EXCLUSIVEADDRUSE")
+
+    def server_bind(self) -> None:
+        option = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if option is not None:
+            # Must be set before bind(): after it, Windows answers WSAEINVAL.
+            self.socket.setsockopt(socket.SOL_SOCKET, option, 1)
+        super().server_bind()
+
+
 class DashboardServer:
     """A read-only HTTP server for the page, on the loopback, for as long as it is started.
 
@@ -2331,8 +2358,7 @@ class DashboardServer:
                  init_max_age: float = INIT_MAX_AGE,
                  read_max_age: float = READ_MAX_AGE,
                  action: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None,
-                 memory: Optional[Callable[[], Optional[str]]] = None,
-                 pointer: Optional[Callable[[], str]] = None) -> None:
+                 memory: Optional[Callable[[], Optional[str]]] = None) -> None:
         self.provider = provider
         #: Whether the provider takes this request's topic filters (#438). A provider that
         #: does is called with them; one that does not (a test's ``lambda: {...}``) is called
@@ -2359,7 +2385,6 @@ class DashboardServer:
         #: ``/memory``'s text (#344), served only to a verified admin login. ``None`` means this
         #: page has no memory to show, and that path stays a 404.
         self.memory = memory
-        self.pointer = pointer
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -2417,7 +2442,7 @@ class DashboardServer:
         """Bind the port and serve in a background thread. Returns the page's URL."""
         if self._httpd is not None:
             return self.url
-        httpd = ThreadingHTTPServer((self.host, self.requested_port), self._handler())
+        httpd = _ExclusiveHTTPServer((self.host, self.requested_port), self._handler())
         httpd.daemon_threads = True
         self._httpd = httpd
         self._thread = threading.Thread(target=httpd.serve_forever, name="swarm-web-dashboard",
@@ -2558,15 +2583,6 @@ class DashboardServer:
                 path, _, query = self.path.partition("?")
                 if not self._host_ok():
                     self._not_found()
-                    return
-                if server.pointer is not None:
-                    target = str(server.pointer() or "")
-                    escaped = html.escape(target, quote=True)
-                    label = html.escape(target or "the dashboard is currently local only")
-                    body = ("<!doctype html><meta charset=utf-8><title>Swarm dashboard</title>"
-                            f"<p>the dashboard is on its current lease holder: "
-                            f"<a href=\"{escaped}\">{label}</a></p>").encode("utf-8")
-                    self._send(200, body, "text/html; charset=utf-8")
                     return
                 if path in (PAGE_PATH, "/index.html"):
                     body = page_html(title=server.title, every=server.every)

@@ -4067,6 +4067,9 @@ class AgentChannel:
             status["web"] = {
                 "public_host": str(getattr(web, "public_host", "") or ""),
                 "bot_username": str(self.config.identity.username or "").lstrip("@"),
+                # #510: the loopback port this config names, so `check` can see two bots on
+                # one host pointed at the same number without reading either bot's config.
+                "port": int(getattr(web, "port", 0) or 0),
             }
         usage = self._pulse_usage(now)
         if usage:
@@ -4917,12 +4920,20 @@ class AgentChannel:
         return scores
 
     def _sync_web_dashboard(self, *, now: Optional[float] = None) -> str:
-        """Serve the page while this bot holds the lease; stop when it does not (#240).
+        """Serve the page while this bot holds the lease; stop when it does not (#240, #510).
 
         The page belongs to the lease holder, for the same reason the pin does: one transport
         answers for the swarm. Started on the first beat that finds this bot coordinating,
         stopped on the first that finds it has been replaced -- so a failover moves the page
         with the lease instead of leaving a stale one answering on an old host.
+
+        A bot that does not hold the lease **never binds** ``web.port`` (#510). It used to
+        serve a small lease pointer there, which is how four transports on one host came to
+        listen on ``127.0.0.1:8787`` at once and the tunnel reached a pointer page instead of
+        the dashboard. One number per host is enough because the tunnel follows the lease, so
+        the pointer went with the shared port it was squatting on; stopping the server on the
+        first beat that finds this bot replaced is what leaves the port free for the new
+        holder, which binds it on its next retry within :attr:`WEB_RETRY_SECONDS`.
         """
         from swarmly.telegram import webui
         moment = self.presence_clock() if now is None else float(now)
@@ -4935,33 +4946,13 @@ class AgentChannel:
                 return "stopped: web dashboard is off"
             return "off"
         if not self.is_coordinator(now=moment):
-            if server is not None and getattr(server, "pointer", None) is None:
+            if server is not None:
+                # Released here, on the first beat that finds this bot replaced: the port is
+                # the new holder's to bind, and holding it would take the page from it.
                 server.stop()
-                server = None
                 self._web_server = None
-            if server is not None and server.running:
-                return "serving lease pointer " + server.url
-            now_wall = time.time()
-            failed_at = float(getattr(self, "_web_pointer_failed_at", 0.0) or 0.0)
-            if failed_at and now_wall - failed_at < self.WEB_RETRY_SECONDS:
-                return "failed: waiting to retry the port"
-            server = webui.DashboardServer(
-                lambda: {}, port=int(getattr(web, "port", 8787) or 0),
-                pointer=lambda: self.mini_app_url())
-            try:
-                url = server.start()
-            except OSError as exc:
-                self._web_pointer_failed_at = now_wall
-                logger.warning("web dashboard pointer: cannot serve on port %s (%s); retrying in %ds",
-                               getattr(web, "port", 8787), exc, self.WEB_RETRY_SECONDS)
-                return f"failed: {exc}"
-            self._web_pointer_failed_at = 0.0
-            self._web_server = server
-            return "serving lease pointer " + url
-        if server is not None and getattr(server, "pointer", None):
-            server.stop()
-            server = None
-            self._web_server = None
+                return "stopped: not the lease holder (the port belongs to it)"
+            return "off: not the lease holder (the port belongs to it)"
         if server is not None and server.running:
             return "serving " + server.url
         # A port that cannot be bound is not worth a warning per heartbeat (review, #256):
@@ -13857,6 +13848,38 @@ def _state_file(config: AgentConfig, stem: str, suffix: Optional[str] = None) ->
     except Exception as exc:                  # noqa: BLE001 - kept in memory only
         logger.warning("%s will not be kept across restarts: %s", stem, exc)
         return None
+
+
+def peer_web_ports(config: AgentConfig) -> Dict[str, int]:
+    """Each peer's ``web.port``, from the pulses this bot already saved (#510).
+
+    ``swarmly-telegram check`` can see no other bot's ``config.yaml`` -- each bot keeps its own
+    -- but it shares the state folder's presence table, which is what this bot heard from its
+    peers. Since #510 every pulse's ``status.web`` carries the loopback port that bot names,
+    so a duplicate on one host is visible here without reading anyone else's file. A peer on
+    an older rev advertises no port and is simply absent, never a zero.
+    """
+    path = _state_file(config, "presence")
+    if path is None or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    records = data.get("peers") if isinstance(data, dict) else None
+    if not isinstance(records, dict):
+        return {}
+    ports: Dict[str, int] = {}
+    for record in records.values():
+        if not isinstance(record, dict):
+            continue
+        alias = str(record.get("alias") or "").strip()
+        snapshot = record.get("snapshot")
+        web = snapshot.get("web") if isinstance(snapshot, dict) else None
+        port = web.get("port") if isinstance(web, dict) else None
+        if alias and isinstance(port, int) and not isinstance(port, bool) and port > 0:
+            ports[alias] = port
+    return ports
 
 
 def resume_quote(text: str, limit: int = 600) -> str:
