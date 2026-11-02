@@ -126,6 +126,41 @@ class TestWhereTheWakeGoes(unittest.TestCase):
         self.assertEqual(channel._test_turns, [])
 
 
+class TestCoordinatorNextStepParsing(unittest.TestCase):
+
+    def test_tick_starts_self_step_and_closes_it(self):
+        channel = channel_with_table(role="coordinator")
+        self.addCleanup(channel._test_table[0].cleanup)
+        channel.is_coordinator = lambda **_kwargs: True
+        channel.topics.remember(GROUP, 5122, "round 5")
+        token = channel.topics.context(GROUP, 5122)
+        row = ow.self_step_row(debtor="Codex", step="inspect topic B", topic=token,
+                               at=1000.0)
+        channel._test_table[1].save_all([row])
+        done = channel.owed_wake_tick(now=1000.0)
+        saved = channel._test_table[1].load()[0]
+        self.assertEqual(len(channel._test_turns), 1)
+        self.assertIn("inspect topic B", channel._test_turns[0][0])
+        self.assertIn("woke Codex", " ".join(done))
+        self.assertEqual((saved.state, saved.closed_by),
+                         (ow.CLOSED, "the declared step started"))
+
+    def test_next_step_line_is_consumed_and_saved_for_its_topic(self):
+        channel = channel_with_table(role="coordinator")
+        self.addCleanup(channel._test_table[0].cleanup)
+        channel.is_coordinator = lambda **_kwargs: True
+        channel.topics.remember(GROUP, 5122, "round 5")
+        from tests.test_telegram_channel import event
+        said = channel.apply_next_step_lines("Working.\nNEXT_STEP: inspect topic B", event(
+            "reply", chat_id=GROUP, thread_id=5122))
+        rows = channel._test_table[1].load()
+        self.assertIn("Next step recorded", said)
+        self.assertNotIn("NEXT_STEP:", said)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].item, "")
+        self.assertEqual(rows[0].topic, channel.topics.context(GROUP, 5122))
+
+
 class TestNoNewsNoTurnInTheTransport(unittest.TestCase):
 
     def channel(self):

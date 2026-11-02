@@ -64,7 +64,7 @@ VERSION = 1
 #: ``fix``: a fix-first verdict or a QA fail means a new head is owed. ``merge``: everything
 #: landed and the coordinator owes the merge. ``progress``: an unticked round item with an
 #: owner. ``admin``: a question the admin owes an answer to (a reminder, never an action).
-KINDS = ("handoff", "ci", "verdict", "fix", "merge", "progress", "admin")
+KINDS = ("handoff", "ci", "verdict", "fix", "merge", "progress", "admin", "self")
 
 #: Debtors that are not bots.
 CI = "CI"
@@ -480,6 +480,15 @@ def admin_row(*, question: str, item: str = "", topic: str = "", asked_by: str =
                key_extra=f"{topic or '-'}#q{digest}" if digest else "",
                waiting_on=_alias(asked_by), opened_by=f"question: {text[:120]}" if text
                else "a question to the admin", topic=topic, deadline=deadline,
+               created_at=moment, updated_at=moment)
+
+
+def self_step_row(*, debtor: str, step: str, topic: str = "", at: Optional[float] = None) -> Row:
+    """A coordinator's next plan step, due when its current turn goes idle (#494)."""
+    moment = time.time() if at is None else float(at)
+    digest = hashlib.sha256(f"{topic}\0{step}".encode("utf-8")).hexdigest()[:16]
+    return Row(kind="self", item="", debtor=debtor, owes=step, topic=topic, key_extra=digest,
+               opened_by="coordinator declared next step", observed="due",
                created_at=moment, updated_at=moment)
 
 
