@@ -14,6 +14,7 @@ Wanted:
 from __future__ import annotations
 
 import asyncio
+import types
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -294,6 +295,45 @@ class TestLiveParallel(unittest.TestCase):
             self.assertIn("bot.settings", press_lines[0])
 
         run(typed_then_press())
+
+    def test_a_press_on_parallel_offers_this_bots_choices(self):
+        """The page's Parallel turns button is a picker: it offers values, sets nothing (#491).
+
+        ``bot.parallel`` was wired as a control but left out of ``PICKERS``, so the press
+        answered with the report instead of a keyboard and the page had nothing to press.
+        """
+        from swarmly.telegram import control_press as cp
+
+        channel, _ = self.channel(parallel=1)
+
+        class Bot:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, chat_id, text, reply_markup=None, **kw):
+                self.sent.append({"chat_id": chat_id, "text": text,
+                                  "reply_markup": reply_markup, **kw})
+                return types.SimpleNamespace(message_id=1)
+
+            async def edit_message_text(self, *a, **kw):
+                return None
+
+        channel.bot = Bot()
+
+        async def scenario():
+            text = await channel.handle_control_press(
+                cp.Press(user_id=ADMIN_ID, data="ctl:bot.parallel", at=1_800_000_000.0))
+            return text
+
+        text = run(scenario())
+        self.assertIn("choice(s)", text)
+        rows = channel.bot.sent[0]["reply_markup"]
+        rows = rows["inline_keyboard"] if isinstance(rows, dict) else rows.inline_keyboard
+        data = [b["callback_data"] if isinstance(b, dict) else b.callback_data
+                for row in rows for b in row]
+        self.assertEqual(data[0], "ctl:bot.parallel::1")
+        self.assertEqual(len(data), 8)                # echo in a git checkout accepts 1..8
+        self.assertEqual(channel.max_parallel_turns(), 1)     # offering is not setting
 
     def test_dashboard_settings_press_and_choices(self):
         """Settings form carries max_parallel_turns and one Apply sets it with CONTROL line."""
