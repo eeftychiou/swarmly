@@ -96,6 +96,20 @@ class TestOpenTopic(unittest.TestCase):
         self.assertTrue(any("@CodexBot please review #42" in text and
                             kwargs.get("thread_id") == 77 for text, kwargs in sent), sent)
 
+    def test_new_topic_copies_shared_plan_into_its_coordinator_turn(self):
+        adapter = Scripted("NO_REPLY")
+        channel = make_channel(adapter=adapter)
+        channel.bot = TopicBot()
+        channel._topic_recap = lambda _event: "Plan: split work into rounds 1, 2 and 3."
+        source = ask("open round two", thread_id=12)
+
+        async def scenario():
+            await channel._open_topic(source, "round two", "Handle round two.")
+            await drain(channel)
+        run(scenario())
+        self.assertTrue(any("Plan: split work into rounds 1, 2 and 3." in msg.text
+                            for msg in adapter.seen), adapter.seen)
+
     def test_opens_topic_runs_own_brief_and_reports_back(self):
         adapter = Scripted("NEW_TOPIC: research\nCompare the two APIs.",
                            "Compared them.\nREPORT_BACK: API B is better.")

@@ -887,6 +887,13 @@ back, it is asked once for that summary. Each agent opens at most 5 topics an ho
 on in the group and the bot needs the admin right to manage topics (`check` warns when it is
 missing); without them the brief is posted in place with a note.
 
+The coordinator can also post an assignment from any of its turns into a known coordinated
+topic by starting its reply with `POST_TO_TOPIC: <topic id>` and putting the assignment on the
+next line. The transport verifies the destination against its topic registry, posts there, and
+links addressed peers in that topic. When the coordinator opens a topic from another topic,
+the source topic's recap is copied into the new topic's opening brief as shared plan context;
+that pinned brief is available to subsequent coordinator turns in the new topic.
+
 **Rate Limit & Turn Cooldown.** By default an agent's sends are at least 3 seconds apart, at
 most 18 a minute (per topic when topics run in parallel; see **Running topics in parallel**):
 - `min_seconds_between_messages: 3.0`: outbound messages are spaced by at least 3 seconds.

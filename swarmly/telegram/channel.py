@@ -11329,6 +11329,13 @@ class AgentChannel:
             # A bot never receives its own posts: its topic memory learns the task here.
             self._log_topic(home, thread_id, self._alias_for(event), event.text or "",
                             self.last_first_message_id)
+        # Carry the source discussion's shared plan into each topic's pinned opening brief.
+        # Topic sessions stay isolated; the coordinator's plan is copied deliberately when
+        # it opens a work topic so later turns do not depend on the source session.
+        source_context = (self._topic_recap(event) if event.thread_id is not None else "")
+        if source_context.strip():
+            brief = (f"Shared plan context from the coordinating topic:\n{source_context.strip()}"
+                     f"\n\nAssignment for this topic:\n{brief}")
         await self.send(brief, chat_id=home, thread_id=thread_id, token=True)
         self._log_topic(home, thread_id, self.config.identity.alias, brief,
                         self.last_first_message_id)
