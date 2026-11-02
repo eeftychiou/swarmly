@@ -178,14 +178,34 @@ def handoff_lines(text: str) -> str:
     return "\n".join(block for _handle, block in handoff_blocks(text)).strip()
 
 
+def _shared_prefix(line: str, known: Sequence[str]) -> str:
+    """The words a line holds *above* its first bot handle: every recipient's context (#496).
+
+    A coordinator's round post opens by addressing the owner and carries the round's question
+    in the same breath ("@<owner>: round 2 starts here. Which token did you get?"), with one
+    line per agent below. Cutting such a line down to a bot's own segment put the question
+    outside two agents' briefs, and both answered that nothing had been posted. So the text
+    before the line's first bot handle is kept -- unless it is itself another bot's ask
+    ("@A: review it. @B: QA it."), which is that bot's brief and nothing else's.
+    """
+    segments = _segments(line, known)
+    if not segments:
+        return ""
+    prefix = line[:segments[0][0]]
+    if not re.search(r"[^\s\-*•.)\d]", prefix):
+        return ""                       # a bullet, a label or a number: not words
+    return "" if requests(prefix, known) else prefix
+
+
 def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
     """*text* as one bot reads it: the shared lines, plus the lines that name it.
 
     Lines that ask something of another bot are dropped -- they are that bot's brief, and the
     point of the split is that each bot runs its own share and no more. Lines that name nobody
-    stay: they are the context every recipient needs. When nothing is left (a message that is
-    only a list of handles and bullets for others), the text is returned unchanged rather than
-    emptied: losing the context is worse than repeating it.
+    stay: they are the context every recipient needs, and so does the shared brief a line
+    carries above its first bot handle (:func:`_shared_prefix`, #496). When nothing is left (a
+    message that is only a list of handles and bullets for others), the text is returned
+    unchanged rather than emptied: losing the context is worse than repeating it.
     """
     mine = _norm(me)
     known = _known(handles)
@@ -211,22 +231,28 @@ def own_brief(text: str, me: str, handles: Iterable[str]) -> str:
             if len([name for name in lead if name in known]) > 1 and mine in lead:
                 kept.append(line)
                 continue
-            # Otherwise my share of *this* line: the shared prefix when mine is its first
-            # handle, then my segment up to the next handle. Two asks on one line therefore
-            # give each bot its own, which is the shape Claudebot posts most (#181 review).
+            # Otherwise my share of *this* line: the shared prefix above its first bot handle
+            # (the owner's opening words, #496), then my segment up to the next handle. Two
+            # asks on one line therefore give each bot its own, which is the shape Claudebot
+            # posts most (#181 review).
             segments = _segments(line, known)
+            prefix = _shared_prefix(line, known)
             for index, (offset, name, _tail) in enumerate(segments):
                 if name != mine:
                     continue
                 stop = segments[index + 1][0] if index + 1 < len(segments) else len(line)
-                prefix = line[:offset] if index == 0 else ""
                 piece = (prefix + line[offset:stop]).strip()
                 if piece:
                     kept.append(piece)
                 break
             continue
         if asked:
-            continue                        # another bot's ask: theirs, not mine
+            # Another bot's ask: theirs, not mine. The words above it still are mine when they
+            # are the shared brief (#496): only the ask itself is dropped.
+            prefix = _shared_prefix(line, known)
+            if prefix.strip():
+                kept.append(prefix.strip())
+            continue
         kept.append(line)                   # a mention only: context, not a task
     kept_text = "\n".join(kept).strip()
     return kept_text or body

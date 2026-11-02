@@ -610,6 +610,14 @@ with a run of handles (`@a @b: review #195 and QA it today`) is one sentence sha
 both — nothing is cut from it. A line that only *mentions* another bot is context every
 recipient keeps.
 
+**The shared brief above the asks is never cut (#496).** A round post often opens by addressing
+the owner and asks the round's question in the same breath, naming an agent in it
+("`@<owner>: round 2 starts here. Which token were you given, @a?`"), with one line per agent
+below. The words a line carries *before* its first bot handle are every recipient's, so each
+named bot reads them; only the asks below them are the other bots'. Before this, such a line
+was cut down to whichever segment named this bot, and two agents in the `#486`/`#488` live test
+answered that no round-2 question had been posted at all.
+
 **An addressed message is never answered with silence (#497).** `NO_REPLY` is a decision for
 unaddressed peer traffic and acknowledgements only. When a turn on the admin's message, or on an
 assignment that names this agent, ends in that sentinel, the transport posts one short notice
@@ -882,7 +890,12 @@ research X") reminds the agent of this format. A brief that opens by addressing 
 the work over; any other brief becomes the agent's own task, run at once in the new topic (a
 peer named further down still sees it). A final reply in that topic that starts with
 `REPORT_BACK: <summary>` is posted there and its summary also goes back where the work came
-from, with a link. When the opener's turn in its topic ends in silence before it reported
+from, with a link — unless that is another work topic (#496): a topic's history holds only its
+own work, so the topic that opened it hears `«<topic>» reported back` with the link and the
+summary stays where it is. In the `#486`/`#488` live test the coordinator's topic B was opened
+from topic A, and B's summary — its token and each agent's B worktree path — was relayed into
+A, which an agent later quoted as A's own. General (when it takes turns) still gets the
+summary. When the opener's turn in its topic ends in silence before it reported
 back, it is asked once for that summary. Each agent opens at most 5 topics an hour. Topics must be turned
 on in the group and the bot needs the admin right to manage topics (`check` warns when it is
 missing); without them the brief is posted in place with a note.

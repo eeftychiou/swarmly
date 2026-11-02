@@ -10979,9 +10979,13 @@ class AgentChannel:
         if report is not None and origin is not None:
             self._topics_reported.add((event.chat_id, event.thread_id))
             link = topic_link(event.chat_id, event.thread_id) if event.thread_id else ""
-            if self.token_barred(*origin) is not None:
-                # The request came from General, which is transport-only: the summary stays in
-                # the topic, and General gets the transport's own line pointing at it.
+            if origin[1] is not None or self.token_barred(*origin) is not None:
+                # #496: a sibling work topic never hears this topic's summary. Work opened from
+                # another work topic (A's coordinator opened B) had B's summary -- its token,
+                # every agent's B worktree path -- relayed into A, so A's history held B's work
+                # and an agent answering from memory named the other topic's token. The origin
+                # gets the transport's own line pointing at the summary, and the summary stays
+                # in the topic it is about. The same line is all a transport-only General gets.
                 name = self.topics.name(event.chat_id, event.thread_id) or "the topic"
                 await self.send(f"↩ «{name}» reported back: {link}".rstrip(": "),
                                 chat_id=origin[0], thread_id=origin[1])
