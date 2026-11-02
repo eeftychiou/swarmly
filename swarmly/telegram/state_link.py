@@ -367,6 +367,11 @@ class StateLink:
         by = f"admin:{author_id}" if author_id is not None else "admin"
         self._record_in_topic(chat_id, thread_id, [], list(named), by)
 
+    def note_handoff_peers(self, chat_id: int, thread_id: Optional[int],
+                           named: list, by: str) -> None:
+        """Link peers assigned by the coordinator to the topic receiving their hand-off."""
+        self._record_in_topic(chat_id, thread_id, [], list(named), by)
+
     @staticmethod
     def _bare(handle: Any) -> str:
         return str(handle or "").strip().lstrip("@").lower()

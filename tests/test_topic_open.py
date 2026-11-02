@@ -89,11 +89,13 @@ class TestParsing(unittest.TestCase):
 class TestOpenTopic(unittest.TestCase):
 
     def coordinator_channel(self, *replies, adapter=None):
-        """A channel that acts as the coordinator, with the sends it makes recorded."""
+        """A channel that acts as the coordinator, with the sends and links it makes recorded."""
         channel = make_channel(adapter=adapter or Scripted(*replies))
         channel.is_coordinator = lambda: True
         channel.topics.remember(GROUP, 77, "coordinated work")
         channel.sent = []
+        channel.linked = []
+        channel.state_link.note_handoff_peers = lambda *args: channel.linked.append(args)
         original_send = channel.send
 
         async def capture(text, **kwargs):
@@ -106,16 +108,14 @@ class TestOpenTopic(unittest.TestCase):
     def test_handle_event_posts_assignment_into_a_known_topic(self):
         channel = self.coordinator_channel("POST_TO_TOPIC: 77\n"
                                            "@CodexBot please review #42")
-        linked = []
-        channel.state_link.note_reply = lambda chat_id, thread_id, text, named=None: (
-            linked.append((chat_id, thread_id, sorted(named or []))))
         run(channel.handle_event(ask("@HermesBot dispatch the next round")))
         self.assertTrue(any("@CodexBot please review #42" in text and
                             kwargs.get("thread_id") == 77 for text, kwargs in channel.sent),
                         channel.sent)
         # The other half of the acceptance: the peer the assignment names is linked in that
         # topic, or it takes no turn there (review S2).
-        self.assertEqual(linked, [(GROUP, 77, ["codexbot"])])
+        self.assertEqual(channel.linked,
+                         [(GROUP, 77, ["Codex"], channel.config.identity.alias)])
         self.assertTrue(any("posted in" in text for text, _ in channel.sent), channel.sent)
 
     def test_an_agent_that_is_not_the_coordinator_cannot_post_into_a_topic(self):
@@ -155,8 +155,8 @@ class TestOpenTopic(unittest.TestCase):
         channel = make_channel(adapter=adapter)
         channel.bot = TopicBot()
         # The plan lives in the source topic, and nothing here stubs the recap (review B2).
-        channel._log_topic(GROUP, 12, "admin", "Plan: split work into rounds 1, 2 and 3.", 12)
-        channel._log_topic(GROUP, 12, "Hermes", "Understood: one topic per round.", 14)
+        channel._log_topic(GROUP, 12, "admin", "Opening context for the topic.", 12)
+        channel._log_topic(GROUP, 12, "Hermes", "Plan: split work into rounds 1, 2 and 3.", 14)
         source = ask("open round two", thread_id=12, message_id=16)
         # The source topic has already had its own turn: a session runtime's recap is empty,
         # which is what lost the plan in the live run.
@@ -169,23 +169,31 @@ class TestOpenTopic(unittest.TestCase):
         self.assertTrue(any("Plan: split work into rounds 1, 2 and 3." in msg.text
                             for msg in adapter.seen), adapter.seen)
 
-    def test_a_peer_addressed_brief_does_not_also_run_the_openers_own_task(self):
-        """B1: the copied plan must not sit in front of the peer's handle."""
+    def test_plan_context_does_not_turn_peer_handoff_into_own_task(self):
+        """B1: the copied plan must not sit in front of the peer's handle.
+
+        An own line is in the log too, so the plan really is copied in from a session
+        runtime's topic -- with nothing to copy, the test would pass on the old head.
+        """
         own_tasks, handoffs = [], []
         adapter = Session("NO_REPLY")
         channel = make_channel(adapter=adapter)
         channel.bot = TopicBot()
-        channel._log_topic(GROUP, 12, "admin", "Plan: round two goes to Codex.", 12)
+        channel._log_topic(GROUP, 12, "admin", "Plan: split work into rounds 1, 2 and 3.", 12)
         channel._run_own_task = lambda brief, *a, **kw: own_tasks.append(brief)
         channel._mirror_handoffs = lambda body, *a, **kw: handoffs.append(body)
         source = ask("open round two", thread_id=12, message_id=13)
 
         async def scenario():
-            await channel._open_topic(source, "round two", "@CodexBot handle round two.")
+            await channel._open_topic(source, "round two", "@CodexBot please handle round two.")
             await drain(channel)
         run(scenario())
+        # The plan really was copied in, so the hand-off below met a prepended block.
+        texts = [s["text"] for s in channel._test_sender.sent]
+        self.assertTrue(any("Plan: split work into rounds 1, 2 and 3." in text
+                            for text in texts), texts)
         self.assertEqual(own_tasks, [])
-        self.assertTrue(any("@CodexBot handle round two." in body for body in handoffs),
+        self.assertTrue(any("@CodexBot please handle round two." in body for body in handoffs),
                         handoffs)
 
     def test_opens_topic_runs_own_brief_and_reports_back(self):
