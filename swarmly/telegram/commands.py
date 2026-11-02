@@ -41,6 +41,7 @@ MENU_COMMANDS: Tuple[Tuple[str, str], ...] = (
     ("topics", "The topic registry: topics, their links, agents and sessions"),
     ("model", "Show or set the model for this topic"),
     ("reasoning", "Show or set the reasoning effort for this topic"),
+    ("parallel", "Admin: show or set max parallel turns"),
     ("memory", "Admin: show this bot's memory.md, or clear it"),
     ("role", "Show or set a bot's role"),
     ("ping", "Check that the bot answers"),
@@ -75,13 +76,13 @@ _COMMAND_REPLY = re.compile(r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\]\s*)?"
                             # peer's "Topic registry: I pushed the phase 4 fix" (#435).
                             r"|Topic registry(?: \(shadow\))?:\n(?:[^\s]|\s{4})"
                             r")")
-# The /model and /reasoning answers lead with the bot's alias ("Codex runs gpt-x here ...").
+# The /model, /reasoning and /parallel answers lead with the bot's alias ("Codex runs gpt-x here ...").
 _SETTING_REPLY = re.compile(
     r"^(?:@\w+[\s:,]*)*(?:\[[^\]\n]{1,40}\])?[\w .-]{0,40}?"
-    r"(?: (?:runs|reasons at|goes back to) [^\n]{1,60}? here (?:\(|from the next turn)"
+    r"(?: (?:runs|reasons at|goes back to) [^\n]{1,60}? (?:here (?:\(|from the next turn)|parallel turn)"
     r"| kept [^\n]{1,60}?: | cannot (?:switch models|set reasoning effort):"
-    r"|: only the admin can (?:switch my model|set my reasoning effort)"
-    r"|: /(?:model|reasoning) takes one)")
+    r"|: only the admin can (?:switch my model|set my reasoning effort|change parallel turns)"
+    r"|: /(?:model|reasoning|parallel) takes)")
 
 
 def is_command_reply(text: str) -> bool:

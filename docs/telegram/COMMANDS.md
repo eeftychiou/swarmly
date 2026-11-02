@@ -68,6 +68,7 @@ Any member may use these.
 |---|---|
 | `/model@bot` (admin to set) | Show the model this bot runs in this topic; `/model@bot <name>` switches it from the next turn (`default` goes back). |
 | `/reasoning@bot` (admin to set) | The same for reasoning effort (`low` … `max`, `default`). `/effort@bot` is the same command. |
+| `/parallel@bot` (admin to set) | Show max parallel turns (`config` or `runtime pick`); `/parallel@bot <n>` switches it live (`default` returns to config.yaml). |
 | `/role@bot` | Show a bot's role and the team's. The admin sets one with `/role@bot <role>` (or `/role @bot <role>`); every bot applies it, and the bot named (or, for `/role @bot`, the coordinator) confirms it. `/role @bot coordinator` names a new coordinator, which announces itself, and the old one becomes a developer. |
 | `/rotate@bot` (admin) | Retires this topic's CLI session now: the old one writes its handover, and the next turn starts a **new** session from the rulebook, the registry's facts and that handover — the retired id is never resumed, and `/topics` shows the new one. Answered by the transport, no model turn. |
 
@@ -135,7 +136,7 @@ takes the same route and leaves the same `via=dashboard` line.
 
 One form per card: a dropdown per setting, prefilled with what that bot's own beat says it
 runs, and one **Apply**. Only the fields that differ from the reported value are sent, as
-`model=opus;effort=high`, and the bot's own `/model` and `/reasoning` decide each one — so a
+`model=opus;effort=high;max_parallel_turns=2`, and the bot's own `/model`, `/reasoning` and `/parallel` decide each one — so a
 value its runtime refuses is answered in that command's words, and the answer names every
 field that changed, every field already at that value, and every field that was refused. A
 form for a peer is forwarded to that peer (`sent ... to Codex`); nothing is set on the bot the
