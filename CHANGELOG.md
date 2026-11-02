@@ -36,6 +36,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The Mini App dashboard no longer freezes after five minutes** (`#445`). Telegram stamps
+  `initData` once, when the app opens, and never refreshes it; the server applied
+  `web.init_max_age` (300 s) to reads and writes alike, so a page left open lost every poll and
+  every button press with no hint why. Reads now use `web.read_max_age` (default 24 h): the
+  JSON state the page polls, `/memory.json` and the `admin` flag, still signature-checked and
+  admin-only. Writes keep the short `web.init_max_age` window. A read refused for age answers
+  `{"refused": "expired", "text": "Session expired: close and reopen the dashboard"}` and the
+  page shows it as a banner and stops polling; a write refused for age says the same in its
+  toast. `docs/telegram-channel.md` documents both keys.
 - **A work topic's summary is no longer relayed into another work topic** (`#496`). In the
   `#486`/`#488` live test the coordinator opened topic B from a turn in topic A; B's
   `REPORT_BACK:` summary — its token and every agent's B worktree path — was then posted into
