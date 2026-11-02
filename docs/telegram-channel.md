@@ -610,6 +610,14 @@ with a run of handles (`@a @b: review #195 and QA it today`) is one sentence sha
 both — nothing is cut from it. A line that only *mentions* another bot is context every
 recipient keeps.
 
+**An addressed message is never answered with silence (#497).** `NO_REPLY` is a decision for
+unaddressed peer traffic and acknowledgements only. When a turn on the admin's message, or on an
+assignment that names this agent, ends in that sentinel, the transport posts one short notice
+instead — `<alias> finished the turn without a reply; the request was not answered.` — so a topic
+the sender is waiting on never reads as a dead transport; the fallback is machine traffic, so a
+peer's transport drops it rather than starting a turn back. The transport's own briefs (a
+continuation after a timeout, a topic it opened) keep their silence.
+
 **A full queue holds, never drops (#184).** With `limits.busy_behavior: queue` a message that
 arrives while a turn runs waits for it, up to `limits.busy_queue_max` waiters per topic. Past
 that limit the message used to be dropped ("its queue is full" -- twice on 22 Oct, and a dropped
