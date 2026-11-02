@@ -205,14 +205,25 @@ class ReportBackToGeneralTests(unittest.TestCase):
         texts = [s["text"] for s in channel._test_sender.sent]
         self.assertEqual(sum("API B is better." in t for t in texts), 1, texts)   # the topic
 
-    def test_a_topic_origin_still_gets_the_summary(self):
+    def test_a_work_topic_origin_gets_a_pointer_not_the_summary(self):
+        """#496: B was opened from a turn in A, and B's summary was relayed into A.
+
+        A then held B's token and each agent's B worktree path, and an agent answering from A's
+        memory named the other topic's token. The topic that opened a work topic hears that it
+        reported back, and where the summary is -- never the summary, which stays in its own
+        topic: a topic's history holds only its own work.
+        """
         adapter = Scripted("Compared them.\nREPORT_BACK: API B is better.")
         channel = channel_for(adapter=adapter)
+        channel.topics.remember(GROUP, 41, "Hermes: research")
         channel._topic_origins[(GROUP, 41)] = (GROUP, 9400)
         spy = Spy(channel)
         run(channel.handle_event(admin("@HermesBot which API?", thread_id=41)))
         there = [text for chat, thread, text in spy.posts if thread == 9400]
-        self.assertTrue(any("API B is better." in t and "↩ from" in t for t in there), spy.posts)
+        self.assertTrue(there, spy.posts)
+        self.assertTrue(all("API B is better." not in t for t in there), spy.posts)
+        self.assertTrue(any("«Hermes: research» reported back" in t and "t.me/c/" in t
+                            for t in there), spy.posts)
 
     def test_today_general_gets_the_summary(self):
         adapter = Scripted("Compared them.\nREPORT_BACK: API B is better.")

@@ -1153,12 +1153,28 @@ class AgentChannel:
                 return name
         return names[0] if names else ""
 
-    def _own_brief(self, text: str) -> str:
+    def _sender_handles(self, event: ChannelEvent) -> List[str]:
+        """The handles that name the bot which wrote *event*, however it spelled itself.
+
+        A post that opens by addressing its own author ("@<its own handle>: round 2 starts
+        here…") is a header, not a hand-off: the round's question after it is every agent's
+        (#496 review).
+        """
+        found: List[str] = []
+        for name in (event.author_username,
+                     self.config.peer_alias_for(event.author_username, event.author_id)):
+            name = str(name or "").strip().lstrip("@")
+            if name and name.lower() not in {f.lower() for f in found}:
+                found.append(name)
+        return found
+
+    def _own_brief(self, text: str, event: Optional[ChannelEvent] = None) -> str:
         """One multi-recipient message, as *this* bot reads it: its own line plus the context."""
         from swarmly.telegram.handoff_split import own_brief
         if not text:
             return text
-        return own_brief(text, self._own_handle(text), self._handoff_handles())
+        return own_brief(text, self._own_handle(text), self._handoff_handles(),
+                         sender=self._sender_handles(event) if event is not None else ())
 
     def _routing_text(self, text: Optional[str]) -> str:
         """*text* as routing reads it: without the trailer of handles a transport appended (#28).
@@ -9519,7 +9535,7 @@ class AgentChannel:
         # #181: a peer message that asks several bots at once is one hand-off per bot. This
         # bot reads its own line plus the shared context, so it does its share and no more.
         if event.author_is_bot and event.text:
-            own = self._own_brief(event.text)
+            own = self._own_brief(event.text, event)
             if own != event.text:
                 logger.info("multi-recipient hand-off: reading %d of %d chars as this bot's "
                             "share", len(own), len(event.text))
@@ -11039,9 +11055,13 @@ class AgentChannel:
         if report is not None and origin is not None:
             self._topics_reported.add((event.chat_id, event.thread_id))
             link = topic_link(event.chat_id, event.thread_id) if event.thread_id else ""
-            if self.token_barred(*origin) is not None:
-                # The request came from General, which is transport-only: the summary stays in
-                # the topic, and General gets the transport's own line pointing at it.
+            if origin[1] is not None or self.token_barred(*origin) is not None:
+                # #496: a sibling work topic never hears this topic's summary. Work opened from
+                # another work topic (A's coordinator opened B) had B's summary -- its token,
+                # every agent's B worktree path -- relayed into A, so A's history held B's work
+                # and an agent answering from memory named the other topic's token. The origin
+                # gets the transport's own line pointing at the summary, and the summary stays
+                # in the topic it is about. The same line is all a transport-only General gets.
                 name = self.topics.name(event.chat_id, event.thread_id) or "the topic"
                 await self.send(f"↩ «{name}» reported back: {link}".rstrip(": "),
                                 chat_id=origin[0], thread_id=origin[1])

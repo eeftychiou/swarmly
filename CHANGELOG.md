@@ -24,6 +24,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A work topic's summary is no longer relayed into another work topic** (`#496`). In the
+  `#486`/`#488` live test the coordinator opened topic B from a turn in topic A; B's
+  `REPORT_BACK:` summary — its token and every agent's B worktree path — was then posted into
+  A with `↩ from`, so A's history held B's work and an agent answering from A quoted B's token
+  as its own. A summary goes back where the work came from only when that is not a work topic
+  (General when it takes turns); a work topic that opened another hears
+  `«<topic>» reported back` with the link, and the summary stays in the topic it is about.
+- **The shared brief above a post's per-agent asks reaches every named agent** (`#496`). The
+  same live test's round-2 post began `@<owner>: Starting round 2 here…`, carried the round's
+  question in the same breath and gave one line per agent; the split cut the owner's line down
+  to a bot's own segment, so two agents answered that no round-2 question had been posted. The
+  words a line carries before its first ask are now every recipient's, and only the asks below
+  them are cut; an agent named inside the shared sentence is not cut out of it, and a post that
+  opens by addressing its own author — a bot posting `@<its own handle>: round 2 starts here…` —
+  has its header read as shared words too, not as a hand-off (`#504` review).
+  `docs/telegram-channel.md` documents both.
 - **A turn that owed an answer says so instead of ending in silence** (`#497`). In the
   `#486`/`#488` live test the admin addressed a task to the swarm in topic B; DeepSeek's turn
   ran it and returned `NO_REPLY`, so nothing was posted, and a re-dispatch of the same task
