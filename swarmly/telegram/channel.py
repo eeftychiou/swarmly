@@ -4555,13 +4555,17 @@ class AgentChannel:
         """Telegram username advertised by the lease holder for its Mini App."""
         alias = str(holder or "").strip()
         if alias.lower() == str(self.config.identity.alias or "").strip().lower():
-            return str(self.config.identity.username or "").lstrip("@").strip()
+            username = str(self.config.identity.username or "").lstrip("@").strip()
+            return "" if username.isdigit() else username
         try:
             peer = next((peer for name, peer in self.presence().peers.items()
                          if str(name).strip().lower() == alias.lower()), None)
             data = (peer.snapshot or {}).get("web") if peer else None
             username = (data or {}).get("bot_username") if isinstance(data, dict) else ""
-            return str(username or self.bot_handle(alias) or "").lstrip("@").strip()
+            username = str(username or "").lstrip("@").strip()
+            if not username or username.isdigit():
+                username = str(self.bot_handle(alias) or "").lstrip("@").strip()
+            return "" if username.isdigit() else username
         except Exception:                         # noqa: BLE001 - no public link is safe
             logger.debug("web dashboard: holder's bot username is not readable", exc_info=True)
             return ""

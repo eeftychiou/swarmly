@@ -904,6 +904,16 @@ class TestThePinnedCardsButton(unittest.TestCase):
             status={"at": NOW, "web": {"public_host": "new.example.ts.net"}}), seen_at=NOW)
         self.assertEqual(channel.mini_app_link(), "https://t.me/RosterBot?startapp=dashboard")
 
+    def test_holder_numeric_peer_id_is_not_used_as_a_telegram_handle(self):
+        from swarmly.telegram.presence import Pulse
+        channel = self.channel(public_host="old.example.ts.net")
+        channel.current_coordinator = lambda now=None: "Reasonix"
+        channel.bot_handle = lambda alias: "123456789"
+        channel.presence().note(Pulse(alias="Reasonix", at=NOW,
+            status={"at": NOW, "web": {"public_host": "new.example.ts.net",
+                                       "bot_username": "123456789"}}), seen_at=NOW)
+        self.assertEqual(channel.mini_app_link(), "")
+
     def test_a_taken_port_is_retried_on_an_interval_not_every_beat(self):
         """A bind that fails is one warning and a quiet minute, not one per heartbeat."""
         channel = self.channel(port=8787)
