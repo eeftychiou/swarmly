@@ -88,7 +88,8 @@ from swarmly.telegram.quota import describe_until, quota_resets_at, ttl_for
 from swarmly.telegram.model_list import available_models, cached_models, format_list
 from swarmly.telegram.redact import Redactor
 from swarmly.telegram.topic_open import (GENERAL_PEER_REPLY_CHARS, GENERAL_REPLY_CHARS,
-                                         MAX_TOPICS_PER_HOUR, REPORT_NOTE, SELF_TASK_NOTE,
+                                         MAX_POSTS_PER_HOUR, MAX_TOPICS_PER_HOUR,
+                                         REPORT_NOTE, SELF_TASK_NOTE,
                                          TOPIC_ASKED_NOTE, asks_for_topic, defuse_mentions,
                                          hands_over, issue_refs, parse_new_topic,
                                          parse_post_to_topic,
@@ -640,6 +641,8 @@ class AgentChannel:
         # Agent-opened topics (topic_open.py): topic -> where its work was asked for.
         self._topic_origins: Dict[Tuple[int, Optional[int]], Tuple[int, Optional[int]]] = {}
         self._topics_opened: List[float] = []
+        # #498: assignments posted into other topics, per hour (MAX_POSTS_PER_HOUR).
+        self._topic_posts: List[float] = []
         self._anonymous_noticed = float("-inf")
         # #27 review: (chat, topic, sender) -> clock of the last cooldown notice, so each peer
         # whose message the cooldown dropped hears it once, not one peer per window for all.
@@ -11214,7 +11217,8 @@ class AgentChannel:
         return target
 
     async def _post_in_known_topic(self, event: ChannelEvent, body: str,
-                                   topic: Tuple[int, int]) -> Any:
+                                   topic: Tuple[int, int],
+                                   note: Optional[str] = None) -> Any:
         chat_id, thread_id = topic
         logger.info("moving work from %s to topic %s, which is about the same item",
                     event.thread_id or "General", thread_id)
@@ -11226,27 +11230,56 @@ class AgentChannel:
         # The moved reply may be the hand-off that matters (live test: it had no bus copy).
         self._mirror_handoffs(body, chat_id, thread_id, self.last_first_message_id,
                               asker=self._asker(event))
-        return await self.send(f"↪ moved this to {topic_link(chat_id, thread_id)}",
+        return await self.send(note or f"↪ moved this to {topic_link(chat_id, thread_id)}",
                                chat_id=event.chat_id, thread_id=event.thread_id,
                                reply_to_message_id=event.message_id, notice=True)
 
-    async def _post_to_known_topic(self, event: ChannelEvent, thread_id: int,
-                                   message: str) -> Any:
-        """Execute POST_TO_TOPIC for a known topic, linking any addressed peers there."""
+    def _topic_post_refusal(self, thread_id: Optional[int]) -> Optional[str]:
+        """Why ``POST_TO_TOPIC: <thread_id>`` cannot be carried out, or None when it can.
+
+        The same checks the other routes make before a post goes into a topic: the target is
+        known, is a work topic (never Swarm pulse), has not been found gone, and this agent
+        is the coordinator -- a plan spanning topics is the coordinator's, and any other
+        agent's post stays where its turn runs.
+        """
         home = int(self.config.identity.home_channel_id or 0)
-        if (not self.is_coordinator() or not self.topics.name(home, thread_id)
-                or (home, thread_id) in self._gone_topics):
-            return await self.send("⚠️ POST_TO_TOPIC refused: target is not a known coordinated "
-                                   "topic.", chat_id=event.chat_id,
-                                   thread_id=event.thread_id, notice=True)
-        await self.send(message, chat_id=home, thread_id=thread_id, token=True)
-        self._log_topic(home, thread_id, self.config.identity.alias, message,
-                        self.last_first_message_id)
-        self._mirror_handoffs(message, home, thread_id, self.last_first_message_id,
-                              asker=self._asker(event))
-        return await self.send(f"↪ posted in {topic_link(home, thread_id)}",
-                               chat_id=event.chat_id, thread_id=event.thread_id,
-                               reply_to_message_id=event.message_id, notice=True)
+        if thread_id is None:
+            return "it needs the numeric id of the topic, on the directive's own line"
+        if not self.is_coordinator():
+            return "only the coordinator posts an assignment into another topic"
+        if not self.topics.name(home, thread_id):
+            return f"topic {thread_id} is not a topic this bot knows"
+        if not self._work_topic((home, thread_id)) or (home, thread_id) in self._gone_topics:
+            return f"topic {thread_id} is gone, or is not a work topic"
+        now = self._clock()
+        self._topic_posts = [t for t in self._topic_posts if now - t < 3600]
+        if len(self._topic_posts) >= MAX_POSTS_PER_HOUR:
+            return f"{MAX_POSTS_PER_HOUR} assignments were posted into topics in the last hour"
+        return None
+
+    async def _post_to_known_topic(self, event: ChannelEvent, thread_id: Optional[int],
+                                   message: str) -> Any:
+        """Execute ``POST_TO_TOPIC``: carry an assignment into a topic this agent coordinates.
+
+        #498: the coordinator runs one plan across the topics it opened, and a turn only
+        posts where it runs. The directive says which topic the post goes in, so where it
+        lands is decided in code. The peers the assignment names are linked in the target
+        topic on the coordinator's own path -- an unlinked peer takes no turn there, which
+        is the half of "carry the assignment over" a post alone does not do.
+        """
+        refusal = self._topic_post_refusal(thread_id)
+        if refusal is not None:
+            logger.info("POST_TO_TOPIC refused in topic %s: %s", event.thread_id, refusal)
+            return await self.send(f"⚠️ POST_TO_TOPIC refused: {refusal}.",
+                                   chat_id=event.chat_id, thread_id=event.thread_id,
+                                   reply_to_message_id=event.message_id, notice=True)
+        home = int(self.config.identity.home_channel_id or 0)
+        self._topic_posts.append(self._clock())
+        self.state_link.note_reply(home, thread_id, message,
+                                   named=self._peer_handles_named(message))
+        return await self._post_in_known_topic(
+            event, message, (home, int(thread_id)),
+            note=f"↪ posted in {topic_link(home, thread_id)}")
 
     def _work_moves_to_topics(self, event: ChannelEvent) -> bool:
         """Whether this message is in the home group's General with limits.work_in_topics on
@@ -11329,12 +11362,15 @@ class AgentChannel:
             # A bot never receives its own posts: its topic memory learns the task here.
             self._log_topic(home, thread_id, self._alias_for(event), event.text or "",
                             self.last_first_message_id)
-        # Carry the source discussion's shared plan into each topic's pinned opening brief.
-        # Topic sessions stay isolated; the coordinator's plan is copied deliberately when
-        # it opens a work topic so later turns do not depend on the source session.
-        source_context = (self._topic_recap(event) if event.thread_id is not None else "")
-        if source_context.strip():
-            brief = (f"Shared plan context from the coordinating topic:\n{source_context.strip()}"
+        # Carry the source discussion's shared plan into the new topic's opening brief (#498).
+        # Topic sessions stay isolated, so the coordinator's plan is copied deliberately when
+        # it opens a work topic, and later turns there do not depend on the source session.
+        # ``hands`` is read before the copy: the plan block would otherwise sit in front of a
+        # peer's handle and turn a hand-off into the opener's own task (review B1).
+        hands = hands_over(brief, self._peer_handle())
+        source_context = self._plan_copy(event)
+        if source_context:
+            brief = (f"Shared plan context from the coordinating topic:\n{source_context}"
                      f"\n\nAssignment for this topic:\n{brief}")
         await self.send(brief, chat_id=home, thread_id=thread_id, token=True)
         self._log_topic(home, thread_id, self.config.identity.alias, brief,
@@ -11348,7 +11384,7 @@ class AgentChannel:
                                notice=True)
         if moved:
             return sent
-        if not hands_over(brief, self._peer_handle()):
+        if not hands:
             # Not addressed to a peer: the brief is this agent's own task, in the new topic.
             # A peer named further down (to confirm scope, say) still sees the brief.
             self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", home, thread_id, name)
@@ -11687,6 +11723,21 @@ class AgentChannel:
         return dataclasses.replace(
             incoming, text=lead + (incoming.text or ""),
             fresh_text=lead + incoming.fresh_text if incoming.fresh_text else None)
+
+    def _plan_copy(self, event: ChannelEvent) -> str:
+        """The source discussion's task and progress, for a brief opened from it (#498).
+
+        Read the way a **fresh** turn would read it, whatever runtime the source topic runs:
+        a session runtime's own recap is only "posted since your last reply", which is empty
+        as the plan is being carried (review B2), so the plan would never follow the
+        coordinator -- and the coordinator in the live run was a session adapter. Nothing is
+        marked seen: this copy is context for another topic, not a turn here.
+        """
+        if event.thread_id is None:
+            return ""
+        return self._topic_memory.recap(
+            event.chat_id, event.thread_id, current_id=event.message_id, fresh=True,
+            own_alias=self.config.identity.alias, mark_seen=False).strip()
 
     def _topic_recap(self, event: ChannelEvent) -> str:
         """What the discussion is about, before the new message. A runtime that starts every
