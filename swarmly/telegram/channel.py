@@ -10366,6 +10366,29 @@ class AgentChannel:
     #: At most one ⏳ line per topic per this many seconds.
     BUSY_NOTICE_REPEAT_SECONDS = 300.0
 
+    def _waited_turn(self, key: Any) -> Tuple[Optional[float], Optional[int]]:
+        """The turn a message for ``key`` waits on: ``(start clock, other running turns)``.
+
+        ``other`` is None when that is one identified turn -- this topic's own, or, with one
+        turn for the whole bot, whatever is running -- and a count when the message waits only
+        because the bot is at ``limits.max_parallel_turns`` (#495). Before #486 a bot ran one
+        turn at a time, so the oldest turn across all topics was always the one a queued
+        message waited for; with parallel turns it is not, and measuring the threshold from
+        it announced a peer topic's turn in a topic whose own turn was seconds old.
+        """
+        own = self._busy_since.get(key)
+        if own is not None:
+            return own, None
+        if self._turn_slots is None:
+            # One turn at a time for the whole bot: the one running is what this waits for.
+            if not self._busy_since:
+                return None, None
+            return min(self._busy_since.values()), None
+        others = [start for other, start in self._busy_since.items() if other != key]
+        if not others:
+            return None, None
+        return min(others), len(others)
+
     async def _busy_notice(self, event: ChannelEvent, key: Any) -> None:
         """Say once in a while that a long turn is running: to the swarm a busy bot used to
         look exactly like a dead one, and peers reminded and escalated (live run). A peer's
@@ -10373,13 +10396,23 @@ class AgentChannel:
         if not self._busy_since:
             return
         now = self._clock()
-        started = min(self._busy_since.values())
-        if now - started < self.BUSY_NOTICE_SECONDS or \
+        started, others = self._waited_turn(key)
+        if started is None or now - started < self.BUSY_NOTICE_SECONDS or \
                 now - self._busy_noticed.get(key, float("-inf")) < self.BUSY_NOTICE_REPEAT_SECONDS:
             return
         self._busy_noticed[key] = now
-        since = time.strftime("%H:%M", time.gmtime(time.time() - (now - started)))
         waiting = self._busy_waiting_by.get(key, 0)
+        if others:
+            # No turn of its own: the wait is the cap, so name the cap rather than a peer's
+            # turn -- its start time is not what this topic's message waits for.
+            plural = "s" if others != 1 else ""
+            await self.send(
+                f"⏳ {self.config.identity.alias} is busy with {others} turn{plural} in other "
+                f"topics; {waiting} message(s) here wait for a free slot and get one answer "
+                "when one frees.", chat_id=event.chat_id, thread_id=event.thread_id,
+                silent=True, notice=True)
+            return
+        since = time.strftime("%H:%M", time.gmtime(time.time() - (now - started)))
         await self.send(f"⏳ {self.config.identity.alias} is busy with a turn running since "
                         f"{since} UTC; {waiting} message(s) here wait for it and get one "
                         "answer when it ends.", chat_id=event.chat_id,
