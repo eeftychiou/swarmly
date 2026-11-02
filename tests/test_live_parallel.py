@@ -384,6 +384,7 @@ class TestLiveParallel(unittest.TestCase):
             cfg.source_path = Path(state_tmp) / "config.yaml"
             ch2 = AgentChannel(cfg)
             self.assertEqual(ch2.max_parallel_turns(), 2)
+            self.assertEqual(ch2.adapter.max_parallel_turns, 2)      # the boot adapter
             topic_adapter = ch2._topic_adapter(Path(self._repo.name), "topic-4")
             self.assertEqual(topic_adapter.max_parallel_turns, 2)
             ok, said = topic_adapter.set_active_conversation(
