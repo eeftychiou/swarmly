@@ -22,6 +22,9 @@ REPORT_BACK = "REPORT_BACK:"
 POST_TO_TOPIC = "POST_TO_TOPIC:"
 #: Topics one agent may open per hour: a guard against a loop opening topics.
 MAX_TOPICS_PER_HOUR = 5
+#: Assignments one agent may post into other topics per hour. Each one wakes the peers it
+#: names there, so a loop must not turn a coordinator into a fan-out (#498 review).
+MAX_POSTS_PER_HOUR = 20
 #: Telegram's limit on a topic name.
 MAX_TOPIC_NAME = 128
 
@@ -49,15 +52,22 @@ def parse_report_back(body: str) -> Optional[str]:
     return summary or None
 
 
-def parse_post_to_topic(body: str) -> Optional[Tuple[int, str]]:
-    """Parse a transport-directed post to an existing forum topic."""
+def parse_post_to_topic(body: str) -> Optional[Tuple[Optional[int], str]]:
+    """``POST_TO_TOPIC: <thread id>`` and the assignment under it (#498), else None.
+
+    The coordinator's plan spans the topics it opened, and a turn only posts where it runs,
+    so this directive names the topic the post goes in: the transport, never the reply's
+    words, decides where it lands. A directive whose target is not a topic id comes back as
+    ``(None, text)`` -- the transport answers it, instead of posting "POST_TO_TOPIC: nope"
+    in the group as if it were a reply.
+    """
     first, _, rest = _LEAD.sub("", body or "").lstrip().partition("\n")
     if not first.upper().startswith(POST_TO_TOPIC):
         return None
     target = first[len(POST_TO_TOPIC):].strip()
-    if not target.isdecimal() or not rest.strip():
+    if not rest.strip():
         return None
-    return int(target), rest.strip()
+    return (int(target) if target.isdecimal() else None), rest.strip()
 
 
 _URL = re.compile(r"\(?https?://\S+\)?")

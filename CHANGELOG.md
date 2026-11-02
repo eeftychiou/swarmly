@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The coordinator can post into its own topics, and its plan follows it** (`#498`). In the
+  `#486`/`#488` live run the coordinator could not run the next rounds from its main topic — a
+  turn only posts where it runs — and its per-topic sessions each held a different piece of one
+  plan. A reply that starts `POST_TO_TOPIC: <topic id>` now carries the assignment into a topic
+  the coordinator coordinates: the transport checks the target (known, a work topic, not found
+  gone, coordinator only, at most 20 an hour), posts there, and links the peers the assignment
+  names in that topic so they can act instead of being refused as unlinked; a directive it
+  cannot carry out is answered, never posted as prose. Opening a topic from another topic now
+  copies that topic's task, progress and latest messages into the new one's opening brief as
+  shared plan context, read the way a fresh turn reads it, so a coordinator on a session
+  runtime carries the plan too. `docs/telegram-channel.md` documents both.
+
 - **`audit-public` asks the other question** (`#1`, item 4): the redactor stops the maintainer's
   handle, chat ids and absolute paths leaving a host, but nothing could say what is *already*
   public — which is what a publication incident needs first. `swarmly-telegram --config

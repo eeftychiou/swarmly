@@ -910,11 +910,16 @@ missing); without them the brief is posted in place with a note.
 
 The coordinator can also post an assignment from any of its turns into a known coordinated
 topic by starting its reply with `POST_TO_TOPIC: <topic id>` and putting the assignment on the
-next line. The transport verifies the destination against its topic registry, posts there, and
-links addressed peers in that topic. When the coordinator opens a topic from another topic,
-the source topic's recap is copied into the new topic's opening brief as shared plan context;
-the recap includes the pinned task and progress for both fresh and session runtimes. That pinned
-brief is available to subsequent coordinator turns in the new topic.
+next line. The transport checks the destination against its topic registry — the topic must be
+known, a work topic, not one found gone — posts there, and **links the peers the assignment
+names in that topic** on the coordinator's path, so they can act there instead of being refused
+as unlinked. Only the coordinator may use it (any other agent's post stays in the topic its turn
+runs in), and a directive it cannot carry out is answered with a `POST_TO_TOPIC refused` notice
+rather than posted as prose; at most 20 assignments an hour, since each one wakes the peers it
+names. When the coordinator opens a topic from another topic, the source topic's task, progress
+and latest messages are copied into the new topic's opening brief as shared plan context — read
+the way a fresh turn reads that topic, whatever runtime it runs, so a coordinator on a session
+runtime gets the plan too — and that pinned brief is available to every later turn there.
 
 **Rate Limit & Turn Cooldown.** By default an agent's sends are at least 3 seconds apart, at
 most 18 a minute (per topic when topics run in parallel; see **Running topics in parallel**):
