@@ -8,13 +8,19 @@ system's light or dark preference, and the server is read-only and bound to the 
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import hmac
+import io
 import json
 import re
+import shutil
 import socket
+import tempfile
 import time
 import unittest
+from pathlib import Path
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
@@ -515,28 +521,69 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
             self.assertEqual(channel._sync_web_dashboard(), "off")
             self.assertIsNone(getattr(channel, "_web_server", None))
 
-    def test_a_non_holder_serves_a_loopback_pointer_page(self):
+    def test_a_non_holder_never_binds_the_shared_port(self):
+        """#510: the port used to carry a lease pointer on every non-holder. It does not."""
         channel = self.channel()
         channel.is_coordinator = lambda now=None: False
         channel.current_coordinator = lambda now=None: "Reasonix"
-        from swarmly.telegram.presence import Pulse
-        channel.presence().note(Pulse(alias="Reasonix", at=NOW,
-            status={"at": NOW, "web": {"public_host": "new.example.ts.net",
-                                       "bot_username": "ReasonixBot"}}), seen_at=NOW)
+        started: list = []
+
+        def record(self: Any) -> str:
+            started.append(self.requested_port)
+            return "http://127.0.0.1:1/"
+
+        original = webui.DashboardServer.start
+        webui.DashboardServer.start = record
+        try:
+            said = channel._sync_web_dashboard()
+        finally:
+            webui.DashboardServer.start = original
+        self.assertEqual(said, "off: not the lease holder (the port belongs to it)")
+        self.assertEqual(started, [])                    # nothing was bound, not even port 0
+        self.assertIsNone(getattr(channel, "_web_server", None))
+
+    def test_a_holder_that_loses_the_lease_releases_the_port_for_the_next_one(self):
+        """#510: after a failover on one host, the new holder binds the same number."""
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        old = self.channel(port=port)
+        old.is_coordinator = lambda now=None: True
+        self.assertTrue(old._sync_web_dashboard().startswith("serving http://127.0.0.1:"))
+        self.assertEqual(old._web_server.port, port)
+        try:
+            old.is_coordinator = lambda now=None: False
+            self.assertIn("stopped: not the lease holder", old._sync_web_dashboard())
+            self.assertIsNone(old._web_server)           # closed on the first beat that says so
+            new = self.channel(port=port)
+            new.is_coordinator = lambda now=None: True
+            said = new._sync_web_dashboard()
+            try:
+                self.assertTrue(said.startswith("serving http://127.0.0.1:"), said)
+                self.assertEqual(new._web_server.port, port)
+            finally:
+                new._web_server.stop()
+        finally:
+            if getattr(old, "_web_server", None) is not None:
+                old._web_server.stop()
+
+    def test_the_lease_holder_serves_the_page_and_losing_the_lease_closes_it(self):
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: True
         said = channel._sync_web_dashboard()
         try:
-            self.assertIn("serving lease pointer", said)
-            with urllib.request.urlopen(channel._web_server.url) as response:
-                self.assertEqual(response.status, 200)
-                body = response.read()
-                self.assertIn(b"current lease holder", body)
-                self.assertIn(b'href="https://t.me/ReasonixBot?startapp=dashboard"', body)
+            self.assertTrue(said.startswith("serving http://127.0.0.1:"), said)
+            self.assertTrue(channel._web_server.running)
+            self.assertTrue(channel._sync_web_dashboard().startswith("serving"))
         finally:
-            channel._web_server.stop()
+            channel.is_coordinator = lambda now=None: False
+            self.assertIn("stopped: not the lease holder", channel._sync_web_dashboard())
+        self.assertIsNone(channel._web_server)
 
-    def test_pointer_bind_failure_is_throttled(self):
+    def test_a_port_it_cannot_bind_is_retried_quietly(self):
         channel = self.channel()
-        channel.is_coordinator = lambda now=None: False
+        channel.is_coordinator = lambda now=None: True
         tries: list = []
 
         def refuse(self: Any) -> str:
@@ -551,20 +598,6 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
             self.assertEqual(len(tries), 1)
         finally:
             webui.DashboardServer.start = original
-
-    def test_the_lease_holder_serves_the_page_and_losing_the_lease_closes_it(self):
-        channel = self.channel()
-        channel.is_coordinator = lambda now=None: True
-        said = channel._sync_web_dashboard()
-        try:
-            self.assertTrue(said.startswith("serving http://127.0.0.1:"), said)
-            self.assertTrue(channel._web_server.running)
-            self.assertTrue(channel._sync_web_dashboard().startswith("serving"))
-        finally:
-            channel.is_coordinator = lambda now=None: False
-            self.assertIn("serving lease pointer", channel._sync_web_dashboard())
-            channel._web_server.stop()
-        self.assertFalse(channel._web_server.running)
 
     def test_the_page_reads_this_bots_own_records_and_no_identifier(self):
         channel = self.channel()
@@ -609,6 +642,121 @@ class TestTheLeaseHoldersTransportServesIt(unittest.TestCase):
         off.state_link.store = FakeStore(records())
         self.assertFalse(off.web_state()["registry"]["topics"][0]["links"][0]["stalled"])
 
+
+
+class TestThePortIsExclusive(unittest.TestCase):
+    """#510: one process per host holds ``web.port``, so the tunnel cannot reach a stranger.
+
+    ``ThreadingHTTPServer`` ships ``allow_reuse_address = True``, and on Windows ``SO_REUSEADDR``
+    lets a second process bind a port that is already listening -- the OS then picks which
+    socket answers. Four transports on one host all bound ``127.0.0.1:8787`` that way, and
+    requests reached a non-holder's pointer page. The bind is exclusive now.
+    """
+
+    def test_a_second_server_on_a_bound_port_does_not_start(self):
+        first = webui.DashboardServer(lambda: {"ok": True}, port=0)
+        url = first.start()
+        second = webui.DashboardServer(lambda: {"ok": True}, port=first.port)
+        try:
+            with self.assertRaises(OSError):
+                second.start()
+            self.assertFalse(second.running)
+            # The real page is still the one answering: the refused bind changed nothing.
+            with urllib.request.urlopen(url + webui.STATE_PATH.lstrip("/")) as response:
+                self.assertEqual(response.status, 200)
+        finally:
+            second.stop()
+            first.stop()
+
+    def test_the_bind_does_not_ask_the_os_to_share_the_port(self):
+        """The reason the outage happened, pinned: no ``SO_REUSEADDR`` where it means sharing."""
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):          # Windows: exclusive, said outright
+            self.assertFalse(webui._ExclusiveHTTPServer.allow_reuse_address)
+        else:                                              # POSIX: only shortens TIME_WAIT
+            self.assertTrue(webui._ExclusiveHTTPServer.allow_reuse_address)
+
+    @unittest.skipUnless(hasattr(socket, "SO_EXCLUSIVEADDRUSE"),
+                         "SO_EXCLUSIVEADDRUSE exists on Windows only")
+    def test_the_windows_socket_is_bound_exclusively(self):
+        server = webui.DashboardServer(lambda: {"ok": True}, port=0)
+        try:
+            server.start()
+            sock = server._httpd.socket
+            self.assertEqual(sock.getsockopt(socket.SOL_SOCKET,
+                                             socket.SO_EXCLUSIVEADDRUSE), 1)
+            self.assertEqual(sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR), 0)
+        finally:
+            server.stop()
+
+
+class TestCheckWarnsOnADuplicatePort(unittest.TestCase):
+    """#510: `check` says when a peer advertises the port this config names.
+
+    Its source is the presence table the transport already keeps in its own state folder:
+    every pulse now carries ``web.port``, so a duplicate on one host is visible without
+    reading another bot's ``config.yaml``.
+    """
+
+    def run_check(self, config: Any) -> Tuple[int, str]:
+        from swarmly.telegram import cli
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = asyncio.run(cli._check(config))
+        return code, out.getvalue()
+
+    def config(self, **web: Any) -> Any:
+        from tests.test_telegram_channel import make_config
+        home = tempfile.mkdtemp(prefix="swarm-web-port-")
+        self.addCleanup(shutil.rmtree, home, True)
+        config = make_config(web=dict({"enabled": True, "port": 8787}, **web),
+                             state={"dir": home}, bus={"enabled": False})
+        # `check` reads a config that came from a file, and `_state_file` needs to know where;
+        # this is the one thing the fixture has to add.
+        config.source_path = Path(home) / "config.yaml"
+        return config
+
+    def save_presence(self, config: Any, *peers: Tuple[str, Optional[Any]]) -> None:
+        from swarmly.telegram.channel import _state_file
+        path = _state_file(config, "presence")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        records = {}
+        for alias, port in peers:
+            web = {"public_host": "", "bot_username": alias.lower() + "_bot"}
+            if port is not None:
+                web["port"] = port
+            records[alias] = {"alias": alias, "last_seen": NOW, "snapshot": {"at": NOW,
+                                                                           "web": web}}
+        path.write_text(json.dumps({"saved_at": NOW, "peers": records}), encoding="utf-8")
+
+    def test_a_peer_on_the_same_port_is_a_note_naming_it(self):
+        config = self.config()
+        self.save_presence(config, ("Codex", 8787), ("Antigravity", 8788))
+        code, printed = self.run_check(config)
+        self.assertIn("web dashboard   : loopback port 8787, also named by Codex", printed)
+        self.assertIn("NOTES:", printed)
+        self.assertIn("only the bot holding the lease binds it", printed)
+        self.assertNotIn("Antigravity", printed.split("NOTES:")[1])   # 8788 is its own port
+        self.assertEqual(code, 0)                    # a note, not a problem: check still passes
+
+    def test_a_peer_on_another_port_is_no_note(self):
+        config = self.config()
+        self.save_presence(config, ("Codex", 8788))
+        _, printed = self.run_check(config)
+        self.assertIn("web dashboard   : loopback port 8787", printed)
+        self.assertNotIn("NOTES:", printed)
+
+    def test_a_peer_on_an_older_rev_advertises_no_port_and_is_no_note(self):
+        config = self.config()
+        self.save_presence(config, ("Codex", None))
+        _, printed = self.run_check(config)
+        self.assertNotIn("NOTES:", printed)
+
+    def test_no_web_section_reads_no_presence_and_says_nothing(self):
+        from tests.test_telegram_channel import make_config
+        config = make_config()
+        code, printed = self.run_check(config)
+        self.assertNotIn("web dashboard", printed)
+        self.assertEqual(code, 0)
 
 
 ADMIN_ID = 424242
@@ -827,7 +975,9 @@ class TestThePinnedCardsButton(unittest.TestCase):
 
     def channel(self, **web: Any) -> Any:
         from tests.test_telegram_channel import make_channel, make_config
-        return make_channel(make_config(web=dict({"enabled": True, "port": 8787}, **web)))
+        # Port 0: since #510 the bind is exclusive, so a test can no longer squat on the
+        # operator's own 8787 while a real transport holds it.
+        return make_channel(make_config(web=dict({"enabled": True, "port": 0}, **web)))
 
     def test_no_public_host_means_no_button_and_no_url(self):
         channel = self.channel()
@@ -840,7 +990,7 @@ class TestThePinnedCardsButton(unittest.TestCase):
         channel = self.channel(public_host="swarm.example.ts.net")
         web = channel.own_pulse(NOW).status["web"]
         self.assertEqual(web, {"public_host": "swarm.example.ts.net",
-                               "bot_username": "HermesBot"})
+                               "bot_username": "HermesBot", "port": 0})
 
     def test_a_disabled_section_draws_no_button_even_with_a_public_host(self):
         """A button that opens nothing is worse than no button (review, #258)."""
@@ -934,17 +1084,6 @@ class TestThePinnedCardsButton(unittest.TestCase):
             self.assertIsNone(getattr(channel, "_web_server", None))
         finally:
             webui.DashboardServer.start = original
-
-    def test_pointer_failure_does_not_throttle_dashboard_after_failover(self):
-        channel = self.channel()
-        channel.is_coordinator = lambda now=None: False
-        with mock.patch.object(webui.DashboardServer, "start", side_effect=OSError("busy")):
-            self.assertTrue(channel._sync_web_dashboard().startswith("failed"))
-        channel.is_coordinator = lambda now=None: True
-        with mock.patch.object(webui.DashboardServer, "start", return_value="http://127.0.0.1:8787/") as start:
-            self.assertTrue(channel._sync_web_dashboard().startswith("serving"))
-            start.assert_called_once()
-        channel._web_server.stop()
 
 class TestTheLookAndLayout(unittest.TestCase):
     """#343: one shell (header, navigation, sections) and a design system behind it."""

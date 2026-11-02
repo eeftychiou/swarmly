@@ -51,6 +51,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The web dashboard's port is exclusive, and only the lease holder binds it** (`#510`). On a
+  host running four transports, all four listened on `127.0.0.1:8787`: `ThreadingHTTPServer`
+  sets `SO_REUSEADDR`, and on Windows that lets a second process bind a port that is already
+  listening, so the OS handed requests to a non-holder's lease pointer and the tunnel never
+  reached the real page. The bind is now exclusive — `SO_EXCLUSIVEADDRUSE` on Windows, and no
+  `SO_REUSEADDR` there either; on POSIX `SO_REUSEADDR` stays, because there it only shortens the
+  `TIME_WAIT` wait and never admits a second live listener — so a second bind raises `OSError`
+  and the existing retry path handles it. A bot that does not hold the lease now binds nothing:
+  the pointer page went with the shared port it was squatting on, and the old holder closes the
+  port on the first beat that finds it replaced, so the new holder binds the same number on its
+  next retry. Every bot on a host names the same `web.port` (the one the tunnel forwards to), so
+  a failover needs no config change and no distinct ports. `swarmly-telegram check` prints the
+  port in force and notes it when a peer's pulse names the same one — the source is the
+  presence table the transport already keeps, since each pulse now advertises `web.port`.
+  `docs/telegram-channel.md` and `config/telegram.template.yaml` describe the one-shared-port
+  behaviour.
+
 - **The Mini App dashboard no longer freezes after five minutes** (`#445`). Telegram stamps
   `initData` once, when the app opens, and never refreshes it; the server applied
   `web.init_max_age` (300 s) to reads and writes alike, so a page left open lost every poll and

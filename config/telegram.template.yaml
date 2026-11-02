@@ -165,6 +165,19 @@ bus:
 #                                      # config.yaml); never a folder shared with other bots
 # `bus.transport` keeps its own default (git): turning gitbus off by default is a later phase.
 
+# The read-only dashboard page (docs/telegram-channel.md). Off unless enabled; the transport
+# holding the lease serves it on the loopback, and a bot that is not the holder binds nothing.
+# web:
+#   enabled: true
+#   port: 8787                         # ONE number per host -- the port your tunnel forwards to
+#                                      # (e.g. `tailscale funnel 8787`). Since #510 only the
+#                                      # lease holder binds it and the bind is exclusive, so the
+#                                      # page follows the lease with no config change. Give a
+#                                      # bot its own port only for a tunnel of its own.
+#   public_host: swarm.example.ts.net  # the name the tunnel gives you: makes it a Mini App
+#   init_max_age: 300                  # how old Mini App initData may be for a write, in seconds
+#   read_max_age: 86400                # ... and for a read
+
 limits:
   max_message_chars: 4096              # Telegram's hard limit for text messages
   max_reply_parts: 4                   # a longer reply is split into up to this many messages
