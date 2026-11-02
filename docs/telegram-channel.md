@@ -1538,11 +1538,15 @@ Three things change when `public_host` is set, and only then.
   host and optional port.
 
 - **The button.** The card follows the current lease holder. Each enabled bot advertises its
-  public host and Telegram bot username in its pulse; the coordinator uses the holder's latest
-  values and links to `https://t.me/<holder-bot>?startapp=dashboard`. Telegram launches the
-  configured Mini App with its signed login intact. A holder with no public host gets a
-  `Dashboard: local only on <bot>` note and no dead link. `web.port` is the loopback port the
-  tunnel forwards to; it is not part of the Telegram link.
+  public host and Telegram bot username in its pulse; if the username is missing, the
+  coordinator uses that bot's handle from the roster. The link is
+  `https://t.me/<holder-bot>?startapp=dashboard`. Every bot that can hold the lease needs its
+  own Mini App configured in BotFather, since Telegram resolves `startapp` against the bot in
+  the link. Without it, Telegram cannot launch the dashboard and the button/pointer may lead
+  to the bot chat instead. Telegram launches the configured Mini App with its signed login
+  intact. A holder with no public host or known handle gets a `Dashboard: local only on <bot>`
+  note and no dead link. `web.port` is the loopback port the tunnel forwards to; it is not part
+  of the Telegram link.
 
 Every bot with `web.enabled` also serves a small lease pointer on its loopback port when it is
 not the holder. Configure a distinct `web.port` per bot on a host, and point each tunnel at that

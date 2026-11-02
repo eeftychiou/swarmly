@@ -895,6 +895,15 @@ class TestThePinnedCardsButton(unittest.TestCase):
         self.assertEqual(channel.mini_app_link(), expected)
         self.assertEqual(channel.control_markup()[0][0]["url"], expected)
 
+    def test_holder_username_falls_back_to_the_roster_handle(self):
+        from swarmly.telegram.presence import Pulse
+        channel = self.channel(public_host="old.example.ts.net")
+        channel.current_coordinator = lambda now=None: "Reasonix"
+        channel.bot_handle = lambda alias: "@RosterBot"
+        channel.presence().note(Pulse(alias="Reasonix", at=NOW,
+            status={"at": NOW, "web": {"public_host": "new.example.ts.net"}}), seen_at=NOW)
+        self.assertEqual(channel.mini_app_link(), "https://t.me/RosterBot?startapp=dashboard")
+
     def test_a_taken_port_is_retried_on_an_interval_not_every_beat(self):
         """A bind that fails is one warning and a quiet minute, not one per heartbeat."""
         channel = self.channel(port=8787)
@@ -915,6 +924,17 @@ class TestThePinnedCardsButton(unittest.TestCase):
             self.assertIsNone(getattr(channel, "_web_server", None))
         finally:
             webui.DashboardServer.start = original
+
+    def test_pointer_failure_does_not_throttle_dashboard_after_failover(self):
+        channel = self.channel()
+        channel.is_coordinator = lambda now=None: False
+        with mock.patch.object(webui.DashboardServer, "start", side_effect=OSError("busy")):
+            self.assertTrue(channel._sync_web_dashboard().startswith("failed"))
+        channel.is_coordinator = lambda now=None: True
+        with mock.patch.object(webui.DashboardServer, "start", return_value="http://127.0.0.1:8787/") as start:
+            self.assertTrue(channel._sync_web_dashboard().startswith("serving"))
+            start.assert_called_once()
+        channel._web_server.stop()
 
 class TestTheLookAndLayout(unittest.TestCase):
     """#343: one shell (header, navigation, sections) and a design system behind it."""

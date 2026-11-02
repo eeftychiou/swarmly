@@ -4560,8 +4560,8 @@ class AgentChannel:
             peer = next((peer for name, peer in self.presence().peers.items()
                          if str(name).strip().lower() == alias.lower()), None)
             data = (peer.snapshot or {}).get("web") if peer else None
-            return (str((data or {}).get("bot_username") or "").lstrip("@").strip()
-                    if isinstance(data, dict) else "")
+            username = (data or {}).get("bot_username") if isinstance(data, dict) else ""
+            return str(username or self.bot_handle(alias) or "").lstrip("@").strip()
         except Exception:                         # noqa: BLE001 - no public link is safe
             logger.debug("web dashboard: holder's bot username is not readable", exc_info=True)
             return ""
@@ -4790,7 +4790,7 @@ class AgentChannel:
             if server is not None and server.running:
                 return "serving lease pointer " + server.url
             now_wall = time.time()
-            failed_at = float(getattr(self, "_web_failed_at", 0.0) or 0.0)
+            failed_at = float(getattr(self, "_web_pointer_failed_at", 0.0) or 0.0)
             if failed_at and now_wall - failed_at < self.WEB_RETRY_SECONDS:
                 return "failed: waiting to retry the port"
             server = webui.DashboardServer(
@@ -4799,11 +4799,11 @@ class AgentChannel:
             try:
                 url = server.start()
             except OSError as exc:
-                self._web_failed_at = now_wall
+                self._web_pointer_failed_at = now_wall
                 logger.warning("web dashboard pointer: cannot serve on port %s (%s); retrying in %ds",
                                getattr(web, "port", 8787), exc, self.WEB_RETRY_SECONDS)
                 return f"failed: {exc}"
-            self._web_failed_at = 0.0
+            self._web_pointer_failed_at = 0.0
             self._web_server = server
             return "serving lease pointer " + url
         if server is not None and getattr(server, "pointer", None):
@@ -4816,7 +4816,7 @@ class AgentChannel:
         # one line, then a quiet retry interval -- the port may be a peer's for a moment
         # during a failover, and the operator needs the fact once, not sixty times an hour.
         now_wall = time.time()
-        failed_at = float(getattr(self, "_web_failed_at", 0.0) or 0.0)
+        failed_at = float(getattr(self, "_web_dashboard_failed_at", 0.0) or 0.0)
         if failed_at and now_wall - failed_at < self.WEB_RETRY_SECONDS:
             return "failed: waiting to retry the port"
         server = webui.DashboardServer(
@@ -4830,11 +4830,11 @@ class AgentChannel:
         try:
             url = server.start()
         except OSError as exc:
-            self._web_failed_at = now_wall
+            self._web_dashboard_failed_at = now_wall
             logger.warning("web dashboard: cannot serve on port %s (%s); retrying in %ds",
                            getattr(web, "port", 8787), exc, self.WEB_RETRY_SECONDS)
             return f"failed: {exc}"
-        self._web_failed_at = 0.0
+        self._web_dashboard_failed_at = 0.0
         self._web_server = server
         logger.info("web dashboard: serving %s (read-only, %s)", url,
                     f"Mini App for {server.public_host}" if server.requires_init else "loopback")
