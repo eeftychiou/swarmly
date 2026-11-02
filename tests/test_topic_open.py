@@ -84,6 +84,8 @@ class TestOpenTopic(unittest.TestCase):
                                                 "@CodexBot please review #42"))
         channel.is_coordinator = lambda: True
         channel.topics.remember(GROUP, 77, "coordinated work")
+        linked = []
+        channel.state_link.note_handoff_peers = lambda *args: linked.append(args)
         sent = []
         original_send = channel.send
 
@@ -95,12 +97,16 @@ class TestOpenTopic(unittest.TestCase):
         run(channel.handle_event(ask("@HermesBot dispatch the next round")))
         self.assertTrue(any("@CodexBot please review #42" in text and
                             kwargs.get("thread_id") == 77 for text, kwargs in sent), sent)
+        self.assertEqual(linked, [(GROUP, 77, ["Codex"], channel.config.identity.alias)])
 
     def test_new_topic_copies_shared_plan_into_its_coordinator_turn(self):
         adapter = Scripted("NO_REPLY")
+        adapter.KEEPS_TOPIC_SESSION = True
         channel = make_channel(adapter=adapter)
         channel.bot = TopicBot()
-        channel._topic_recap = lambda _event: "Plan: split work into rounds 1, 2 and 3."
+        channel._topic_memory.record(GROUP, 12, "Hermes", "Opening context for the topic.", 13)
+        channel._topic_memory.record(
+            GROUP, 12, "Hermes", "Plan: split work into rounds 1, 2 and 3.", 14)
         source = ask("open round two", thread_id=12)
 
         async def scenario():
@@ -109,6 +115,22 @@ class TestOpenTopic(unittest.TestCase):
         run(scenario())
         self.assertTrue(any("Plan: split work into rounds 1, 2 and 3." in msg.text
                             for msg in adapter.seen), adapter.seen)
+
+    def test_plan_context_does_not_turn_peer_handoff_into_own_task(self):
+        adapter = Scripted("NO_REPLY")
+        adapter.KEEPS_TOPIC_SESSION = True
+        channel = make_channel(adapter=adapter)
+        channel.bot = TopicBot()
+        channel._topic_memory.record(GROUP, 12, "Hermes", "Opening context for the topic.", 13)
+        channel._topic_memory.record(GROUP, 12, "Hermes", "Plan: round two is topic B.", 14)
+        own_tasks = []
+        channel._run_own_task = lambda *args: own_tasks.append(args)
+
+        run(channel._open_topic(ask("open round two", thread_id=12), "round two",
+                                "@CodexBot please handle round two."))
+        self.assertEqual(own_tasks, [])
+        self.assertTrue(any("@CodexBot please handle round two." in item["text"]
+                            for item in channel._test_sender.sent))
 
     def test_opens_topic_runs_own_brief_and_reports_back(self):
         adapter = Scripted("NEW_TOPIC: research\nCompare the two APIs.",

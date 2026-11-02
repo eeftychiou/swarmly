@@ -11214,9 +11214,10 @@ class AgentChannel:
         return target
 
     async def _post_in_known_topic(self, event: ChannelEvent, body: str,
-                                   topic: Tuple[int, int]) -> Any:
+                                   topic: Tuple[int, int], *,
+                                   notice_verb: str = "moved this to") -> Any:
         chat_id, thread_id = topic
-        logger.info("moving work from %s to topic %s, which is about the same item",
+        logger.info("posting work from %s in topic %s",
                     event.thread_id or "General", thread_id)
         await self.send(body, chat_id=chat_id, thread_id=thread_id, token=True)
         # A bot never receives its own posts: the new items the reply names are learned here,
@@ -11226,7 +11227,7 @@ class AgentChannel:
         # The moved reply may be the hand-off that matters (live test: it had no bus copy).
         self._mirror_handoffs(body, chat_id, thread_id, self.last_first_message_id,
                               asker=self._asker(event))
-        return await self.send(f"↪ moved this to {topic_link(chat_id, thread_id)}",
+        return await self.send(f"↪ {notice_verb} {topic_link(chat_id, thread_id)}",
                                chat_id=event.chat_id, thread_id=event.thread_id,
                                reply_to_message_id=event.message_id, notice=True)
 
@@ -11239,14 +11240,11 @@ class AgentChannel:
             return await self.send("⚠️ POST_TO_TOPIC refused: target is not a known coordinated "
                                    "topic.", chat_id=event.chat_id,
                                    thread_id=event.thread_id, notice=True)
-        await self.send(message, chat_id=home, thread_id=thread_id, token=True)
-        self._log_topic(home, thread_id, self.config.identity.alias, message,
-                        self.last_first_message_id)
-        self._mirror_handoffs(message, home, thread_id, self.last_first_message_id,
-                              asker=self._asker(event))
-        return await self.send(f"↪ posted in {topic_link(home, thread_id)}",
-                               chat_id=event.chat_id, thread_id=event.thread_id,
-                               reply_to_message_id=event.message_id, notice=True)
+        sent = await self._post_in_known_topic(
+            event, message, (home, thread_id), notice_verb="posted in")
+        self.state_link.note_handoff_peers(
+            home, thread_id, self.assigned_peers(message), self.config.identity.alias)
+        return sent
 
     def _work_moves_to_topics(self, event: ChannelEvent) -> bool:
         """Whether this message is in the home group's General with limits.work_in_topics on
@@ -11263,6 +11261,7 @@ class AgentChannel:
         ``moved``: the brief is this agent's reply to work started in General, posted in the
         new topic instead; it already is the work, so nothing more is run."""
         home = self.config.identity.home_channel_id
+        hands = hands_over(brief, self._peer_handle())
         if not moved:
             # A topic already about the same issue or PR takes the work (round 2 export:
             # "PR #37 re-review" was opened while a topic about #37 existed). With General and
@@ -11332,7 +11331,11 @@ class AgentChannel:
         # Carry the source discussion's shared plan into each topic's pinned opening brief.
         # Topic sessions stay isolated; the coordinator's plan is copied deliberately when
         # it opens a work topic so later turns do not depend on the source session.
-        source_context = (self._topic_recap(event) if event.thread_id is not None else "")
+        source_context = ""
+        if event.thread_id is not None:
+            source_context = self._topic_memory.recap(
+                event.chat_id, event.thread_id, current_id=event.message_id, fresh=True,
+                own_alias=self.config.identity.alias, mark_seen=False)
         if source_context.strip():
             brief = (f"Shared plan context from the coordinating topic:\n{source_context.strip()}"
                      f"\n\nAssignment for this topic:\n{brief}")
@@ -11348,7 +11351,7 @@ class AgentChannel:
                                notice=True)
         if moved:
             return sent
-        if not hands_over(brief, self._peer_handle()):
+        if not hands:
             # Not addressed to a peer: the brief is this agent's own task, in the new topic.
             # A peer named further down (to confirm scope, say) still sees the brief.
             self._run_own_task(f"{SELF_TASK_NOTE}\n\n{brief}", home, thread_id, name)

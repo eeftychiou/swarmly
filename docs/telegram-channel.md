@@ -892,7 +892,8 @@ topic by starting its reply with `POST_TO_TOPIC: <topic id>` and putting the ass
 next line. The transport verifies the destination against its topic registry, posts there, and
 links addressed peers in that topic. When the coordinator opens a topic from another topic,
 the source topic's recap is copied into the new topic's opening brief as shared plan context;
-that pinned brief is available to subsequent coordinator turns in the new topic.
+the recap includes the pinned task and progress for both fresh and session runtimes. That pinned
+brief is available to subsequent coordinator turns in the new topic.
 
 **Rate Limit & Turn Cooldown.** By default an agent's sends are at least 3 seconds apart, at
 most 18 a minute (per topic when topics run in parallel; see **Running topics in parallel**):
