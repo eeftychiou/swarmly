@@ -286,5 +286,15 @@ class TestLiveParallel(unittest.TestCase):
         self.assertIn("value=max_parallel_turns=2", notes[0])
 
 
+    def test_the_keyboard_pick_and_the_page_carry_the_control(self):
+        """The card's Parallel picker sets it live, and the build claims it (#491)."""
+        channel, _ = self.channel(parallel=1)
+        self.assertIn("bot.parallel", channel.control_actions())
+        self.assertTrue(ct.is_picker("bot.parallel"))
+        said = run(channel._apply_pick("bot.parallel", "3"))
+        self.assertEqual(channel.max_parallel_turns(), 3)
+        self.assertIn("runs up to 3 parallel turns", said)
+
+
 if __name__ == "__main__":
     unittest.main()

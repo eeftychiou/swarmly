@@ -5306,7 +5306,7 @@ class AgentChannel:
         (#451): the chat keyboard leaves it out, the dashboard draws it as one form.
         """
         return ("bot.pause", "bot.resume", "bot.restart", "bot.offline", "bot.stop_turn",
-                "bot.model", "bot.effort", "bot.settings", "bot.cli", "bot.memory",
+                "bot.model", "bot.effort", "bot.parallel", "bot.settings", "bot.cli", "bot.memory",
                 "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
                 "swarm.lease", "swarm.failback",
                 "swarm.hold", "swarm.release", "swarm.admit", "swarm.remove",

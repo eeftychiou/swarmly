@@ -406,7 +406,8 @@ def keyboard(actions: Iterable[str]) -> List[List[Dict[str, str]]]:
 #: The controls that take a **picked value**: pressing one with no value offers the choices,
 #: pressing one with a value sets it after the second tap (#153). The list is short on purpose
 #: -- a control joins it when its choices can actually be read in code, with no model turn.
-PICKERS: Tuple[str, ...] = ("bot.model", "bot.effort", "swarm.role", "swarm.lease")
+PICKERS: Tuple[str, ...] = ("bot.model", "bot.effort", "bot.parallel", "swarm.role",
+                           "swarm.lease")
 
 
 def is_picker(action: str) -> bool:
