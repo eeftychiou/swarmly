@@ -776,7 +776,11 @@ liveness line, e.g. `peers=Claudebot:up,DeepSeek:down(12m),Reasonix:busy(25m)`. 
 **Busy is not gone.** A message that queues behind a turn running for two minutes or more
 gets one "⏳ <alias> is busy with a turn running since HH:MM UTC" line in its topic (at
 most one per topic per five minutes), so peers and people see a working bot rather than a
-silent one. When the turn ends, every message that queued behind it in that topic runs as
+silent one. The line names the turn *that topic's* message waits for, and the two minutes
+are measured from that turn's start: with `limits.max_parallel_turns` above 1 a neighbor
+topic's older turn is not it (#495). When the topic has no turn of its own and waits only
+because the bot is at its cap, the line says so instead — "busy with 2 turns in other
+topics" — rather than naming another topic's start time. When the turn ends, every message that queued behind it in that topic runs as
 one turn, oldest first, instead of one turn each.
 
 **A turn that hits the time limit continues.** When a topic turn of a runtime that resumes
