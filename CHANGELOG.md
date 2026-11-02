@@ -8,6 +8,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`limits.max_parallel_turns` is a live per-bot setting** (`#491`). It was config-only: raising
+  it meant editing five `config.yaml` files, checking each and restarting each bot. It is now one
+  field on the bot's dashboard settings form and an admin command — `/parallel@bot` says the
+  value in force and its source (`config.yaml` or a runtime pick), `/parallel@bot <n>` sets it,
+  `/parallel@bot default` clears the pick. Both doors run the same validation as the parser (the
+  `MAX_PARALLEL_TURNS` bound, a single-session adapter, a pinned conversation, a `cwd` that is
+  not a git checkout) and refuse in its own words, changing nothing. The pick is kept in the
+  bot's `state.dir` and re-validated when it is loaded, so it survives a restart and a pick the
+  adapter can no longer carry falls back to `config.yaml`. A new value applies without a restart:
+  at once when no turn fills it, and at the next idle moment otherwise, letting running turns
+  finish — the bot says which. Every adapter, the base one and each topic's, hears the value in
+  force, so the `#78` pinned-conversation guard stays on. `/status` and the card show
+  `parallel=<n>`, marked `(override)` for a runtime pick. `docs/telegram-channel.md` and
+  `docs/telegram/COMMANDS.md` document it.
+
 - **The coordinator can post into its own topics, and its plan follows it** (`#498`). In the
   `#486`/`#488` live run the coordinator could not run the next rounds from its main topic — a
   turn only posts where it runs — and its per-topic sessions each held a different piece of one

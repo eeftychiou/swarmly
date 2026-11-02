@@ -63,9 +63,9 @@ from swarmly.telegram.commands import (
     status_reply,
     where_reply,
 )
-from swarmly.telegram.config import (EFFORT_LEVELS, MAX_REPLY_PARTS, AgentConfig,
+from swarmly.telegram.config import (EFFORT_LEVELS, MAX_PARALLEL_TURNS, MAX_REPLY_PARTS, AgentConfig,
                                      MODEL_NAME, MODEL_TYPES, effort_problem,
-                                     model_problem)
+                                     model_problem, parallel_problem)
 from swarmly.telegram import native as native_cli
 from swarmly.telegram import topic_filter
 from swarmly.telegram.poll import bus_poll_once
@@ -525,13 +525,35 @@ class AgentChannel:
                  gitbus_read: Optional[Callable[[Path], List[Any]]] = None,
                  transport: bool = False):
         self.config = config
+        # #491 (review): the live max_parallel_turns pick is read *before* any adapter is
+        # built, so the base adapter and every topic's adapter hear the value in force. Loaded
+        # after the base adapter was told the config's number, a stored pick was silently
+        # invisible to them, and the adapter's #78 pinned-conversation guard stayed off.
+        self._parallel_path = _state_file(config, "parallel")
+        self._parallel_override: Optional[int] = None
+        self._pending_parallel_turns: Optional[int] = None
+        self._pending_parallel_reply_chat_id: Optional[int] = None
+        self._pending_parallel_reply_thread_id: Optional[int] = None
+        saved_parallel = load_state(self._parallel_path, "parallel choices")
+        saved_value = saved_parallel.get("max_parallel_turns")
+        if saved_value is not None:
+            try:
+                # Re-validated on load: a pick the adapter or cwd can no longer carry (the
+                # config changed under it) falls back to config.yaml rather than applying.
+                if parallel_problem(config.adapter, config.limits, int(saved_value)) is None:
+                    self._parallel_override = int(saved_value)
+            except (TypeError, ValueError):
+                pass
+        parallel = (self._parallel_override if self._parallel_override is not None
+                    else int(getattr(config.limits, "max_parallel_turns", 1) or 1))
+        self._parallel_turns = max(parallel, 1)
         # Issue #123: only the long-running transport may arm the fail-fast gate;
         # it calls `AgentChannel(config, transport=True)` from cli._run.
         self.adapter = adapter or build_adapter(config, transport=transport)
         if hasattr(self.adapter, "use_parallel_limit"):
             # Issue #78: the adapter refuses a runtime conversation pin while topics run in
             # parallel -- a pinned conversation is one context for all of them.
-            self.adapter.use_parallel_limit(config.limits.max_parallel_turns)
+            self.adapter.use_parallel_limit(self._parallel_turns)
         sessions = getattr(self.adapter, "SESSIONS_STATE", None)
         if adapter is None and sessions and hasattr(self.adapter, "use_state_file"):
             self.adapter.use_state_file(_state_file(config, sessions))
@@ -600,8 +622,8 @@ class AgentChannel:
         # how many topics run at once.
         self._turn_lock = asyncio.Lock()
         self._turn_locks: Dict[Tuple[int, Optional[int]], asyncio.Lock] = {}
-        parallel = int(getattr(config.limits, "max_parallel_turns", 1) or 1)
-        self._parallel_turns = max(parallel, 1)
+        self._idle_event = asyncio.Event()
+        self._idle_event.set()
         # #486: each topic's working copy, resolved once ((base, name) -> folder or None), so
         # the lock, the folder and the adapter all read the same answer. The lock makes that
         # "once" true under concurrency: the creation may run in a worker thread (the loop's
@@ -609,14 +631,15 @@ class AgentChannel:
         self._topic_folders: Dict[Tuple[str, str], Optional[Path]] = {}
         self._topic_folders_lock = threading.Lock()
         self._turn_slots: Optional[asyncio.Semaphore] = (
-            asyncio.Semaphore(parallel) if parallel > 1 else None)
+            asyncio.Semaphore(self._parallel_turns) if self._parallel_turns > 1 else None)
         home = getattr(config.identity, "home_channel_id", None)
         self.topics = TopicMap(_topics_path(config), home_chat_id=int(home) if home else None)
-        if parallel > 1 and getattr(config.limits, "allow_shared_cwd", False):
+        if self._parallel_turns > 1 and getattr(config.limits, "allow_shared_cwd", False):
             logger.warning("%s runs up to %d topic turns at once and allows a shared working "
                            "directory (%s): a topic whose own copy cannot be made runs there "
                            "alone, and nothing stops it overwriting what it finds",
-                           config.identity.alias, parallel, config.adapter.cwd or ".")
+                           config.identity.alias, self._parallel_turns,
+                           config.adapter.cwd or ".")
         self._last_agent_turn = float("-inf")     # the bot-to-bot cooldown, per lock key
         self._last_turn_at: Dict[Any, float] = {}
         self._peer_turns: Dict[Any, int] = {}     # consecutive peer-started turns, per topic
@@ -1002,7 +1025,9 @@ class AgentChannel:
         cfg = dataclasses.replace(self.config, adapter=cfg_adapter)
         adapter = build_adapter(cfg, transport=True)
         if hasattr(adapter, "use_parallel_limit"):
-            adapter.use_parallel_limit(self.config.limits.max_parallel_turns)
+            # The value in force, not the config's (#491 review): a stored /parallel pick must
+            # keep the #78 pinned-conversation guard on for every topic's adapter too.
+            adapter.use_parallel_limit(self._parallel_turns)
         sessions = getattr(adapter, "SESSIONS_STATE", None)
         if sessions and hasattr(adapter, "use_state_file"):
             adapter.use_state_file(_state_file(self.config, sessions, suffix=suffix))
@@ -1743,6 +1768,9 @@ class AgentChannel:
         if self.config.adapter.model_switchable:
             result += f" model={self._model_for(event) or 'cli-default'}"
             result += f" effort={self._effort_for(event) or 'cli-default'}"
+        parallel = self.max_parallel_turns()
+        source = "(override)" if self._parallel_override is not None else ""
+        result += f" parallel={parallel}{source}"
         if event is not None:
             proj = self.router.project_for(event.chat_id, event.thread_id)
             if proj:
@@ -2064,7 +2092,7 @@ class AgentChannel:
         command, target = parsed
         if command == "effort":
             command = "reasoning"
-        if command not in (*DIAG_COMMANDS, "model", "reasoning", "round", "wakes",
+        if command not in (*DIAG_COMMANDS, "model", "reasoning", "parallel", "round", "wakes",
                             "owed", "usage", "memory", "drift", "storetest", "state", "topics"):
             return None
         if target:
@@ -2083,6 +2111,8 @@ class AgentChannel:
             return self._model_command(event)
         if command == "reasoning":
             return self._reasoning_command(event)
+        if command == "parallel":
+            return self._parallel_command(event)
         if command == "round":
             return self._round_summary(event)
         if command == "wakes":
@@ -2109,6 +2139,121 @@ class AgentChannel:
                 show_all=any(word.lower() == "all" for word in words),
                 filters=topic_filter.parse(words))
         return self._command_reply(command, event)
+
+    def max_parallel_turns(self) -> int:
+        """The max parallel turns setting in force for this bot (#491)."""
+        return self._parallel_turns
+
+    def parallel_choices(self, adapter: Optional[Any] = None,
+                         limits: Optional[Any] = None) -> List[int]:
+        """The parallel turn values this bot's adapter and cwd accept (1 to 8) (#491).
+
+        Every refusal above 1 is a property of the adapter, its pinned conversation and its
+        cwd — never of the number itself — so one check decides the whole list. Building it
+        with a check per value ran `git rev-parse` seven times on every dashboard build, on
+        the event loop (review, #491).
+        """
+        ad = adapter or self.config.adapter
+        lim = limits or self.config.limits
+        if parallel_problem(ad, lim, 2) is not None:
+            return [1]
+        return list(range(1, MAX_PARALLEL_TURNS + 1))
+
+    def _parallel_command(self, event: ChannelEvent, log: bool = True) -> str:
+        """``/parallel`` shows the parallel turn limit in force and its source;
+        ``/parallel <n>`` (admin only) switches it live;
+        ``/parallel default`` returns to config.yaml (#491).
+
+        *log* is False for a press: the press already posts its own ``CONTROL`` line
+        (``control_press``), and a form press posts ``bot.settings`` — one press, one line
+        (#450, review).
+        """
+        alias = self.config.identity.alias
+        args = command_args(event.text or "")
+        current = self.max_parallel_turns()
+        if not args:
+            source = ("a runtime pick" if self._parallel_override is not None
+                      else "config.yaml")
+            return (f"{alias} runs up to {current} parallel turn{'s' if current > 1 else ''} "
+                    f"({source}). The admin can change it with "
+                    f"/parallel@{self.config.identity.name} <n>.")
+        if not self.config.is_admin(event.author_id):
+            logger.warning("/parallel from @%s ignored: only the admin changes parallel turns",
+                           event.author_username)
+            return f"{alias}: only the admin can change parallel turns."
+        if len(args) > 1:
+            return f"{alias}: /parallel takes a number from 1 to {MAX_PARALLEL_TURNS} (or default)."
+        target_val = args[0]
+        if target_val.lower() == "default":
+            self._parallel_override = None
+            save_state(self._parallel_path, {}, "parallel choices")
+            cfg_val = int(getattr(self.config.limits, "max_parallel_turns", 1) or 1)
+            said = self._apply_parallel_turns(cfg_val, event=event)
+            if log:
+                self._log_control_parallel(event, "default")
+            return (f"{alias} goes back to {cfg_val} parallel turn{'s' if cfg_val > 1 else ''} "
+                    f"(from config.yaml){said}.")
+        problem = parallel_problem(self.config.adapter, self.config.limits, target_val)
+        if problem:
+            return f"{alias} kept {current} parallel turns: {problem}"
+        n = int(target_val)
+        self._parallel_override = n
+        save_state(self._parallel_path, {"max_parallel_turns": n}, "parallel choices")
+        said = self._apply_parallel_turns(n, event=event)
+        if log:
+            self._log_control_parallel(event, str(n))
+        return f"{alias} runs up to {n} parallel turn{'s' if n > 1 else ''}{said}."
+
+    def _apply_parallel_turns(self, n: int, event: Optional[ChannelEvent] = None) -> str:
+        """Apply a new parallel turn limit live (#491)."""
+        alias = self.config.identity.alias
+        if n == self._parallel_turns and self._pending_parallel_turns is None:
+            return f" (already {n})"
+        running_count = len(self._busy_since)
+        if running_count >= n:
+            # A running turn already fills the new cap, so the switch waits for it: applying
+            # now would drop `_turn_slots` (n == 1) while a turn still holds only its own
+            # per-topic lock, and the next topic would start at once -- two turns at a cap of
+            # 1 (review, #491). At the idle moment nothing is held and the swap is safe.
+            self._pending_parallel_turns = n
+            self._pending_parallel_reply_chat_id = event.chat_id if event else None
+            self._pending_parallel_reply_thread_id = event.thread_id if event else None
+            self._idle_event.clear()
+            logger.info("turn limiter: max_parallel_turns=%d pending for %s until idle (%d running)",
+                        n, alias, running_count)
+            return f" from the next idle moment ({running_count} turns running now)"
+        self._pending_parallel_turns = None
+        self._parallel_turns = n
+        if n > 1:
+            sem = asyncio.Semaphore(n)
+            for _ in range(running_count):
+                # A slot reserved for each turn still running: they hold their slot on the
+                # semaphore this one replaces, and the new one must not hand it out twice.
+                # The review suggested `acquire_nowait()`, but that is 3.13+ and this
+                # project still supports 3.10, so the value is reserved directly (and
+                # `running_count < n` is guaranteed by the defer above).
+                sem._value -= 1
+            self._turn_slots = sem
+        else:
+            self._turn_slots = None
+        for adapter in {id(a): a for a in [self.adapter, *self._project_adapters.values()]}.values():
+            # Every adapter hears the value in force, not just the base one: a topic's adapter
+            # built later reads it at build time, and a cached one would keep believing the
+            # config's number -- which turns off the #78 pinned-conversation guard (#491 review).
+            if hasattr(adapter, "use_parallel_limit"):
+                adapter.use_parallel_limit(n)
+        self._idle_event.set()
+        self._beat_soon("parallel turns changed")
+        logger.info("turn limiter: max_parallel_turns=%d applied for %s immediately", n, alias)
+        return " from now"
+
+    def _log_control_parallel(self, event: ChannelEvent, value: str) -> None:
+        """Post a CONTROL line on the durable plane when /parallel is run by admin."""
+        author = str(event.author_id or "0")
+        line = press_mod.PressPolicy.log_line("bot.parallel", "self", author, time.time(),
+                                              done=True, value=value)
+        self._notice_soon(format_message(Envelope(
+            type=MessageType.NOTE, to="*", intent="CONTROL", ref=self._alias_ref()), line))
 
     def _storetest_command(self, event: ChannelEvent) -> str:
         """/storetest@bot [-Alias ...]: this bot leads one run of the Telegram store check
@@ -4080,6 +4225,8 @@ class AgentChannel:
             models = ()
         efforts = tuple(level for level in EFFORT_LEVELS
                         if not effort_problem(adapter.type, level))
+        parallels = tuple(str(k) for k in self.parallel_choices())
+        max_parallel_turns = self.max_parallel_turns()
         drift_score = None
         drift_hard = None
         drift_resets_today = None
@@ -4111,6 +4258,7 @@ class AgentChannel:
             queue=queue, wakes=(),                  # #215: no timers left to report
             model=str(model or ""), effort=str(effort or ""),
             models=models, efforts=efforts,
+            max_parallel_turns=max_parallel_turns, parallels=parallels,
             rev=str(self._running_revision or ""),
             uptime=max(0.0, self._clock() - self._booted_at), restarts=max(0, self._boots - 1),
             term=term, lease_ends=lease_ends,
@@ -5116,11 +5264,18 @@ class AgentChannel:
             if not action:
                 refused.append(f"{key} (not a setting this dashboard has)")
                 continue
-            store = self._models if key == "model" else self._efforts
-            before = store.get(self._pick_key())
-            said = self._pick_through("model" if key == "model" else "reasoning", wanted, store,
-                                      key, None)
-            after = store.get(self._pick_key())
+            if key == "max_parallel_turns":
+                before = str(self.max_parallel_turns())
+                # The forwarded note is the record of a remote press, so the command does not
+                # post a CONTROL line of its own here (#491 review: one press, one line).
+                said = self._parallel_command(self._control_event("parallel", wanted), log=False)
+                after = str(self.max_parallel_turns())
+            else:
+                store = self._models if key == "model" else self._efforts
+                before = store.get(self._pick_key())
+                said = self._pick_through("model" if key == "model" else "reasoning", wanted, store,
+                                          key, None)
+                after = store.get(self._pick_key())
             if after != before:
                 changed.append(f"{key} → {after}")
             elif str(after or "").strip().lower() == wanted.strip().lower():
@@ -5144,6 +5299,14 @@ class AgentChannel:
             self._self_tasks.add(asyncio.get_running_loop().create_task(self.send(
                 text, silent=True, notice=True, allow_when_frozen=True)))
         except RuntimeError:                   # no loop (a test applying a note directly)
+            pass
+
+    def _notice_soon_to(self, text: str, chat_id: int, thread_id: Optional[int] = None) -> None:
+        """Post a machine line to a specific topic from synchronous code (#491)."""
+        try:
+            self._self_tasks.add(asyncio.get_running_loop().create_task(self.send(
+                text, chat_id=chat_id, thread_id=thread_id, silent=True, notice=True, allow_when_frozen=True)))
+        except RuntimeError:
             pass
 
     def _stop_every_turn(self) -> str:
@@ -5175,7 +5338,7 @@ class AgentChannel:
         (#451): the chat keyboard leaves it out, the dashboard draws it as one form.
         """
         return ("bot.pause", "bot.resume", "bot.restart", "bot.offline", "bot.stop_turn",
-                "bot.model", "bot.effort", "bot.settings", "bot.cli", "bot.memory",
+                "bot.model", "bot.effort", "bot.parallel", "bot.settings", "bot.cli", "bot.memory",
                 "swarm.pause_all", "swarm.sync", "swarm.cleanup", "swarm.role",
                 "swarm.lease", "swarm.failback",
                 "swarm.hold", "swarm.release", "swarm.admit", "swarm.remove",
@@ -5258,7 +5421,7 @@ class AgentChannel:
         unreadable list is an empty one, and the press then says there is nothing to pick.
         """
         adapter = self.config.adapter
-        if action in ("bot.model", "bot.effort") and not self.own_target(target):
+        if action in ("bot.model", "bot.effort", "bot.parallel") and not self.own_target(target):
             # A pick aimed at another bot offers *that* bot's list, as its own beat reported
             # it (#373): one bot's models are never offered for another, and a bot whose
             # runtime cannot say offers nothing rather than a guess.
@@ -5268,6 +5431,8 @@ class AgentChannel:
             return [(name, name) for name in names][:12]
         if action == "bot.effort":
             return [(level, level) for level in EFFORT_LEVELS]
+        if action == "bot.parallel":
+            return [(str(k), str(k)) for k in self.parallel_choices()][:12]
         if action == "swarm.lease":
             # Who may take the role: every peer and this bot -- minus itself, because a
             # hand-over to the current holder is not a hand-over (#154).
@@ -5297,7 +5462,7 @@ class AgentChannel:
         then offers nothing, which is the truth, rather than this bot's own list.
         """
         wanted = self.canonical_peer(alias).strip().lstrip("@").lower()
-        field = "models" if action == "bot.model" else "efforts"
+        field = "parallels" if action == "bot.parallel" else ("models" if action == "bot.model" else "efforts")
         try:
             peers = self.presence().peers or {}
         except Exception:                      # noqa: BLE001 - no table, no choices
@@ -5523,7 +5688,7 @@ class AgentChannel:
         that asks for the value already there can answer "already set" instead of sending a
         press that changes nothing.
         """
-        field = "effort" if action == "bot.effort" else "model"
+        field = "max_parallel_turns" if action == "bot.parallel" else ("effort" if action == "bot.effort" else "model")
         wanted = self.canonical_peer(alias).strip().lstrip("@").lower()
         if not wanted:
             return ""
@@ -5591,15 +5756,21 @@ class AgentChannel:
             except Exception:                  # noqa: BLE001 - a form without a guess
                 logger.debug("dashboard: this bot's own model is not resolvable", exc_info=True)
         for key, action in control_mod.SETTING_ACTIONS:
-            if mine:
-                value = mine_model if key == "model" else mine_effort
+            if mine and key == "model":
+                value = mine_model
                 choices = self.control_choices(action)
+            elif mine and key == "effort":
+                value = mine_effort
+                choices = self.control_choices(action)
+            elif mine and key == "max_parallel_turns":
+                value = str(self.max_parallel_turns())
+                choices = [(str(k), str(k)) for k in self.parallel_choices()]
             else:
+                # A peer's field, or one this build has no local value for: its own beat says.
                 value = self.peer_pick_value(alias, action)
-                # That bot's own list, as its beat reported it (#373): the values it offers
-                # are the labels too, since a peer publishes names and not pairs.
                 choices = [(name, name) for name in self.peer_choices(action, alias)]
-            out.append({"key": key, "label": key.capitalize(), "value": str(value),
+            label = "Max parallel turns" if key == "max_parallel_turns" else key.capitalize()
+            out.append({"key": key, "label": label, "value": str(value),
                         "choices": [[str(label), str(val)] for label, val in choices]})
         return out
 
@@ -5651,14 +5822,17 @@ class AgentChannel:
             if not action:
                 refused.append(f"{key} (not a setting this dashboard has)")
                 continue
-            store = self._models if key == "model" else self._efforts
-            before = store.get(self._pick_key())
-            # No *pending* here: a field that was already set is this form's business, not the
-            # press's. Letting the per-field path mark the press "unchanged" silenced the
-            # CONTROL line for a form where another field really did change (review, #451).
-            said = self._pick_through("model" if key == "model" else "reasoning", wanted, store,
-                                      key, None)
-            after = store.get(self._pick_key())
+            if key == "max_parallel_turns":
+                before = str(self.max_parallel_turns())
+                # The form posts its own `bot.settings` CONTROL line: the command stays quiet.
+                said = self._parallel_command(self._control_event("parallel", wanted), log=False)
+                after = str(self.max_parallel_turns())
+            else:
+                store = self._models if key == "model" else self._efforts
+                before = store.get(self._pick_key())
+                said = self._pick_through("model" if key == "model" else "reasoning", wanted, store,
+                                          key, None)
+                after = store.get(self._pick_key())
             if after != before:
                 changed.append(f"{key} → {after}")
             elif str(after or "").strip().lower() == wanted.strip().lower():
@@ -5735,6 +5909,17 @@ class AgentChannel:
             return self._pick_through("model", value, self._models, "model", pending)
         if action == "bot.effort":
             return self._pick_through("reasoning", value, self._efforts, "effort", pending)
+        if action == "bot.parallel":
+            event = self._control_event("parallel", value)
+            before = str(self.max_parallel_turns())
+            # The press posts the CONTROL line (control_press): the command stays quiet.
+            said = self._parallel_command(event, log=False)
+            after = str(self.max_parallel_turns())
+            if after == before and after == value:
+                if pending is not None:
+                    pending["unchanged"] = True
+                return f"max_parallel_turns was already {value}: nothing changed, so nothing was sent"
+            return said
         if action == "swarm.lease":
             # A hand-over posts its own CONTROL note, so the marker has to reach it (#347).
             return await self.hand_over_lease(value, presser=presser, via=via)
@@ -5780,6 +5965,8 @@ class AgentChannel:
             return self._model_command(self._control_event("model"))
         if action == "bot.effort":
             return self._reasoning_command(self._control_event("reasoning"))
+        if action == "bot.parallel":
+            return self._parallel_command(self._control_event("parallel"))
         if action == "bot.cli":
             return self._cli_report()
         return None
@@ -9904,7 +10091,10 @@ class AgentChannel:
             return await self._paused(event)
 
         lock = self._lock_for(event)
-        busy = lock.locked() or (self._turn_slots is not None and self._turn_slots.locked())
+        busy = (lock.locked()
+                or (self._turn_slots is not None and self._turn_slots.locked())
+                or (self._pending_parallel_turns is not None
+                    and len(self._busy_since) >= self._pending_parallel_turns))
         queued = False
         queue_seq = 0
         queued_at = 0.0
@@ -10164,6 +10354,9 @@ class AgentChannel:
 
     async def _take_turn(self, lock: asyncio.Lock) -> None:
         """Take the turn lock, then a parallel-topic slot."""
+        while (self._pending_parallel_turns is not None
+               and len(self._busy_since) >= self._pending_parallel_turns):
+            await self._idle_event.wait()
         await lock.acquire()
         if self._turn_slots is not None:
             try:
@@ -10185,6 +10378,23 @@ class AgentChannel:
         if self._pause_pending:
             asyncio.get_running_loop().call_soon(
                 lambda: asyncio.ensure_future(self._finish_pause()))
+        if not self._turn_running() and self._pending_parallel_turns is not None:
+            new_n = self._pending_parallel_turns
+            self._pending_parallel_turns = None
+            self._parallel_turns = new_n
+            self._turn_slots = asyncio.Semaphore(new_n) if new_n > 1 else None
+            if hasattr(self.adapter, "use_parallel_limit"):
+                self.adapter.use_parallel_limit(new_n)
+            self._idle_event.set()
+            alias = self.config.identity.alias
+            notice = f"▶ {alias}: max_parallel_turns is now {new_n}."
+            if self._pending_parallel_reply_chat_id is not None:
+                self._notice_soon_to(notice, self._pending_parallel_reply_chat_id,
+                                     self._pending_parallel_reply_thread_id)
+            else:
+                self._notice_soon(notice)
+            self._beat_soon("parallel turns applied at idle")
+            logger.info("turn limiter: applied max_parallel_turns=%d at idle moment", new_n)
 
     def _turn_running(self) -> bool:
         return self._turn_lock.locked() or any(

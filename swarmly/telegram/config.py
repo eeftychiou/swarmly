@@ -671,6 +671,47 @@ def _is_git_checkout(folder: Optional[str]) -> bool:
     return res.returncode == 0 and res.stdout.strip() == "true"
 
 
+def parallel_problem(adapter: "AdapterSettings", limits: "ChannelLimits", n: Any) -> Optional[str]:
+    """Why *n* cannot be used as ``limits.max_parallel_turns``, or None when it is valid (#491).
+
+    The same checks for config.yaml and the live /parallel setting (AGENTS.md §6):
+    - a positive whole number at most MAX_PARALLEL_TURNS (8);
+    - above 1: needs an adapter that keeps one session per discussion (not single-session);
+    - above 1: no pinned conversation;
+    - above 1: adapter.cwd is a git checkout unless allow_shared_cwd is true.
+    """
+    if isinstance(n, bool) or not isinstance(n, int):
+        try:
+            val = int(str(n).strip())
+        except (TypeError, ValueError):
+            return f"limits.max_parallel_turns must be a whole number (got {n!r})"
+    else:
+        val = n
+    if val < 1:
+        return f"limits.max_parallel_turns must be at least 1 (got {val!r})"
+    if val > MAX_PARALLEL_TURNS:
+        return f"limits.max_parallel_turns must be at most {MAX_PARALLEL_TURNS} (got {val!r})."
+    if val > 1 and adapter.type in SINGLE_SESSION_ADAPTERS:
+        return (f"limits.max_parallel_turns > 1 needs an adapter that keeps one session per "
+                f"discussion (or none); {adapter.type!r} keeps a single conversation, so "
+                "parallel turns would interleave in it. Use 1.")
+    if val > 1 and adapter.type in PER_TOPIC_CONVERSATION_ADAPTERS:
+        pinned = pinned_conversation(adapter)
+        if pinned:
+            return (f"limits.max_parallel_turns > 1 needs one conversation per discussion, "
+                    f"but this {adapter.type!r} adapter pins a single one ({pinned}), so "
+                    "parallel turns would interleave in it. Use 1, or drop the pinned "
+                    "conversation.")
+    if (val > 1 and adapter.type not in NO_FILES_ADAPTERS
+            and not getattr(limits, "allow_shared_cwd", False) and not _is_git_checkout(adapter.cwd)):
+        return (f"limits.max_parallel_turns > 1 gives every topic its own working copy, but "
+                f"{adapter.cwd or '.'} is not a git checkout, so no copy can be made there and "
+                f"several {adapter.type!r} turns would run in the same directory, where they can "
+                "overwrite each other's edits. Point adapter.cwd at a git checkout, set "
+                "limits.allow_shared_cwd: true to accept the sharing, or use 1.")
+    return None
+
+
 @dataclass
 class ChannelLimits:
     """Pacing and size limits — by default sends at least 3 s apart (per topic when topics
@@ -872,6 +913,9 @@ class ChannelLimits:
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
             raise ConfigError("limits.max_peer_turns_per_topic must be a whole number, 0 for "
                               f"no cap (got {cap!r}).")
+        if self.max_parallel_turns < 1:
+            raise ConfigError(f"limits.max_parallel_turns must be at least 1 "
+                              f"(got {self.max_parallel_turns!r}).")
         if self.max_parallel_turns > MAX_PARALLEL_TURNS:
             raise ConfigError(f"limits.max_parallel_turns must be at most {MAX_PARALLEL_TURNS} "
                               f"(got {self.max_parallel_turns!r}).")
@@ -1337,30 +1381,9 @@ class AgentConfig:
             gitbus_ref=ref,
         )
 
-        if limits.max_parallel_turns > 1 and adapter.type in SINGLE_SESSION_ADAPTERS:
-            raise ConfigError(
-                f"limits.max_parallel_turns > 1 needs an adapter that keeps one session per "
-                f"discussion (or none); {adapter.type!r} keeps a single conversation, so "
-                "parallel turns would interleave in it. Use 1.")
-        if limits.max_parallel_turns > 1 and adapter.type in PER_TOPIC_CONVERSATION_ADAPTERS:
-            pinned = pinned_conversation(adapter)
-            if pinned:
-                raise ConfigError(
-                    f"limits.max_parallel_turns > 1 needs one conversation per discussion, "
-                    f"but this {adapter.type!r} adapter pins a single one ({pinned}), so "
-                    "parallel turns would interleave in it. Use 1, or drop the pinned "
-                    "conversation.")
-        if (limits.max_parallel_turns > 1 and adapter.type not in NO_FILES_ADAPTERS
-                and not limits.allow_shared_cwd and not _is_git_checkout(adapter.cwd)):
-            # #486: every parallel topic works in its own copy, made as a git worktree of
-            # adapter.cwd. Outside a checkout no copy can be made, and the turns would share
-            # one folder -- that stays an explicit opt-in.
-            raise ConfigError(
-                f"limits.max_parallel_turns > 1 gives every topic its own working copy, but "
-                f"{adapter.cwd or '.'} is not a git checkout, so no copy can be made there and "
-                f"several {adapter.type!r} turns would run in the same directory, where they can "
-                "overwrite each other's edits. Point adapter.cwd at a git checkout, set "
-                "limits.allow_shared_cwd: true to accept the sharing, or use 1.")
+        problem = parallel_problem(adapter, limits, limits.max_parallel_turns)
+        if problem:
+            raise ConfigError(problem)
         projects_dict: Dict[str, ProjectSettings] = {}
         projects_raw = data.get("projects") or {}
         if not isinstance(projects_raw, dict):

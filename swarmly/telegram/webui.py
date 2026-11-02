@@ -172,6 +172,7 @@ def bot_cards(*, now: float, snapshots: Sequence[Snapshot] = (),
                       else (max(0.0, moment - since) if since and since <= moment else None)),
             "model": str(row.model or "").strip() or None,
             "effort": str(row.effort or "").strip() or None,
+            "max_parallel_turns": int(getattr(row, "max_parallel_turns", 1) or 1),
             "rev": str(row.rev or "").strip() or None,
             "topic": str(row.topic or "").strip() or None,
             "turn_seconds": (max(0.0, _num(row.turn_elapsed)) if working else None),
@@ -1339,6 +1340,7 @@ function card(bot, state) {
   const meta = el("div", "meta");
   const model = bot.model ? (bot.model + (bot.effort ? "/" + bot.effort : "")) : "?";
   meta.append(el("span", "", "runtime " + model));
+  if (bot.max_parallel_turns) meta.append(el("span", "", "parallel " + bot.max_parallel_turns));
   if (bot.rev) meta.append(el("span", "", "rev " + bot.rev));
   meta.append(el("span", "", "pulse " + ago(bot.pulse_age) + " ago"));
   meta.append(el("span", "", "today " + num(bot.turns) + " turns"));
@@ -1920,8 +1922,13 @@ function controlsFor(state, where, target) {
     // What the card's one form already carries is not drawn beside it (#451): a Model picker
     // next to a Model dropdown is the two-step the admin asked to be rid of.
     const form = (view.controls || []).find((row) => row.settings);
-    const carried = form ? (form.settings[target || ""] || []).map((field) => "bot." + field.key)
+    // A form field is not always "bot." + key: max_parallel_turns is carried by bot.parallel
+    // (#491), and the old push-after-the-map left a dead bot.max_parallel_turns entry.
+    const carriedFor = { model: "bot.model", effort: "bot.effort", max_parallel_turns: "bot.parallel" };
+    const carried = form
+      ? (form.settings[target || ""] || []).map((field) => carriedFor[field.key] || ("bot." + field.key))
       : [];
+
     (view.controls || [])
       // Model, effort, CLI and memory are this bot's own: drawn on its card, never on a
       // peer's, because a pick is applied by the bot the press lands on (review, #345).

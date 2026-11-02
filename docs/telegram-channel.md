@@ -1027,6 +1027,18 @@ with one `context_id`, which every agent works out the same way from the topic's
 
 **Running topics in parallel.** `limits.max_parallel_turns: N` (default 1, at most 8) lets up
 to N topics run a turn at the same time.
+
+**It is a live per-bot setting (#491).** The value in force is changed without a restart, from
+either door: `/parallel@<bot>` says what the bot runs and where the value comes from
+(`config.yaml` or a runtime pick), `/parallel@<bot> <n>` sets it, `/parallel@<bot> default`
+clears the pick, and the same setting is one field on the bot's dashboard settings form (#451).
+Both doors run the same checks as the config file and refuse in the parser's own words, so a
+refused value changes nothing. The pick is kept in the bot's `state.dir` as
+`parallel-<alias>.json` and re-validated when it is loaded, so a pick this adapter or `cwd` can
+no longer carry falls back to `config.yaml` after a restart. It applies at the next idle moment:
+when the turns already running fill the new limit they finish first, and the bot says so
+("from the next idle moment (2 turns running now)") rather than claiming "from now". `/status`
+carries `parallel=<n>`, marked `(override)` when it is a runtime pick, and the card shows it.
 - Messages in one topic still run one after another. A message that has to wait (same topic, or
   all N slots busy) is queued like any other (`busy_behavior`); `busy_queue_max` then caps each
   topic's queue rather than one shared queue.

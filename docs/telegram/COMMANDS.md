@@ -68,6 +68,7 @@ Any member may use these.
 |---|---|
 | `/model@bot` (admin to set) | Show the model this bot runs in this topic; `/model@bot <name>` switches it from the next turn (`default` goes back). |
 | `/reasoning@bot` (admin to set) | The same for reasoning effort (`low` … `max`, `default`). `/effort@bot` is the same command. |
+| `/parallel@bot` (admin to set) | Show max parallel turns (`config` or `runtime pick`); `/parallel@bot <n>` switches it live (`default` returns to config.yaml). |
 | `/role@bot` | Show a bot's role and the team's. The admin sets one with `/role@bot <role>` (or `/role @bot <role>`); every bot applies it, and the bot named (or, for `/role @bot`, the coordinator) confirms it. `/role @bot coordinator` names a new coordinator, which announces itself, and the old one becomes a developer. |
 | `/rotate@bot` (admin) | Retires this topic's CLI session now: the old one writes its handover, and the next turn starts a **new** session from the rulebook, the registry's facts and that handover — the retired id is never resumed, and `/topics` shows the new one. Answered by the transport, no model turn. |
 
@@ -103,7 +104,8 @@ same things with lines in its replies: `LINK: …`, `ASSIGN: @bot <ref|L1> as <r
 With `control:` set, the coordinator keeps a pinned dashboard in the chat it names (or in
 📡 Swarm pulse). Its buttons are admin only, and some ask for a second tap. A per-bot button
 names its bot: Pause, Resume, Stop turn, Restart and Stop travel as the `CONTROL` note that bot
-applies to itself, and Model and Effort are forwarded to it as well — it applies them under its own rules,
+applies to itself, and Model, Effort and Parallel turns are forwarded to it as well — it applies
+them under its own rules,
 and its card shows the new value once its own beat reports it. CLI and Memory act on the
 coordinator only. A typed `ctl:` code reaches every bot, so the others answer that the
 coordinator has the dashboard: pressing the button is quieter.
@@ -114,7 +116,7 @@ coordinator has the dashboard: pressing the button is quieter.
 | Stop turn | Stops the coordinator's turns and drops its queue, like `/stop@bot all`. |
 | Restart | Restarts the coordinator now; a turn it cuts off is replayed when it starts again. The `swarmly --cli` launcher starts it again; `swarmly-telegram run` just exits. |
 | Stop | Stops the bot for good, after a second tap: it yields the coordinator lease (so a peer takes over at once, not after `limits.takeover_minutes`), posts its OFFLINE line, and exits **0**. A pause is not this — a paused bot stays online and keeps the lease. Starting it again is the admin's job on the host: a unit with `Restart=always` brings it back after `RestartSec`, one with `Restart=on-failure` leaves it down ([`SETUP-ADMIN.md`](SETUP-ADMIN.md#stopping-a-bot-from-the-dashboard)). Its card then goes DOWN, because the bot's pulse has stopped. |
-| Model, Effort | Picks the coordinator's model or effort, for the dashboard's own topic only. |
+| Model, Effort, Parallel turns | Picks the coordinator's model, effort or max parallel turns, for the dashboard's own topic only. A parallel value is refused in `/parallel`'s own words when this bot's adapter, its pinned conversation or its `cwd` cannot carry it, and lowering below the turns running now lets those finish. |
 | Apply | The live page's one settings form (#451): a dropdown per setting, prefilled with what the card's bot runs now, and one **Apply** for all of them. Only the fields you changed are sent, so one Apply is one `CONTROL` line and no second tap. Not on the chat keyboard, because a keypad cannot carry a form. |
 | CLI | Lists the `/cli` commands the coordinator may run; it runs nothing. |
 | Memory | `clear`: empties the coordinator's own `memory.md`, after a second tap. It is that bot's own file, so a press aimed at another bot's card is refused. |
@@ -135,7 +137,7 @@ takes the same route and leaves the same `via=dashboard` line.
 
 One form per card: a dropdown per setting, prefilled with what that bot's own beat says it
 runs, and one **Apply**. Only the fields that differ from the reported value are sent, as
-`model=opus;effort=high`, and the bot's own `/model` and `/reasoning` decide each one — so a
+`model=opus;effort=high;max_parallel_turns=2`, and the bot's own `/model`, `/reasoning` and `/parallel` decide each one — so a
 value its runtime refuses is answered in that command's words, and the answer names every
 field that changed, every field already at that value, and every field that was refused. A
 form for a peer is forwarded to that peer (`sent ... to Codex`); nothing is set on the bot the

@@ -83,6 +83,8 @@ class Snapshot:
     #: this bot cannot say -- the picker then offers nothing rather than guessing.
     models: Tuple[str, ...] = ()
     efforts: Tuple[str, ...] = ()
+    max_parallel_turns: int = 1
+    parallels: Tuple[str, ...] = ()
     #: The revision this bot is running, for /diag's "which build is that?".
     rev: str = ""
     uptime: float = 0.0
@@ -110,6 +112,8 @@ class Snapshot:
             "queue": int(self.queue), "wakes": [[str(i), float(at)] for i, at in self.wakes],
             "model": self.model, "effort": self.effort, "rev": self.rev,
             "models": list(self.models), "efforts": list(self.efforts),
+            "max_parallel_turns": int(self.max_parallel_turns),
+            "parallels": list(self.parallels),
             "uptime": self.uptime, "restarts": int(self.restarts),
             "term": int(self.term), "lease_ends": self.lease_ends,
             "drift_score": self.drift_score,
@@ -164,6 +168,8 @@ class Snapshot:
             turns=tuple(turns), queue=int(_num(data.get("queue"))), wakes=tuple(wakes),
             model=str(data.get("model") or ""), effort=str(data.get("effort") or ""),
             models=_names(data.get("models")), efforts=_names(data.get("efforts")),
+            max_parallel_turns=int(_num(data.get("max_parallel_turns", 1)) or 1),
+            parallels=_names(data.get("parallels")),
             rev=str(data.get("rev") or ""), uptime=_num(data.get("uptime")),
             restarts=int(_num(data.get("restarts"))), term=int(_num(data.get("term"))),
             lease_ends=_num(data.get("lease_ends")),

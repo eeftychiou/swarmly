@@ -44,7 +44,7 @@ class TestTheSettingsTable(unittest.TestCase):
     """What a form may offer, per adapter -- and why the rest is not there."""
 
     def test_the_form_offers_the_settings_a_turn_takes_a_flag_for(self):
-        self.assertEqual(ct.SETTING_KEYS, ("model", "effort"))
+        self.assertEqual(ct.SETTING_KEYS, ("model", "effort", "max_parallel_turns"))
         for key, action in ct.SETTING_ACTIONS:
             self.assertEqual(ct.control(action).action, action)
             self.assertEqual(ct.setting_action(key), action)
@@ -133,7 +133,8 @@ class TestTheFormOnThePage(unittest.TestCase):
     def test_the_form_replaces_the_two_pickers_it_carries(self):
         page = self.page()
         self.assertIn('const form = (view.controls || []).find((row) => row.settings);', page)
-        self.assertIn('.map((field) => "bot." + field.key)', page)
+        # A field is not always "bot." + key: max_parallel_turns is carried by bot.parallel.
+        self.assertIn('.map((field) => carriedFor[field.key] || ("bot." + field.key))', page)
         self.assertIn(".filter((row) => !carried.includes(row.action))", page)
 
     def test_the_card_draws_one_form_with_a_dropdown_per_field(self):
@@ -377,7 +378,7 @@ class TestTheSettingsViewOnThePage(unittest.TestCase):
         self.assertTrue(row["settings"])
         self.assertIn("DeepSeek", row["settings"])
         fields = {field["key"]: field for field in row["settings"]["DeepSeek"]}
-        self.assertEqual(sorted(fields), ["effort", "model"])
+        self.assertEqual(sorted(fields), ["effort", "max_parallel_turns", "model"])
         self.assertIn("choices", fields["model"])
 
 
