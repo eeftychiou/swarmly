@@ -16,12 +16,14 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from typing import Any, List
 
 from swarmly.telegram import config as config_mod
 from swarmly.telegram import control as ct
 from swarmly.telegram import control_press as cp
+from swarmly.telegram import snapshot as sn
 from swarmly.telegram.channel import AgentChannel, ChannelEvent
 from tests.aio import run
 from tests.test_topics import Gate, settle
@@ -374,6 +376,34 @@ class TestLiveParallel(unittest.TestCase):
             await settle()
             self.assertEqual(channel.max_parallel_turns(), 3)
             self.assertEqual(len(controls()), 1, controls())
+
+        run(scenario())
+
+    def test_the_beat_carries_the_parallel_fields_to_a_peer(self):
+        """A peer's card offers its own parallel values, read from its last beat (#491, #373).
+
+        The fields have to survive the beat both ways: `status_snapshot` puts them on the
+        record, `Snapshot.to_dict` writes them onto the wire, and `from_dict` reads them back
+        for `peer_choices`. This pins the one thing #509 claimed and #508 was asked to check
+        it had not lost: a peer's card offering that bot's own parallel values.
+        """
+        channel, _ = self.channel(parallel=3)
+
+        async def scenario():
+            snap = channel.status_snapshot(1000.0)
+            self.assertEqual(snap.max_parallel_turns, 3)
+            self.assertEqual(snap.parallels, tuple(str(k) for k in range(1, 9)))
+            row = sn.Snapshot.from_dict(snap.to_dict())
+            self.assertEqual(row.max_parallel_turns, 3)
+            self.assertEqual(row.parallels, snap.parallels)
+
+            peer = SimpleNamespace(snapshot=snap.to_dict())
+            channel.presence = lambda: SimpleNamespace(peers={"Codex": peer})
+            self.assertEqual(channel.peer_choices("bot.parallel", "Codex"), snap.parallels)
+            # The card's prefilled value reads the same beat through `control_snapshots`.
+            channel.control_snapshots = lambda: [sn.Snapshot.from_dict(
+                dict(snap.to_dict(), alias="Codex"))]
+            self.assertEqual(channel.peer_pick_value("Codex", "bot.parallel"), "3")
 
         run(scenario())
 
