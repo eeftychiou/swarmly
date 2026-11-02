@@ -38,7 +38,14 @@ class TestNoNewsNoTurn(unittest.TestCase):
         wake = wk.plan([step], now=100, bots={"Codex"})
         self.assertEqual(len(wake), 1)
         saved = wk.mark_woken([step], wake, now=100)[0]
+        self.assertEqual(saved.state, ow.CLOSED)
+        self.assertEqual(saved.closed_by, "the declared step started")
         self.assertEqual(wk.plan([saved], now=100 + wk.WAKE_GRACE + 1, bots={"Codex"}), [])
+
+    def test_self_step_identity_includes_topic(self):
+        first = ow.self_step_row(debtor="Codex", step="continue", topic="tg-111")
+        second = ow.self_step_row(debtor="Codex", step="continue", topic="tg-222")
+        self.assertNotEqual(first.id, second.id)
 
 
 class TestWhatIsNotABot(unittest.TestCase):

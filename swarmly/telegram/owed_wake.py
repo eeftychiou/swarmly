@@ -203,6 +203,9 @@ def mark_woken(rows: Sequence[Row], wakes: Sequence[Wake], *, now: Optional[floa
             row.wakes = int(row.wakes) + 1
             row.woken_at = moment
         row.updated_at = moment
+        if row.kind == "self" and not wake.escalated:
+            row.state = "closed"
+            row.closed_by = "the declared step started"
         touched.append(row)
     return touched
 

@@ -486,8 +486,8 @@ def admin_row(*, question: str, item: str = "", topic: str = "", asked_by: str =
 def self_step_row(*, debtor: str, step: str, topic: str = "", at: Optional[float] = None) -> Row:
     """A coordinator's next plan step, due when its current turn goes idle (#494)."""
     moment = time.time() if at is None else float(at)
-    digest = hashlib.sha256(step.encode("utf-8")).hexdigest()[:16]
-    return Row(kind="self", debtor=debtor, owes=step, topic=topic, key_extra=digest,
+    digest = hashlib.sha256(f"{topic}\0{step}".encode("utf-8")).hexdigest()[:16]
+    return Row(kind="self", item="", debtor=debtor, owes=step, topic=topic, key_extra=digest,
                opened_by="coordinator declared next step", observed="due",
                created_at=moment, updated_at=moment)
 
