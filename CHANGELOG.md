@@ -51,6 +51,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The dashboard's first view is the open topics, and says so** (`#512`). The default view hid
+  closed records and topics whose every item was at phase `done`, but it read the phase only: a
+  topic whose issue and PR were both closed or merged on GitHub, with the phase never moved past
+  `review`, still sat on the first screen. The shared `topic_filter` default now reads the item's
+  own state too — `closed`, `merged`, `done` and the registry's `abandoned` all mean finished —
+  so such a topic drops out, while one with a live item, a tracking link (`#468`) or no work item
+  at all stays. Only the default view reads it: `type=…`, `stage=…` and `state=…` answer the
+  question they were asked, and `all`, `state=closed` and `reset` behave as before. The Topics
+  panel draws the `open` chip as selected on that view (and pressing it there no longer widens
+  the list), so the first screen no longer looks unfiltered, and `/topics` with no arguments
+  prints the same set from the same filter. `docs/telegram-channel.md` and
+  `docs/telegram/COMMANDS.md` describe it.
+
 - **The web dashboard's port is exclusive, and only the lease holder binds it** (`#510`). On a
   host running four transports, all four listened on `127.0.0.1:8787`: `ThreadingHTTPServer`
   sets `SO_REUSEADDR`, and on Windows that lets a second process bind a port that is already

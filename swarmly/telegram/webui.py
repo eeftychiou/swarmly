@@ -801,6 +801,10 @@ def filters_view(filters: Any = None) -> Dict[str, Any]:
         "selected": chosen.as_query(),
         "words": chosen.describe(),
         "asked": chosen.asked,
+        # The default view is "showing: open" whatever the URL says (#512): the panel marks
+        # the open chip with this, so the first screen says what it left out instead of
+        # looking like an unfiltered list.
+        "default": not chosen.asked,
         "unknown": list(chosen.unknown),
         "choices": {"type": list(topic_filter.TYPES), "state": list(topic_filter.STATES),
                     "stage": list(topic_filter.STAGES)},
@@ -2176,6 +2180,10 @@ function filterQuery() {
 }
 
 function filterSet(key, value) {
+  // The open state chip is the default view (#512): it is drawn selected with no query at
+  // all, so pressing it there would write state=open and quietly stop hiding the finished
+  // items. "all" is how the first view is widened, so the press does nothing.
+  if (key === "state" && value === "open" && !location.search) return;
   const params = new URLSearchParams(location.search);
   const now = (params.get(key) || "").split(",").filter(Boolean);
   const next = now.includes(value) ? now.filter((word) => word !== value)
@@ -2207,7 +2215,10 @@ function filterBar(registry) {
   const view = registry.filters;
   if (!view || !view.choices) return;
   const selected = (key) => (view.selected || {})[key] || "";
-  const chosen = (key, word) => selected(key).split(",").filter(Boolean).includes(word);
+  // The default view reads as state=open on purpose (#512): no query at all *is* the open
+  // filter, so the chip is drawn selected and the first screen never looks unfiltered.
+  const chosen = (key, word) => selected(key).split(",").filter(Boolean).includes(word)
+    || (Boolean(view.default) && key === "state" && word === "open");
   (view.choices.type || []).forEach((word) =>
     bar.append(filterChip(word, chosen("type", word), () => filterSet("type", word))));
   (view.choices.state || []).forEach((word) =>

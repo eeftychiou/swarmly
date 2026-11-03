@@ -8,8 +8,10 @@ They combine, and both readers use *these* functions: the panel filters cards it
 
 The default view is the admin's: **open topics that still have something to do**. An item in
 ``done`` is hidden and a topic whose every item is done drops out — that is what makes a long
-registry readable. A topic with no items at all stays: nothing says it is finished, and a
-topic the admin just opened must not vanish.
+registry readable. So does an item GitHub shows closed or merged: the phase is a bookkeeping
+field someone may never have set, and a topic whose every item has landed is finished
+whatever its phase says (#512). A topic with no items at all stays: nothing says it is
+finished, and a topic the admin just opened must not vanish.
 """
 
 from __future__ import annotations
@@ -80,10 +82,16 @@ def item_type(link: Mapping[str, Any]) -> str:
 
 
 def item_state(link: Mapping[str, Any]) -> str:
-    """``open`` or ``closed`` for one item: GitHub's state, or the record's, else unknown."""
+    """``open`` or ``closed`` for one item: GitHub's state, or the record's, else unknown.
+
+    ``merged`` and ``done`` are how GitHub and a phase read after landing, and ``abandoned``
+    is the registry's other finished word (``records.LINK_STATUS``): every one of them means
+    the item is not still live. An item that states no state at all is ``open`` -- nothing
+    says it is finished, and the default view must not drop the topic the admin just opened.
+    """
     data = dict(link or {})
     state = str(data.get("status") or data.get("state") or "").strip().lower()
-    return "closed" if state in ("closed", "done", "merged") else "open"
+    return "closed" if state in ("closed", "done", "merged", "abandoned") else "open"
 
 
 def item_stage(link: Mapping[str, Any]) -> str:
@@ -120,20 +128,30 @@ class Filters:
         return ("open", "closed") if self.show_closed else ("open",)
 
     @property
-    def hides_done(self) -> bool:
-        """The default view's other half: an item in ``done`` is not what the admin asked for."""
+    def default_view(self) -> bool:
+        """Whether the default view is in force, i.e. the admin asked for nothing.
+
+        It hides what is finished by either sign -- an item whose phase is ``done``, and one
+        GitHub shows closed or merged (#512) -- since the phase is bookkeeping a round may
+        never get to. An asked dimension is a question of its own, and reading another one to
+        answer it says something the admin did not ask: ``type=pr`` must not quietly drop the
+        PRs that landed.
+        """
         return not self.asked
 
     def item_ok(self, link: Mapping[str, Any]) -> bool:
         """Whether one item passes: its type, its state and its phase, where they are asked."""
         if self.types and item_type(link) not in self.types:
             return False
-        if self.states and item_state(link) not in self.states:
+        if self.states:
+            if item_state(link) not in self.states:
+                return False
+        elif self.default_view and item_state(link) == "closed":
             return False
         stage = item_stage(link)
         if self.stages and stage not in self.stages:
             return False
-        if self.hides_done and stage in DONE_STAGES:
+        if self.default_view and stage in DONE_STAGES:
             return False
         return True
 
@@ -167,10 +185,12 @@ class Filters:
         if self.types or self.stages or self.states:
             return bool(passed)
         # The default view: open, and still something to do in it -- or a tracking issue of
-        # its own, which is the topic's last live item once every slice has landed.
+        # its own, which is the topic's last live item once every slice has landed. A work
+        # item that is done *or* closed/merged on GitHub is finished, so a topic whose every
+        # item is either is finished too (#512): the phase is a field nobody may have set.
         if tracked:
             return True
-        return bool(passed) or not any(item_stage(link) in DONE_STAGES for link in items)
+        return bool(passed)
 
     # -- the words -------------------------------------------------------------------
     def words(self) -> List[str]:

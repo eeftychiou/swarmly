@@ -101,6 +101,18 @@ class TestSlashTopicsFilters(unittest.TestCase):
         self.assertIn("moving (12)", text)
         self.assertNotIn("finished (11)", text)
 
+    def test_the_default_view_hides_work_github_closed_without_a_done_phase(self):
+        """#512: the phase was never set, and the item is closed on GitHub all the same."""
+        landed = dict(PR_LINK, status="closed")             # phase stays "review"
+        store = self.store(record(11, "landed, phase left", [landed]),
+                           record(12, "one live item left", [landed, ISSUE_LINK]),
+                           record(13, "moving", [ISSUE_LINK]))
+        text = self.shadow.describe(store)
+        self.assertNotIn("landed, phase left (11)", text)
+        self.assertIn("one live item left (12)", text)
+        self.assertIn("moving (13)", text)
+        self.assertIn("1 hidden by the filters", text)
+
     def test_an_unknown_filter_is_said_not_swallowed(self):
         store = self.store(record(11, "an issue", [ISSUE_LINK]))
         text = self.shadow.describe(store, filters=tf.parse(["stage=reveiw"]))
@@ -136,6 +148,23 @@ class TestThePanelFilters(unittest.TestCase):
         cards = self.cards(record(11, "moving", [ISSUE_LINK]),
                            record(12, "finished", [DONE_LINK]))
         self.assertEqual([card["topic"] for card in cards], ["moving"])
+
+    def test_a_topic_github_closed_drops_out_of_the_first_view(self):
+        """#512, on the panel's side: same rule as the command, on the cards it filters."""
+        landed = dict(PR_LINK, status="closed", phase="review")
+        cards = self.cards(record(11, "landed, phase left", [landed]),
+                           record(12, "one live item left", [landed, ISSUE_LINK]))
+        self.assertEqual([card["topic"] for card in cards], ["one live item left"])
+
+    def test_the_first_view_says_it_is_showing_open(self):
+        """#512: the page must not look unfiltered on first open."""
+        view = webui.filters_view()
+        self.assertEqual(view["selected"], {})
+        self.assertTrue(view["default"], "no query at all is the open view")
+        self.assertFalse(webui.filters_view(tf.parse(["state=closed"]))["default"])
+        page = webui.page_html(title="Swarm", every=3.0)
+        self.assertIn('view.default', page)
+        self.assertIn('key === "state" && word === "open"', page)
 
     def test_a_card_says_what_type_each_link_is(self):
         cards = self.cards(record(11, "mixed", [ISSUE_LINK, PR_LINK]))
