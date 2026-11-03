@@ -44,11 +44,12 @@ class TestTheTypeOfALink(unittest.TestCase):
 class TestTheStateOfALink(unittest.TestCase):
     def test_closed_covers_the_words_a_work_item_is_closed_in(self):
         self.assertEqual(tf.item_state(ISSUE), "open")
-        for word in ("closed", "merged", "done"):
+        for word in ("closed", "merged", "done", "abandoned"):
             self.assertEqual(tf.item_state({"status": word}), "closed", word)
 
     def test_an_unstated_state_is_open(self):
         self.assertEqual(tf.item_state({"phase": "review"}), "open")
+        self.assertEqual(tf.item_state({"status": None, "phase": "review"}), "open")
 
 
 class TestOneFilterAtATime(unittest.TestCase):
@@ -105,6 +106,30 @@ class TestTheDefaultView(unittest.TestCase):
         self.assertFalse(tf.DEFAULT.topic_ok("open", [DONE]),
                          "a topic whose every item is done is finished, not news")
         self.assertFalse(tf.DEFAULT.topic_ok("closed", [ISSUE]))
+
+    def test_a_topic_whose_every_item_landed_is_finished_whatever_its_phase(self):
+        """#512: GitHub shows it merged and nobody set the phase to done, so it stayed.
+
+        The admin's first open of the dashboard listed a topic whose issue and PR were both
+        closed: the default view read the phase only, and the phase is bookkeeping a round
+        may never get to. The item's own state is the fact.
+        """
+        merged = dict(PR, status="closed", phase="review")
+        self.assertFalse(tf.DEFAULT.topic_ok("open", [merged]))
+        abandoned = dict(ISSUE, status="abandoned", phase="development")
+        self.assertFalse(tf.DEFAULT.topic_ok("open", [abandoned]))
+        # One item still live keeps the topic: that is work left to do.
+        self.assertTrue(tf.DEFAULT.topic_ok("open", [merged, ISSUE]))
+        # Nothing said is not "closed": a link whose state nobody wrote stays.
+        self.assertTrue(tf.DEFAULT.topic_ok("open", [dict(merged, status=None)]))
+
+    def test_an_asked_filter_still_does_not_read_the_state_it_was_not_asked_about(self):
+        """``type=pr`` is a question about type: it must not answer the state one (#512)."""
+        merged = dict(PR, status="closed", phase="review")
+        self.assertTrue(tf.parse(["type=pr"]).topic_ok("open", [merged]))
+        self.assertTrue(tf.parse(["stage=review"]).topic_ok("open", [merged]))
+        self.assertTrue(tf.parse(["state=open"]).topic_ok("open", [ISSUE]))
+        self.assertFalse(tf.parse(["state=open"]).topic_ok("open", [merged]))
 
     def test_a_topic_with_no_items_stays(self):
         """Nothing says it is done, and a topic the admin just opened must not vanish."""

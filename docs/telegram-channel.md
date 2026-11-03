@@ -1498,6 +1498,18 @@ on the page, and only the drift score this bot can see (its own ledger) is shown
 being an unknown `?`. On a bot whose store is not ready the panel says **registry not ready**
 — never an empty list, which would claim there are no topics.
 
+**The first view is the open one (#512).** The panel opens on *open topics with work left*, the
+same default `/topics` reads: an item at phase `done`, or one GitHub shows closed or merged
+(the registry's `closed` and `abandoned`) is finished, and a topic whose every work item is
+finished drops out — unless it holds a tracking link (#468) or no work item at all. The phase
+is bookkeeping a round may never get to, so the item's own state decides. Leaving a done item's
+phase at `review` no longer keeps the topic on the first screen. The chips under the panel say
+so: the `open` state chip is drawn selected on the default view rather than leaving every chip
+blank, and a line under the list counts what was left out. `all` widens the view to the closed
+records, `state=closed` and the other chips filter as before, and `reset` comes back to this
+default. `/topics` with no arguments prints the same set — one `topic_filter`, so the panel and
+the command cannot drift.
+
 **The same page as a Telegram Mini App (#240, slice 2).** Name the host the page is reached
 under and the page becomes a Mini App: the pinned card grows an **Open dashboard** button, and
 `/state.json` answers only the admin.
